@@ -1,0 +1,182 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_ligowave",
+  "plugin": "Wireless LigoWave SNMP",
+  "plugin_desc": "SNMP monitoring template for LigoWave wireless device. It reports uptime and interface traffic (enterprise PEN 32750).",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='wireless', collect_type='snmp_ligowave'}) by (instance_id)",
+  "name": "Wireless",
+  "icon": "mm-ligowave_ligowave",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='wireless'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "rx_signal_level_0",
+    "rx_noise",
+    "rx_snr_0",
+    "tx_power"
+  ],
+  "metrics": [
+    {
+      "metric_group": "Radio",
+      "name": "rx_signal_level_0",
+      "query": "rx_signal_level_0{instance_type='wireless', __$labels__}",
+      "display_name": "Antenna 0 RSSI",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index (ifIndex and endpoint)"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Radio3 antenna-0 last receive signal level from ligoRdo3RxLastSigLevel0 under PEN 32750 ligoRdo3StatsTable. Indexed by ifIndex and endpoint. Integer32 with no scaling. A dropping RSSI is an early sign of path fade, antenna misalignment or radio degradation."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "rx_noise",
+      "query": "rx_noise{instance_type='wireless', __$labels__}",
+      "display_name": "Receive Noise",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index (ifIndex and endpoint)"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Radio3 receive noise from ligoRdo3RxNoise under PEN 32750 ligoRdo3StatsTable. Indexed by ifIndex and endpoint. Integer32 with no scaling. Rising noise reduces SNR and link margin."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "rx_snr_0",
+      "query": "rx_snr_0{instance_type='wireless', __$labels__}",
+      "display_name": "Antenna 0 SNR",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index (ifIndex and endpoint)"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Radio3 antenna-0 last signal-to-noise ratio from ligoRdo3RxLastSnr0 under PEN 32750 ligoRdo3StatsTable. Indexed by ifIndex and endpoint. Integer32 with no scaling. A dropping SNR is an early sign of path fade or interference."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "tx_power",
+      "query": "tx_power{instance_type='wireless', __$labels__}",
+      "display_name": "Transmit Power",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index (ifIndex and endpoint)"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Optional Radio3 transmit power from ligoRdo3TxPower under PEN 32750 ligoRdo3StatsTable. Indexed by ifIndex and endpoint. Gauge32 with no scaling. Missing rows on some firmware revisions are skipped. Unexpectedly low transmit power can indicate radio mute, hardware fault or configuration change."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "rx_signal_level_1",
+      "query": "rx_signal_level_1{instance_type='wireless', __$labels__}",
+      "display_name": "Antenna 1 RSSI",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index (ifIndex and endpoint)"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Optional Radio3 antenna-1 last receive signal level from ligoRdo3RxLastSigLevel1 under PEN 32750 ligoRdo3StatsTable. Indexed by ifIndex and endpoint. Integer32 with no scaling. Missing antenna columns are skipped."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "rx_signal_level_2",
+      "query": "rx_signal_level_2{instance_type='wireless', __$labels__}",
+      "display_name": "Antenna 2 RSSI",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index (ifIndex and endpoint)"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Optional Radio3 antenna-2 last receive signal level from ligoRdo3RxLastSigLevel2 under PEN 32750 ligoRdo3StatsTable. Indexed by ifIndex and endpoint. Integer32 with no scaling. Missing antenna columns are skipped."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCInOctets",
+      "query": "rate(interface_ifHCInOctets{instance_type='wireless', __$labels__}[5m])",
+      "display_name": "Interface Incoming Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the average rate of bytes received over the past 5 minutes, based on the 64-bit ifHCInOctets counter which does not wrap on high-speed interfaces."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCOutOctets",
+      "query": "rate(interface_ifHCOutOctets{instance_type='wireless', __$labels__}[5m])",
+      "display_name": "Interface Outgoing Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the average rate of bytes sent over the past 5 minutes, based on the 64-bit ifHCOutOctets counter which does not wrap on high-speed interfaces."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='wireless', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
+    }
+  ]
+}

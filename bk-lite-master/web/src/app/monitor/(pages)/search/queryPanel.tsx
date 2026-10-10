@@ -1,0 +1,1467 @@
+'use client';
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useImperativeHandle,
+  forwardRef
+} from 'react';
+import { Select, Button, Tooltip, AutoComplete, Input, Card, message } from 'antd';
+import {
+  PlusOutlined,
+  DeleteOutlined,
+  CopyOutlined,
+  BellOutlined,
+  SaveOutlined,
+  FolderOpenOutlined,
+  ClearOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  CaretDownFilled,
+  CaretRightFilled,
+  DoubleLeftOutlined,
+  MinusCircleOutlined,
+  RightOutlined
+} from '@ant-design/icons';
+import { useTranslation } from '@/utils/i18n';
+import { useConditionList } from '@/app/monitor/hooks';
+import useMonitorApi from '@/app/monitor/api';
+import useViewApi from '@/app/monitor/api/view';
+import useApiClient from '@/utils/request';
+import { runWithConcurrency } from '@/app/monitor/dashboards/shared/utils/concurrency';
+import { useSearchParams } from 'next/navigation';
+import {
+  ListItem,
+  MetricItem,
+  IndexViewItem,
+  ObjectItem
+} from '@/app/monitor/types';
+import {
+  buildGroupedMetricSelectOptions,
+  METRIC_SELECT_POPUP_CLASSNAME,
+} from '@/app/monitor/components/metricSelectOptions';
+import { loadMonitorPluginsByObjectCached } from '@/app/monitor/utils/monitorPluginCache';
+import {
+  InstanceItem,
+  PluginItem,
+  QueryGroup,
+  SearchPayload,
+  QueryPanelRef,
+  QueryPanelProps,
+  SaveQueryModalRef,
+  SavedQueryDrawerRef
+} from '@/app/monitor/types/search';
+import { cloneDeep } from 'lodash';
+import SavedQueryDrawer from './savedQueryDrawer';
+import SaveQueryModal from './saveQueryModal';
+import { loadSavedQueryResources } from './savedQueryLoading';
+import {
+  getMetricsAbortKey,
+  mergeMetricsById
+} from './savedQueryMetricMerge';
+import {
+  generateSearchId,
+  getMetricsMapKey,
+  extractDimensionLabelValues,
+  intersectMetricDimensionLabels,
+  listSelectedMetricIds,
+  normalizeMonitorEntityId,
+  resolveInitialPlugin,
+  resolveMetricSelection
+} from './searchQueryLogic';
+
+const { Option } = Select;
+
+export type { QueryGroup, SearchPayload, QueryPanelRef, QueryPanelProps };
+
+const generateGroupName = (index: number) => `查询条件 ${index + 1}`;
+
+const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
+  ({ onSearch }, ref) => {
+    const { t } = useTranslation();
+    const { isLoading } = useApiClient();
+    const searchParams = useSearchParams();
+    const {
+      getMonitorObject,
+      getMonitorPlugin,
+      getMonitorMetrics,
+      getMetricsGroup,
+      getInstanceList
+    } = useMonitorApi();
+    const { getMetricsInstanceQuery } = useViewApi();
+    const CONDITION_LIST = useConditionList();
+    const [panelCollapsed, setPanelCollapsed] = useState(false);
+    const initialObjectId = searchParams.get('monitor_object');
+    const initialPluginId = searchParams.get('plugin_id');
+    const initialInstanceId = searchParams.get('instance_id');
+    const initialMetricId = searchParams.get('metric_id');
+    const normalizedInitialObjectId = normalizeMonitorEntityId(initialObjectId);
+    const normalizedInitialPluginId = normalizeMonitorEntityId(initialPluginId);
+    const [queryGroups, setQueryGroups] = useState<QueryGroup[]>([
+      {
+        id: generateSearchId(),
+        name: '查询条件 1',
+        object: '',
+        plugin: null,
+        instanceIds: [],
+        metric: null,
+        legacyMetricName: null,
+        aggregation: 'AVG',
+        conditions: [],
+        collapsed: false
+      }
+    ]);
+    const [activeGroupId, setActiveGroupId] = useState<string>(
+      queryGroups[0].id
+    );
+    const [urlParamsApplied, setUrlParamsApplied] = useState(false);
+    const [autoSearchTriggered, setAutoSearchTriggered] = useState(false);
+    const [editingNameGroupId, setEditingNameGroupId] = useState<string | null>(
+      null
+    );
+    const [objLoading, setObjLoading] = useState<boolean>(false);
+    const [objects, setObjects] = useState<ObjectItem[]>([]);
+    const [pluginsMap, setPluginsMap] = useState<Record<string, PluginItem[]>>(
+      {}
+    );
+    const [metricsMap, setMetricsMap] = useState<Record<string, MetricItem[]>>(
+      {}
+    );
+    const [metricsGroupMap, setMetricsGroupMap] = useState<
+      Record<string, IndexViewItem[]>
+    >({});
+    const [metricSearchResultMap, setMetricSearchResultMap] = useState<
+      Record<string, IndexViewItem[]>
+    >({});
+    const [selectedMetricMap, setSelectedMetricMap] = useState<
+      Record<string, MetricItem[]>
+    >({});
+    const [metricSearchMap, setMetricSearchMap] = useState<
+      Record<string, string>
+    >({});
+    const [instancesMap, setInstancesMap] = useState<
+      Record<string, InstanceItem[]>
+    >({});
+    // 条件值下拉：key = object_plugin_metric_instances_label
+    const [conditionValueOptionsMap, setConditionValueOptionsMap] = useState<
+      Record<string, string[]>
+    >({});
+    const [conditionValueLoadingMap, setConditionValueLoadingMap] = useState<
+      Record<string, boolean>
+    >({});
+    const [metricsLoading, setMetricsLoading] = useState<
+      Record<string, boolean>
+    >({});
+    const [pluginLoading, setPluginLoading] = useState<
+      Record<string, boolean>
+    >({});
+    const [instanceLoading, setInstanceLoading] = useState<
+      Record<string, boolean>
+    >({});
+    const pluginAbortControllerRef = useRef<Record<string, AbortController>>(
+      {}
+    );
+    const metricsAbortControllerRef = useRef<Record<string, AbortController>>(
+      {}
+    );
+    const metricSearchTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>(
+      {}
+    );
+    const instanceAbortControllerRef = useRef<Record<string, AbortController>>(
+      {}
+    );
+    const savedQueryDrawerRef = useRef<SavedQueryDrawerRef>(null);
+    const saveQueryModalRef = useRef<SaveQueryModalRef>(null);
+    const activeGroup =
+      queryGroups.find((g) => g.id === activeGroupId) || queryGroups[0];
+    const canSearch = () => {
+      return queryGroups.some(
+        (g) =>
+          g.plugin &&
+          listSelectedMetricIds(g.metric).length > 0 &&
+          g.instanceIds.length > 0
+      );
+    };
+
+    const getSearchPayload = (): SearchPayload | null => {
+      if (!canSearch()) return null;
+      const objectsMap: Record<string, ObjectItem> = {};
+      objects.forEach((obj) => {
+        objectsMap[String(obj.id)] = obj;
+      });
+      const payloadMetricsMap = { ...metricsMap };
+      queryGroups.forEach((group) => {
+        const selectedMetrics = selectedMetricMap[group.id] || [];
+        if (!selectedMetrics.length) return;
+        const key = getMetricsMapKey(group.object, group.plugin);
+        const current = payloadMetricsMap[key] || [];
+        const missing = selectedMetrics.filter(
+          (selected) => !current.some((metric) => metric.id === selected.id)
+        );
+        if (missing.length) {
+          payloadMetricsMap[key] = [...current, ...missing];
+        }
+      });
+      return {
+        queryGroups,
+        activeGroup,
+        metricsMap: payloadMetricsMap,
+        instancesMap,
+        pluginsMap,
+        objectsMap
+      };
+    };
+
+    useImperativeHandle(ref, () => ({
+      getSearchPayload,
+      canSearch,
+      getActiveGroup: () => activeGroup,
+      updateGroupPresentation: (groupId, presentation) => {
+        updateQueryGroup(groupId, presentation);
+      }
+    }));
+
+    useEffect(() => {
+      return () => {
+        Object.values(metricsAbortControllerRef.current).forEach((c) =>
+          c?.abort()
+        );
+        Object.values(pluginAbortControllerRef.current).forEach((c) =>
+          c?.abort()
+        );
+        Object.values(instanceAbortControllerRef.current).forEach((c) =>
+          c?.abort()
+        );
+        Object.values(metricSearchTimerRef.current).forEach((timer) =>
+          clearTimeout(timer)
+        );
+      };
+    }, []);
+
+    useEffect(() => {
+      if (isLoading) return;
+      getObjects();
+      // 应用 URL 参数到初始查询组
+      if (
+        !urlParamsApplied &&
+        (normalizedInitialObjectId || initialInstanceId || initialMetricId)
+      ) {
+        setQueryGroups((prev) => {
+          const first = prev[0];
+          if (!first) return prev;
+          return [
+            {
+              ...first,
+              object: normalizedInitialObjectId ?? first.object,
+              plugin: normalizedInitialPluginId ?? first.plugin,
+              instanceIds: initialInstanceId
+                ? [initialInstanceId]
+                : first.instanceIds,
+              metric:
+                initialMetricId && /^\d+$/.test(initialMetricId)
+                  ? [Number(initialMetricId)]
+                  : first.metric,
+              legacyMetricName:
+                initialMetricId && !/^\d+$/.test(initialMetricId)
+                  ? initialMetricId
+                  : first.legacyMetricName
+            },
+            ...prev.slice(1)
+          ];
+        });
+        setUrlParamsApplied(true);
+        if (normalizedInitialObjectId) {
+          getPlugins(
+            normalizedInitialObjectId,
+            queryGroups[0].id,
+            normalizedInitialPluginId,
+            Boolean(initialMetricId && !/^\d+$/.test(initialMetricId)),
+            initialMetricId && !/^\d+$/.test(initialMetricId)
+              ? initialMetricId
+              : null,
+            initialMetricId && /^\d+$/.test(initialMetricId)
+              ? Number(initialMetricId)
+              : null
+          );
+        }
+      }
+    }, [
+      isLoading,
+      initialObjectId,
+      initialPluginId,
+      initialInstanceId,
+      initialMetricId,
+      urlParamsApplied
+    ]);
+
+    useEffect(() => {
+      if (!urlParamsApplied || autoSearchTriggered || !initialObjectId) return;
+      const key = String(initialObjectId);
+      const isDataReady =
+        !metricsLoading[key] &&
+        !instanceLoading[key] &&
+        metricsMap[key] &&
+        instancesMap[key];
+      const group = queryGroups[0];
+      const pluginKey = group?.plugin
+        ? getMetricsMapKey(initialObjectId, group.plugin)
+        : key;
+      const pluginDataReady =
+        !metricsLoading[pluginKey] &&
+        !instanceLoading[pluginKey] &&
+        metricsMap[pluginKey] &&
+        instancesMap[pluginKey];
+      if ((isDataReady || pluginDataReady) && canSearch()) {
+        setAutoSearchTriggered(true);
+        handleSearch();
+      }
+    }, [
+      urlParamsApplied,
+      metricsMap,
+      instancesMap,
+      metricsLoading,
+      instanceLoading,
+      autoSearchTriggered,
+      initialObjectId,
+      queryGroups
+    ]);
+
+    const getObjects = async () => {
+      try {
+        setObjLoading(true);
+        const data: ObjectItem[] = await getMonitorObject({
+          add_instance_count: true
+        });
+        setObjects(data);
+      } finally {
+        setObjLoading(false);
+      }
+    };
+
+    const getPlugins = async (
+      objectId: React.Key,
+      groupId?: string,
+      preferredPluginId?: React.Key | null,
+      allowFirstPluginFallback = false,
+      legacyMetricName?: string | null,
+      preferredMetricId?: React.Key | null
+    ): Promise<PluginItem[]> => {
+      const key = String(objectId);
+      pluginAbortControllerRef.current[key]?.abort();
+      const abortController = new AbortController();
+      pluginAbortControllerRef.current[key] = abortController;
+      try {
+        setPluginLoading((prev) => ({ ...prev, [key]: true }));
+        const plugins = (await loadMonitorPluginsByObjectCached(
+          objectId,
+          () => getMonitorPlugin({ monitor_object_id: objectId })
+        )) as PluginItem[];
+        if (abortController.signal.aborted) {
+          return [];
+        }
+        setPluginsMap((prev) => ({ ...prev, [key]: plugins }));
+        const selectedPlugin =
+          normalizeMonitorEntityId(preferredPluginId) ??
+          resolveInitialPlugin(plugins) ??
+          (allowFirstPluginFallback ? plugins[0]?.id : null);
+        if (groupId && selectedPlugin) {
+          updateQueryGroup(groupId, { plugin: selectedPlugin });
+          getMetrics(
+            objectId,
+            selectedPlugin,
+            groupId,
+            legacyMetricName,
+            preferredMetricId
+          );
+          getInstList(objectId, selectedPlugin);
+        }
+        return plugins;
+      } catch {
+        return [];
+      } finally {
+        setPluginLoading((prev) => ({ ...prev, [key]: false }));
+      }
+    };
+
+    const getMetrics = async (
+      objectId: React.Key,
+      pluginId?: React.Key | null,
+      groupId?: string,
+      legacyMetricName?: string | null,
+      selectedMetricId?: React.Key | React.Key[] | null,
+      keyword = ''
+    ): Promise<MetricItem[]> => {
+      const key = getMetricsMapKey(objectId, pluginId);
+      const requestKey = getMetricsAbortKey(
+        key,
+        keyword,
+        groupId,
+        selectedMetricId
+      );
+      metricsAbortControllerRef.current[requestKey]?.abort();
+      const abortController = new AbortController();
+      metricsAbortControllerRef.current[requestKey] = abortController;
+      try {
+        setMetricsLoading((prev) => ({ ...prev, [key]: true }));
+        const config = { signal: abortController.signal };
+        const params = {
+          monitor_object_id: String(objectId),
+          ...(pluginId ? { monitor_plugin_id: String(pluginId) } : {}),
+          ...(keyword.trim() ? { keyword: keyword.trim() } : {})
+        };
+        const [groupList, firstMetricsPage] = await Promise.all([
+          getMetricsGroup(params, config),
+          getMonitorMetrics(params, config)
+        ]);
+        if (abortController.signal.aborted) return [];
+        let metricsList = firstMetricsPage;
+        const requestedIds = listSelectedMetricIds(selectedMetricId);
+        const missingIds = requestedIds.filter(
+          (id) =>
+            !metricsList.items.some((metric) => String(metric.id) === String(id))
+        );
+        const legacyMetricExists = legacyMetricName
+          ? metricsList.items.some((metric) => metric.name === legacyMetricName)
+          : true;
+        if (!keyword.trim() && (missingIds.length || !legacyMetricExists)) {
+          const extraPages = await Promise.all([
+            ...missingIds.map((id) =>
+              getMonitorMetrics(
+                {
+                  monitor_object_id: String(objectId),
+                  ...(pluginId ? { monitor_plugin_id: String(pluginId) } : {}),
+                  id
+                },
+                config
+              )
+            ),
+            ...(!legacyMetricExists && legacyMetricName
+              ? [
+                getMonitorMetrics(
+                  {
+                    monitor_object_id: String(objectId),
+                    ...(pluginId ? { monitor_plugin_id: String(pluginId) } : {}),
+                    name: legacyMetricName
+                  },
+                  config
+                )
+              ]
+              : [])
+          ]);
+          if (abortController.signal.aborted) return [];
+          metricsList = extraPages.reduce(
+            (merged, page) => ({
+              ...merged,
+              items: [...merged.items, ...page.items],
+              metric_groups: [
+                ...(merged.metric_groups || []),
+                ...(page.metric_groups || [])
+              ]
+            }),
+            metricsList
+          );
+        }
+        const metricData = cloneDeep(metricsList.items);
+        if (!keyword.trim()) {
+          setMetricsMap((prev) => ({
+            ...prev,
+            [key]: mergeMetricsById(prev[key], metricsList.items)
+          }));
+        }
+        const groupData: IndexViewItem[] = (
+          metricsList.metric_groups || groupList.items
+        ).map((item) => ({
+          ...item,
+          id: Number(item.id),
+          child: []
+        }));
+        metricData.forEach((metric: MetricItem) => {
+          const target = groupData.find(
+            (item) => item.id === metric.metric_group
+          );
+          if (target) {
+            target.child.push(metric);
+          }
+        });
+        const filteredGroupData = groupData.filter((item) => !!item.child?.length);
+        if (keyword.trim() && groupId) {
+          setMetricSearchResultMap((prev) => ({
+            ...prev,
+            [groupId]: filteredGroupData
+          }));
+        } else {
+          setMetricsGroupMap((prev) => ({ ...prev, [key]: filteredGroupData }));
+          if (groupId) {
+            setMetricSearchResultMap((prev) => ({
+              ...prev,
+              [groupId]: filteredGroupData
+            }));
+          }
+        }
+        const group = groupId
+          ? queryGroups.find((item) => item.id === groupId)
+          : null;
+        const legacyName = legacyMetricName || group?.legacyMetricName;
+        if (legacyName && listSelectedMetricIds(group?.metric).length === 0) {
+          const legacyMetric = resolveMetricSelection(
+            metricsList.items,
+            legacyName
+          );
+          if (legacyMetric && (group?.id || groupId)) {
+            updateQueryGroup(group?.id || groupId!, {
+              metric: [legacyMetric.id],
+              legacyMetricName: null
+            });
+          }
+        }
+        return metricsList.items;
+      } catch {
+        return [];
+      } finally {
+        if (metricsAbortControllerRef.current[requestKey] === abortController) {
+          setMetricsLoading((prev) => ({ ...prev, [key]: false }));
+        }
+      }
+    };
+
+    const getInstList = async (
+      objectId: React.Key,
+      pluginId?: React.Key | null
+    ): Promise<InstanceItem[]> => {
+      const key = getMetricsMapKey(objectId, pluginId);
+      instanceAbortControllerRef.current[key]?.abort();
+      const abortController = new AbortController();
+      instanceAbortControllerRef.current[key] = abortController;
+      try {
+        setInstanceLoading((prev) => ({ ...prev, [key]: true }));
+        const data = await getInstanceList(
+          objectId,
+          {
+            page_size: -1,
+            ...(pluginId ? { monitor_plugin_id: pluginId } : {})
+          },
+          { signal: abortController.signal }
+        );
+        const results = data.results || [];
+        setInstancesMap((prev) => ({ ...prev, [key]: results }));
+        return results;
+      } catch {
+        return [];
+      } finally {
+        setInstanceLoading((prev) => ({ ...prev, [key]: false }));
+      }
+    };
+
+    const updateQueryGroup = (
+      groupId: string,
+      updates: Partial<QueryGroup>
+    ) => {
+      setQueryGroups((prev) =>
+        prev.map((g) => (g.id === groupId ? { ...g, ...updates } : g))
+      );
+    };
+
+    const addQueryGroup = () => {
+      const newGroup: QueryGroup = {
+        id: generateSearchId(),
+        name: generateGroupName(queryGroups.length),
+        object: '',
+        plugin: null,
+        instanceIds: [],
+        metric: null,
+        legacyMetricName: null,
+        aggregation: 'AVG',
+        conditions: [],
+        collapsed: false
+      };
+      setQueryGroups((prev) => [...prev, newGroup]);
+      setActiveGroupId(newGroup.id);
+    };
+
+    const deleteQueryGroup = (groupId: string) => {
+      if (queryGroups.length <= 1) return;
+      setQueryGroups((prev) => {
+        const filtered = prev.filter((g) => g.id !== groupId);
+        return filtered.map((g, i) => ({ ...g, name: generateGroupName(i) }));
+      });
+      if (activeGroupId === groupId) {
+        setActiveGroupId(
+          queryGroups[0].id === groupId ? queryGroups[1]?.id : queryGroups[0].id
+        );
+      }
+      setSelectedMetricMap((prev) => {
+        const next = { ...prev };
+        delete next[groupId];
+        return next;
+      });
+    };
+
+    const duplicateQueryGroup = (groupId: string) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      const newGroup: QueryGroup = {
+        ...cloneDeep(group),
+        id: generateSearchId(),
+        name: generateGroupName(queryGroups.length)
+      };
+      setQueryGroups((prev) => [...prev, newGroup]);
+      if (selectedMetricMap[groupId]) {
+        setSelectedMetricMap((prev) => ({
+          ...prev,
+          [newGroup.id]: selectedMetricMap[groupId]
+        }));
+      }
+    };
+
+    const toggleGroupCollapse = (groupId: string) => {
+      updateQueryGroup(groupId, {
+        collapsed: !queryGroups.find((g) => g.id === groupId)?.collapsed
+      });
+    };
+
+    const toggleAllGroups = () => {
+      const allCollapsed = queryGroups.every((g) => g.collapsed);
+      setQueryGroups((prev) =>
+        prev.map((g) => ({ ...g, collapsed: !allCollapsed }))
+      );
+    };
+
+    const handleObjectChange = (groupId: string, objectId: unknown) => {
+      const normalizedObjectId = normalizeMonitorEntityId(objectId);
+      if (normalizedObjectId === null) return;
+      setSelectedMetricMap((prev) => {
+        const next = { ...prev };
+        delete next[groupId];
+        return next;
+      });
+      updateQueryGroup(groupId, {
+        object: normalizedObjectId,
+        plugin: null,
+        instanceIds: [],
+        metric: null,
+        legacyMetricName: null,
+        conditions: []
+      });
+      if (normalizedObjectId) {
+        getPlugins(normalizedObjectId, groupId);
+      }
+    };
+
+    const handlePluginChange = (
+      groupId: string,
+      pluginId: unknown
+    ) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      const normalizedPluginId = normalizeMonitorEntityId(pluginId);
+      setSelectedMetricMap((prev) => {
+        const next = { ...prev };
+        delete next[groupId];
+        return next;
+      });
+      updateQueryGroup(groupId, {
+        plugin: normalizedPluginId,
+        instanceIds: [],
+        metric: null,
+        legacyMetricName: null,
+        conditions: []
+      });
+      if (group.object && normalizedPluginId) {
+        getMetrics(group.object, normalizedPluginId, groupId);
+        getInstList(group.object, normalizedPluginId);
+      }
+    };
+
+    const handleMetricChange = (groupId: string, metricId: unknown) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      const dataKey = getMetricsMapKey(group.object, group.plugin);
+      const searchMetrics = (metricSearchResultMap[groupId] || []).flatMap(
+        (item) => item.child || []
+      );
+      const metrics = [
+        ...(selectedMetricMap[groupId] || []),
+        ...searchMetrics,
+        ...(metricsMap[dataKey] || [])
+      ];
+      const normalizedIds = listSelectedMetricIds(metricId);
+      const resolved = normalizedIds
+        .map((id) => resolveMetricSelection(metrics, id))
+        .filter((item): item is MetricItem => Boolean(item));
+      setSelectedMetricMap((prev) => ({ ...prev, [groupId]: resolved }));
+      const sharedLabels = new Set(intersectMetricDimensionLabels(resolved));
+      updateQueryGroup(groupId, {
+        metric: normalizedIds,
+        legacyMetricName: null,
+        conditions: normalizedIds.length
+          ? group.conditions.filter(
+            (item) => !item.label || sharedLabels.has(String(item.label))
+          )
+          : []
+      });
+    };
+
+    const handleMetricSearch = (group: QueryGroup, value: string) => {
+      setMetricSearchMap((prev) => ({ ...prev, [group.id]: value }));
+      const previousTimer = metricSearchTimerRef.current[group.id];
+      if (previousTimer) {
+        clearTimeout(previousTimer);
+      }
+      metricSearchTimerRef.current[group.id] = setTimeout(() => {
+        const selectedIds = listSelectedMetricIds(group.metric);
+        getMetrics(
+          group.object,
+          group.plugin,
+          group.id,
+          null,
+          selectedIds.length ? selectedIds : null,
+          value
+        );
+      }, 300);
+    };
+
+    const getConditionValueOptionsKey = (
+      group: QueryGroup,
+      label: string | null | undefined
+    ) =>
+      [
+        group.object,
+        group.plugin,
+        listSelectedMetricIds(group.metric).join(','),
+        (group.instanceIds || []).slice().sort().join(','),
+        label || ''
+      ].join('_');
+
+    const loadConditionValueOptions = async (
+      group: QueryGroup,
+      label: string | null | undefined
+    ) => {
+      const dim = String(label || '').trim();
+      const metricId = listSelectedMetricIds(group.metric)[0];
+      if (
+        !dim ||
+        !group.object ||
+        metricId === undefined ||
+        !(group.instanceIds || []).length
+      ) {
+        return;
+      }
+      const cacheKey = getConditionValueOptionsKey(group, dim);
+      if (conditionValueOptionsMap[cacheKey]) return;
+
+      setConditionValueLoadingMap((prev) => ({ ...prev, [cacheKey]: true }));
+      try {
+        const responses = await runWithConcurrency(
+          group.instanceIds,
+          4,
+          (instanceId) =>
+            getMetricsInstanceQuery({
+              monitor_object_id: group.object,
+              instance_id: instanceId,
+              metric_id: metricId,
+              auto_convert: false,
+              limit: 200,
+              mode: 'limited'
+            })
+        );
+        const series = responses.flatMap(
+          (resp) => resp?.data?.result || []
+        );
+        const values = extractDimensionLabelValues(series, dim);
+        setConditionValueOptionsMap((prev) => ({
+          ...prev,
+          [cacheKey]: values
+        }));
+      } catch {
+        setConditionValueOptionsMap((prev) => ({
+          ...prev,
+          [cacheKey]: []
+        }));
+      } finally {
+        setConditionValueLoadingMap((prev) => ({
+          ...prev,
+          [cacheKey]: false
+        }));
+      }
+    };
+
+    const handleLabelChange = (groupId: string, val: string, index: number) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      const conditions = cloneDeep(group.conditions);
+      conditions[index].label = val;
+      conditions[index].value = '';
+      updateQueryGroup(groupId, { conditions });
+      void loadConditionValueOptions(group, val);
+    };
+
+    const handleConditionChange = (
+      groupId: string,
+      val: string,
+      index: number
+    ) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      const conditions = cloneDeep(group.conditions);
+      conditions[index].condition = val;
+      updateQueryGroup(groupId, { conditions });
+    };
+
+    const handleValueChange = (
+      groupId: string,
+      val: string,
+      index: number
+    ) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      const conditions = cloneDeep(group.conditions);
+      conditions[index].value = val;
+      updateQueryGroup(groupId, { conditions });
+    };
+
+    const addConditionItem = (groupId: string) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      updateQueryGroup(groupId, {
+        conditions: [
+          ...group.conditions,
+          { label: null, condition: null, value: '' }
+        ]
+      });
+    };
+
+    const deleteConditionItem = (groupId: string, index: number) => {
+      const group = queryGroups.find((g) => g.id === groupId);
+      if (!group) return;
+      const conditions = cloneDeep(group.conditions);
+      conditions.splice(index, 1);
+      updateQueryGroup(groupId, { conditions });
+    };
+
+    const clearAll = () => {
+      setQueryGroups([
+        {
+          id: generateSearchId(),
+          name: '查询条件 1',
+          object: '',
+          plugin: null,
+          instanceIds: [],
+          metric: null,
+          legacyMetricName: null,
+          aggregation: 'AVG',
+          conditions: [],
+          collapsed: false
+        }
+      ]);
+    };
+
+    const handleSearch = () => {
+      const payload = getSearchPayload();
+      if (payload) {
+        onSearch(payload);
+      }
+    };
+
+    const handleSaveQuery = () => {
+      if (!canSearch()) {
+        message.warning(t('monitor.search.noData'));
+        return;
+      }
+      saveQueryModalRef.current?.showModal(queryGroups);
+    };
+
+    const handleOpenLoadDrawer = () => {
+      savedQueryDrawerRef.current?.showDrawer();
+    };
+
+    const handleLoadSavedQuery = async (savedQueryGroups: QueryGroup[]) => {
+      const loadedResources = await loadSavedQueryResources({
+        queryGroups: savedQueryGroups,
+        pluginsMap,
+        metricsMap,
+        instancesMap,
+        loadPlugins: getPlugins,
+        loadMetrics: (objectId, pluginId, selectedMetricId) =>
+          getMetrics(objectId, pluginId, undefined, null, selectedMetricId),
+        loadInstances: getInstList,
+        getResourceKey: getMetricsMapKey,
+        resolvePlugin: (plugins, group) =>
+          group.plugin ||
+          resolveInitialPlugin(plugins) ||
+          (group.legacyMetricName ? plugins[0]?.id : null),
+        resolveLegacyMetric: resolveMetricSelection
+      });
+      const loadedPluginsMap = loadedResources.pluginsMap;
+      const loadedMetricsMap = loadedResources.metricsMap;
+      const loadedInstancesMap = loadedResources.instancesMap;
+      setPluginsMap(loadedPluginsMap);
+      setQueryGroups(savedQueryGroups);
+      const canSearchNow = savedQueryGroups.some(
+        (g) =>
+          g.plugin &&
+          listSelectedMetricIds(g.metric).length > 0 &&
+          g.instanceIds.length > 0
+      );
+      if (canSearchNow) {
+        const objectsMap: Record<string, ObjectItem> = {};
+        objects.forEach((obj) => {
+          objectsMap[String(obj.id)] = obj;
+        });
+        const payload: SearchPayload = {
+          queryGroups: savedQueryGroups,
+          activeGroup: savedQueryGroups[0],
+          metricsMap: loadedMetricsMap,
+          instancesMap: loadedInstancesMap,
+          pluginsMap: loadedPluginsMap,
+          objectsMap
+        };
+        onSearch(payload);
+      }
+    };
+
+    const renderQueryGroup = (group: QueryGroup) => {
+      const pluginOptions = pluginsMap[String(group.object)] || [];
+      const dataKey = getMetricsMapKey(group.object, group.plugin);
+      const groupMetrics =
+        metricSearchResultMap[group.id] || metricsGroupMap[dataKey] || [];
+      const groupInstances = instancesMap[dataKey] || [];
+      const selectedIds = listSelectedMetricIds(group.metric);
+      const selectedMetrics = selectedIds
+        .map((id) =>
+          resolveMetricSelection(
+            [
+              ...(selectedMetricMap[group.id] || []),
+              ...(metricsMap[dataKey] || [])
+            ],
+            id
+          )
+        )
+        .filter((metric): metric is MetricItem => Boolean(metric));
+      const groupLabels = intersectMetricDimensionLabels(selectedMetrics);
+      const isPluginLoading = pluginLoading[String(group.object)] || false;
+      const isMetricsLoading = metricsLoading[dataKey] || false;
+      const isInstanceLoading = instanceLoading[dataKey] || false;
+
+      return (
+        <Card
+          key={group.id}
+          size="small"
+          className="mb-3"
+          title={
+            <div
+              className="flex items-center gap-2 cursor-pointer"
+              onClick={() => toggleGroupCollapse(group.id)}
+            >
+              {group.collapsed ? (
+                <CaretRightFilled className="text-[var(--color-text-3)] text-xs" />
+              ) : (
+                <CaretDownFilled className="text-[var(--color-text-2)] text-xs" />
+              )}
+              {editingNameGroupId === group.id ? (
+                <Input
+                  size="small"
+                  autoFocus
+                  defaultValue={group.name}
+                  className="w-[120px]"
+                  onClick={(e) => e.stopPropagation()}
+                  onBlur={(e) => {
+                    const newName = e.target.value.trim() || group.name;
+                    updateQueryGroup(group.id, { name: newName });
+                    setEditingNameGroupId(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      const newName =
+                        (e.target as HTMLInputElement).value.trim() ||
+                        group.name;
+                      updateQueryGroup(group.id, { name: newName });
+                      setEditingNameGroupId(null);
+                    }
+                    if (e.key === 'Escape') {
+                      setEditingNameGroupId(null);
+                    }
+                  }}
+                />
+              ) : (
+                <span
+                  className="font-medium text-[var(--color-text-1)] hover:text-[var(--color-primary)] cursor-text"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditingNameGroupId(group.id);
+                  }}
+                >
+                  {group.name}
+                </span>
+              )}
+            </div>
+          }
+          extra={
+            <div
+              className="flex items-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Tooltip title={t('monitor.events.createPolicy')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<BellOutlined />}
+                  className="hidden text-[var(--color-text-3)] hover:text-[var(--color-primary)]"
+                  onClick={() => {
+                    const objectInfo = objects.find(
+                      (o) => o.id === group.object
+                    );
+                    const params = {
+                      monitorName: objectInfo?.display_name || '',
+                      monitorObjId: String(group.object),
+                      instanceId: group.instanceIds[0] || '',
+                      metricId: String(listSelectedMetricIds(group.metric)[0] || ''),
+                      type: 'add'
+                    };
+                    const queryString = new URLSearchParams(params).toString();
+                    window.open(
+                      `/monitor/event/strategy/detail?${queryString}`,
+                      '_blank',
+                      'noopener,noreferrer'
+                    );
+                  }}
+                />
+              </Tooltip>
+              <Tooltip title={t('common.copy')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<CopyOutlined />}
+                  className="text-[var(--color-text-3)] hover:text-[var(--color-primary)]"
+                  onClick={() => duplicateQueryGroup(group.id)}
+                />
+              </Tooltip>
+              {queryGroups.length > 1 && (
+                <Tooltip title={t('common.delete')}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<DeleteOutlined />}
+                    className="text-[var(--color-text-3)] hover:text-[var(--color-fail)]"
+                    onClick={() => deleteQueryGroup(group.id)}
+                  />
+                </Tooltip>
+              )}
+            </div>
+          }
+          styles={{
+            header: {
+              cursor: 'pointer',
+              backgroundColor: 'var(--color-fill-2)',
+              borderRadius: '8px 8px 0 0'
+            },
+            body: group.collapsed
+              ? { display: 'none' }
+              : { backgroundColor: 'var(--color-bg-1)' }
+          }}
+        >
+          <div className="space-y-4">
+            {/* 对象选择 */}
+            <div>
+              <label className="text-xs font-medium text-[var(--color-text-3)] mb-[10px] block">
+                {t('monitor.monitorObject')}
+              </label>
+              <Select
+                className="w-full"
+                placeholder={t('monitor.selectObject')}
+                value={group.object || undefined}
+                loading={objLoading}
+                showSearch
+                filterOption={(input, option) =>
+                  String(option?.label || '')
+                    .toLowerCase()
+                    .includes(input.toLowerCase())
+                }
+                onChange={(val) => handleObjectChange(group.id, val)}
+              >
+                {objects.map((item) => (
+                  <Option
+                    key={item.id}
+                    value={item.id}
+                    label={item.display_name}
+                  >
+                    {item.display_name}
+                  </Option>
+                ))}
+              </Select>
+            </div>
+
+            {pluginOptions.length > 1 && (
+              <div>
+                <label className="text-xs font-medium text-[var(--color-text-3)] mb-[10px] block">
+                  插件
+                </label>
+                <Select
+                  className="w-full"
+                  placeholder="请选择插件"
+                  value={group.plugin || undefined}
+                  loading={isPluginLoading}
+                  disabled={!group.object}
+                  showSearch
+                  filterOption={(input, option) =>
+                    String(option?.label || '')
+                      .toLowerCase()
+                      .includes(input.toLowerCase())
+                  }
+                  options={pluginOptions.map((item) => ({
+                    label: item.display_name || item.name || String(item.id),
+                    value: item.id
+                  }))}
+                  onChange={(val) => handlePluginChange(group.id, val)}
+                />
+              </div>
+            )}
+
+            {/* 资产选择 */}
+            <div>
+              <label className="text-xs font-medium text-[var(--color-text-3)] mb-[10px] block">
+                {t('monitor.source')}
+              </label>
+              <Select
+                mode="multiple"
+                className="w-full"
+                placeholder={t('monitor.instance')}
+                value={group.instanceIds}
+                loading={isInstanceLoading}
+                disabled={!group.object || !group.plugin}
+                maxTagCount="responsive"
+                showSearch
+                filterOption={(input, option) =>
+                  String(option?.children || '')
+                    .toLowerCase()
+                    .includes(input.toLowerCase())
+                }
+                onChange={(val) =>
+                  updateQueryGroup(group.id, { instanceIds: val })
+                }
+              >
+                {groupInstances.map((item) => (
+                  <Option key={item.instance_id} value={item.instance_id}>
+                    {item.instance_name}
+                  </Option>
+                ))}
+              </Select>
+            </div>
+            {/* 指标选择 */}
+            <div>
+              <label className="text-xs font-medium text-[var(--color-text-3)] mb-[10px] block">
+                {t('monitor.metric')}
+              </label>
+              <Select
+                mode="multiple"
+                allowClear
+                maxTagCount="responsive"
+                className="w-full"
+                placeholder={t('monitor.metric')}
+                value={listSelectedMetricIds(group.metric)}
+                loading={isMetricsLoading}
+                disabled={!group.object || !group.plugin}
+                showSearch
+                filterOption={false}
+                optionLabelProp="displayLabel"
+                popupClassName={METRIC_SELECT_POPUP_CLASSNAME}
+                options={buildGroupedMetricSelectOptions(
+                  groupMetrics,
+                  metricSearchMap[group.id] || '',
+                )}
+                onSearch={(value) => handleMetricSearch(group, value)}
+                onDropdownVisibleChange={(open) => {
+                  if (!open) {
+                    handleMetricSearch(group, '');
+                  }
+                }}
+                onChange={(val) => handleMetricChange(group.id, val)}
+              />
+            </div>
+            {/* 汇聚方法 */}
+            <div>
+              <label className="text-xs font-medium text-[var(--color-text-3)] mb-[10px] block">
+                {t('monitor.aggregation')}
+              </label>
+              <Select
+                className="w-full"
+                value={group.aggregation}
+                onChange={(val) =>
+                  updateQueryGroup(group.id, { aggregation: val })
+                }
+              >
+                <Option value="AVG">AVG</Option>
+                <Option value="SUM">SUM</Option>
+                <Option value="MAX">MAX</Option>
+                <Option value="MIN">MIN</Option>
+                <Option value="COUNT">COUNT</Option>
+              </Select>
+            </div>
+            {/* 条件 */}
+            <div>
+              <label className="text-xs font-medium text-[var(--color-text-3)] mb-[10px] block">
+                {t('monitor.filter')}
+              </label>
+              {group.conditions.length > 0 && (
+                <div className="space-y-2 mb-3">
+                  {group.conditions.map((conditionItem, index) => {
+                    const valueOptionsKey = getConditionValueOptionsKey(
+                      group,
+                      conditionItem.label
+                    );
+                    const valueOptions =
+                      conditionValueOptionsMap[valueOptionsKey] || [];
+                    const valueLoading = Boolean(
+                      conditionValueLoadingMap[valueOptionsKey]
+                    );
+                    return (
+                    <div
+                      key={index}
+                      className="flex items-center gap-1.5 bg-[var(--color-fill-1)] rounded-md p-1.5"
+                    >
+                      <Select
+                        className="min-w-[96px] flex-[1.1]"
+                        size="small"
+                        placeholder={t('monitor.label')}
+                        value={conditionItem.label}
+                        showSearch
+                        popupMatchSelectWidth={false}
+                        dropdownStyle={{ minWidth: 180 }}
+                        styles={{
+                          popup: {
+                            root: { minWidth: 180 }
+                          }
+                        }}
+                        onChange={(val) =>
+                          handleLabelChange(group.id, val, index)
+                        }
+                        onDropdownVisibleChange={(open) => {
+                          if (open && conditionItem.label) {
+                            void loadConditionValueOptions(
+                              group,
+                              conditionItem.label
+                            );
+                          }
+                        }}
+                        options={groupLabels.map((item) => ({
+                          label: item,
+                          value: item
+                        }))}
+                      />
+                      <Select
+                        className="min-w-[80px] w-[80px] shrink-0"
+                        size="small"
+                        placeholder={t('monitor.term')}
+                        value={conditionItem.condition}
+                        onChange={(val) =>
+                          handleConditionChange(group.id, val, index)
+                        }
+                        options={CONDITION_LIST.map((item: ListItem) => ({
+                          label: item.name,
+                          value: item.id
+                        }))}
+                      />
+                      <AutoComplete
+                        className="min-w-[120px] flex-[1.6]"
+                        size="small"
+                        allowClear
+                        placeholder={t('monitor.value')}
+                        value={conditionItem.value}
+                        options={valueOptions.map((item) => ({
+                          value: item,
+                          label: item
+                        }))}
+                        disabled={!conditionItem.label}
+                        popupMatchSelectWidth={false}
+                        dropdownStyle={{ minWidth: 220 }}
+                        styles={{
+                          popup: {
+                            root: { minWidth: 220 }
+                          }
+                        }}
+                        onFocus={() => {
+                          if (conditionItem.label) {
+                            void loadConditionValueOptions(
+                              group,
+                              conditionItem.label
+                            );
+                          }
+                        }}
+                        onDropdownVisibleChange={(open) => {
+                          if (open && conditionItem.label) {
+                            void loadConditionValueOptions(
+                              group,
+                              conditionItem.label
+                            );
+                          }
+                        }}
+                        filterOption={(input, option) =>
+                          String(option?.value || '')
+                            .toLowerCase()
+                            .includes(input.toLowerCase())
+                        }
+                        onChange={(val) =>
+                          handleValueChange(group.id, val || '', index)
+                        }
+                        notFoundContent={
+                          valueLoading
+                            ? t('common.loading')
+                            : t('common.noData')
+                        }
+                      />
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<MinusCircleOutlined />}
+                        className="shrink-0 text-[var(--color-text-3)] hover:text-[var(--color-fail)]"
+                        onClick={() => deleteConditionItem(group.id, index)}
+                      />
+                    </div>
+                    );
+                  })}
+                </div>
+              )}
+              <Button
+                type="link"
+                size="small"
+                disabled={!selectedIds.length}
+                className="p-0 m-0"
+                onClick={() => addConditionItem(group.id)}
+              >
+                {t('monitor.addCondition')}
+              </Button>
+            </div>
+          </div>
+        </Card>
+      );
+    };
+
+    return (
+      <div className="relative h-full">
+        {/* 左侧面板 */}
+        <div
+          className={`flex flex-col border-r transition-all duration-300 h-full ${
+            panelCollapsed ? 'w-0 overflow-hidden' : 'w-[400px]'
+          }`}
+          style={{
+            backgroundColor: 'var(--color-bg-1)',
+            borderColor: 'var(--color-border-2)'
+          }}
+        >
+          {/* 面板头部 */}
+          <div
+            className="flex items-center justify-between px-4 py-3"
+            style={{ borderBottom: '1px solid var(--color-border-2)' }}
+          >
+            <span className="font-medium text-[var(--color-text-1)]">
+              {t('monitor.search.dataQuery')}
+            </span>
+            <div className="flex items-center gap-0.5">
+              <Tooltip
+                title={
+                  queryGroups.every((g) => g.collapsed)
+                    ? t('common.expandAll')
+                    : t('common.collapseAll')
+                }
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  className="text-[var(--color-text-3)] hover:text-[var(--color-text-2)] hover:bg-[var(--color-bg-hover)]"
+                  icon={
+                    queryGroups.every((g) => g.collapsed) ? (
+                      <MenuUnfoldOutlined />
+                    ) : (
+                      <MenuFoldOutlined />
+                    )
+                  }
+                  onClick={toggleAllGroups}
+                />
+              </Tooltip>
+              <Tooltip title={t('common.collapse')}>
+                <Button
+                  type="text"
+                  size="small"
+                  className="text-[var(--color-text-3)] hover:text-[var(--color-text-2)] hover:bg-[var(--color-bg-hover)]"
+                  icon={<DoubleLeftOutlined />}
+                  onClick={() => setPanelCollapsed(true)}
+                />
+              </Tooltip>
+            </div>
+          </div>
+          {/* 查询组列表 */}
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {queryGroups.map(renderQueryGroup)}
+            {/* 添加查询按钮 */}
+            <Button
+              type="dashed"
+              icon={<PlusOutlined />}
+              className="w-full"
+              onClick={addQueryGroup}
+            >
+              {t('monitor.search.addQuery')}
+            </Button>
+          </div>
+          {/* 面板底部 */}
+          <div
+            className="flex items-center gap-3 px-4 py-3"
+            style={{ borderTop: '1px solid var(--color-border-2)' }}
+          >
+            <Button
+              type="primary"
+              disabled={!canSearch()}
+              onClick={handleSearch}
+              className="flex-1"
+            >
+              {t('common.search')}
+            </Button>
+            <span className="w-px h-5 bg-[var(--color-border-3)]" />
+            <div className="flex items-center">
+              <Tooltip title={t('monitor.search.saveQuery')}>
+                <Button
+                  type="text"
+                  icon={<SaveOutlined />}
+                  disabled={!canSearch()}
+                  onClick={handleSaveQuery}
+                />
+              </Tooltip>
+              <Tooltip title={t('monitor.search.loadSavedQuery')}>
+                <Button
+                  type="text"
+                  icon={<FolderOpenOutlined />}
+                  onClick={handleOpenLoadDrawer}
+                />
+              </Tooltip>
+              <Tooltip title={t('monitor.search.clearQuery')}>
+                <Button
+                  type="text"
+                  icon={<ClearOutlined />}
+                  onClick={clearAll}
+                />
+              </Tooltip>
+            </div>
+          </div>
+        </div>
+
+        {/* 展开按钮 */}
+        {panelCollapsed && (
+          <Button
+            type="text"
+            icon={<RightOutlined />}
+            className="absolute left-0 top-1/2 -translate-y-1/2 z-10 h-12 bg-[var(--color-bg-1)] shadow-md rounded-r-md border border-l-0 border-[var(--color-border-2)]"
+            onClick={() => setPanelCollapsed(false)}
+          />
+        )}
+        {/* 保存/加载查询组件 */}
+        <SavedQueryDrawer
+          ref={savedQueryDrawerRef}
+          onLoad={handleLoadSavedQuery}
+        />
+        <SaveQueryModal ref={saveQueryModalRef} />
+      </div>
+    );
+  }
+);
+
+QueryPanel.displayName = 'QueryPanel';
+
+export default QueryPanel;

@@ -1,0 +1,457 @@
+'use client';
+import './register-strategy-pilot';
+import React, { useEffect, useState, useRef } from 'react';
+import { Spin, Input, Button, message, Switch, Popconfirm } from 'antd';
+import useApiClient from '@/utils/request';
+import useMonitorApi from '@/app/monitor/api';
+import useEventApi from '@/app/monitor/api/event';
+import assetStyle from './index.module.scss';
+import { useTranslation } from '@/utils/i18n';
+import {
+  ColumnItem,
+  TreeItem,
+  Pagination,
+  ObjectItem,
+  ModalRef,
+  TableDataItem,
+  UserItem
+} from '@/app/monitor/types';
+import { SourceFeild } from '@/app/monitor/types/event';
+import CustomTable from '@/components/custom-table';
+import SelectAssets from './selectAssets';
+import UserAvatar from '@/components/user-avatar';
+import { findLabelById } from '@/app/monitor/utils/common';
+import { buildMonitorStrategyDetailUrl } from '@/app/monitor/utils/policyRouteUtils';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import { PlusOutlined } from '@ant-design/icons';
+import { useSearchParams } from 'next/navigation';
+import { useScreenAwareRouter } from '@/console-layout';
+import TreeSelector from '@/app/monitor/components/treeSelector';
+import ResizableSidebar from '@/app/monitor/components/resizableSidebar';
+import Permission from '@/components/permission';
+import { cloneDeep } from 'lodash';
+import { useCommon } from '@/app/monitor/context/common';
+import { formatUserDisplayName } from '@/utils/userDisplay';
+import {
+  getPolicyNameDisambiguation
+} from '@/app/monitor/utils/policyDisplayName';
+import { useMonitorObjectQuery } from '@/app/monitor/hooks/useMonitorObjectQuery';
+import {
+  resolveMonitorObjectQueryId,
+  resolveMonitorObjectTreeKey
+} from '@/app/monitor/utils/monitorObjectQuery';
+
+const Strategy: React.FC = () => {
+  const { t } = useTranslation();
+  const { isLoading } = useApiClient();
+  const { getMonitorObject } = useMonitorApi();
+  const { getMonitorPolicy, patchMonitorPolicy, deleteMonitorPolicy } =
+    useEventApi();
+  const searchParams = useSearchParams();
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const commonContext = useCommon();
+  const userList: UserItem[] = commonContext?.userList || [];
+  const router = useScreenAwareRouter();
+  const { syncObjectId } = useMonitorObjectQuery();
+  const instRef = useRef<ModalRef>(null);
+  const policyAbortControllerRef = useRef<AbortController | null>(null);
+  const policyRequestIdRef = useRef<number>(0);
+  const [pagination, setPagination] = useState<Pagination>({
+    current: 1,
+    total: 0,
+    pageSize: 20
+  });
+  const [tableLoading, setTableLoading] = useState<boolean>(false);
+  const [treeLoading, setTreeLoading] = useState<boolean>(false);
+  const [treeData, setTreeData] = useState<TreeItem[]>([]);
+  const [tableData, setTableData] = useState<TableDataItem[]>([]);
+  const [searchText, setSearchText] = useState<string>('');
+  const [enableLoading, setEnableLoading] = useState<boolean>(false);
+  const [defaultSelectObj, setDefaultSelectObj] = useState<React.Key>('');
+  const [objectId, setObjectId] = useState<React.Key>('');
+  const [objects, setObjects] = useState<ObjectItem[]>([]);
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const columns: ColumnItem[] = [
+    {
+      title: t('common.name'),
+      dataIndex: 'name',
+      key: 'name',
+      render: (_, record) => {
+        const monitorObj = objects.find((item) => item.id === record.monitor_object);
+        const enriched = {
+          ...record,
+          monitor_object_display_name: monitorObj?.display_name || monitorObj?.name
+        };
+        const secondary = getPolicyNameDisambiguation(enriched, tableData);
+        return (
+          <div>
+            <div title={String(record.name || '--')}>{record.name || '--'}</div>
+            {secondary ? (
+              <div
+                className="mt-0.5 text-[12px] leading-4 text-[var(--color-text-3)]"
+                title={secondary}
+              >
+                {secondary}
+              </div>
+            ) : null}
+          </div>
+        );
+      }
+    },
+    {
+      title: t('monitor.events.monitoringTarget'),
+      dataIndex: 'source',
+      key: 'source',
+      render: (_, record) => (
+        <Permission
+          requiredPermissions={['Edit']}
+          instPermissions={record.permission}
+        >
+          <Button
+            type="link"
+            onClick={() => {
+              openInstModal(record);
+            }}
+          >
+            {record.source.values?.length || 0}
+          </Button>
+        </Permission>
+      )
+    },
+    {
+      title: t('common.creator'),
+      dataIndex: 'created_by',
+      key: 'created_by',
+      render: (_, { created_by }) =>
+        created_by ? (
+          <UserAvatar
+            userName={formatUserDisplayName(created_by, userList)}
+            size="small"
+          />
+        ) : (
+          <>--</>
+        )
+    },
+    {
+      title: t('common.createTime'),
+      dataIndex: 'created_at',
+      key: 'created_at',
+      render: (_, { created_at }) => (
+        <>{created_at ? convertToLocalizedTime(created_at) : '--'}</>
+      )
+    },
+    {
+      title: t('monitor.events.executionTime'),
+      dataIndex: 'last_run_time',
+      key: 'last_run_time',
+      render: (_, { last_run_time }) => (
+        <>{last_run_time ? convertToLocalizedTime(last_run_time) : '--'}</>
+      )
+    },
+    {
+      title: t('monitor.events.effective'),
+      dataIndex: 'effective',
+      key: 'effective',
+      render: (_, record) => (
+        <Permission
+          requiredPermissions={['Edit']}
+          instPermissions={record.permission}
+        >
+          <Switch
+            size="small"
+            loading={enableLoading}
+            onChange={(val) => handleEffectiveChange(val, record.id as number)}
+            checked={record.enable}
+          />
+        </Permission>
+      )
+    },
+    {
+      title: t('common.action'),
+      key: 'action',
+      dataIndex: 'action',
+      width: 120,
+      fixed: 'right',
+      render: (_, record) => (
+        <>
+          <Permission
+            className="mr-[10px]"
+            requiredPermissions={['Edit']}
+            instPermissions={record.permission}
+          >
+            <Button
+              type="link"
+              onClick={() => linkToStrategyDetail('edit', record as any)}
+            >
+              {t('common.edit')}
+            </Button>
+          </Permission>
+          <Permission
+            requiredPermissions={['Delete']}
+            instPermissions={record.permission}
+          >
+            <Popconfirm
+              title={t('common.deleteTitle')}
+              description={t('common.deleteContent')}
+              okText={t('common.confirm')}
+              cancelText={t('common.cancel')}
+              okButtonProps={{ loading: confirmLoading }}
+              onConfirm={() => deleteConfirm(record.id as React.Key)}
+            >
+              <Button type="link">{t('common.delete')}</Button>
+            </Popconfirm>
+          </Permission>
+        </>
+      )
+    }
+  ];
+
+  useEffect(() => {
+    if (isLoading) return;
+    getObjects();
+  }, [isLoading]);
+
+  useEffect(() => {
+    if (objectId) {
+      getAssetInsts(objectId);
+    }
+  }, [pagination.current, pagination.pageSize, objectId]);
+
+  useEffect(() => {
+    return () => {
+      cancelAllRequests();
+    };
+  }, []);
+
+  const cancelAllRequests = () => {
+    policyAbortControllerRef.current?.abort();
+  };
+
+  const handleObjectChange = async (id: string) => {
+    cancelAllRequests();
+    setObjectId(id);
+    syncObjectId(id);
+  };
+
+  const openInstModal = (row: TableDataItem) => {
+    const title = t('monitor.events.monitoringTarget');
+    instRef.current?.showModal({
+      title,
+      type: 'add',
+      form: {
+        ...row.source,
+        id: row.id
+      }
+    });
+  };
+
+  const onChooseAssets = async (assets: SourceFeild, id: number) => {
+    setTableLoading(true);
+    patchMonitorPolicy(id, {
+      source: assets
+    })
+      .then(() => {
+        message.success(t('common.successfullyModified'));
+        getAssetInsts(objectId);
+      })
+      .catch(() => {
+        setTableLoading(false);
+      });
+  };
+
+  const getParams = (text?: string) => {
+    return {
+      name: text ? '' : searchText,
+      page: pagination.current,
+      page_size: pagination.pageSize,
+      monitor_object_id: objectId || ''
+    };
+  };
+
+  const handleEffectiveChange = async (val: boolean, id: number) => {
+    try {
+      setEnableLoading(true);
+      await patchMonitorPolicy(id, {
+        enable: val
+      });
+      message.success(t(val ? 'common.started' : 'common.closed'));
+      getAssetInsts(objectId);
+    } finally {
+      setEnableLoading(false);
+    }
+  };
+
+  const handleTableChange = (pagination: any) => {
+    setPagination(pagination);
+  };
+
+  const getAssetInsts = async (objectId: React.Key, text?: string) => {
+    policyAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    policyAbortControllerRef.current = abortController;
+    const currentRequestId = ++policyRequestIdRef.current;
+    try {
+      setTableLoading(true);
+      const params = {
+        ...getParams(text),
+        monitor_object_id: String(objectId)
+      };
+      const data = await getMonitorPolicy('', params, {
+        signal: abortController.signal
+      });
+      if (currentRequestId !== policyRequestIdRef.current) return;
+      setTableData(data.items || []);
+      setPagination((pre) => ({
+        ...pre,
+        total: data.count
+      }));
+    } finally {
+      if (currentRequestId === policyRequestIdRef.current) {
+        setTableLoading(false);
+      }
+    }
+  };
+
+  const getObjects = async () => {
+    try {
+      setTreeLoading(true);
+      const data: ObjectItem[] = await getMonitorObject({
+        add_policy_count: true
+      });
+      setObjects(data);
+      const _treeData = getTreeData(cloneDeep(data));
+      setDefaultSelectObj(
+        resolveMonitorObjectTreeKey(
+          data,
+          resolveMonitorObjectQueryId({
+            searchParams,
+            objects: data,
+            fallback: data[0]?.id
+          }),
+          data[0]?.id
+        )
+      );
+      setTreeData(_treeData);
+    } finally {
+      setTreeLoading(false);
+    }
+  };
+
+  const getTreeData = (data: ObjectItem[]): TreeItem[] => {
+    const groupedData = data.reduce(
+      (acc, item) => {
+        if (!acc[item.type]) {
+          acc[item.type] = {
+            title: item.display_type || '--',
+            key: item.type,
+            children: []
+          };
+        }
+        acc[item.type].children.push({
+          title: (item.display_name || '--') + `(${item.policy_count})`,
+          label: item.name || '--',
+          key: item.id,
+          icon: item.icon,
+          children: []
+        });
+        return acc;
+      },
+      {} as Record<string, TreeItem>
+    );
+    return Object.values(groupedData);
+  };
+
+  const deleteConfirm = async (id: React.Key) => {
+    setConfirmLoading(true);
+    try {
+      await deleteMonitorPolicy(id);
+      message.success(t('common.successfullyDeleted'));
+      getAssetInsts(objectId);
+    } finally {
+      setConfirmLoading(false);
+    }
+  };
+
+  const enterText = () => {
+    getAssetInsts(objectId);
+  };
+
+  const clearText = () => {
+    setSearchText('');
+    getAssetInsts(objectId, 'clear');
+  };
+
+  const linkToStrategyDetail = (type: string, row = { id: '', name: '' }) => {
+    const monitorObjId = objectId as string;
+    const monitorName = findLabelById(treeData, monitorObjId) as string;
+    router.push(
+      buildMonitorStrategyDetailUrl(type, {
+        monitorObjId,
+        monitorName,
+        id: row.id,
+        name: row.name
+      })
+    );
+  };
+
+  return (
+    <Spin
+      spinning={treeLoading}
+      wrapperClassName="flex h-full min-h-0 w-full min-w-0 max-w-full flex-1 flex-col [&>.ant-spin-container]:flex [&>.ant-spin-container]:h-full [&>.ant-spin-container]:min-h-0 [&>.ant-spin-container]:flex-1 [&>.ant-spin-container]:flex-col"
+    >
+      <div className={assetStyle.asset}>
+        <ResizableSidebar collapseStorageKey="monitor.event.strategy.sidebarCollapsed">
+          <div className={assetStyle.assetTree}>
+            <TreeSelector
+              data={treeData}
+              defaultSelectedKey={defaultSelectObj as string}
+              loading={treeLoading}
+              onNodeSelect={handleObjectChange}
+            />
+          </div>
+        </ResizableSidebar>
+        <div className={assetStyle.table}>
+          <div className={assetStyle.search}>
+            <div className="min-w-0 flex-1">
+              <Input
+                className="w-full max-w-[320px]"
+                placeholder={t('common.searchPlaceHolder')}
+                allowClear
+                onPressEnter={enterText}
+                onClear={clearText}
+                onChange={(e) => setSearchText(e.target.value)}
+              ></Input>
+            </div>
+            <Permission requiredPermissions={['Add']}>
+              <Button
+                type="primary"
+                icon={<PlusOutlined />}
+                onClick={() => linkToStrategyDetail('add')}
+              >
+                {t('common.add')}
+              </Button>
+            </Permission>
+          </div>
+          <div className="min-h-0 min-w-0 flex-1">
+            <CustomTable
+              scroll={{ x: 'max-content' }}
+              columns={columns}
+              dataSource={tableData}
+              pagination={pagination}
+              loading={tableLoading}
+              rowKey="id"
+              onChange={handleTableChange}
+            ></CustomTable>
+          </div>
+        </div>
+        <SelectAssets
+          ref={instRef}
+          monitorObject={objectId}
+          objects={objects}
+          onSuccess={onChooseAssets}
+        />
+      </div>
+    </Spin>
+  );
+};
+export default Strategy;

@@ -1,0 +1,156 @@
+'use client';
+
+import React, { useEffect, useRef } from 'react';
+import { Radio, Select, Spin } from 'antd';
+import type { InputControlConfig, InputOption } from '@/app/ops-analysis/types/dataSource';
+import { useParamInputOptions } from '@/app/ops-analysis/hooks/useParamInputOptions';
+import {
+  createParamInputOptionsNotifier,
+  getParamInputConfigKey,
+} from '@/app/ops-analysis/utils/paramInputOptionsLoader';
+import { normalizeParamInputChangeValue } from '@/app/ops-analysis/components/normalizeParamInputChangeValue';
+import ParamInputTableSelect from '@/app/ops-analysis/components/paramInputTableSelect';
+import { toSingleOrganizationValue } from '@/app/ops-analysis/utils/paramInputConfigUtils';
+import GroupTreeSelect from '@/components/group-tree-select';
+
+interface ParamInputControlProps {
+  inputConfig?: InputControlConfig;
+  fallback: React.ReactNode;
+  value?: string | number | Array<string | number>;
+  onChange?: (value: string | number | Array<string | number> | null) => void;
+  disabled?: boolean;
+  placeholder?: string;
+  allowClear?: boolean;
+  style?: React.CSSProperties;
+  onOptionsResolved?: (options: InputOption[]) => void;
+}
+
+export const ParamInputControl: React.FC<ParamInputControlProps> = ({
+  inputConfig,
+  fallback,
+  value,
+  onChange,
+  disabled,
+  placeholder,
+  allowClear = true,
+  style,
+  onOptionsResolved,
+}) => {
+  const state = useParamInputOptions(inputConfig);
+  const onOptionsResolvedRef = useRef(onOptionsResolved);
+  const notifierRef = useRef(createParamInputOptionsNotifier());
+  onOptionsResolvedRef.current = onOptionsResolved;
+
+  const renderFallback = () => {
+    if (!React.isValidElement(fallback)) return fallback;
+    return React.cloneElement(fallback as React.ReactElement<any>, {
+      value,
+      onChange: (valueOrEvent: unknown) =>
+        onChange?.(normalizeParamInputChangeValue(valueOrEvent)),
+      disabled,
+    });
+  };
+
+  useEffect(() => {
+    if (!onOptionsResolvedRef.current) return;
+    if (state.status === 'success' && state.resultKey) {
+      notifierRef.current.notify(
+        state.resultKey,
+        state.options,
+        onOptionsResolvedRef.current,
+      );
+      return;
+    }
+    // 数据源明确返回空列表时也要通知，否则导入来的 ID 会一直挂在控件上。
+    if (state.status === 'error' && !state.errorMessage) {
+      notifierRef.current.notify(
+        `empty:${getParamInputConfigKey(inputConfig)}`,
+        [],
+        onOptionsResolvedRef.current,
+      );
+    }
+  }, [inputConfig, state]);
+
+  if (!inputConfig || inputConfig.control === 'input') return <>{renderFallback()}</>;
+
+  if (inputConfig.control === 'organization') {
+    return (
+      <GroupTreeSelect
+        value={toSingleOrganizationValue(value)}
+        onChange={(nextValue) => {
+          const scalar = Array.isArray(nextValue) ? nextValue[0] : nextValue;
+          onChange?.(scalar ?? null);
+        }}
+        multiple={false}
+        mode="ownership"
+        allowClear={allowClear}
+        disabled={disabled}
+        placeholder={placeholder || ' '}
+        style={{ minWidth: 180, ...style }}
+      />
+    );
+  }
+
+  if (state.status === 'loading') return <Spin size="small" />;
+
+  const options = state.status === 'success' ? state.options : [];
+
+  if (inputConfig.control === 'radio') {
+    return (
+      <Radio.Group
+        value={value}
+        disabled={disabled}
+        options={options}
+        optionType="button"
+        buttonStyle="outline"
+        onChange={(event) => onChange?.(event.target.value ?? null)}
+      />
+    );
+  }
+
+  if (inputConfig.control === 'select') {
+    const isMultiple = Boolean(inputConfig.multiple);
+    if (inputConfig.picker === 'table') {
+      return (
+        <ParamInputTableSelect
+          options={options}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          placeholder={placeholder}
+          allowClear={allowClear}
+          multiple={isMultiple}
+          maxCount={isMultiple ? inputConfig.maxCount : undefined}
+          style={style}
+        />
+      );
+    }
+    return (
+      <Select
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        allowClear={allowClear}
+        mode={inputConfig.multiple ? 'multiple' : undefined}
+        maxCount={isMultiple ? inputConfig.maxCount : undefined}
+        maxTagCount={isMultiple ? 'responsive' : undefined}
+        maxTagTextLength={isMultiple ? 16 : undefined}
+        style={{ width: '100%', ...style }}
+        options={options}
+        onChange={(nextValue) => onChange?.(nextValue ?? null)}
+      />
+    );
+  }
+
+  return (
+    <Select
+      value={value}
+      disabled={disabled}
+      placeholder={placeholder}
+      allowClear={allowClear}
+      style={{ width: '100%', ...style }}
+      options={options}
+      onChange={(nextValue) => onChange?.(nextValue ?? null)}
+    />
+  );
+};

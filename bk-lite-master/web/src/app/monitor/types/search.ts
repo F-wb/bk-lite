@@ -1,0 +1,176 @@
+import React from 'react';
+import { MetricItem, ObjectItem, ChartData } from './index';
+import type {
+  SearchChartView,
+  SearchTableKind
+} from '@/app/monitor/(pages)/search/searchChartPresentation';
+
+export interface InstanceItem {
+  instance_id: string;
+  instance_name: string;
+  instance_id_values: string[];
+  interval?: number;
+}
+
+export interface PluginItem {
+  id: React.Key;
+  name?: string;
+  display_name?: string;
+  collector?: string;
+  collect_type?: string;
+  [key: string]: unknown;
+}
+
+export interface ConditionItem {
+  label: string | null;
+  condition: string | null;
+  value: string;
+}
+
+export interface SearchParams {
+  time?: number;
+  end?: number;
+  start?: number;
+  step?: number;
+  query?: string;
+  capability_id?: string;
+  capability_params?: Record<string, unknown>;
+  scope?: {
+    type: 'host_process';
+    host_monitor_object_id: React.Key;
+    host_instance_id: React.Key;
+    process_names?: string[];
+  };
+  monitor_object_id?: React.Key;
+  metric_id?: React.Key;
+  instance_ids?: string[];
+  filters?: Array<{
+    label: string;
+    operator: string;
+    value: string;
+  }>;
+  aggregation?: string;
+  source_unit?: string;
+  auto_convert_unit?: boolean;
+  detect_gaps?: boolean;
+  collection_interval?: number;
+  card_budget?: boolean;
+  keyword?: string;
+  ip?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface QueryGroup {
+  id: string;
+  name: string;
+  object: React.Key;
+  plugin: React.Key | null;
+  instanceIds: string[];
+  metric: React.Key | React.Key[] | null;
+  legacyMetricName?: string | null;
+  aggregation: string;
+  conditions: ConditionItem[];
+  collapsed: boolean;
+  viewMode?: SearchChartView;
+  tableKind?: SearchTableKind | null;
+}
+
+export interface SearchPayload {
+  queryGroups: QueryGroup[];
+  activeGroup: QueryGroup;
+  metricsMap: Record<string, MetricItem[]>;
+  instancesMap: Record<string, InstanceItem[]>;
+  pluginsMap: Record<string, PluginItem[]>;
+  objectsMap: Record<string, ObjectItem>;
+}
+
+export interface QueryPanelRef {
+  getSearchPayload: () => SearchPayload | null;
+  canSearch: () => boolean;
+  getActiveGroup: () => QueryGroup;
+  updateGroupPresentation: (
+    groupId: string,
+    presentation: {
+      viewMode: SearchChartView;
+      tableKind: SearchTableKind | null;
+    }
+  ) => void;
+}
+
+export interface QueryPanelProps {
+  onSearch: (payload: SearchPayload) => void;
+}
+
+export interface ChartItem {
+  cardId?: string;
+  groupId: string;
+  groupName: string;
+  metric: MetricItem | null;
+  data: ChartData[];
+  unit: string;
+  loading: boolean;
+  duration: number;
+  objectName: string;
+  aggregation: string;
+}
+
+export interface ConditionItemData {
+  label: string | null;
+  condition: string | null;
+  value: string;
+}
+
+export interface QueryGroupData {
+  id: string;
+  name: string;
+  object: React.Key;
+  plugin?: React.Key | null;
+  instance_ids: string[];
+  metric: React.Key | React.Key[] | null;
+  legacy_metric_name?: string | null;
+  aggregation: string;
+  conditions: ConditionItemData[];
+  view_mode?: SearchChartView | 'table';
+  table_kind?: SearchTableKind | null;
+}
+
+export interface SaveConditionParams {
+  name: string;
+  condition: QueryGroupData[];
+  organizations?: number[];
+  monitor_object_id?: React.Key | null;
+  description?: string;
+}
+
+export interface ListConditionParams {
+  name?: string;
+  is_active?: boolean;
+  monitor_object_id?: React.Key;
+  page?: number;
+  page_size?: number;
+}
+
+export interface SavedConditionItem {
+  id: number;
+  name: string;
+  condition: QueryGroupData[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SaveQueryModalRef {
+  showModal: (queryGroups: QueryGroup[]) => void;
+}
+
+export interface SaveQueryModalProps {
+  onSuccess?: () => void;
+}
+
+export interface SavedQueryDrawerRef {
+  showDrawer: () => void;
+}
+
+export interface SavedQueryDrawerProps {
+  onLoad: (queryGroups: QueryGroup[]) => void;
+}

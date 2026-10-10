@@ -1,0 +1,123 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_microsens"
+        config_type = "microsens"
+        brand = "microsens"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB) + 64-bit HC ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- MICROSENS G6 机箱温度 / 电源 / 风扇（私有企业号 3181，g6.device = 3181.10.6.1）：均为标量，顶层 field 带 .0 → measurement snmp。----
+    # G6-SYSTEM system(30).systemTemperature(104)：Integer32，直接 ℃。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.3181.10.6.1.30.104.0"
+        name = "device_temperature_celsius"
+    # G6-HARDWARE hardware(31).hardwarePowerSupply1Status(100) / PowerSupply2Status(101)：
+    # ok(0) overload(1) inputLow(2) fuseFail(3) notApplicable(4) unmanaged(5) notInstalled(6)。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.3181.10.6.1.31.100.0"
+        name = "psu1_status"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.3181.10.6.1.31.101.0"
+        name = "psu2_status"
+    # G6-HARDWARE hardware(31).hardwareFanStatus(103)：unused(0，无风扇机型) ok(1) degraded(2) fail(3) missing(4)。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.3181.10.6.1.31.103.0"
+        name = "fan_status"
+# ---- 电源/风扇标量拆分为 device_psu / device_fan 指标（沿用共享盘 device_psu_state / device_fan_state）----
+# 电源 notApplicable(4) / notInstalled(6) 视为空槽不上报；风扇 unused(0) 为无风扇机型，不上报。
+[[processors.starlark]]
+    namepass = ["snmp"]
+    source = '''
+def _child(metric, name):
+    m = Metric(name)
+    for key, value in metric.tags.items():
+        m.tags[key] = value
+    m.time = metric.time
+    return m
+
+def apply(metric):
+    out = [metric]
+    for idx in ["1", "2"]:
+        raw = metric.fields.pop("psu" + idx + "_status", None)
+        if raw == None or int(raw) in (4, 6):
+            continue
+        psu = _child(metric, "device_psu")
+        psu.tags["index"] = idx
+        psu.fields["state"] = int(raw)
+        out.append(psu)
+    fan = metric.fields.pop("fan_status", None)
+    if fan != None and int(fan) != 0:
+        f = _child(metric, "device_fan")
+        f.tags["index"] = "1"
+        f.fields["state"] = int(fan)
+        out.append(f)
+    return out
+'''
+    [processors.starlark.tagpass]
+        brand = ["microsens"]
+# ---- CPU / 内存：G6-SYSTEM systemShowUtilization(30.4) 为 DisplayString 文本转储，非数值 Gauge；G6 MIB 无内存 Gauge → CPU/内存 N/A 不采。----
+# ---- 状态归一：电源 ok(0)→1(正常)，其余→2(异常)。----
+[[processors.enum]]
+    namepass = ["device_psu"]
+    [processors.enum.tagpass]
+        brand = ["microsens"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "0" = 1
+# ---- 状态归一：风扇 ok(1)→1(正常)，degraded(2)/fail(3)/missing(4) 等→2(异常)。----
+[[processors.enum]]
+    namepass = ["device_fan"]
+    [processors.enum.tagpass]
+        brand = ["microsens"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "1" = 1

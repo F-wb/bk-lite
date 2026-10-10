@@ -1,0 +1,363 @@
+from types import SimpleNamespace
+
+from rest_framework import serializers
+
+from apps.core.utils.serializers import AuthSerializer
+from apps.mlops.models.classification import (
+    ClassificationDataset,
+    ClassificationDatasetRelease,
+    ClassificationServing,
+    ClassificationTrainData,
+    ClassificationTrainJob,
+)
+from apps.mlops.serializers.train_data_inline import (
+    BoundedInlineTrainDataListSerializer,
+    InlineTrainDataLimitExceeded,
+    consume_inline_records,
+    inline_csv_read_options,
+    open_inline_train_data,
+)
+from apps.mlops.utils.group_scope import (
+    assert_dataset_version_scope,
+    assert_parent_team_matches,
+    assert_team_ownership,
+    get_current_team,
+    validate_requested_teams,
+)
+from apps.mlops.utils.i18n import serializer_message
+from apps.mlops.utils.serving_port import ServingPortValidationMixin
+
+
+class ClassificationDatasetSerializer(AuthSerializer):
+    """分类任务数据集序列化器"""
+
+    permission_key = "dataset.classification_dataset"
+
+    class Meta:
+        model = ClassificationDataset
+        fields = "__all__"
+
+    def validate_team(self, value):
+        return validate_requested_teams(self.context["request"], value)
+
+
+class ClassificationServingSerializer(ServingPortValidationMixin, AuthSerializer):
+    """分类任务服务序列化器"""
+
+    permission_key = "serving.classification_serving"
+
+    train_job_algorithm = serializers.CharField(source="train_job.algorithm", read_only=True)
+
+    class Meta:
+        model = ClassificationServing
+        fields = "__all__"
+
+    def validate_train_job(self, value):
+        request = self.context["request"]
+        assert_team_ownership(value, get_current_team(request), "train_job", request=request)
+        return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        train_job = attrs.get("train_job", getattr(self.instance, "train_job", None))
+        team = attrs.get("team", getattr(self.instance, "team", None))
+        if train_job is not None and team is not None:
+            field_name = "train_job" if "train_job" in attrs or "team" not in attrs else "team"
+            assert_parent_team_matches(SimpleNamespace(team=team), train_job, field_name, request=self.context.get("request"))
+
+        return attrs
+
+    def validate_team(self, value):
+        return validate_requested_teams(self.context["request"], value)
+
+
+class ClassificationTrainDataSerializer(AuthSerializer):
+    """分类任务训练数据序列化器"""
+
+    permission_key = "dataset.classification_train_data"
+
+    class Meta:
+        model = ClassificationTrainData
+        fields = "__all__"
+        list_serializer_class = BoundedInlineTrainDataListSerializer
+        extra_kwargs = {
+            "name": {"required": False},
+            "train_data": {"required": False},
+            "dataset": {"required": False},
+        }
+
+    def __init__(self, *args, **kwargs):
+        """
+        初始化序列化器，从请求上下文中获取 include_train_data 参数
+        """
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request:
+            self.include_train_data = request.query_params.get("include_train_data", "false").lower() == "true"
+            self.include_metadata = request.query_params.get("include_metadata", "false").lower() == "true"
+        else:
+            self.include_train_data = False
+            self.include_metadata = False
+
+    def validate_train_data(self, value):
+        """校验CSV格式"""
+        import pandas as pd
+
+        try:
+            df = pd.read_csv(value)
+
+            # 检查必需列
+            required_columns = ["text", "label"]
+            missing = set(required_columns) - set(df.columns)
+            if missing:
+                raise serializers.ValidationError(
+                    serializer_message(self, "error.training_data_required_columns_missing", columns=", ".join(missing))
+                )
+
+            # 检查数据类型
+            if df["text"].isnull().any():
+                raise serializers.ValidationError(serializer_message(self, "error.training_data_column_contains_null", column="text"))
+
+            if df["label"].isnull().any():
+                raise serializers.ValidationError(serializer_message(self, "error.training_data_column_contains_null", column="label"))
+
+            # 重置文件指针到开头，以便后续保存时能读取完整内容
+            value.seek(0)
+
+            return value
+        except pd.errors.ParserError as e:
+            raise serializers.ValidationError(serializer_message(self, "error.training_data_csv_invalid", detail=str(e)))
+
+    def validate_dataset(self, value):
+        request = self.context["request"]
+        assert_team_ownership(value, get_current_team(request), "dataset", request=request)
+        return value
+
+    def to_representation(self, instance):
+        """
+        自定义返回数据，根据 include_train_data 参数动态控制 train_data 字段
+        当 include_train_data=true 时，后端直接读取 CSV 并解析为结构化数据返回
+        """
+        import pandas as pd
+
+        from apps.core.logger import mlops_logger as logger
+
+        representation = super().to_representation(instance)
+
+        # 处理 train_data：后端直接读取并解析 CSV
+        if self.include_train_data and instance.train_data:
+            try:
+                # 读取 CSV 文件
+                train_data_stream = open_inline_train_data(instance.train_data, self)
+                csv_options, csv_cells = inline_csv_read_options(self, train_data_stream)
+                df = pd.read_csv(
+                    train_data_stream,
+                    **csv_options,
+                )
+                consume_inline_records(
+                    self,
+                    len(df),
+                    csv_columns=len(df.columns),
+                    csv_cells=csv_cells,
+                )
+
+                # 转换为字典列表并添加索引
+                data_list = df.to_dict("records")
+                for i, row in enumerate(data_list):
+                    row["index"] = i
+
+                representation["train_data"] = data_list
+                logger.info(f"Successfully loaded train_data for instance {instance.id}: {len(data_list)} rows")
+
+            except InlineTrainDataLimitExceeded:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Failed to read train_data for instance {instance.id}: {e}",
+                    exc_info=True,
+                )
+                representation["train_data"] = []
+                representation["error"] = serializer_message(self, "error.training_data_read_failed", detail=str(e))
+        elif not self.include_train_data:
+            representation.pop("train_data", None)
+
+        # 处理 metadata：S3JSONField 自动处理，直接返回对象
+        if self.include_metadata and instance.metadata:
+            # S3JSONField 会自动从 MinIO 读取并解压
+            representation["metadata"] = instance.metadata
+        elif not self.include_metadata:
+            representation.pop("metadata", None)
+
+        return representation
+
+
+class ClassificationTrainJobSerializer(AuthSerializer):
+    """分类任务训练作业序列化器"""
+
+    permission_key = "train_job.classification_train_job"
+
+    class Meta:
+        model = ClassificationTrainJob
+        fields = "__all__"
+        extra_kwargs = {
+            "config_url": {
+                "required": False,
+                "read_only": True,
+                "help_text": "自动生成，无需手动提供",
+            }
+        }
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        request = self.context["request"]
+        dataset_version = attrs.get("dataset_version", getattr(self.instance, "dataset_version", None))
+        team = attrs.get("team", getattr(self.instance, "team", None))
+        assert_dataset_version_scope(dataset_version, team, request)
+        return attrs
+
+    def validate_team(self, value):
+        return validate_requested_teams(self.context["request"], value)
+
+
+class ClassificationDatasetReleaseSerializer(AuthSerializer):
+    """分类任务数据集发布版本序列化器"""
+
+    permission_key = "dataset.classification_dataset_release"
+
+    # 添加只写字段用于接收文件ID
+    train_file_id = serializers.IntegerField(write_only=True, required=False)
+    val_file_id = serializers.IntegerField(write_only=True, required=False)
+    test_file_id = serializers.IntegerField(write_only=True, required=False)
+
+    class Meta:
+        model = ClassificationDatasetRelease
+        fields = "__all__"
+        validators = []
+        extra_kwargs = {
+            "name": {"required": False},  # 创建时可选，会自动生成
+            "dataset_file": {"required": False},  # 创建时不需要直接提供文件
+            "file_size": {"required": False},
+            "status": {"required": False},
+        }
+
+    def validate_dataset(self, value):
+        request = self.context["request"]
+        assert_team_ownership(value, get_current_team(request), "dataset", request=request)
+        return value
+
+    def validate(self, attrs):
+        dataset = attrs.get("dataset")
+        version = attrs.get("version")
+        train_file_id = attrs.get("train_file_id")
+        val_file_id = attrs.get("val_file_id")
+        test_file_id = attrs.get("test_file_id")
+
+        if dataset and version:
+            existing_releases = ClassificationDatasetRelease.objects.filter(dataset=dataset, version=version)
+            if self.instance:
+                existing_releases = existing_releases.exclude(pk=self.instance.pk)
+
+            existing = existing_releases.first()
+            allow_failed_retry = bool(train_file_id and val_file_id and test_file_id) and existing and existing.status == "failed"
+
+            if existing and not allow_failed_retry:
+                raise serializers.ValidationError(
+                    {"version": serializer_message(self, "error.dataset_release_version_exists", dataset_name=dataset.name, version=version)}
+                )
+
+        return attrs
+
+    def create(self, validated_data):
+        """
+        自定义创建方法，支持从文件ID创建数据集发布版本
+        """
+        # 提取文件ID
+        train_file_id = validated_data.pop("train_file_id", None)
+        val_file_id = validated_data.pop("val_file_id", None)
+        test_file_id = validated_data.pop("test_file_id", None)
+
+        # 如果提供了文件ID，则执行文件打包逻辑
+        if train_file_id and val_file_id and test_file_id:
+            return self._create_from_files(validated_data, train_file_id, val_file_id, test_file_id)
+        else:
+            # 否则使用标准创建（适用于直接上传ZIP文件的场景）
+            return super().create(validated_data)
+
+    def _create_from_files(self, validated_data, train_file_id, val_file_id, test_file_id):
+        """
+        从训练数据文件ID创建数据集发布版本（异步）
+
+        创建 pending 状态的记录，触发 Celery 任务进行异步处理
+        """
+        from rest_framework import serializers
+
+        from apps.core.logger import mlops_logger as logger
+
+        dataset = validated_data.get("dataset")
+        version = validated_data.get("version")
+        name = validated_data.get("name")
+        description = validated_data.get("description", "")
+
+        try:
+            # 验证文件是否存在
+            train_obj = ClassificationTrainData.objects.get(id=train_file_id, dataset=dataset)
+            val_obj = ClassificationTrainData.objects.get(id=val_file_id, dataset=dataset)
+            test_obj = ClassificationTrainData.objects.get(id=test_file_id, dataset=dataset)
+
+            # 检查是否已有相同版本的记录（失败记录允许重试）
+            existing = ClassificationDatasetRelease.objects.filter(dataset=dataset, version=version).first()
+
+            if existing:
+                if existing.status == "failed":
+                    release = existing
+                    release.status = "pending"
+                    release.file_size = 0
+                    release.metadata = {}
+                    release.save(update_fields=["status", "file_size", "metadata"])
+                else:
+                    logger.info(f"数据集版本已存在 - Dataset: {dataset.id}, Version: {version}, Status: {existing.status}")
+                    raise serializers.ValidationError(
+                        serializer_message(self, "error.dataset_release_version_unavailable", dataset_name=dataset.name, version=version)
+                    )
+            else:
+                # 创建 pending 状态的发布记录
+                validated_data["status"] = "pending"
+                validated_data["file_size"] = 0
+                validated_data["metadata"] = {}
+
+                if not name:
+                    validated_data["name"] = f"{dataset.name}_v{version}"
+
+                if not description:
+                    validated_data["description"] = f"从数据集文件手动发布: {train_obj.name}, {val_obj.name}, {test_obj.name}"
+
+                release = ClassificationDatasetRelease.objects.create(**validated_data)
+
+            # 触发异步任务
+            from apps.mlops.tasks.classification import publish_dataset_release_async
+
+            try:
+                result = publish_dataset_release_async.delay(release.id, train_file_id, val_file_id, test_file_id)
+                logger.info(f"创建数据集发布任务 - Release ID: {release.id}, Dataset: {dataset.id}, Version: {version}, Task ID: {result.id}")
+
+            except Exception as task_error:
+                logger.error(
+                    f"投递 Celery 任务失败 - Release ID: {release.id}, Error: {str(task_error)}",
+                    exc_info=True,
+                )
+                # 任务投递失败，更新发布状态为失败
+                release.status = "failed"
+                release.save(update_fields=["status"])
+                raise serializers.ValidationError(serializer_message(self, "error.dataset_release_task_enqueue_failed"))
+
+            return release
+
+        except ClassificationTrainData.DoesNotExist as e:
+            logger.error(f"训练数据文件不存在 - {str(e)}")
+            raise serializers.ValidationError(serializer_message(self, "error.dataset_release_training_data_not_found"))
+        except serializers.ValidationError:
+            raise
+        except Exception as e:
+            logger.error(f"创建数据集发布任务失败 - {str(e)}", exc_info=True)
+            raise serializers.ValidationError(serializer_message(self, "error.dataset_release_create_failed"))

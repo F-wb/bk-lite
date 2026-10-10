@@ -1,0 +1,149 @@
+collect_type:
+  Auditbeat:
+    auditd:
+      description: Collects Linux audit framework logs for comprehensive system security
+        monitoring and compliance.
+      name: Auditd
+    file_integrity:
+      name: File Integrity
+      description: Monitors file system changes to detect unauthorized modifications
+        and ensure data integrity.
+  Vector:
+    syslog:
+      name: Syslog
+      description: Collects syslog messages for centralized logging and monitoring
+    kubernetes:
+      name: Kubernetes
+      description: Collects logs and metrics from Kubernetes clusters for monitoring
+        and analysis.
+    exec:
+      name: Exec
+      description: Executes commands to collect log data from various sources for
+        processing and analysis.
+    docker:
+      description: Collects and processes logs from Docker containers for centralized
+        logging and analysis.
+      name: Docker
+    file:
+      description: Collects log data from files for centralized logging and analysis.
+      name: File
+    kafka_subscribe:
+      name: Kafka Log Subscription
+      description: Subscribes to log events from external Kafka topics and forwards
+        them into the log system. This is not Kafka broker log file collection.
+  Packetbeat:
+    http:
+      description: Monitors HTTP traffic to analyze web application performance and
+        detect anomalies.
+      name: HTTP
+    dhcp:
+      name: DHCP
+      description: Collects DHCP traffic to monitor IP address allocation and network
+        configuration.
+    dns:
+      name: DNS
+      description: Captures DNS query and response data for network troubleshooting
+        and security analysis.
+    flows:
+      description: Analyzes network flow data to monitor traffic patterns and detect
+        potential security threats.
+      name: Flows
+    icmp:
+      name: ICMP
+      description: Monitors ICMP traffic for network diagnostics and performance analysis.
+  Snmptrapd:
+    snmp_trap:
+      name: SNMP Trap
+      description: Collects SNMP Trap messages from network devices.
+  Filebeat:
+    filestream:
+      name: Filestream
+      description: Collects and forwards log data from various sources for centralized
+        logging and analysis.
+    apache:
+      name: Apache
+      description: Collects and parses Apache HTTP server access and error logs using Filebeat module.
+    elasticsearch:
+      name: Elasticsearch
+      description: Collects and parses Elasticsearch server, audit, slowlog, deprecation and GC logs using Filebeat module.
+    mysql:
+      name: MySQL
+      description: Collects and parses MySQL slow logs and error logs using Filebeat module.
+    kafka:
+      name: Kafka
+      description: Collects and parses Kafka log files using Filebeat module.
+    nginx:
+      name: Nginx
+      description: Collects and parses Nginx access and error logs using Filebeat module.
+    mongodb:
+      name: MongoDB
+      description: Collects and parses MongoDB logs using Filebeat module.
+    rabbitmq:
+      name: RabbitMQ
+      description: Collects and parses RabbitMQ log files using Filebeat module.
+    redis:
+      name: Redis
+      description: Collects and parses Redis logs and slowlogs using Filebeat module.
+    postgresql:
+      name: PostgreSQL
+      description: Collects and parses PostgreSQL logs using Filebeat module.
+  Winlogbeat:
+    winlogbeat:
+      name: Windows Event Logs
+      description: Collects Windows event logs including Security, System, Application, Sysmon, PowerShell, Defender and Task Scheduler logs.
+
+display_category:
+  general:
+    name: General
+    description: General file stream, syslog and basic collection
+  k8s:
+    name: K8s
+    description: Kubernetes cluster log collection
+  database:
+    name: Database
+    description: RDBMS, NoSQL, cache and data storage system logs
+  middleware:
+    name: Middleware
+    description: Web servers, message queues, application servers logs
+  network:
+    name: Network
+    description: Network protocol analysis and connection monitoring
+  container:
+    name: Container
+    description: Container runtime log collection
+  security:
+    name: Security & Audit
+    description: System audit, file integrity, security event monitoring
+error:
+  extractor_name_required: Name is required
+  extractor_instance_locked: The collect instance cannot be changed while editing
+  extractor_type_locked: The collect type cannot be changed while editing
+  must_be_list: Must be a list
+  list_items_must_be_int: List items must be integers
+  log_group_rule_object: Log group rule must be an object
+  organization_required: At least one organization is required
+  search_condition_object: Search condition must be an object
+  search_condition_query_required: Search condition must include a query field
+  search_condition_groups_required: Search condition must include a log_groups field
+  log_groups_must_be_list: log_groups must be a list
+  log_groups_missing: "These log groups do not exist: {names}"
+  handler_invalid: Invalid handler identifier
+  handler_required: Specify at least one handler
+  policy_name_exists: A policy with this name already exists in the current scope
+  topn_unsupported: This field does not support TopN statistics
+  type_extractor_unsupported: Only syslog and snmp_trap support type-level extractors
+  collect_type_missing: Collect type does not exist
+  instance_rule_limit: "A collect instance can have at most {count} rules"
+  instance_name_duplicate: Duplicate name or order within the instance
+  type_rule_limit: "A collect type can have at most {count} rules"
+  type_name_duplicate: Duplicate name or order within the collect type
+  scope_name_duplicate: Duplicate name within the scope
+  rule_ids_unique: Submit the complete list of rule IDs without duplicates
+  instance_rule_ids_exact: Submit all rule IDs for this instance, and only those IDs
+  type_rule_ids_exact: Submit all rule IDs for this collect type, and only those IDs
+  event_object_required: Event must be a log event object
+  rule_out_of_scope: The rule does not belong to the current scope
+  collect_instance_required: Collect instance is required
+  scope_exclusive: Provide either a collect instance or a collect type, but not both
+  generation_published: The current generation is already published
+  channel_query_failed: Failed to query notification channels

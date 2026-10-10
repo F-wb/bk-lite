@@ -1,0 +1,98 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_nti",
+  "plugin": "NetworkService NTI ENVIROMUX SNMP",
+  "plugin_desc": "NTI ENVIROMUX SNMP collection for environmental monitors under NTI PEN 3699. The shared SNMP floor supplies MIB-II uptime and IF-MIB 64-bit HC interface traffic. This child template adds internal temperature and humidity from the 16D scalars plus the MICRO internal sensor table. Shared CPU, memory, fan and power-health scalars are not claimed.",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='network_service', collect_type='snmp_nti'}) by (instance_id)",
+  "name": "NetworkService",
+  "icon": "mm-network_service_网络服务",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='network_service'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "network_service_nti_temperature",
+    "network_service_nti_humidity"
+  ],
+  "metrics": [
+    {
+      "metric_group": "NetworkService",
+      "name": "network_service_nti_temperature",
+      "query": "max(network_service_nti_temperature{instance_type='network_service', __$labels__} or network_service_nti_sensor_value{instance_type='network_service', intSensorType=~'1|temperature', __$labels__}) by (instance_id)",
+      "display_name": "NTI Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "ENVIROMUX internal temperature from the 16D scalar, coalesced with MICRO sensor-table rows whose type is temperature."
+    },
+    {
+      "metric_group": "NetworkService",
+      "name": "network_service_nti_humidity",
+      "query": "max(network_service_nti_humidity{instance_type='network_service', __$labels__} or network_service_nti_sensor_value{instance_type='network_service', intSensorType=~'2|humidity', __$labels__}) by (instance_id)",
+      "display_name": "NTI Humidity",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "ENVIROMUX internal relative humidity from the 16D scalar, coalesced with MICRO sensor-table rows whose type is humidity."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCInOctets",
+      "query": "rate(interface_ifHCInOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Incoming Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Average inbound interface bytes per second over five minutes from the 64-bit IF-MIB ifHCInOctets counter."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCOutOctets",
+      "query": "rate(interface_ifHCOutOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Outgoing Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Average outbound interface bytes per second over five minutes from the 64-bit IF-MIB ifHCOutOctets counter."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='network_service', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Device uptime since the last restart, derived from sysUpTime."
+    }
+  ]
+}

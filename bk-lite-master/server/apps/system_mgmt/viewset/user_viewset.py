@@ -1,0 +1,878 @@
+import re
+import secrets
+import uuid
+
+from django.contrib.auth.hashers import make_password
+from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
+from django.db import transaction
+from django.db.models import F, Q
+from django.http import JsonResponse
+from django.utils import timezone
+from rest_framework.decorators import action
+
+try:
+    # EE 增强判断：优先加载 enterprise 脱敏实现，缺失时回退到 CE 默认行为。
+    from apps.system_mgmt.enterprise.sensitive_info import apply_sensitive_info_mask, apply_sensitive_info_mask_to_list
+except (ImportError, ModuleNotFoundError):
+    apply_sensitive_info_mask = None
+    apply_sensitive_info_mask_to_list = None
+
+from apps.core.decorators.api_permission import HasPermission
+from apps.core.logger import system_mgmt_logger as logger
+from apps.core.utils.loader import LanguageLoader
+from apps.core.utils.permission_cache import clear_user_permission_cache, clear_users_permission_cache
+from apps.rpc.cmdb import CMDB
+from apps.system_mgmt.models import Channel, ChannelChoices, Group, Role, SystemSettings, User, UserRule
+from apps.system_mgmt.serializers.user_serializer import UserSerializer
+from apps.system_mgmt.utils.group_filter_mixin import (
+    filter_queryset_by_group_ids,
+    get_unauthorized_group_ids,
+    get_user_group_ids,
+    normalize_group_id_set,
+)
+from apps.system_mgmt.utils.group_utils import GroupUtils
+from apps.system_mgmt.utils.operation_log_utils import log_operation
+from apps.system_mgmt.utils.password_validator import PasswordValidator
+from apps.system_mgmt.utils.password_vault import decrypt_from_vault
+from apps.system_mgmt.utils.user_status import is_user_locked
+from apps.system_mgmt.utils.viewset_utils import ViewSetUtils
+
+
+class InitialPasswordDeliveryError(Exception):
+    """初始密码邮件未投递，创建事务必须回滚。"""
+
+
+def _generate_random_initial_password(locale="zh-Hans"):
+    """生成满足当前密码策略的随机初始密码。"""
+    policy = PasswordValidator.get_password_settings()
+    token_bytes = max(12, (policy["min_length"] * 3 + 3) // 4)
+    for _ in range(20):
+        candidate = secrets.token_urlsafe(token_bytes)
+        is_valid, _ = PasswordValidator.validate_password_with_config(candidate, policy, locale=locale)
+        if is_valid:
+            return candidate
+    raise ValueError(LanguageLoader(app="system_mgmt", default_lang=locale).get("error.initial_password_generation_failed"))
+
+
+def _normalize_group_ids(groups):
+    normalized = []
+    invalid = []
+    for group_id in groups or []:
+        try:
+            normalized.append(int(group_id))
+        except (TypeError, ValueError):
+            invalid.append(group_id)
+    return normalized, invalid
+
+
+def _filter_active_group_ids(groups):
+    normalized, _ = _normalize_group_ids(groups)
+    if not normalized:
+        return []
+    active_ids = set(GroupUtils.active_queryset(id__in=normalized).values_list("id", flat=True))
+    return [group_id for group_id in normalized if group_id in active_ids]
+
+
+def _merge_retained_archived_groups(submitted_ids, existing_groups):
+    """更新用户时保留其已有归档组织 ID，不允许新指定原本没有的归档组织。"""
+    existing_ids, _ = _normalize_group_ids(existing_groups or [])
+    if not existing_ids:
+        return list(submitted_ids)
+    archived_ids = set(Group.objects.filter(id__in=existing_ids, is_delete=True).values_list("id", flat=True))
+    submitted_set = set(submitted_ids)
+    retained = [group_id for group_id in existing_ids if group_id in archived_ids and group_id not in submitted_set]
+    return list(submitted_ids) + retained
+
+
+def _validate_selected_groups(groups, loader):
+    if not groups:
+        return loader.get("error.group_selection_required", "At least one group must be selected")
+
+    normalized_groups, invalid_ids = _normalize_group_ids(groups)
+    group_queryset = GroupUtils.active_queryset(id__in=normalized_groups)
+    group_map = {group.id: group for group in group_queryset}
+
+    missing_group_ids = [group_id for group_id in normalized_groups if group_id not in group_map]
+    all_invalid_ids = invalid_ids + missing_group_ids
+    if all_invalid_ids:
+        return loader.get("error.invalid_group_ids", "Invalid group IDs: {ids}").format(ids=all_invalid_ids)
+
+    if not any(not group.is_virtual for group in group_map.values()):
+        return loader.get("error.normal_group_required", "At least one normal group must be selected")
+
+    return None
+
+
+def _get_synced_group_ids(groups):
+    group_ids, _ = _normalize_group_ids(groups)
+    return set(Group.objects.filter(id__in=group_ids, sync_source__isnull=False).values_list("id", flat=True))
+
+
+def _validate_local_user_group_changes(groups, existing_groups=None, loader=None):
+    loader = loader or LanguageLoader(app="system_mgmt", default_lang="en")
+    selected_synced_group_ids = _get_synced_group_ids(groups)
+    if existing_groups is None:
+        if selected_synced_group_ids:
+            return loader.get("error.synced_groups_local_users_forbidden")
+        return None
+
+    existing_synced_group_ids = _get_synced_group_ids(existing_groups)
+    if selected_synced_group_ids != existing_synced_group_ids:
+        return loader.get("error.synced_group_membership_immutable")
+    return None
+
+
+class UserViewSet(ViewSetUtils):
+    """用户 ViewSet - 禁用所有内置 CRUD 接口，仅使用自定义 action
+
+    权限校验：
+    - 所有接口需要对应的 HasPermission 装饰器
+    - user_all/user_id_all 限制为用户有权限的组成员
+    - get_user_detail/update_user/delete_user/reset_password 校验目标用户属于有权限的组
+    """
+
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+    # 仅允许 GET (actions), POST (actions)
+    # 禁用所有内置 CRUD 方法
+    http_method_names = ["get", "post", "options"]
+
+    def _get_loader(self, request):
+        """获取语言加载器"""
+        locale = getattr(request.user, "locale", "en") if hasattr(request, "user") else "en"
+        return LanguageLoader(app="system_mgmt", default_lang=locale)
+
+    def _get_user_group_ids(self, user):
+        """获取用户有权限的组ID集合"""
+        return get_user_group_ids(user)
+
+    def _validate_group_scope_for_request(self, request, group_ids, loader):
+        unauthorized_group_ids = get_unauthorized_group_ids(request.user, group_ids)
+        if unauthorized_group_ids:
+            message = loader.get("error.no_permission_access_group", "无权访问该组织")
+            return JsonResponse({"result": False, "message": message}, status=403)
+        return None
+
+    def _validate_target_user_permission(self, request, target_user):
+        """校验当前用户是否有权限访问目标用户
+
+        Args:
+            request: 请求对象
+            target_user: 目标用户对象（User model instance）
+
+        Returns:
+            tuple: (is_valid, error_response)
+        """
+        if getattr(request.user, "is_superuser", False):
+            return True, None
+
+        user_group_ids = self._get_user_group_ids(request.user)
+        target_group_ids = normalize_group_id_set(target_user.group_list)
+
+        # 检查目标用户的组是否与当前用户的组有交集
+        if not user_group_ids.intersection(target_group_ids):
+            loader = self._get_loader(request)
+            message = loader.get("error.no_permission_access_user", "无权访问该用户")
+            return False, JsonResponse({"result": False, "message": message}, status=403)
+        return True, None
+
+    def _filter_users_by_accessible_groups(self, queryset, user):
+        """按用户有权限的组筛选用户列表
+
+        Args:
+            queryset: 原始查询集
+            user: 当前用户对象
+
+        Returns:
+            QuerySet: 筛选后的查询集
+        """
+        if getattr(user, "is_superuser", False):
+            return queryset
+
+        user_group_ids = self._get_user_group_ids(user)
+        if not user_group_ids:
+            return queryset.none()
+
+        return filter_queryset_by_group_ids(queryset, user_group_ids)
+
+    def list(self, request, *args, **kwargs):
+        """禁用内置 list 接口 - 使用 search_user_list action"""
+        return JsonResponse({"result": False, "message": self._get_loader(request).get("error.api_not_enabled")}, status=405)
+
+    def retrieve(self, request, *args, **kwargs):
+        """禁用内置 retrieve 接口 - 使用 get_user_detail action"""
+        return JsonResponse({"result": False, "message": self._get_loader(request).get("error.api_not_enabled")}, status=405)
+
+    def create(self, request, *args, **kwargs):
+        """禁用内置 create 接口 - 使用 create_user action"""
+        return JsonResponse({"result": False, "message": self._get_loader(request).get("error.api_not_enabled")}, status=405)
+
+    def update(self, request, *args, **kwargs):
+        """禁用内置 update 接口 - 使用 update_user action"""
+        return JsonResponse({"result": False, "message": self._get_loader(request).get("error.api_not_enabled")}, status=405)
+
+    def partial_update(self, request, *args, **kwargs):
+        """禁用内置 partial_update 接口 - 使用 update_user action"""
+        return JsonResponse({"result": False, "message": self._get_loader(request).get("error.api_not_enabled")}, status=405)
+
+    def destroy(self, request, *args, **kwargs):
+        """禁用内置 destroy 接口 - 使用 delete_user action"""
+        return JsonResponse({"result": False, "message": self._get_loader(request).get("error.api_not_enabled")}, status=405)
+
+    @staticmethod
+    def _is_valid_phone(phone):
+        if phone is None:
+            return True
+        if not isinstance(phone, str):
+            return False
+
+        normalized_phone = phone.strip()
+        if not normalized_phone:
+            return True
+        if re.fullmatch(r"[0-9+\-()\s]+", normalized_phone) is None:
+            return False
+
+        digits_only = re.sub(r"[+\-()\s]", "", normalized_phone)
+        return digits_only.isdigit() and 7 <= len(digits_only) <= 15
+
+    @staticmethod
+    def _mask_user_payload(data, request):
+        # EE 增强判断：有 enterprise 脱敏实现时按授权结果处理；缺失时保持 CE 原始返回。
+        if apply_sensitive_info_mask is None:
+            return data
+        return apply_sensitive_info_mask(data, getattr(request, "user", None))
+
+    @staticmethod
+    def _mask_user_payload_list(data, request):
+        # EE 增强判断：列表查询同样优先走 enterprise 脱敏实现；缺失时回退到 CE 原始数据。
+        if apply_sensitive_info_mask_to_list is None:
+            return data
+        return apply_sensitive_info_mask_to_list(data, getattr(request, "user", None))
+
+    @staticmethod
+    def _normalize_user_ids(user_ids):
+        normalized = []
+        invalid = []
+        for user_id in user_ids or []:
+            try:
+                normalized.append(int(user_id))
+            except (TypeError, ValueError):
+                invalid.append(user_id)
+        return normalized, invalid
+
+    @staticmethod
+    def _get_change_status_skip_reason(action, user, now):
+        if action == "enable":
+            return None if user.disabled else "user_not_disabled"
+        if action == "disable":
+            return None if not user.disabled else "user_not_enabled"
+        if action == "unlock":
+            return None if is_user_locked(user, now=now) else "user_not_locked"
+        if action == "unbind_otp":
+            return None if user.otp_secret else "otp_not_bound"
+        return "invalid_action"
+
+    @action(detail=False, methods=["GET"])
+    @HasPermission("user_group-View")
+    def search_user_list(self, request):
+        # 获取请求参数
+        search = request.GET.get("search", "")
+        group_id = request.GET.get("group_id", "")
+        page = int(request.GET.get("page", 1))
+        page_size = int(request.GET.get("page_size", 10))
+        is_superuser = request.GET.get("is_superuser", "0") == "1"
+
+        # 过滤用户数据
+        queryset = User.objects.filter(Q(username__icontains=search) | Q(display_name__icontains=search) | Q(email__icontains=search))
+
+        # 如果筛选超级用户，则过滤包含超管角色的用户
+        if is_superuser:
+            super_role_id = Role.objects.get(app="", name="admin").id
+            queryset = queryset.filter(role_list__contains=super_role_id)
+
+        queryset = self._filter_users_by_accessible_groups(queryset, request.user)
+
+        # 如果指定了用户组ID，则过滤该组内的用户
+        if group_id:
+            queryset = queryset.filter(group_list__contains=int(group_id))
+
+        # 排序
+        queryset = queryset.order_by("-id")
+
+        # 分页
+        total = queryset.count()
+        start = (page - 1) * page_size
+        end = page * page_size
+        users = queryset[start:end]
+
+        # 使用 UserSerializer 序列化数据（自动包含 group_role_list）
+        serializer = UserSerializer(users, many=True)
+        data = serializer.data
+
+        # 添加角色信息（保持原有逻辑）
+        roles = Role.objects.all().values("id", "name", "app")
+        role_map = {}
+        for i in roles:
+            role_map[i["id"]] = f"{i['app']}@@{i['name']}"
+
+        otp_user_ids = set(User.objects.filter(id__in=[item["id"] for item in data], otp_secret__isnull=False).exclude(otp_secret="").values_list("id", flat=True))
+        for user_data in data:
+            user_data["has_otp"] = user_data["id"] in otp_user_ids
+            user_data["roles"] = [role_map.get(role_id, "") for role_id in user_data.get("role_list", [])]
+        data = self._mask_user_payload_list(data, request)
+
+        return JsonResponse({"result": True, "data": {"count": total, "users": data}})
+
+    @action(detail=False, methods=["GET"])
+    @HasPermission("user_group-View")
+    def user_all(self, request):
+        queryset = User.objects.all()
+        # 按用户有权限的组筛选
+        queryset = self._filter_users_by_accessible_groups(queryset, request.user)
+        data = queryset.values(*User.display_fields())
+        return JsonResponse({"result": True, "data": self._mask_user_payload_list(list(data), request)})
+
+    @action(detail=False, methods=["GET"])
+    @HasPermission("user_group-View")
+    def user_id_all(self, request):
+        queryset = User.objects.all()
+        # 按用户有权限的组筛选
+        queryset = self._filter_users_by_accessible_groups(queryset, request.user)
+        data = queryset.values("id", "user_id", "display_name", "username")
+        return JsonResponse({"result": True, "data": list(data)})
+
+    @action(detail=False, methods=["POST"])
+    @HasPermission("user_group-View")
+    def get_user_detail(self, request):
+        pk = request.data.get("user_id")
+        user = User.objects.get(id=pk)
+
+        # 校验当前用户是否有权限访问目标用户
+        is_valid, error_response = self._validate_target_user_permission(request, user)
+        if not is_valid:
+            return error_response
+
+        # 使用 UserSerializer 序列化用户数据（自动包含 group_role_list 和 is_superuser）
+        serializer = UserSerializer(user)
+        data = serializer.data
+
+        # 添加角色详情
+        roles = Role.objects.filter(id__in=user.role_list).values(role_id=F("id"), role_name=F("name"), display_name=F("name"))
+        data["roles"] = list(roles)
+
+        # 添加用户组详情及规则
+        groups = list(GroupUtils.active_queryset(id__in=user.group_list).values("id", "name"))
+        group_rule_map = {}
+        rules = UserRule.objects.filter(username=user.username).values("group_rule__group_id", "group_rule_id", "group_rule__app")
+        for rule in rules:
+            group_id = rule["group_rule__group_id"]
+            app = rule["group_rule__app"]
+            group_rule_map.setdefault(group_id, {}).setdefault(app, []).append(rule["group_rule_id"])
+        for i in groups:
+            i["rules"] = group_rule_map.get(i["id"], {})
+        data["groups"] = groups
+
+        group_role_ids = []
+        if user.group_list:
+            user_groups = GroupUtils.active_queryset(id__in=user.group_list).prefetch_related("roles")
+            group_role_id_set = set()
+            for g in user_groups:
+                for role in g.roles.all():
+                    group_role_id_set.add(role.id)
+            group_role_ids = list(group_role_id_set)
+        data["group_role_ids"] = group_role_ids
+
+        data = self._mask_user_payload(data, request)
+
+        return JsonResponse({"result": True, "data": data})
+
+    # @action(detail=False, methods=["GET"])
+    # def get_users_in_role(self, request, role_name: str):
+    #     data = UserManage().user_list_by_role(role_name)
+    #     return JsonResponse({"result": True, "data": data})
+
+    @action(detail=False, methods=["POST"])
+    @HasPermission("user_group-Add User")
+    def create_user(self, request):
+        kwargs = request.data
+        rules = kwargs.pop("rules", [])
+
+        # 获取用户语言设置
+        locale = getattr(request.user, "locale", "en") if hasattr(request, "user") else "en"
+        loader = LanguageLoader(app="system_mgmt", default_lang=locale)
+
+        groups = kwargs.get("groups", [])
+        group_validation_error = _validate_selected_groups(groups, loader)
+        if group_validation_error:
+            return JsonResponse({"result": False, "message": group_validation_error})
+        groups, _ = _normalize_group_ids(groups)
+        synced_group_error = _validate_local_user_group_changes(groups, loader=loader)
+        if synced_group_error:
+            return JsonResponse({"result": False, "message": synced_group_error})
+        group_scope_error = self._validate_group_scope_for_request(request, groups, loader)
+        if group_scope_error:
+            return group_scope_error
+
+        # 校验 roles ID 是否真实存在
+        roles = kwargs.get("roles", [])
+        if roles:
+            valid_role_ids = set(Role.objects.filter(id__in=roles).values_list("id", flat=True))
+            invalid_role_ids = set(roles) - valid_role_ids
+            if invalid_role_ids:
+                message = loader.get("error.invalid_role_ids", "Invalid role IDs: {ids}").format(ids=list(invalid_role_ids))
+                return JsonResponse({"result": False, "message": message})
+        if not self._is_valid_phone(kwargs.get("phone")):
+            return JsonResponse({"result": False, "message": loader.get("error.invalid_phone")})
+        is_superuser = kwargs.pop("is_superuser", False)
+        if is_superuser:
+            roles = [Role.objects.get(name="admin", app="").id]
+
+        initial_password_settings = dict(
+            SystemSettings.objects.filter(
+                key__in=[
+                    "user_create_initial_password_hash",
+                    "user_create_initial_password_encrypted",
+                    "user_create_initial_password_mode",
+                    "user_create_initial_password_random_email_channel_id",
+                ]
+            ).values_list("key", "value")
+        )
+        initial_password_mode = initial_password_settings.get("user_create_initial_password_mode", "none")
+        initial_password_hash = initial_password_settings.get("user_create_initial_password_hash", "")
+        initial_password_encrypted = initial_password_settings.get("user_create_initial_password_encrypted", "")
+        random_email_channel_id = initial_password_settings.get("user_create_initial_password_random_email_channel_id", "")
+
+        initial_password_active = initial_password_mode in ("fixed", "random")
+        if initial_password_mode == "fixed" and not initial_password_hash:
+            return JsonResponse({"result": False, "message": loader.get("error.initial_password_not_configured")}, status=400)
+        if initial_password_mode == "fixed" and not initial_password_encrypted:
+            return JsonResponse({"result": False, "message": loader.get("error.initial_password_not_configured")}, status=400)
+        if initial_password_active:
+            try:
+                email_channel = Channel.objects.get(id=int(random_email_channel_id))
+            except (Channel.DoesNotExist, ValueError, TypeError):
+                return JsonResponse({"result": False, "message": loader.get("error.initial_password_email_channel_unavailable")}, status=400)
+            if email_channel.channel_type != ChannelChoices.EMAIL:
+                return JsonResponse({"result": False, "message": loader.get("error.initial_password_email_channel_invalid")}, status=400)
+            if not kwargs.get("email"):
+                return JsonResponse({"result": False, "message": loader.get("error.initial_password_email_required")}, status=400)
+
+        # 准备本地用户初始密码:三种模式与用户同步处的 random/uniform/none 对齐。
+        if initial_password_mode == "random":
+            try:
+                raw_password = _generate_random_initial_password(locale)
+            except ValueError as error:
+                return JsonResponse({"result": False, "message": str(error)}, status=400)
+            initial_password_value = make_password(raw_password)
+            temporary_pwd = True
+        elif initial_password_mode == "fixed":
+            raw_password = None
+            initial_password_value = initial_password_hash
+            temporary_pwd = True
+        else:
+            # mode=none
+            raw_password = None
+            initial_password_value = make_password(None)
+            temporary_pwd = False
+
+        email_password = raw_password
+        if initial_password_mode == "fixed":
+            try:
+                email_password = decrypt_from_vault(initial_password_encrypted)
+            except ValueError:
+                return JsonResponse({"result": False, "message": loader.get("error.initial_password_decrypt_failed")}, status=400)
+
+        try:
+            with transaction.atomic():
+                user = User.objects.create(
+                    user_id=str(uuid.uuid4()),
+                    username=kwargs["username"],
+                    display_name=kwargs["lastName"],
+                    email=kwargs["email"],
+                    phone=kwargs.get("phone"),
+                    disabled=False,
+                    locale=kwargs["locale"],
+                    timezone=kwargs["timezone"],
+                    group_list=groups,
+                    role_list=roles,
+                    temporary_pwd=temporary_pwd,
+                    password=initial_password_value,
+                )
+                if rules:
+                    add_rule = [UserRule(username=kwargs["username"], group_rule_id=i) for i in rules]
+                    UserRule.objects.bulk_create(add_rule, batch_size=100)
+
+                if initial_password_active:
+                    from apps.system_mgmt.services.password_init_email import send_local_user_initial_password_email
+
+                    email_result = send_local_user_initial_password_email(user, email_password, str(email_channel.id))
+                    if not email_result.get("result"):
+                        raise InitialPasswordDeliveryError(
+                            email_result.get("message") or loader.get("error.initial_password_email_delivery_failed")
+                        )
+
+                # 记录操作日志
+                log_operation(request, "create", "system-manager", f"新增用户: {kwargs['username']} ({kwargs['lastName']})")
+        except InitialPasswordDeliveryError as error:
+            return JsonResponse({"result": False, "message": str(error)}, status=400)
+
+        if initial_password_active:
+            return JsonResponse({"result": True, "data": {"email_sent": True}})
+        return JsonResponse({"result": True})
+
+    @action(detail=False, methods=["POST"])
+    @HasPermission("user_group-Add User")
+    def import_users(self, request):
+        """同步导入同一组织的本地用户，不授予个人角色。"""
+        loader = self._get_loader(request)
+        group_id = request.data.get("group_id")
+        rows = request.data.get("users")
+        file_name = str(request.data.get("file_name") or "")
+        if not isinstance(rows, list) or not rows:
+            return JsonResponse({"result": False, "message": loader.get("error.import_users_empty")}, status=400)
+        if len(rows) > 500:
+            return JsonResponse({"result": False, "message": loader.get("error.import_users_limit")}, status=400)
+
+        group_error = _validate_selected_groups([group_id], loader)
+        if group_error:
+            return JsonResponse({"result": False, "message": group_error}, status=400)
+        groups, _ = _normalize_group_ids([group_id])
+        scope_error = self._validate_group_scope_for_request(request, groups, loader)
+        if scope_error:
+            return scope_error
+        group = GroupUtils.active_queryset().filter(id=groups[0]).first()
+        if group is None:
+            return JsonResponse(
+                {"result": False, "message": loader.get("error.invalid_group_ids", "Invalid group IDs: {ids}").format(ids=groups)},
+                status=400,
+            )
+
+        settings = dict(SystemSettings.objects.filter(
+            key__in=["user_create_initial_password_enabled", "user_create_initial_password_hash"]
+        ).values_list("key", "value"))
+        initial_password_enabled = settings.get("user_create_initial_password_enabled") == "1"
+        initial_password_hash = settings.get("user_create_initial_password_hash", "")
+        if initial_password_enabled and not initial_password_hash:
+            return JsonResponse({"result": False, "message": loader.get("error.initial_password_not_configured")}, status=400)
+
+        failures = []
+        successful_usernames = set()
+        for index, row in enumerate(rows, start=2):
+            row_number = row.get("row_number", index) if isinstance(row, dict) else index
+            username = str(row.get("username", "")).strip() if isinstance(row, dict) else ""
+            failure = None
+            if not isinstance(row, dict):
+                failure = loader.get("error.import_users_invalid_row")
+            elif not all(str(row.get(field, "")).strip() for field in ("username", "lastName", "email")):
+                failure = loader.get("error.import_users_missing_fields")
+            elif username in successful_usernames or User.objects.filter(username=username, domain="domain.com").exists():
+                failure = loader.get("error.import_users_username_exists")
+            elif not self._is_valid_phone(row.get("phone", "")):
+                failure = loader.get("error.invalid_phone")
+            else:
+                try:
+                    validate_email(str(row["email"]).strip())
+                except ValidationError:
+                    failure = loader.get("error.import_users_invalid_email")
+
+            if failure:
+                failures.append({"row_number": row_number, "username": username, "message": failure})
+                continue
+
+            try:
+                with transaction.atomic():
+                    User.objects.create(
+                        user_id=str(uuid.uuid4()), username=username,
+                        display_name=str(row["lastName"]).strip(), email=str(row["email"]).strip(),
+                        phone=str(row.get("phone", "")).strip() or None, disabled=False,
+                        locale=str(row.get("locale", "")).strip() or "zh-Hans",
+                        timezone=str(row.get("timezone", "")).strip() or "Asia/Shanghai",
+                        group_list=groups, role_list=[], temporary_pwd=initial_password_enabled,
+                        password=initial_password_hash if initial_password_enabled else make_password(None),
+                    )
+                successful_usernames.add(username)
+            except Exception:
+                logger.exception("用户导入失败 username=%s", username)
+                failures.append({"row_number": row_number, "username": username, "message": loader.get("error.import_users_create_failed")})
+
+        result = {
+            "total_count": len(rows),
+            "success_count": len(successful_usernames),
+            "failed_count": len(failures),
+            "failures": failures,
+        }
+        log_operation(
+            request, "create", "system-manager",
+            f"导入用户：组织“{group.name}”，文件“{file_name}”，共 {len(rows)} 条，成功 {len(successful_usernames)} 条，失败 {len(failures)} 条",
+            target_type="organization", target_id=group.id,
+            detail={"scenario": "user_xlsx_import", "organization_name": group.name, "file_name": file_name, **result},
+        )
+        return JsonResponse({"result": True, "data": result})
+
+    @action(detail=False, methods=["POST"])
+    @HasPermission("user_group-Edit User")
+    def reset_password(self, request):
+        password = request.data.get("password")
+        temporary_pwd = request.data.get("temporary", False)
+        user_id = request.data.get("id")
+
+        # 校验密码是否为空
+        if not password:
+            return JsonResponse({"result": False, "message": self._get_loader(request).get("error.password_required")}, status=400)
+
+        # 校验密码复杂度
+        locale = getattr(request.user, "locale", "en") if hasattr(request, "user") else "en"
+        is_valid, error_message = PasswordValidator.validate_password(password, locale=locale)
+        if not is_valid:
+            return JsonResponse({"result": False, "message": error_message}, status=400)
+
+        user = User.objects.get(id=user_id)
+
+        # 校验当前用户是否有权限访问目标用户
+        is_valid, error_response = self._validate_target_user_permission(request, user)
+        if not is_valid:
+            return error_response
+
+        user.password = make_password(password)
+        user.temporary_pwd = temporary_pwd
+        user.save()  # 使用save方法自动更新password_last_modified
+
+        # 记录操作日志
+        log_operation(request, "update", "system-manager", f"重置用户密码: {user.username}")
+        return JsonResponse({"result": True})
+
+    @action(detail=False, methods=["POST"])
+    @HasPermission("user_group-Delete User")
+    def delete_user(self, request):
+        user_ids = request.data.get("user_ids")
+        users = User.objects.filter(id__in=user_ids)
+
+        # 校验当前用户是否有权限访问所有目标用户
+        for user in users:
+            is_valid, error_response = self._validate_target_user_permission(request, user)
+            if not is_valid:
+                return error_response
+
+        synced_users = list(users.filter(sync_source__isnull=False).values_list("id", flat=True))
+        if synced_users:
+            return JsonResponse(
+                {
+                    "result": False,
+                    "message": self._get_loader(request).get("error.synced_users_delete_forbidden"),
+                }
+            )
+
+        usernames = list(users.values_list("username", flat=True))
+
+        # 收集需要删除的用户信息（id, username和domain）
+        user_info_list = list(users.values("id", "username", "domain"))
+
+        menu_cache_keys = [f"menus-user:{user['id']}" for user in user_info_list]
+        with transaction.atomic():
+            # 批量删除用户相关的 UserRule（避免 N+1）
+            if user_info_list:
+                user_rule_filter = Q()
+                for user_info in user_info_list:
+                    user_rule_filter |= Q(username=user_info["username"], domain=user_info["domain"])
+                UserRule.objects.filter(user_rule_filter).delete()
+
+            users.delete()
+
+            # 独立权限代际不会随 User 删除，必须与删除事务一并推进。
+            if user_info_list:
+                clear_users_permission_cache(user_info_list)
+            if menu_cache_keys:
+                transaction.on_commit(lambda: cache.delete_many(menu_cache_keys), robust=True)
+
+        # 记录操作日志
+        log_operation(request, "delete", "system-manager", f"批量删除用户: {', '.join(usernames)} (共{len(usernames)}个)")
+        return JsonResponse({"result": True})
+
+    @action(detail=False, methods=["POST"])
+    @HasPermission("user_group-Edit User")
+    def change_status(self, request):
+        user_ids = request.data.get("user_ids")
+        action_name = request.data.get("action")
+
+        if not isinstance(user_ids, list) or not user_ids:
+            return JsonResponse({"result": False, "message": self._get_loader(request).get("error.user_ids_list_required")}, status=400)
+
+        if action_name not in {"enable", "disable", "unlock", "unbind_otp"}:
+            return JsonResponse({"result": False, "message": self._get_loader(request).get("error.invalid_user_status_action")}, status=400)
+
+        normalized_user_ids, invalid_user_ids = self._normalize_user_ids(user_ids)
+        if invalid_user_ids:
+            return JsonResponse(
+                {
+                    "result": False,
+                    "message": self._get_loader(request).get("error.invalid_user_ids").format(ids=invalid_user_ids),
+                },
+                status=400,
+            )
+
+        now = timezone.now()
+        users = User.objects.filter(id__in=normalized_user_ids)
+        user_map = {user.id: user for user in users}
+        success_ids = []
+        skipped = []
+
+        with transaction.atomic():
+            for user_id in normalized_user_ids:
+                user = user_map.get(user_id)
+                if user is None:
+                    skipped.append({"id": user_id, "reason": "user_not_found"})
+                    continue
+
+                is_valid, error_response = self._validate_target_user_permission(request, user)
+                if not is_valid:
+                    if getattr(error_response, "status_code", None) == 403:
+                        skipped.append({"id": user_id, "reason": "no_permission"})
+                        continue
+                    return error_response
+
+                skip_reason = self._get_change_status_skip_reason(action_name, user, now)
+                if skip_reason is not None:
+                    skipped.append({"id": user_id, "reason": skip_reason})
+                    continue
+
+                if action_name == "enable":
+                    user.disabled = False
+                    update_fields = ["disabled"]
+                elif action_name == "disable":
+                    user.disabled = True
+                    update_fields = ["disabled"]
+                elif action_name == "unlock":
+                    user.account_locked_until = None
+                    user.password_error_count = 0
+                    update_fields = ["account_locked_until", "password_error_count"]
+                elif action_name == "unbind_otp":
+                    user.otp_secret = None
+                    update_fields = ["otp_secret"]
+
+                user.save(update_fields=update_fields)
+                transaction.on_commit(lambda user_id=user.id: cache.delete(f"menus-user:{user_id}"), robust=True)
+                success_ids.append(user.id)
+
+        if success_ids:
+            usernames = [user_map[user_id].username for user_id in success_ids if user_id in user_map]
+            log_operation(
+                request,
+                "update",
+                "system-manager",
+                f"批量{action_name}用户: {', '.join(usernames)} (共{len(usernames)}个)",
+            )
+
+        return JsonResponse(
+            {
+                "result": True,
+                "data": {
+                    "action": action_name,
+                    "total": len(normalized_user_ids),
+                    "success_ids": success_ids,
+                    "skipped": skipped,
+                },
+            }
+        )
+
+    @action(detail=False, methods=["POST"])
+    @HasPermission("user_group-Edit User")
+    def update_user(self, request):
+        params = request.data
+        pk = params.pop("user_id")
+        rules = params.pop("rules", [])
+        locale = getattr(request.user, "locale", "en") if hasattr(request, "user") else "en"
+        loader = LanguageLoader(app="system_mgmt", default_lang=locale)
+
+        # 获取目标用户并校验权限
+        target_user = User.objects.get(id=pk)
+        is_valid, error_response = self._validate_target_user_permission(request, target_user)
+        if not is_valid:
+            return error_response
+
+        is_synced_user = target_user.sync_source_id is not None
+        submitted_groups = target_user.group_list if is_synced_user else params.get("groups", [])
+        groups_to_validate = (
+            _filter_active_group_ids(submitted_groups) if is_synced_user else submitted_groups
+        )
+        group_validation_error = _validate_selected_groups(groups_to_validate, loader)
+        if group_validation_error:
+            return JsonResponse({"result": False, "message": group_validation_error})
+        submitted_ids, _ = _normalize_group_ids(groups_to_validate if is_synced_user else submitted_groups)
+        if is_synced_user:
+            groups = submitted_ids
+        else:
+            groups = _merge_retained_archived_groups(submitted_ids, target_user.group_list)
+            synced_group_error = _validate_local_user_group_changes(groups, target_user.group_list, loader=loader)
+            if synced_group_error:
+                return JsonResponse({"result": False, "message": synced_group_error})
+        group_scope_error = self._validate_group_scope_for_request(request, submitted_ids, loader)
+        if group_scope_error:
+            return group_scope_error
+        params["groups"] = groups
+        is_superuser = params.pop("is_superuser", False)
+        admin_role_id = Role.objects.get(name="admin", app="").id
+        if "email" in params:
+            email_value = params.get("email")
+            if not isinstance(email_value, str) or not email_value.strip():
+                return JsonResponse({"result": False, "message": loader.get("error.email_required")}, status=400)
+            params["email"] = email_value.strip()
+        if "phone" in params and isinstance(params.get("phone"), str):
+            params["phone"] = params["phone"].strip()
+        should_validate_phone = (not is_synced_user) or ("phone" in params)
+        if should_validate_phone and not self._is_valid_phone(params.get("phone")):
+            return JsonResponse({"result": False, "message": loader.get("error.invalid_phone")}, status=400)
+        if is_superuser:
+            params["roles"] = [admin_role_id]
+        else:
+            role_ids = params.get("roles") or []
+            params["roles"] = [role_id for role_id in role_ids if role_id != admin_role_id]
+        with transaction.atomic():
+            # 删除旧的规则
+            UserRule.objects.filter(
+                username=target_user.username,
+                domain=target_user.domain,
+            ).delete()
+            # 更新用户信息
+            if rules:
+                add_rule = [
+                    UserRule(
+                        username=target_user.username,
+                        domain=target_user.domain,
+                        group_rule_id=i,
+                    )
+                    for i in rules
+                ]
+                UserRule.objects.bulk_create(add_rule, batch_size=100)
+            update_fields = {
+                "locale": params.get("locale"),
+                "timezone": params.get("timezone"),
+                "role_list": params.get("roles"),
+            }
+            if not is_synced_user:
+                update_fields["display_name"] = params.get("lastName")
+                update_fields["group_list"] = params.get("groups")
+            if "email" in params:
+                update_fields["email"] = params["email"]
+            if "phone" in params:
+                update_fields["phone"] = params["phone"]
+
+            User.objects.filter(id=pk).update(**update_fields)
+            # 清除用户菜单缓存（缓存键格式为 menus-user:{user_id}）
+            cache.delete(f"menus-user:{pk}")
+
+            # 同步用户数据到 CMDB
+            try:
+                CMDB().sync_display_fields(
+                    users=[{"id": pk, "username": params["username"], "display_name": update_fields.get("display_name", target_user.display_name)}]
+                )
+            except Exception as e:
+                logger.exception(e)
+            # 记录操作日志
+            log_operation(request, "update", "system-manager", f"编辑用户: {params['username']}")
+
+            # 清除权限缓存
+            clear_user_permission_cache(target_user.username, target_user.domain)
+
+        return JsonResponse({"result": True})

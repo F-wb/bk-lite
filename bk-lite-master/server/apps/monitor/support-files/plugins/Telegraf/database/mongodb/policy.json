@@ -1,0 +1,81 @@
+{
+  "object": "MongoDB",
+  "plugin": "MongoDB",
+  "templates": [
+    {
+      "name": "命令执行延迟告警",
+      "alert_name": "MongoDB 实例 ${resource_name} 操作延迟超标",
+      "description": "监控命令执行P99延迟，高延迟表明数据库负载过重。需优化慢查询或检查硬件资源瓶颈。",
+      "metric_name": "mongodb_latency_commands_avg",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 500,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 300,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 100,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    },
+    {
+      "name": "活跃写入操作堆积",
+      "alert_name": "MongoDB 实例 ${resource_name} 写入延迟",
+      "description": "监控当前活跃写入操作数量，持续高位可能导致写入排队。需检查存储引擎性能或分片均衡状态。",
+      "metric_name": "mongodb_active_writes",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 100,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 50,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 20,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    },
+    {
+      "name": "文档扫描速率过高",
+      "alert_name": "MongoDB 实例 ${resource_name} 文档扫描速率过高",
+      "description": "监控查询执行器每秒扫描的文档数。该值持续偏高通常表示缺索引或查询条件过宽，会放大磁盘读和 CPU。这是实例级 scannedObjects，不是某个集合的文档总量。",
+      "metric_name": "mongodb_total_docs_scanned_rate",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1000000,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 500000,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 100000,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    }
+  ]
+}

@@ -1,0 +1,681 @@
+import React, {
+  useRef,
+  useEffect,
+  forwardRef,
+  useImperativeHandle,
+  useState,
+  useCallback,
+  useMemo,
+} from 'react';
+import { useIntl } from 'react-intl';
+import styles from './index.module.scss';
+import { useTranslation } from '@/utils/i18n';
+import { useOpsAnalysis } from '@/app/ops-analysis/context/common';
+import { useShareOrganizationSeed } from '@/app/ops-analysis/context/shareOrganization';
+import { setLocaleData } from './utils/localeStore';
+import { Select } from 'antd';
+import { useTopologyState } from './hooks/useTopologyState';
+import { useGraphOperations } from './hooks/useGraphOperations';
+import { useContextMenuAndModal } from './hooks/useGraphInteractions';
+import { useTopologyResources } from './hooks/useTopologyResources';
+import { useTopologyRefresh } from './hooks/useTopologyRefresh';
+import { useTopologyLifecycle } from './hooks/useTopologyLifecycle';
+import { useNodeConfigFlow } from './hooks/useNodeConfigFlow';
+import { useDataSourceManager } from '@/app/ops-analysis/hooks/useDataSource';
+import { useUnifiedFilter } from '@/app/ops-analysis/hooks/useUnifiedFilter';
+import { useCanvasShareAction } from '@/app/ops-analysis/hooks/useCanvasShareAction';
+import { useDirectoryApi } from '@/app/ops-analysis/api';
+import useBtnPermissions from '@/hooks/usePermissions';
+import { useCanvasPeriodicRefresh } from '@/app/ops-analysis/hooks/useCanvasPeriodicRefresh';
+import { canPersistCanvasRefreshInterval, normalizeCanvasRefreshInterval } from '@/app/ops-analysis/utils/canvasRefreshInterval';
+import {
+  TopologyProps,
+  TopologyRef,
+  TopologyViewSets,
+} from '@/app/ops-analysis/types/topology';
+import type { FilterValue } from '@/app/ops-analysis/types/dashBoard';
+import TopologyToolbar from './components/toolbar';
+import TopologyCanvasShell from './components/canvasShell';
+import SingleValueFetchErrorTooltip from './components/singleValueFetchErrorTooltip';
+import type { SingleValueFetchErrorTooltipState } from './components/singleValueFetchErrorTooltip';
+import ViewWorkspace from '../components/viewWorkspace';
+import ContextMenu from './components/contextMenu';
+import EdgeConfigPanel from './components/edgeConfPanel';
+import NodeSidebar from './components/nodeSidebar';
+import ShapeNodePanel from './components/shapeNodePanel';
+import SingleValueNodePanel from './components/singleValueNodePanel';
+import ViewConfig from '@/app/ops-analysis/components/widgetConfig';
+import ViewSelector from '@/app/ops-analysis/components/widgetSelector';
+import {
+  UnifiedFilterBar,
+  UnifiedFilterConfigModal,
+} from '@/app/ops-analysis/components/unifiedFilter';
+import {
+  getOpsChartTheme,
+  resolveOpsChartThemeName,
+} from '@/app/ops-analysis/utils/chartTheme';
+import { convertNodesToLayoutItems } from './utils/namespaceUtils';
+import {
+  AppViewFullscreenExit,
+  useAppViewFullscreen,
+} from '@/app/ops-analysis/components/appFullscreen';
+import { useCanvasDraft } from '@/app/ops-analysis/hooks/useCanvasDraft';
+import {
+  restoreDraftRefreshInterval,
+  toCanvasDraftResourceId,
+  type CanvasDraftPayload,
+} from '@/app/ops-analysis/api/canvasDraft';
+import { syncAndFillOrganizationFilterValues } from '@/app/ops-analysis/utils/unifiedFilterState';
+import { bindCanvasDraftControls } from '@/app/ops-analysis/components/canvasDraftControls';
+
+const Topology = forwardRef<TopologyRef, TopologyProps>(
+  ({ selectedTopology, shareMode = false }, ref) => {
+    const themeName = resolveOpsChartThemeName();
+    const chartTheme = getOpsChartTheme(themeName);
+    const isDarkTheme = themeName === 'dark';
+    const { shareLoading, openShare } = useCanvasShareAction('topology');
+    const { updateItem } = useDirectoryApi();
+    const { hasPermission } = useBtnPermissions();
+    const containerRef = useRef<HTMLDivElement>(null);
+    const canvasContainerRef = useRef<HTMLDivElement>(null);
+    const canvasHostRef = useRef<HTMLDivElement>(null);
+    const minimapContainerRef = useRef<HTMLDivElement>(null);
+    const refreshTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const resizeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const [minimapVisible, setMinimapVisible] = useState(true);
+    const [filterConfigModalVisible, setFilterConfigModalVisible] =
+      useState(false);
+    const [namespaceDraftId, setNamespaceDraftId] = useState<
+      number | undefined
+    >(undefined);
+    const [appliedNamespaceId, setAppliedNamespaceId] = useState<
+      number | undefined
+    >(undefined);
+    const [appliedFilterValues, setAppliedFilterValues] = useState<
+      Record<string, FilterValue>
+    >({});
+    const [savedRefreshInterval, setSavedRefreshInterval] = useState(0);
+    const [nodeChangeKey, setNodeChangeKey] = useState(0);
+    const [singleValueFetchErrorTooltip, setSingleValueFetchErrorTooltip] =
+      useState<SingleValueFetchErrorTooltipState | null>(null);
+    const rebuildFiltersRef = useRef<(() => void) | null>(null);
+    const { isFullscreen, enterFullscreen, exitFullscreen } =
+      useAppViewFullscreen();
+    const handleFullscreenToggle = useCallback(() => {
+      if (isFullscreen) {
+        exitFullscreen();
+        return;
+      }
+      enterFullscreen();
+    }, [enterFullscreen, exitFullscreen, isFullscreen]);
+
+    const { t } = useTranslation();
+    const intl = useIntl();
+    const state = useTopologyState();
+    const dataSourceManager = useDataSourceManager();
+    const { loadCanvasNamespaces } = useOpsAnalysis();
+    const shareOrganizationSeed = useShareOrganizationSeed();
+
+    const {
+      definitions,
+      filterValues,
+      setFilterValues,
+      updateDefinitions,
+      setDefinitions,
+    } = useUnifiedFilter();
+
+    useEffect(() => {
+      setLocaleData(intl.locale, intl.messages as Record<string, string>);
+    }, [intl.locale, intl.messages]);
+
+    const handleNodeRemovedCallback = useCallback(() => {
+      rebuildFiltersRef.current?.();
+    }, []);
+
+    const {
+      zoomIn,
+      zoomOut,
+      handleFit,
+      handleDelete,
+      addNewNode,
+      handleNodeUpdate,
+      handleViewConfigConfirm,
+      handleAddChartNode,
+      handleSaveTopology,
+      handleLoadTopology,
+      loadTopologyData,
+      serializeTopologyData,
+      resizeCanvas,
+      loading,
+      toggleEditMode,
+      undo,
+      redo,
+      canUndo,
+      canRedo,
+      startInitialization,
+      finishInitialization,
+      clearOperationHistory,
+      refreshAllSingleValueNodes,
+      refreshAllChartNodes,
+      loadChartNodeData,
+      updateSingleNodeData,
+    } = useGraphOperations(
+      containerRef,
+      state,
+      minimapContainerRef,
+      handleNodeRemovedCallback,
+      isFullscreen,
+      setSingleValueFetchErrorTooltip,
+    );
+
+    const { handleEdgeConfigConfirm, closeEdgeConfig, handleMenuClick } =
+      useContextMenuAndModal(containerRef, state);
+    const { namespaceOptions, syncTopologyCanvasResources } =
+      useTopologyResources({
+        graphInstance: state.graphInstance,
+        dataSources: dataSourceManager.dataSources,
+        nodeChangeKey,
+        namespaceDraftId,
+        appliedNamespaceId,
+        setNamespaceDraftId,
+        setAppliedNamespaceId,
+      });
+
+    const namespaceSelectorElement = useMemo(() => {
+      if (namespaceOptions.length <= 1) return undefined;
+      return (
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-(--color-text-2) whitespace-nowrap">
+            {t('namespace.title')}:
+          </span>
+          <Select
+            value={namespaceDraftId}
+            onChange={(val: number) => {
+              setNamespaceDraftId(val);
+            }}
+            options={namespaceOptions}
+            style={{ minWidth: 160 }}
+          />
+        </div>
+      );
+    }, [namespaceOptions, namespaceDraftId, t]);
+
+    const {
+      clearRefreshTimer,
+      handleFilterConfigConfirm,
+      handleFilterSearch,
+      handleRefresh,
+      rebuildFiltersFromNodes,
+      refreshTopologyNodes,
+      scheduleTopologyInitialization,
+      scheduleTopologyPostMutation,
+    } = useTopologyRefresh({
+      graphInstance: state.graphInstance,
+      namespaceOptions,
+      refreshTimerRef,
+      dataSources: dataSourceManager.dataSources,
+      definitions,
+      filterValues,
+      appliedFilterValues,
+      appliedNamespaceId,
+      namespaceDraftId,
+      setAppliedFilterValues,
+      setAppliedNamespaceId,
+      setDefinitions,
+      setFilterValues,
+      setNamespaceDraftId,
+      setNodeChangeKey,
+      syncTopologyCanvasResources,
+      refreshAllSingleValueNodes,
+      refreshAllChartNodes,
+      updateDefinitions,
+      organizationId: shareOrganizationSeed,
+    });
+
+    const canPersistRefreshInterval = canPersistCanvasRefreshInterval({
+      shareMode,
+      isBuiltIn: Boolean(selectedTopology?.is_build_in),
+      hasEditPermission: hasPermission(['EditChart']),
+    });
+
+    const { effectiveRefreshInterval, handleFrequencyChange } =
+      useCanvasPeriodicRefresh({
+        canvasId: selectedTopology?.data_id,
+        savedInterval: savedRefreshInterval,
+        canPersist: canPersistRefreshInterval,
+        enabled: !state.isEditMode,
+        patchRefreshInterval: async (interval) => {
+          if (!selectedTopology?.data_id) {
+            return;
+          }
+          await updateItem('topology', selectedTopology.data_id, {
+            refresh_interval: interval,
+          });
+        },
+        onPeriodicRefresh: (cause) => {
+          refreshTopologyNodes(cause);
+        },
+        onSavedIntervalChange: setSavedRefreshInterval,
+      });
+
+    // 监听画布容器大小变化，自动调整画布大小
+    const handleCanvasResize = useCallback(() => {
+      if (resizeCanvas && canvasContainerRef.current) {
+        // 稍微延迟以确保DOM已经更新
+        setTimeout(() => {
+          if (canvasContainerRef.current) {
+            resizeCanvas(
+              canvasContainerRef.current.clientWidth,
+              canvasContainerRef.current.clientHeight,
+            );
+          }
+        }, 100);
+      }
+    }, [resizeCanvas]);
+
+    useEffect(() => {
+      if (!canvasContainerRef.current) return;
+
+      const resizeObserver = new ResizeObserver(() => {
+        if (resizeTimeoutRef.current) {
+          clearTimeout(resizeTimeoutRef.current);
+        }
+        resizeTimeoutRef.current = setTimeout(() => {
+          handleCanvasResize();
+        }, 150);
+      });
+
+      resizeObserver.observe(canvasContainerRef.current);
+
+      return () => {
+        resizeObserver.disconnect();
+        if (resizeTimeoutRef.current) {
+          clearTimeout(resizeTimeoutRef.current);
+          resizeTimeoutRef.current = null;
+        }
+      };
+    }, [handleCanvasResize]);
+
+    useEffect(() => {
+      handleCanvasResize();
+    }, [state.collapsed]);
+
+    useEffect(() => {
+      const timers = [80, 220, 420].map((delay) =>
+        window.setTimeout(() => {
+          const canvasElement = canvasContainerRef.current;
+
+          if (canvasElement?.clientWidth && canvasElement.clientHeight) {
+            resizeCanvas(canvasElement.clientWidth, canvasElement.clientHeight);
+          }
+
+          if (isFullscreen) {
+            state.graphInstance?.zoomToFit({ padding: 20, maxScale: 1 });
+          }
+        }, delay),
+      );
+
+      return () => {
+        timers.forEach((timer) => window.clearTimeout(timer));
+      };
+    }, [isFullscreen, resizeCanvas, state.graphInstance]);
+
+    const {
+      addNodeVisible,
+      handleChartSelectorCancel,
+      handleChartSelectorConfirm,
+      handleNodeConfirm,
+      handleNodeEditClose,
+      handleShowChartSelector,
+      handleShowNodeConfig,
+      handleTopologyViewConfigConfirm,
+      handleViewConfigClose,
+      nodeReadonly,
+      nodeTitle,
+      nodeType,
+      viewSelectorVisible,
+    } = useNodeConfigFlow({
+      state,
+      t,
+      dataSources: dataSourceManager.dataSources,
+      definitions,
+      appliedFilterValues,
+      appliedNamespaceId,
+      addNewNode,
+      handleAddChartNode,
+      handleNodeUpdate,
+      handleViewConfigConfirm,
+      loadChartNodeData,
+      scheduleTopologyPostMutation,
+      updateSingleNodeData,
+    });
+
+    const topologyDraftResourceId = toCanvasDraftResourceId(
+      selectedTopology?.data_id,
+    );
+    const getTopologyDraftPayload = useCallback(
+      (): CanvasDraftPayload => {
+        const topologyData = serializeTopologyData();
+        return {
+          name: selectedTopology?.name,
+          desc: selectedTopology?.desc,
+          view_sets: {
+            nodes: topologyData.nodes,
+            edges: topologyData.edges,
+            filters: definitions,
+          },
+          refresh_interval: savedRefreshInterval,
+        };
+      },
+      [
+        definitions,
+        savedRefreshInterval,
+        selectedTopology?.desc,
+        selectedTopology?.name,
+        serializeTopologyData,
+      ],
+    );
+    const applyTopologyDraftPayload = useCallback(
+      (payload: CanvasDraftPayload) => {
+        const viewSets = (payload.view_sets || {}) as TopologyViewSets;
+        const loadedDefinitions = Array.isArray(viewSets.filters)
+          ? viewSets.filters
+          : [];
+        const nextValues = syncAndFillOrganizationFilterValues(
+          loadedDefinitions,
+          {},
+          shareOrganizationSeed,
+        );
+
+        restoreDraftRefreshInterval(payload, setSavedRefreshInterval);
+        loadTopologyData(viewSets);
+        setDefinitions(loadedDefinitions);
+        setFilterValues(nextValues);
+        setAppliedFilterValues(nextValues);
+        void syncTopologyCanvasResources().then(() => {
+          refreshTopologyNodes(
+            'reload',
+            nextValues,
+            loadedDefinitions,
+            appliedNamespaceId,
+          );
+        });
+      },
+      [
+        appliedNamespaceId,
+        loadTopologyData,
+        refreshTopologyNodes,
+        setAppliedFilterValues,
+        setDefinitions,
+        setFilterValues,
+        setSavedRefreshInterval,
+        shareOrganizationSeed,
+        syncTopologyCanvasResources,
+      ],
+    );
+    const topologyDraft = useCanvasDraft({
+      resourceType: 'topology',
+      resourceId: topologyDraftResourceId,
+      enabled: Boolean(
+        state.isEditMode &&
+          !shareMode &&
+          topologyDraftResourceId &&
+          !selectedTopology?.is_build_in,
+      ),
+      getPayload: getTopologyDraftPayload,
+      applyPayload: applyTopologyDraftPayload,
+    });
+
+    const handleSave = async () => {
+      if (!selectedTopology) return;
+      await handleSaveTopology(selectedTopology, definitions);
+    };
+
+    useEffect(() => {
+      rebuildFiltersRef.current = rebuildFiltersFromNodes;
+    }, [rebuildFiltersFromNodes]);
+
+    const hasUnsavedChanges = () => {
+      return state.isEditMode && canUndo;
+    };
+
+    useImperativeHandle(ref, () => ({
+      hasUnsavedChanges,
+    }));
+
+    const { handleCancelEdit, handleEnterEditMode } = useTopologyLifecycle({
+      selectedTopology,
+      state,
+      definitions,
+      appliedFilterValues,
+      appliedNamespaceId,
+      setAppliedFilterValues,
+      setAppliedNamespaceId,
+      setDefinitions,
+      setFilterValues,
+      setNamespaceDraftId,
+      clearOperationHistory,
+      clearRefreshTimer,
+      finishInitialization,
+      handleLoadTopology,
+      loadCanvasNamespaces,
+      refreshAllSingleValueNodes,
+      refreshAllChartNodes,
+      refreshTopologyNodes,
+      scheduleTopologyInitialization,
+      startInitialization,
+      syncTopologyCanvasResources,
+      toggleEditMode,
+      onLoadedRefreshInterval: (interval) => {
+        setSavedRefreshInterval(normalizeCanvasRefreshInterval(interval));
+      },
+      organizationId: shareOrganizationSeed,
+    });
+
+    const onCancelEdit = () => {
+      handleCancelEdit();
+    };
+
+    const handleSelectMode = () => {
+      state.setIsSelectMode(!state.isSelectMode);
+      if (state.graphInstance) {
+        state.graphInstance.enableSelection();
+      }
+    };
+
+    // 键盘快捷键监听
+    useEffect(() => {
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.ctrlKey || e.metaKey) {
+          if (e.key === 'z' && !e.shiftKey) {
+            e.preventDefault();
+            undo();
+          } else if (e.key === 'y' || (e.key === 'z' && e.shiftKey)) {
+            e.preventDefault();
+            redo();
+          }
+        }
+      };
+
+      document.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.removeEventListener('keydown', handleKeyDown);
+      };
+    }, [undo, redo]);
+
+    const NodePanel =
+      nodeType === 'single-value' ? SingleValueNodePanel : ShapeNodePanel;
+
+    const panelStyle = {
+      background: chartTheme.panelBg,
+    };
+    const topologyContainerStyle: React.CSSProperties = {
+      backgroundColor: isDarkTheme ? 'var(--color-fill-1)' : '#f5f6f8',
+      zIndex: isFullscreen ? 1100 : undefined,
+    };
+
+    const topologyToolbar = (
+      <TopologyToolbar
+        selectedTopology={selectedTopology}
+        shareMode={shareMode}
+        shareLoading={shareLoading}
+        onOpenShare={
+          !shareMode && selectedTopology?.data_id
+            ? () => {
+              void openShare(selectedTopology.data_id);
+            }
+            : undefined
+        }
+        onEdit={handleEnterEditMode}
+        onSave={handleSave}
+        onCancel={onCancelEdit}
+        editExtra={bindCanvasDraftControls(topologyDraft)}
+        onFilterConfig={() => setFilterConfigModalVisible(true)}
+        onZoomIn={zoomIn}
+        onZoomOut={zoomOut}
+        onFit={handleFit}
+        onDelete={handleDelete}
+        onSelectMode={handleSelectMode}
+        onUndo={undo}
+        onRedo={redo}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        isSelectMode={state.isSelectMode}
+        isEditMode={state.isEditMode}
+        isFullscreen={isFullscreen}
+        onFullscreenToggle={handleFullscreenToggle}
+        onRefresh={handleRefresh}
+        onFrequencyChange={handleFrequencyChange}
+        frequenceValue={effectiveRefreshInterval}
+      />
+    );
+
+    const topologyFilterBar =
+      (definitions.length > 0 || namespaceSelectorElement) && (
+        <UnifiedFilterBar
+          definitions={definitions}
+          values={filterValues}
+          onChange={setFilterValues}
+          onSearch={handleFilterSearch}
+          onReset={handleFilterSearch}
+          prefixContent={namespaceSelectorElement}
+          popupZIndex={isFullscreen ? 1200 : undefined}
+        />
+      );
+
+    const topologyCanvasContent = (
+      <div
+        className={`flex h-full min-h-0 overflow-hidden p-0 ${state.collapsed ? 'gap-0' : 'gap-2'}`}
+      >
+        <div className={isFullscreen ? 'hidden' : 'min-h-0 shrink-0'}>
+          <NodeSidebar
+            collapsed={state.collapsed}
+            isEditMode={state.isEditMode}
+            graphInstance={state.graphInstance ?? undefined}
+            setCollapsed={state.setCollapsed}
+            onShowNodeConfig={handleShowNodeConfig}
+            onShowChartSelector={handleShowChartSelector}
+          />
+        </div>
+
+        <TopologyCanvasShell
+          canvasContainerRef={canvasContainerRef}
+          containerRef={containerRef}
+          minimapContainerRef={minimapContainerRef}
+          canvasHostRef={canvasHostRef}
+          isFullscreen={isFullscreen}
+          loading={loading}
+          minimapVisible={minimapVisible}
+          panelStyle={panelStyle}
+          t={t}
+          setMinimapVisible={setMinimapVisible}
+        />
+        <SingleValueFetchErrorTooltip tooltip={singleValueFetchErrorTooltip} />
+      </div>
+    );
+
+    return (
+      <div
+        className={`flex flex-col ${styles.topologyContainer} ${
+          isFullscreen
+            ? 'fixed inset-0 h-screen w-screen overflow-hidden'
+            : 'h-full flex-1 overflow-hidden'
+        }`}
+        data-topology-mode={state.isEditMode ? 'edit' : 'view'}
+        style={topologyContainerStyle}
+      >
+        <AppViewFullscreenExit visible={isFullscreen} onExit={exitFullscreen} />
+        <ViewWorkspace
+          selectedItem={selectedTopology}
+          titleFallback={t('topology.canvasTitle')}
+          emptyDescription={t('topology.emptySelect')}
+          toolbar={isFullscreen ? undefined : topologyToolbar}
+          filterBar={topologyFilterBar}
+          headerVisible={!isFullscreen}
+        >
+          {topologyCanvasContent}
+        </ViewWorkspace>
+
+        <ContextMenu
+          visible={state.contextMenuVisible}
+          position={state.contextMenuPosition}
+          targetType={state.contextMenuTargetType}
+          onMenuClick={handleMenuClick}
+          isEditMode={state.isEditMode}
+        />
+
+        <EdgeConfigPanel
+          visible={state.edgeConfigVisible}
+          readonly={!state.isEditMode}
+          onClose={closeEdgeConfig}
+          edgeData={state.currentEdgeData}
+          onConfirm={handleEdgeConfigConfirm}
+        />
+
+        <NodePanel
+          visible={state.nodeEditVisible || addNodeVisible}
+          title={nodeTitle}
+          nodeType={nodeType}
+          readonly={nodeReadonly}
+          builtinNamespaceId={namespaceDraftId}
+          editingNodeData={addNodeVisible ? null : state.editingNodeData}
+          filterDefinitions={definitions}
+          onClose={handleNodeEditClose}
+          onConfirm={handleNodeConfirm}
+          onCancel={handleNodeEditClose}
+        />
+
+        <ViewSelector
+          visible={viewSelectorVisible}
+          onOpenConfig={handleChartSelectorConfirm}
+          onCancel={handleChartSelectorCancel}
+        />
+
+        <ViewConfig
+          open={state.viewConfigVisible}
+          item={state.editingNodeData}
+          onClose={handleViewConfigClose}
+          onConfirm={handleTopologyViewConfigConfirm}
+          builtinNamespaceId={namespaceDraftId}
+          dataSourceManager={dataSourceManager}
+          filterDefinitions={definitions}
+          unifiedFilterValues={filterValues}
+          showChartThemeMode={true}
+        />
+
+        <UnifiedFilterConfigModal
+          open={filterConfigModalVisible}
+          definitions={definitions}
+          onConfirm={handleFilterConfigConfirm}
+          onCancel={() => setFilterConfigModalVisible(false)}
+          layoutItems={convertNodesToLayoutItems(state.graphInstance)}
+          dataSources={dataSourceManager.dataSources}
+        />
+      </div>
+    );
+  },
+);
+
+Topology.displayName = 'Topology';
+
+export default Topology;

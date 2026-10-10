@@ -1,0 +1,297 @@
+import os
+
+from apps.core.logger import logger
+from apps.rpc.base import AppClient, RpcClient
+from apps.rpc.exceptions import RpcLocalClientRequiredError
+
+
+class NodeMgmt(object):
+    def __init__(self, is_local_client=False):
+        is_local_client = os.getenv("IS_LOCAL_RPC", "0") == "1" or is_local_client
+        self.is_local_client = is_local_client
+
+        self.permission_client = AppClient("apps.node_mgmt.nats.node.permission") if is_local_client else RpcClient()
+        self.client = AppClient("apps.node_mgmt.nats.node") if is_local_client else RpcClient()
+
+    def get_module_data(self, **kwargs):
+        """
+        :param module: 模块
+        :param child_module: 子模块
+        :param page: 页码
+        :param page_size: 页条目数
+        :param group_id: 组ID
+        """
+        return_data = self.permission_client.run("get_node_module_data", **kwargs)
+        return return_data
+
+    def get_module_list(self, **kwargs):
+        """
+        :param module: 模块
+        :return: 模块的枚举值列表
+        """
+        return_data = self.permission_client.run("get_node_module_list", **kwargs)
+        return return_data
+
+    def cloud_region_list(self):
+        """
+        :return: 云区域列表
+        """
+        return_data = self.client.run("cloud_region_list")
+        return return_data
+
+    def get_cloud_region_proxy_address(self, cloud_region_id, organization_ids=None):
+        """获取云区域代理地址。"""
+        return self.client.run("get_cloud_region_proxy_address", cloud_region_id, organization_ids)
+
+    def node_list(self, query_data):
+        """
+        :param query_data: 查询条件
+        {
+            "cloud_region_id": 1,
+            "organization_ids": ["1", "2"],
+            "name": "node_name",
+            "ip": "10.10.10.1",
+            "os": "linux/windows",
+            "page": 1,
+            "page_size": 10,
+        }
+        """
+        return_data = self.client.run("node_list", query_data)
+        return return_data
+
+    def get_nodes_with_child_config(self, node_ids, collector, collect_type):
+        """查询关联了指定采集器子配置的节点 ID。"""
+        return self.client.run(
+            "get_nodes_with_child_config",
+            node_ids,
+            collector,
+            collect_type,
+        )
+
+    def get_node_names_by_ids(self, node_ids):
+        """
+        :param node_ids: 节点ID列表
+        :return: [{"id": "node_id", "name": "node_name"}]
+        """
+        return self.client.run("get_node_names_by_ids", node_ids)
+
+    def get_nodes_by_ids(self, node_ids):
+        """
+        :param node_ids: 节点ID列表
+        :return: [{"id": "node_id", "cloud_region_id": 1, "cloud_region_name": "default"}]
+        """
+        return self.client.run("get_nodes_by_ids", node_ids)
+
+    def batch_create_configs_and_child_configs(self, configs: list, child_configs: list):
+        """
+        批量创建配置和子配置
+        :param configs: 配置列表
+        :param child_configs: 子配置列表
+        """
+        return_data = self.client.run("batch_create_configs_and_child_configs", configs, child_configs)
+        return return_data
+
+    def batch_add_node_child_config(self, configs: list):
+        """
+        批量创建子配置
+        :param configs: 配置列表，每个配置包含以下字段：
+            - id: 子配置ID
+            - collect_type: 采集类型
+            - type: 配置类型
+            - content: 配置内容
+            - node_id: 节点ID
+            - collector_name: 采集器名称
+            - env_config: 环境变量配置（可选）
+            - sort_order: 排序（可选）
+        """
+        return_data = self.client.run("batch_add_node_child_config", configs)
+        return return_data
+
+    def batch_add_node_config(self, configs: list):
+        """
+        批量创建配置
+        :param configs: 配置列表，每个配置包含以下字段：
+            - id: 配置ID
+            - name: 配置名称
+            - content: 配置内容
+            - node_id: 节点ID
+            - collector_name: 采集器名称
+            - env_config: 环境变量配置（可选）
+        """
+        return_data = self.client.run("batch_add_node_config", configs)
+        return return_data
+
+    def get_child_configs_by_ids(self, ids):
+        """
+        :param ids: 子配置ID列表
+        """
+        return_data = self.client.run("get_child_configs_by_ids", ids)
+        return return_data
+
+    def run_telegraf_child_configs_once(self, request_id, config_ids, expected_node_id, organization_ids):
+        """在配置所属节点上一次性执行已保存的 CMDB Telegraf 子配置。"""
+        from apps.core.utils.current_team_scope import _normalize_organization_ids
+        from apps.node_mgmt.services.telegraf_oneshot import TelegrafOneShotService
+
+        normalized_organizations = sorted(_normalize_organization_ids(organization_ids))
+        authorization = TelegrafOneShotService.build_authorization(
+            request_id=request_id,
+            config_ids=config_ids,
+            expected_node_id=expected_node_id,
+            organization_ids=normalized_organizations,
+        )
+        timeout_options = {} if self.is_local_client else {"_timeout": 61}
+        return self.client.run(
+            "run_telegraf_child_configs_once",
+            {
+                "request_id": request_id,
+                "config_ids": config_ids,
+                "expected_node_id": expected_node_id,
+                "organization_ids": normalized_organizations,
+                "authorization": authorization,
+            },
+            **timeout_options,
+        )
+
+    def get_child_config_nodes_by_ids(self, ids, organization_ids):
+        """按子配置 ID 批量获取当前组织范围内的采集节点。"""
+        return self.client.run(
+            "get_child_config_nodes_by_ids",
+            ids,
+            organization_ids,
+        )
+
+    def get_configs_by_ids(self, ids):
+        """
+        :param ids: 配置ID列表
+        """
+        return_data = self.client.run("get_configs_by_ids", ids)
+        return return_data
+
+    def get_authorized_nodes_by_ids(self, node_ids, permission_data=None):
+        return_data = self.client.run(
+            "get_authorized_nodes_by_ids",
+            node_ids,
+            permission_data or {},
+        )
+        return return_data
+
+    def get_authorized_execution_targets_by_ids(self, node_ids, permission_data=None):
+        if not self.is_local_client:
+            logger.warning("RPC local client required: operation=get_authorized_execution_targets_by_ids")
+            raise RpcLocalClientRequiredError("get_authorized_execution_targets_by_ids")
+        return self.client.run(
+            "get_authorized_execution_targets_by_ids",
+            node_ids,
+            permission_data or {},
+        )
+
+    def get_authorized_execution_targets_by_ips(self, ips, permission_data=None):
+        if not self.is_local_client:
+            logger.warning("RPC local client required: operation=get_authorized_execution_targets_by_ips")
+            raise RpcLocalClientRequiredError("get_authorized_execution_targets_by_ips")
+        return self.client.run(
+            "get_authorized_execution_targets_by_ips",
+            ips,
+            permission_data or {},
+        )
+
+    def update_child_config_content(self, id, content, env_config=None):
+        """
+        :param id: 子配置ID
+        :param content: 子配置内容
+        """
+        return_data = self.client.run(
+            "update_child_config_content",
+            {"id": id, "content": content, "env_config": env_config},
+        )
+        return return_data
+
+    def compare_and_swap_child_config_content_local(self, id, expected_content, content):
+        """同进程运维专用：仅当子配置内容仍等于读取快照时更新。"""
+        if not self.is_local_client:
+            logger.warning("RPC local client required: operation=compare_and_swap_child_config_content")
+            raise RpcLocalClientRequiredError("compare_and_swap_child_config_content")
+        return self.client.run(
+            "compare_and_swap_child_config_content",
+            {"id": id, "expected_content": expected_content, "content": content},
+        )
+
+    def update_config_content(self, id, content, env_config=None):
+        """
+        :param id: 配置ID
+        :param content: 配置内容
+        """
+        return_data = self.client.run(
+            "update_config_content",
+            {"id": id, "content": content, "env_config": env_config},
+        )
+        return return_data
+
+    def delete_child_configs(self, ids):
+        """
+        :param ids: 子配置ID列表
+        """
+        return_data = self.client.run("delete_child_configs", ids)
+        return return_data
+
+    def delete_configs(self, ids):
+        """
+        :param ids: 配置ID列表
+        """
+        return_data = self.client.run("delete_configs", ids)
+        return return_data
+
+    def collectors_import(self, collectors: list):
+        """
+        导入采集器
+        :param collectors: 采集器列表
+        """
+        return_data = self.client.run("import_collectors", collectors)
+        return return_data
+
+    def cloudregion_tls_env_by_node_id(self, node_id):
+        """
+        获取节点对应云区域的TLS配置
+        :param node_id: 节点ID
+        """
+        return_data = self.client.run("cloudregion_tls_env_by_node_id", node_id)
+        return return_data
+
+    def get_cloud_region_envconfig(self, cloud_region_id):
+        """
+        获取云区域的所有环境变量配置
+        :param cloud_region_id: 云区域 ID
+        :return: 环境变量字典
+        """
+        return_data = self.client.run("get_cloud_region_envconfig", cloud_region_id)
+        return return_data
+
+    def get_cloud_region_public_config(self, cloud_region_id):
+        """获取允许跨业务模块读取的非敏感云区域配置。"""
+        return self.client.run("get_cloud_region_public_config", cloud_region_id)
+
+    def install_collector(self, collector_package: int, nodes: list[str]):
+        """通过 NATS 触发采集器安装"""
+        return self.client.run(
+            "install_collector",
+            {"collector_package": collector_package, "nodes": nodes},
+        )
+
+    def install_managed_component(self, collector_package: int, nodes: list[str]):
+        """通过 NATS 触发托管组件安装"""
+        return self.client.run(
+            "install_managed_component",
+            {"collector_package": collector_package, "nodes": nodes},
+        )
+
+    def ingest_from_source(self, **kwargs):
+        """跨模块推送写入节点（只关联，不创建）。
+
+        NATS handler 签名为 node_ingest_from_source(params)，须整包为 params。
+        """
+        return self.client.run("node_ingest_from_source", params=kwargs)
+
+    def install_controller(self, data: dict, organization_ids: list):
+        """通过 NATS 触发控制器远程安装。不含卸载、重试、手动安装或任务查询。"""
+        return self.client.run("install_controller", data, organization_ids)

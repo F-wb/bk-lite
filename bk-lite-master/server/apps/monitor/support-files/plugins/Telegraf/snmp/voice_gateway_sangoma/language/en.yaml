@@ -1,0 +1,65 @@
+VoiceGateway Sangoma Vega SNMP:
+  name: Sangoma Vega (Telegraf)
+  desc: "SNMP monitoring template for Sangoma Vega voice gateway. It reports uptime, CPU utilization, memory, temperature, and interface traffic, for Dialogic IMG 2020 (enterprise PEN 3028)."
+monitor_object:
+  VoiceGateway: VoiceGateway
+monitor_object_type:
+  Network Device: Network Equipment
+monitor_object_metric:
+  VoiceGateway:
+    snmp_uptime:
+      name: System Uptime
+      desc: This metric indicates the uptime of the device since the last restart,
+        derived from sysUpTime. Monitoring uptime helps administrators understand
+        device stability and identify unexpected reboots or failures.
+    interface_ifHCInOctets:
+      name: Interface Incoming Traffic Rate
+      desc: This metric indicates the average rate of bytes received over the past
+        5 minutes, measured in bytes per second, from the 64-bit IF-MIB ifHCInOctets
+        counter (ifXTable). The 64-bit counter avoids the rapid wrap of the 32-bit
+        ifInOctets on high-speed ports, keeping the rate accurate.
+    interface_ifHCOutOctets:
+      name: Interface Outgoing Traffic Rate
+      desc: This metric calculates the average rate of bytes sent over the past 5
+        minutes, measured in bytes per second, from the 64-bit IF-MIB ifHCOutOctets
+        counter (ifXTable). The 64-bit counter avoids the rapid wrap of the 32-bit
+        ifOutOctets on high-speed ports, keeping the rate accurate.
+    device_total_incoming_traffic:
+      name: Device Total Incoming Traffic Rate
+      desc: This metric indicates the average rate of total bytes received by the
+        entire device over the past 5 minutes, measured in bytes per second, summed
+        across all interfaces from the 64-bit ifHCInOctets counter. It helps administrators
+        obtain an overview of incoming traffic for overall monitoring and capacity
+        planning.
+    device_total_outgoing_traffic:
+      name: Device Total Outgoing Traffic Rate
+      desc: This metric represents the average rate of total bytes sent by the entire
+        device over the past 5 minutes, measured in bytes per second, summed across
+        all interfaces from the 64-bit ifHCOutOctets counter. It helps administrators
+        assess sending performance for traffic management and optimization.
+    device_cpu_usage:
+      name: CPU Usage
+      desc: Dialogic IMG 2020 CPU busy as a whole percent, walked from the cpu info
+        table by cpuInfoIndex. The dashboard value is the maximum across CPU indexes.
+    memory_free_bytes:
+      name: Free Memory
+      desc: Dialogic IMG 2020 free memory in bytes from the cpu info table. The table
+        has no total-memory column, so memory percent is not derived. The dashboard
+        value is the minimum across CPU indexes.
+    device_temperature_celsius:
+      name: Device Temperature
+      desc: Dialogic IMG 2020 temperature in degrees Celsius from the temperature
+        location table, with an optional location name tag. High temperature can indicate
+        cooling or airflow problems.
+    device_psu_state:
+      name: PSU State
+      desc: Voice gateway power-source state normalized so 1 means healthy and 2 means
+        fault.
+monitor_object_metric_group:
+  VoiceGateway:
+    Base: Base
+    Traffic: Traffic
+    CPU: CPU
+    Memory: Memory
+    Temperature: Temperature
+    Hardware Status: Hardware Status

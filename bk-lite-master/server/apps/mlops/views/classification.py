@@ -1,0 +1,1402 @@
+import json
+import os
+
+import numpy as np
+import pandas as pd
+import requests
+from django.http import FileResponse
+from rest_framework import status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from apps.core.decorators.api_permission import HasPermission
+from apps.core.logger import mlops_logger as logger
+from apps.mlops.constants import DatasetReleaseStatus, TrainJobStatus
+from apps.mlops.filters.algorithm_config import AlgorithmConfigFilter
+from apps.mlops.filters.classification import (
+    ClassificationDatasetFilter,
+    ClassificationDatasetReleaseFilter,
+    ClassificationServingFilter,
+    ClassificationTrainDataFilter,
+    ClassificationTrainJobFilter,
+)
+from apps.mlops.models import AlgorithmConfig
+from apps.mlops.models.classification import (
+    ClassificationDataset,
+    ClassificationDatasetRelease,
+    ClassificationServing,
+    ClassificationTrainData,
+    ClassificationTrainJob,
+)
+from apps.mlops.predict_response import map_predict_upstream_status
+from apps.mlops.predict_url_builder import build_predict_url
+from apps.mlops.serializers.algorithm_config import AlgorithmConfigListSerializer, AlgorithmConfigSerializer
+from apps.mlops.serializers.classification import (
+    ClassificationDatasetReleaseSerializer,
+    ClassificationDatasetSerializer,
+    ClassificationServingSerializer,
+    ClassificationTrainDataSerializer,
+    ClassificationTrainJobSerializer,
+)
+from apps.mlops.services import ConfigurationError, get_image_by_prefix, get_mlflow_tracking_uri, get_mlflow_train_config
+from apps.mlops.utils import mlflow_service
+from apps.mlops.utils.group_scope import filter_queryset_by_parent_team
+from apps.mlops.utils.i18n import mlops_exception_message, mlops_message
+from apps.mlops.utils.webhook_client import WebhookClient, WebhookConnectionError, WebhookError, WebhookTimeoutError
+from apps.mlops.views.base import BaseTrainJobViewSet, TeamModelViewSet
+from config.drf.pagination import CustomPageNumberPagination
+from config.drf.viewsets import ModelViewSet
+
+
+class ClassificationDatasetViewSet(TeamModelViewSet):
+    queryset = ClassificationDataset.objects.all()
+    serializer_class = ClassificationDatasetSerializer
+    pagination_class = CustomPageNumberPagination
+    filterset_class = ClassificationDatasetFilter
+    ordering = ("-id",)
+    permission_key = "dataset.classification_dataset"
+
+    @HasPermission("classification-View")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @HasPermission("classification-View")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @HasPermission("classification-Delete")
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+
+    @HasPermission("classification-Add")
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    @HasPermission("classification-Edit")
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+
+
+class ClassificationServingViewSet(TeamModelViewSet):
+    queryset = ClassificationServing.objects.select_related("train_job", "train_job__dataset_version", "train_job__dataset_version__dataset").all()
+    serializer_class = ClassificationServingSerializer
+    pagination_class = CustomPageNumberPagination
+    filterset_class = ClassificationServingFilter
+    ordering = ("-id",)
+    permission_key = "serving.classification_serving"
+
+    MLFLOW_PREFIX = "Classification"  # MLflow 命名前缀
+
+    @HasPermission("classification-View")
+    def list(self, request, *args, **kwargs):
+        """列表查询，实时同步容器状态"""
+        response = super().list(request, *args, **kwargs)
+
+        if isinstance(response.data, dict):
+            servings = response.data.get("items", [])
+        else:
+            servings = response.data
+
+        if not servings:
+            return response
+
+        serving_ids = [f"Classification_Serving_{s['id']}" for s in servings]
+
+        try:
+            # 批量查询容器状态
+            result = WebhookClient.get_status(serving_ids)
+            status_map = {s.get("id"): s for s in result}
+
+            # 批量获取所有需要更新的对象（避免N+1查询）
+            serving_id_list = [s["id"] for s in servings]
+            serving_objs = ClassificationServing.objects.filter(id__in=serving_id_list)
+            serving_obj_map = {obj.id: obj for obj in serving_objs}
+
+            updates = []
+            for serving_data in servings:
+                serving_id = f"Classification_Serving_{serving_data['id']}"
+                container_info = status_map.get(serving_id)
+
+                if container_info:
+                    serving_data["container_info"] = container_info
+
+                    # 同步到数据库：从缓存字典获取对象，无额外查询
+                    serving_obj = serving_obj_map.get(serving_data["id"])
+                    if serving_obj:
+                        serving_obj.container_info = container_info
+                        updates.append(serving_obj)
+                else:
+                    serving_data["container_info"] = {
+                        "status": "error",
+                        "state": "unknown",
+                        "message": mlops_message(request, "error.webhookd_container_status_missing"),
+                    }
+
+            if updates:
+                ClassificationServing.objects.bulk_update(updates, ["container_info"])
+
+        except WebhookError as e:
+            logger.error(f"查询容器状态失败: {e}")
+            # 降级：使用数据库中的旧值
+            for serving_data in servings:
+                old_info = serving_data.get("container_info") or {}
+                serving_data["container_info"] = {
+                    **old_info,
+                    "status": "error",
+                    "_query_failed": True,
+                    "_error": mlops_exception_message(request, e),
+                }
+
+        return response
+
+    @HasPermission("classification-View")
+    def retrieve(self, request, *args, **kwargs):
+        """详情查询，实时同步容器状态"""
+        response = super().retrieve(request, *args, **kwargs)
+
+        serving_id = f"Classification_Serving_{response.data['id']}"
+
+        try:
+            result = WebhookClient.get_status([serving_id])
+            container_info = result[0] if result else None
+
+            if container_info:
+                response.data["container_info"] = container_info
+
+                # 更新数据库
+                ClassificationServing.objects.filter(id=response.data["id"]).update(container_info=container_info)
+            else:
+                response.data["container_info"] = {
+                    "status": "error",
+                    "state": "unknown",
+                    "message": mlops_message(request, "error.webhookd_container_status_unavailable"),
+                }
+
+        except WebhookError as e:
+            logger.error(f"查询容器状态失败: {e}")
+            old_info = response.data.get("container_info") or {}
+            response.data["container_info"] = {
+                **old_info,
+                "status": "error",
+                "_query_failed": True,
+                "_error": mlops_exception_message(request, e),
+            }
+
+        return response
+
+    @HasPermission("classification-Delete")
+    def destroy(self, request, *args, **kwargs):
+        return self.destroy_serving_with_runtime_cleanup(request, *args, **kwargs)
+
+    @HasPermission("classification-Add")
+    def create(self, request, *args, **kwargs):
+        """创建 serving 服务并自动启动容器"""
+        response = super().create(request, *args, **kwargs)
+        serving_id = response.data["id"]
+
+        try:
+            serving = ClassificationServing.objects.get(id=serving_id)
+
+            # 获取 MLflow tracking URI
+            mlflow_tracking_uri = get_mlflow_tracking_uri()
+            if not mlflow_tracking_uri:
+                logger.error("MLFLOW_TRACKER_URL is not configured")
+                serving.container_info = {
+                    "status": "error",
+                    "message": mlops_message(request, "error.mlflow_tracker_url_not_configured"),
+                }
+                serving.save(update_fields=["container_info"])
+                response.data["container_info"] = serving.container_info
+                response.data["message"] = mlops_message(request, "message.serving_created_start_failed_config_missing")
+                return response
+
+            # 解析 model_uri
+            try:
+                model_uri = self._resolve_model_uri(serving)
+            except ValueError as e:
+                logger.error(f"解析 model URI 失败: {e}")
+                serving.container_info = {
+                    "status": "error",
+                    "message": mlops_exception_message(request, e),
+                }
+                serving.save(update_fields=["container_info"])
+                response.data["container_info"] = serving.container_info
+                response.data["message"] = mlops_message(
+                        request, "message.serving_created_start_failed", detail=mlops_exception_message(request, e)
+                    )
+                return response
+
+            # 构建 serving ID
+            container_id = f"Classification_Serving_{serving.id}"
+
+            try:
+                # 动态获取推理镜像
+                train_image = get_image_by_prefix(self.MLFLOW_PREFIX, serving.train_job.algorithm)
+
+                # 调用 WebhookClient 启动服务
+                result = WebhookClient.serve(
+                    container_id,
+                    mlflow_tracking_uri,
+                    model_uri,
+                    port=serving.port,
+                    train_image=train_image,
+                )
+
+                serving.container_info = result
+                serving.port = int(result.get("port", 0)) if result.get("port") else serving.port
+                serving.save(update_fields=["container_info", "port"])
+
+                response.data["container_info"] = result
+                response.data["message"] = mlops_message(request, "message.serving_created_and_started")
+
+            except WebhookError as e:
+                error_msg = str(e)
+                logger.error(f"自动启动 serving 失败: {error_msg}")
+
+                # 处理容器已存在的情况
+                if e.code == "CONTAINER_ALREADY_EXISTS":
+                    try:
+                        result = WebhookClient.get_status([container_id])
+                        container_info = (
+                            result[0]
+                            if result
+                            else {
+                                "status": "error",
+                                "id": container_id,
+                                "message": mlops_message(request, "error.container_status_query_failed"),
+                            }
+                        )
+
+                        serving.container_info = container_info
+                        serving.save(update_fields=["container_info"])
+
+                        response.data["container_info"] = container_info
+                        response.data["message"] = mlops_message(request, "message.serving_created_existing_container_synced")
+                        response.data["warning"] = mlops_message(request, "message.container_already_exists_synced")
+                    except WebhookError:
+                        serving.container_info = {
+                            "status": "error",
+                            "message": mlops_message(request, "error.serving_container_sync_failed", detail=mlops_exception_message(request, e)),
+                        }
+                        serving.save(update_fields=["container_info"])
+                        response.data["container_info"] = serving.container_info
+                        response.data["message"] = mlops_message(request, "message.serving_created_start_failed_generic")
+                else:
+                    serving.container_info = {"status": "error", "message": mlops_exception_message(request, e)}
+                    serving.save(update_fields=["container_info"])
+                    response.data["container_info"] = serving.container_info
+                    response.data["message"] = mlops_message(
+                        request, "message.serving_created_start_failed", detail=mlops_exception_message(request, e)
+                    )
+
+        except Exception as e:
+            logger.error(f"自动启动 serving 异常: {str(e)}", exc_info=True)
+            response.data["message"] = mlops_message(request, "message.serving_created_start_exception", detail=mlops_exception_message(request, e))
+
+        return response
+
+    @HasPermission("classification-Edit")
+    def update(self, request, *args, **kwargs):
+        """
+        更新 serving 配置，自动检测并重启容器
+
+        基于实际容器运行状态决策：
+        - 容器 running + 配置变更 → 自动重启
+        - 容器非 running → 仅更新数据库，用户自行决定是否启动
+        """
+        instance = self.get_object()
+
+        # 保存旧值用于判断变更
+        old_port = instance.port
+        old_model_version = instance.model_version
+        old_train_job_id = instance.train_job.id
+
+        # 检测是否更新了影响容器的字段（基于请求数据与旧值对比）
+        model_version_changed = "model_version" in request.data and str(request.data["model_version"]) != str(old_model_version)
+        train_job_changed = "train_job" in request.data and int(request.data["train_job"]) != old_train_job_id
+        port_changed = "port" in request.data and request.data.get("port") != old_port
+
+        container_id = f"Classification_Serving_{instance.id}"
+
+        # 获取容器实际状态（更新前），防御性处理 container_info 为空的情况
+        container_info = instance.container_info or {}
+        container_state = container_info.get("state")
+        container_port = container_info.get("port")
+
+        # 更新数据库
+        response = super().update(request, *args, **kwargs)
+        instance.refresh_from_db()
+
+        # 只有容器在运行时才考虑重启
+        if container_state != "running":
+            return response
+
+        # 决策：是否需要重启
+        need_restart = False
+
+        # 1. model/train_job 变更，必须重启
+        if model_version_changed or train_job_changed:
+            need_restart = True
+
+        # 2. 仅 port 变更，检查策略
+        elif port_changed:
+            new_port = instance.port
+            if new_port is None and old_port is not None:
+                # 有值 → None：不重启（当前端口视为自动分配，下次再应用）
+                need_restart = False
+            elif new_port is not None and old_port is None:
+                # None → 有值：需要重启（用户明确要指定端口）
+                need_restart = True
+            elif new_port is not None and old_port is not None:
+                # 有值 → 另一个有值：检查是否与实际端口一致
+                if container_port and str(new_port) != str(container_port):
+                    need_restart = True
+
+        # 如果需要重启，先删除旧容器
+        if need_restart:
+            try:
+                logger.warning(f"配置变更需要重启，删除旧容器: {container_id}")
+                WebhookClient.remove(container_id)
+            except WebhookError as e:
+                logger.warning(f"删除旧容器失败（可能已不存在）: {e}")
+                # 继续执行，尝试启动新容器
+
+            try:
+                # 获取环境变量
+                mlflow_tracking_uri = get_mlflow_tracking_uri()
+                if not mlflow_tracking_uri:
+                    raise ValueError("error.mlflow_tracker_url_not_configured")
+
+                # 解析新的 model_uri
+                model_uri = self._resolve_model_uri(instance)
+
+                # 动态获取推理镜像
+                train_image = get_image_by_prefix(self.MLFLOW_PREFIX, instance.train_job.algorithm)
+
+                # 启动新容器
+                result = WebhookClient.serve(
+                    container_id,
+                    mlflow_tracking_uri,
+                    model_uri,
+                    port=instance.port,
+                    train_image=train_image,
+                )
+
+                # 更新容器信息（status 由用户控制，不修改）
+                instance.container_info = result
+                instance.port = int(result.get("port", 0)) if result.get("port") else instance.port
+                instance.save(update_fields=["container_info", "port"])
+
+                # 更新返回数据
+                response.data["container_info"] = result
+                response.data["message"] = mlops_message(request, "message.serving_updated_and_restarted")
+
+            except Exception as e:
+                logger.error(f"自动重启失败: {str(e)}", exc_info=True)
+
+                # 启动失败，仅更新容器信息
+                instance.container_info = {
+                    "status": "error",
+                    "message": mlops_message(request, "message.serving_updated_restart_failed", detail=mlops_exception_message(request, e)),
+                }
+                instance.save(update_fields=["container_info"])
+
+                response.data["container_info"] = instance.container_info
+                response.data["message"] = mlops_message(
+                    request, "message.serving_updated_restart_failed", detail=mlops_exception_message(request, e)
+                )
+                response.data["warning"] = mlops_message(request, "message.serving_restart_manually")
+
+        return response
+
+    @action(detail=True, methods=["post"], url_path="start")
+    @HasPermission("classification-Start")
+    def start(self, request, *args, **kwargs):
+        """
+        启动 serving 服务
+        """
+        try:
+            serving = self.get_object()
+
+            # 获取 MLflow tracking URI
+            mlflow_tracking_uri = get_mlflow_tracking_uri()
+            if not mlflow_tracking_uri:
+                logger.error("MLflow tracking URI not configured")
+                return Response(
+                    {"error": mlops_message(request, "error.system_configuration_error")},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            # 解析 model_uri
+            try:
+                model_uri = self._resolve_model_uri(serving)
+            except ValueError as e:
+                return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 构建 serving ID
+            serving_id = f"Classification_Serving_{serving.id}"
+
+            try:
+                # 动态获取推理镜像
+                train_image = get_image_by_prefix(self.MLFLOW_PREFIX, serving.train_job.algorithm)
+
+                # 调用 WebhookClient 启动服务
+                result = WebhookClient.serve(
+                    serving_id,
+                    mlflow_tracking_uri,
+                    model_uri,
+                    port=serving.port,
+                    train_image=train_image,
+                )
+
+                # 正常启动成功，仅更新容器信息
+                serving.container_info = result
+                serving.port = int(result.get("port", 0)) if result.get("port") else serving.port
+                serving.save(update_fields=["container_info", "port"])
+
+                return Response(
+                    {
+                        "message": mlops_message(request, "message.service_started"),
+                        "serving_id": serving_id,
+                        "container_info": result,
+                    }
+                )
+
+            except WebhookError as e:
+                error_msg = str(e)
+
+                # 处理容器已存在的情况
+                if e.code == "CONTAINER_ALREADY_EXISTS":
+                    logger.warning(f"检测到容器已存在，同步容器信息: {serving_id}")
+                    try:
+                        # 查询当前容器状态
+                        result = WebhookClient.get_status([serving_id])
+                        container_info = (
+                            result[0]
+                            if result
+                            else {
+                                "status": "error",
+                                "id": serving_id,
+                                "message": mlops_message(request, "error.container_status_query_failed"),
+                            }
+                        )
+
+                        # 正常启动成功，更新容器信息
+                        serving.container_info = container_info
+                        serving.save(update_fields=["container_info"])
+
+                        return Response(
+                            {
+                                "message": mlops_message(request, "message.container_already_exists_status_synced"),
+                                "container_info": container_info,
+                                "warning": mlops_message(request, "message.container_already_exists"),
+                            }
+                        )
+                    except WebhookError as sync_error:
+                        logger.error(f"同步容器状态失败: {sync_error}")
+                        return Response(
+                            {
+                                "error": mlops_message(
+                                    request,
+                                    "error.serving_container_sync_failed",
+                                    detail=mlops_exception_message(request, sync_error),
+                                )
+                            },
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        )
+                else:
+                    # 其他错误直接返回
+                    logger.error(f"启动 serving 失败: {error_msg}")
+                    return Response(
+                        {"error": mlops_exception_message(request, e)},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+
+        except WebhookTimeoutError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookConnectionError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error(f"启动 serving 服务失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.serving_start_failed", detail=mlops_exception_message(request, e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["post"], url_path="stop")
+    @HasPermission("classification-Stop")
+    def stop(self, request, *args, **kwargs):
+        """
+        停止 serving 服务（停止并删除容器）
+        """
+        try:
+            serving = self.get_object()
+
+            # 构建 serving ID
+            serving_id = f"Classification_Serving_{serving.id}"
+
+            # 调用 WebhookClient 停止服务（默认删除容器）
+            result = WebhookClient.stop(serving_id)
+
+            return Response(
+                {
+                    "message": mlops_message(request, "message.service_stopped_and_deleted"),
+                    "serving_id": serving_id,
+                    "webhook_response": result,
+                }
+            )
+
+        except WebhookTimeoutError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookConnectionError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookError as e:
+            logger.error(f"停止 serving 失败: {e}")
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error(f"停止 serving 服务失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.serving_stop_failed", detail=mlops_exception_message(request, e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["post"], url_path="remove")
+    @HasPermission("classification-Remove")
+    def remove(self, request, *args, **kwargs):
+        """
+        删除 serving 容器（可处理运行中的容器）
+        """
+        try:
+            serving = self.get_object()
+
+            # 构建 serving ID
+            serving_id = f"Classification_Serving_{serving.id}"
+
+            # 调用 WebhookClient 删除容器
+            result = WebhookClient.remove(serving_id)
+
+            # 更新容器信息
+            serving.container_info = {
+                "status": "success",
+                "id": serving_id,
+                "state": "removed",
+                "message": mlops_message(request, "message.container_deleted"),
+            }
+            serving.save(update_fields=["container_info"])
+
+            return Response(
+                {
+                    "message": mlops_message(request, "message.container_deleted"),
+                    "serving_id": serving_id,
+                    "webhook_response": result,
+                }
+            )
+
+        except WebhookTimeoutError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookConnectionError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookError as e:
+            logger.error(f"删除容器失败: {e}")
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error(f"删除 serving 容器失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.serving_container_delete_failed", detail=mlops_exception_message(request, e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def _resolve_model_uri(self, serving):
+        """
+        解析 MLflow Model URI
+
+        Args:
+            serving: ClassificationServing 实例
+
+        Returns:
+            str: MLflow model URI
+
+        Raises:
+            ValueError: 解析失败时抛出
+        """
+        train_job = serving.train_job
+        model_name = mlflow_service.build_model_name(
+            prefix=self.MLFLOW_PREFIX,
+            algorithm=train_job.algorithm,
+            train_job_id=train_job.id,
+        )
+
+        # 使用 serving 上保存的模型版本
+        return mlflow_service.resolve_model_uri(model_name, serving.model_version)
+
+    @action(detail=True, methods=["post"], url_path="predict")
+    @HasPermission("classification-Predict")
+    def predict(self, request, *args, **kwargs):
+        """
+        调用 serving 服务进行文本分类预测
+
+        请求参数:
+            texts: 待预测文本列表，list[str]，例如 ["text1", "text2"]
+            config: 可选推理配置参数（dict）
+        """
+        try:
+            serving = self.get_object()
+
+            texts = request.data.get("texts")
+            config = request.data.get("config")
+
+            if not texts:
+                return Response({"error": mlops_message(request, "error.predict_input_required", field="texts")}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not isinstance(texts, list):
+                return Response(
+                    {"error": mlops_message(request, "error.predict_input_must_be_array", field="texts")}, status=status.HTTP_400_BAD_REQUEST
+                )
+
+            max_batch_size = int(os.getenv("MLOPS_PREDICT_MAX_BATCH_SIZE", "10000"))
+            if len(texts) > max_batch_size:
+                return Response(
+                    {"error": mlops_message(request, "error.predict_batch_limit_exceeded", limit=max_batch_size, count=len(texts))},
+                    status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                )
+
+            try:
+                predict_url = build_predict_url(
+                    serving_id=f"Classification_Serving_{serving.id}",
+                    container_info=serving.container_info,
+                )
+            except ValueError as e:
+                return Response(
+                    {"error": mlops_message(request, str(e))},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 构建请求体
+            payload = {"texts": texts}
+            if config is not None:
+                payload["config"] = config
+
+            # 发起 HTTP POST 请求
+            response = requests.post(
+                predict_url,
+                json=payload,
+                timeout=60,
+                headers={"Content-Type": "application/json"},
+            )
+
+            # 处理响应
+            if response.status_code == 200:
+                result = response.json()
+
+                # 检查业务层面的 success 状态
+                if result.get("success") is False:
+                    error_info = result.get("error") or {}
+                    error_code = error_info.get("code", "UNKNOWN")
+                    error_message = error_info.get("message") or mlops_message(request, "error.prediction_failed")
+
+                    logger.error(f"预测服务返回失败: serving_id={serving.id}, code={error_code}, message={error_message}")
+                    return Response(
+                        {
+                            "error": error_message,
+                            "error_code": error_code,
+                            "details": error_info.get("details"),
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                # 预测成功
+                return Response(result)
+            else:
+                error_msg = mlops_message(request, "error.serving_prediction_service_error", status_code=response.status_code)
+                logger.error(f"{error_msg}, serving_id={serving.id}")
+                return Response(
+                    {"error": error_msg, "detail": response.text},
+                    status=map_predict_upstream_status(response.status_code),
+                )
+
+        except requests.exceptions.Timeout:
+            logger.error(f"预测超时: serving_id={serving.id}")
+            return Response(
+                {"error": mlops_message(request, "error.serving_prediction_timeout_exceeded", seconds=60)},
+                status=status.HTTP_504_GATEWAY_TIMEOUT,
+            )
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"预测连接失败: serving_id={serving.id}, error={e}")
+            return Response(
+                {"error": mlops_message(request, "error.serving_prediction_connection_failed", detail=str(e))},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"预测请求异常: serving_id={serving.id}, error={e}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.serving_prediction_request_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        except Exception as e:
+            logger.error(f"预测失败: serving_id={serving.id}, error={str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.serving_prediction_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class ClassificationTrainDataViewSet(ModelViewSet):
+    queryset = ClassificationTrainData.objects.select_related("dataset").all()
+    serializer_class = ClassificationTrainDataSerializer
+    pagination_class = CustomPageNumberPagination
+    filterset_class = ClassificationTrainDataFilter
+    ordering = ("-id",)
+    permission_key = "dataset.classification_train_data"
+
+    def get_queryset(self):
+        return filter_queryset_by_parent_team(super().get_queryset(), self.request, "dataset__team")
+
+    @HasPermission("classification-View")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @HasPermission("classification-View")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @HasPermission("classification-Delete")
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+
+    @HasPermission("classification-Add")
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    @HasPermission("classification-Edit")
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+
+
+class ClassificationTrainJobViewSet(BaseTrainJobViewSet):
+    queryset = ClassificationTrainJob.objects.select_related("dataset_version", "dataset_version__dataset").all()
+    serializer_class = ClassificationTrainJobSerializer
+    pagination_class = CustomPageNumberPagination
+    filterset_class = ClassificationTrainJobFilter
+    ordering = ("-id",)
+    permission_key = "train_job.classification_train_job"
+
+    MLFLOW_PREFIX = "Classification"  # MLflow 命名前缀
+
+    @HasPermission("classification-View")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @HasPermission("classification-View")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @HasPermission("classification-Delete")
+    def destroy(self, request, *args, **kwargs):
+        return self.destroy_train_job_with_runtime_cleanup(request, *args, **kwargs)
+
+    @HasPermission("classification-Add")
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    @HasPermission("classification-Edit")
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"], url_path="train")
+    @HasPermission("classification-Train")
+    def train(self, request, pk=None):
+        """
+        启动训练任务
+        """
+        train_job = None
+        previous_status = None
+        try:
+            train_job = self.get_object()
+
+            # 检查任务状态
+            if train_job.status == TrainJobStatus.RUNNING:
+                return Response({"error": mlops_message(request, "error.training_task_already_running")}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 获取训练配置
+            try:
+                config = get_mlflow_train_config()
+            except ConfigurationError as e:
+                logger.error(str(e))
+                return Response(
+                    {"error": mlops_message(request, "error.system_configuration_error")},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            # 检查必要字段
+            if not train_job.dataset_version or not train_job.dataset_version.dataset_file:
+                return Response({"error": mlops_message(request, "error.dataset_file_not_found")}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not train_job.config_url:
+                return Response({"error": mlops_message(request, "error.training_config_file_not_found")}, status=status.HTTP_400_BAD_REQUEST)
+
+            scope_error = self.ensure_train_job_dataset_scope(request, train_job)
+            if scope_error is not None:
+                return scope_error
+
+            # 构建训练任务标识
+            job_id = mlflow_service.build_job_id(
+                prefix=self.MLFLOW_PREFIX,
+                algorithm=train_job.algorithm,
+                train_job_id=train_job.id,
+            )
+
+            # 调用 WebhookClient 启动训练
+            # 动态获取训练镜像
+            train_image = get_image_by_prefix(self.MLFLOW_PREFIX, train_job.algorithm)
+
+            # 获取当前 run 数量（在容器启动前查询，避免读到新 run 导致 off-by-one）
+            from apps.mlops.tasks.poll_train_job_status import poll_train_job_status
+
+            expected_run_count = 0
+            try:
+                experiment_name = mlflow_service.build_experiment_name(
+                    prefix=self.MLFLOW_PREFIX,
+                    algorithm=train_job.algorithm,
+                    train_job_id=train_job.id,
+                )
+                experiment = mlflow_service.get_experiment_by_name(experiment_name)
+                current_run_count = 0
+                if experiment:
+                    runs = mlflow_service.get_experiment_runs(experiment.experiment_id)
+                    current_run_count = len(runs) if not runs.empty else 0
+                expected_run_count = current_run_count + 1
+            except Exception:
+                logger.warning(f"查询 MLflow run 数量失败，降级 expected_run_count=0, TrainJob ID={train_job.id}")
+
+            previous_status = self.claim_train_job_running(train_job)
+            if previous_status is None:
+                return Response({"error": mlops_message(request, "error.training_task_already_running")}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 启动前清理可能残留的旧训练容器
+            try:
+                WebhookClient.stop(job_id)
+                logger.info(f"已清理残留的旧训练容器: job_id={job_id}")
+            except (WebhookError, WebhookConnectionError, WebhookTimeoutError):
+                pass  # 容器不存在是正常的
+
+            WebhookClient.train(
+                job_id=job_id,
+                bucket=config.bucket,
+                dataset=train_job.dataset_version.dataset_file.name,
+                config=train_job.config_url.name,
+                minio_endpoint=config.minio_endpoint,
+                mlflow_tracking_uri=config.mlflow_tracking_uri,
+                minio_access_key=config.minio_access_key,
+                minio_secret_key=config.minio_secret_key,
+                train_image=train_image,
+            )
+
+            # 启动异步轮询训练状态
+            logger.info(f"触发轮询任务: TrainJob ID={train_job.id}, 预期 run 数量: {expected_run_count}")
+            poll_train_job_status.delay(train_job.id, self.MLFLOW_PREFIX, expected_run_count)
+
+            return Response(
+                {
+                    "message": mlops_message(request, "message.training_task_started"),
+                    "job_id": job_id,
+                    "train_job_id": train_job.id,
+                }
+            )
+
+        except WebhookTimeoutError as e:
+            if train_job and previous_status is not None:
+                self.restore_train_job_status(train_job, previous_status)
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookConnectionError as e:
+            if train_job and previous_status is not None:
+                self.restore_train_job_status(train_job, previous_status)
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookError as e:
+            if train_job and previous_status is not None:
+                self.restore_train_job_status(train_job, previous_status)
+            logger.error(f"启动训练任务失败: {e}")
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            if train_job and previous_status is not None:
+                self.restore_train_job_status(train_job, previous_status)
+            logger.error(f"启动训练任务失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.training_task_start_failed", detail=mlops_exception_message(request, e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["post"], url_path="stop")
+    @HasPermission("classification-Stop")
+    def stop(self, request, *args, **kwargs):
+        """
+        停止训练任务
+        """
+        try:
+            train_job = self.get_object()
+
+            # 检查任务状态
+            if train_job.status != TrainJobStatus.RUNNING:
+                return Response({"error": mlops_message(request, "error.training_task_not_running")}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 构建训练任务标识
+            job_id = mlflow_service.build_job_id(
+                prefix=self.MLFLOW_PREFIX,
+                algorithm=train_job.algorithm,
+                train_job_id=train_job.id,
+            )
+
+            # 调用 WebhookClient 停止任务（默认删除容器）
+            result = WebhookClient.stop(job_id)
+
+            # 更新任务状态
+            train_job.status = TrainJobStatus.PENDING
+            train_job.save(update_fields=["status"])
+
+            return Response(
+                {
+                    "message": mlops_message(request, "message.training_task_stopped"),
+                    "job_id": job_id,
+                    "train_job_id": train_job.id,
+                    "webhook_response": result,
+                }
+            )
+
+        except WebhookTimeoutError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookConnectionError as e:
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except WebhookError as e:
+            logger.error(f"停止训练任务失败: {e}")
+            return Response({"error": mlops_exception_message(request, e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error(f"停止训练任务失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.training_task_stop_failed", detail=mlops_exception_message(request, e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["get"], url_path="runs_data_list")
+    @HasPermission("classification-View")
+    def get_run_data_list(self, request, pk=None):
+        try:
+            pagination = self.parse_run_list_pagination(request)
+            if pagination is None:
+                return Response({"error": mlops_message(request, "error.pagination_must_be_positive_integer")}, status=status.HTTP_400_BAD_REQUEST)
+            page, page_size, use_pagination = pagination
+
+            # 获取训练任务
+            train_job = self.get_object()
+
+            # 构造实验名称（与训练时保持一致）
+            experiment_name = mlflow_service.build_experiment_name(
+                prefix=self.MLFLOW_PREFIX,
+                algorithm=train_job.algorithm,
+                train_job_id=train_job.id,
+            )
+
+            # 查找实验
+            experiment = mlflow_service.get_experiment_by_name(experiment_name)
+            if not experiment:
+                return Response(
+                    {
+                        "train_job_id": train_job.id,
+                        "train_job_name": train_job.name,
+                        "algorithm": train_job.algorithm,
+                        "job_status": train_job.status,
+                        "message": mlops_message(request, "message.mlflow_experiment_not_found"),
+                        "count": 0,
+                        "items": [],
+                    }
+                )
+
+            # 查找该实验中的运行
+            runs = mlflow_service.get_experiment_runs(experiment.experiment_id)
+
+            if runs.empty:
+                return Response(
+                    {
+                        "train_job_id": train_job.id,
+                        "train_job_name": train_job.name,
+                        "algorithm": train_job.algorithm,
+                        "job_status": train_job.status,
+                        "message": mlops_message(request, "message.training_run_not_found"),
+                        "count": 0,
+                        "items": [],
+                    }
+                )
+
+            # 每次运行信息的耗时和名称
+            run_datas = []
+
+            for idx, row in runs.iterrows():
+                # 处理时间计算，避免产生NaN或Infinity
+                try:
+                    start_time = row["start_time"]
+                    end_time = row["end_time"]
+
+                    # 计算耗时
+                    if pd.notna(start_time):
+                        if pd.notna(end_time):
+                            duration_seconds = (end_time - start_time).total_seconds()
+                        else:
+                            current_time = pd.Timestamp.now(tz=start_time.tz)
+                            duration_seconds = (current_time - start_time).total_seconds()
+                        duration_minutes = duration_seconds / 60
+                    else:
+                        duration_minutes = 0
+
+                    # 获取run_name，处理可能的缺失值
+                    run_name = row.get("tags.mlflow.runName", "")
+                    if pd.isna(run_name):
+                        run_name = ""
+
+                    # 获取状态
+                    run_status = row.get("status", "UNKNOWN")
+
+                    run_data = {
+                        "run_id": str(row["run_id"]),
+                        "run_name": str(run_name),
+                        "status": str(run_status),
+                        "start_time": start_time.isoformat() if pd.notna(start_time) else None,
+                        "end_time": end_time.isoformat() if pd.notna(end_time) else None,
+                        "duration_minutes": float(duration_minutes) if np.isfinite(duration_minutes) else 0,
+                    }
+                    run_datas.append(run_data)
+
+                except Exception as e:
+                    logger.warning(f"解析 run 数据失败: {e}")
+                    continue
+
+            # 标注 run 删除资格
+            self.annotate_run_delete_eligibility(run_datas, train_job.status)
+
+            # 分页处理
+            total_count = len(run_datas)
+            if use_pagination:
+                start_idx = (page - 1) * page_size
+                end_idx = start_idx + page_size
+                paginated_data = run_datas[start_idx:end_idx]
+            else:
+                paginated_data = run_datas
+
+            return Response(
+                {
+                    "train_job_id": train_job.id,
+                    "train_job_name": train_job.name,
+                    "algorithm": train_job.algorithm,
+                    "job_status": train_job.status,
+                    "count": total_count,
+                    "items": paginated_data,
+                }
+            )
+        except Exception as e:
+            logger.error(f"获取训练记录列表失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.training_records_fetch_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["delete"], url_path="runs/(?P<run_id>[^/]+)")
+    @HasPermission("classification-Delete")
+    def delete_run(self, request, pk=None, run_id=None):
+        return super().delete_run(request, pk=pk, run_id=run_id)
+
+    @action(detail=True, methods=["get"], url_path="runs/(?P<run_id>[^/]+)/metrics_list")
+    @HasPermission("classification-View")
+    def get_runs_metrics_list(self, request, pk=None, run_id: str = ""):
+        try:
+            train_job = self.get_authorized_object_or_none()
+            if train_job is None:
+                return self.run_not_found_response(run_id)
+            if not self.train_job_has_run(train_job, run_id):
+                return self.run_not_found_response(run_id)
+
+            # 获取运行的指标列表（过滤系统指标）
+            model_metrics = mlflow_service.get_run_metrics(run_id=run_id, filter_system=True)
+
+            return Response({"run_id": run_id, "metrics": model_metrics})
+
+        except Exception as e:
+            return Response(
+                {"error": mlops_message(request, "error.metrics_list_fetch_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="runs/(?P<run_id>[^/]+)/metrics_history/(?P<metric_name>.+?)",
+    )
+    @HasPermission("classification-View")
+    def get_metric_data(self, request, pk=None, run_id: str = "", metric_name: str = ""):
+        return super().get_metric_data(request, pk=pk, run_id=run_id, metric_name=metric_name)
+
+    @action(detail=True, methods=["get"], url_path="runs/(?P<run_id>[^/]+)/run_params")
+    @HasPermission("classification-View")
+    def get_run_params(self, request, pk=None, run_id: str = ""):
+        return super().get_run_params(request, pk=pk, run_id=run_id)
+
+    @action(detail=True, methods=["get"], url_path="model_versions")
+    @HasPermission("classification-View")
+    def get_model_versions(self, request, pk=None):
+        """
+        获取训练任务对应模型的所有版本列表
+        """
+        try:
+            train_job = self.get_object()
+
+            # 构造模型名称
+            model_name = mlflow_service.build_model_name(
+                prefix=self.MLFLOW_PREFIX,
+                algorithm=train_job.algorithm,
+                train_job_id=train_job.id,
+            )
+
+            # 查询模型版本
+            version_data = mlflow_service.get_model_versions(model_name)
+
+            if not version_data:
+                logger.warning(f"模型未找到版本: {model_name}")
+                return Response({"model_name": model_name, "versions": [], "total": 0})
+
+            return Response(
+                {
+                    "model_name": model_name,
+                    "total": len(version_data),
+                    "versions": version_data,
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"获取模型版本列表失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.model_versions_fetch_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["get"], url_path="runs/(?P<run_id>[^/]+)/download_model")
+    @HasPermission("classification-View")
+    def download_model(self, request, pk=None, run_id: str = ""):
+        """
+        从 MLflow 下载模型并直接返回 ZIP 文件
+        """
+        try:
+            train_job = self.get_authorized_object_or_none()
+            if train_job is None:
+                return self.run_not_found_response(run_id)
+            if not self.train_job_has_run(train_job, run_id):
+                return self.run_not_found_response(run_id)
+
+            # 获取 run 信息（用于文件命名）
+            run = mlflow_service.get_run_info(run_id)
+            run_name = run.data.tags.get("mlflow.runName", run_id)
+
+            # 下载并打包模型
+            zip_buffer = mlflow_service.download_model_artifact(run_id)
+
+            # 构建文件名
+            filename = f"Classification_{run_name}_{run_id[:8]}.zip"
+
+            # 返回文件
+            response = mlflow_service.build_model_download_response(zip_buffer, filename)
+
+            return response
+
+        except Exception as e:
+            logger.error(f"下载模型失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.model_download_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class ClassificationDatasetReleaseViewSet(ModelViewSet):
+    """分类数据集发布版本视图集"""
+
+    queryset = ClassificationDatasetRelease.objects.select_related("dataset").all()
+    serializer_class = ClassificationDatasetReleaseSerializer
+    pagination_class = CustomPageNumberPagination
+    filterset_class = ClassificationDatasetReleaseFilter
+    ordering = ("-id",)
+    permission_key = "dataset.classification_dataset_release"
+
+    def get_queryset(self):
+        return filter_queryset_by_parent_team(super().get_queryset(), self.request, "dataset__team")
+
+    @HasPermission("classification-View")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @HasPermission("classification-View")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @HasPermission("classification-Delete")
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+
+    @HasPermission("classification-Add")
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    @HasPermission("classification-Edit")
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+
+    @action(detail=True, methods=["get"], url_path="download")
+    @HasPermission("classification-View")
+    def download(self, request, *args, **kwargs):
+        """
+        下载数据集版本的 ZIP 文件
+        """
+        try:
+            release = self.get_object()
+
+            if not release.dataset_file or not release.dataset_file.name:
+                return Response({"error": mlops_message(request, "error.dataset_file_not_found")}, status=status.HTTP_404_NOT_FOUND)
+
+            # 获取文件
+            file = release.dataset_file.open("rb")
+            filename = f"{release.dataset.name}_{release.version}.zip"
+
+            response = FileResponse(file, content_type="application/zip")
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+            return response
+
+        except Exception as e:
+            logger.error(f"下载数据集失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.dataset_download_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["post"], url_path="archive")
+    @HasPermission("classification-Edit")
+    def archive(self, request, *args, **kwargs):
+        """归档数据集版本。"""
+        try:
+            release = self.get_object()
+
+            if release.status == DatasetReleaseStatus.ARCHIVED:
+                return Response(
+                    {"error": mlops_message(request, "error.dataset_release_already_archived")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            release.status = DatasetReleaseStatus.ARCHIVED
+            release.save(update_fields=["status"])
+            return Response({"message": mlops_message(request, "message.archive_success"), "release_id": release.id})
+
+        except Exception as e:
+            logger.error(f"归档数据集版本失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.dataset_release_archive_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=True, methods=["post"], url_path="unarchive")
+    @HasPermission("classification-Edit")
+    def unarchive(self, request, *args, **kwargs):
+        """恢复归档的数据集版本。"""
+        try:
+            release = self.get_object()
+
+            if release.status != DatasetReleaseStatus.ARCHIVED:
+                return Response(
+                    {"error": mlops_message(request, "error.dataset_release_not_archived")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            release.status = DatasetReleaseStatus.PUBLISHED
+            release.save(update_fields=["status"])
+            return Response({"message": mlops_message(request, "message.unarchive_success"), "release_id": release.id})
+
+        except Exception as e:
+            logger.error(f"恢复数据集版本失败: {str(e)}", exc_info=True)
+            return Response(
+                {"error": mlops_message(request, "error.dataset_release_unarchive_failed", detail=str(e))},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class ClassificationAlgorithmConfigViewSet(ModelViewSet):
+    """文本分类算法配置视图集"""
+
+    queryset = AlgorithmConfig.objects.filter(algorithm_type="classification")
+    serializer_class = AlgorithmConfigSerializer
+    filterset_class = AlgorithmConfigFilter
+    pagination_class = CustomPageNumberPagination
+    ordering = ("id",)
+    permission_key = "algorithm.classification_algorithm_config"
+
+    def get_serializer_class(self):
+        if self.action == "list" and not self.request.query_params.get("include_form_config", "false").lower() == "true":
+            return AlgorithmConfigListSerializer
+        return AlgorithmConfigSerializer
+
+    @HasPermission("classification-View")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @HasPermission("classification-View")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @HasPermission("classification-Add")
+    def create(self, request, *args, **kwargs):
+        request.data["algorithm_type"] = "classification"
+        return super().create(request, *args, **kwargs)
+
+    @HasPermission("classification-Edit")
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+
+    @HasPermission("classification-Edit")
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        is_active_new = request.data.get("is_active")
+        if instance.is_active and is_active_new is False:
+            task_count = ClassificationTrainJob.objects.filter(algorithm=instance.name).count()
+            if task_count > 0:
+                return Response(
+                    {
+                        "error": mlops_message(request, "error.algorithm_in_use_cannot_disable", task_count=task_count),
+                        "task_count": task_count,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return super().partial_update(request, *args, **kwargs)
+
+    @HasPermission("classification-Delete")
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        task_count = ClassificationTrainJob.objects.filter(algorithm=instance.name).count()
+        if task_count > 0:
+            return Response(
+                {
+                    "error": mlops_message(request, "error.algorithm_in_use_cannot_delete", task_count=task_count),
+                    "task_count": task_count,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=False, methods=["get"], url_path="by_type")
+    @HasPermission("classification-View")
+    def by_type(self, request):
+        queryset = self.get_queryset().filter(is_active=True)
+        serializer = AlgorithmConfigSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="get_image")
+    @HasPermission("classification-View")
+    def get_image(self, request):
+        name = request.query_params.get("name")
+        if not name:
+            return Response({"error": mlops_message(request, "error.algorithm_name_required")}, status=400)
+        try:
+            config = AlgorithmConfig.objects.get(algorithm_type="classification", name=name, is_active=True)
+            return Response({"image": config.image})
+        except AlgorithmConfig.DoesNotExist:
+            return Response({"error": mlops_message(request, "error.algorithm_config_not_found", algorithm=f"classification/{name}")}, status=404)

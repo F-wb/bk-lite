@@ -1,0 +1,294 @@
+{
+  "client_id": "system-manager",
+  "name": "Setting",
+  "url": "/system-manager/user",
+  "icon": "system-manager",
+  "tags": [
+    "tag.user_management",
+    "tag.organization",
+    "tag.role_permission",
+    "tag.general_settings"
+  ],
+  "description": "app.system-manager",
+  "menus": [
+    {
+      "name": "Organization",
+      "children": [
+        {
+          "id": "user_group",
+          "name": "User&Group",
+          "operation": [
+            "View",
+            "Add User",
+            "Edit User",
+            "Delete User",
+            "Add Group",
+            "Edit Group",
+            "Delete Group"
+          ]
+        },
+        {
+          "id": "login_auth",
+          "name": "Login Auth",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Delete"
+          ]
+        },
+        {
+          "id": "user_sync",
+          "name": "User Sync",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Delete"
+          ]
+        },
+        {
+          "id": "security_settings",
+          "name": "Security Settings",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Delete"
+          ]
+        },
+        {
+          "id": "super_admin",
+          "name": "Super Administrator",
+          "operation": [
+            "View",
+            "Add",
+            "Delete"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Credential",
+      "children": [
+        {
+          "id": "credential",
+          "name": "Credential",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Application",
+      "children": [
+        {
+          "id": "application_list",
+          "name": "Application-list",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Delete"
+          ]
+        },
+        {
+          "id": "application_role",
+          "name": "Application-role",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Add user",
+            "Remove user",
+            "Edit Permission",
+            "Add group",
+            "Remove group",
+            "Delete"
+          ]
+        },
+        {
+          "id": "data_permission",
+          "name": "Data permission",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Delete"
+          ]
+        },
+        {
+          "id": "custom_menu",
+          "name": "Custom Menu",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Delete"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Channel",
+      "children": [
+        {
+          "id": "channel_list",
+          "name": "Channel-list",
+          "operation": [
+            "View",
+            "Edit",
+            "Delete",
+            "Add"
+          ]
+        },
+        {
+          "id": "channel_setting",
+          "name": "Channel-setting",
+          "operation": [
+            "View",
+            "Edit",
+            "Delete",
+            "Add"
+          ]
+        },
+        {
+          "id": "im_notification",
+          "name": "IM Notification",
+          "operation": [
+            "View",
+            "Edit",
+            "Delete",
+            "Add"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Integration Center",
+      "children": [
+        {
+          "id": "integration_center",
+          "name": "Integration Center",
+          "operation": [
+            "View",
+            "Edit",
+            "Add",
+            "Delete"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Setting",
+      "icon": "settings-fill",
+      "children": [
+        {
+          "id": "audit_log",
+          "name": "Audit Logs",
+          "operation": [
+            "View"
+          ]
+        },
+        {
+          "id": "error_logs",
+          "name": "Error Logs",
+          "operation": [
+            "View"
+          ]
+        },
+        {
+          "id": "network_white_list",
+          "name": "Network Whitelist",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "openapi_docs",
+          "name": "API Documentation",
+          "operation": [
+            "View"
+          ]
+        },
+        {
+          "id": "api_secret_key",
+          "name": "API Token",
+          "operation": [
+            "View",
+            "Add",
+            "Delete"
+          ]
+        },
+        {
+          "id": "system_api_secret",
+          "name": "System Token",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        }
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "name": "admin",
+      "role_name": "system-manager_admin",
+      "menus": []
+    },
+    {
+      "name": "security",
+      "role_name": "system-manager_security",
+      "menus": [
+        "user_group-View",
+        "user_group-Add User",
+        "user_group-Add Group",
+        "user_group-Edit User",
+        "user_group-Edit Group",
+        "user_group-Delete Group",
+        "user_group-Delete User",
+        "login_auth-View",
+        "login_auth-Add",
+        "login_auth-Edit",
+        "login_auth-Delete",
+        "user_sync-View",
+        "user_sync-Add",
+        "user_sync-Edit",
+        "user_sync-Delete",
+        "security_settings-View",
+        "security_settings-Add",
+        "security_settings-Edit",
+        "security_settings-Delete",
+        "credential-View",
+        "credential-Add",
+        "credential-Edit",
+        "credential-Delete"
+      ]
+    },
+    {
+      "name": "audit",
+      "role_name": "system-manager_audit",
+      "menus": [
+        "audit_log-View",
+        "error_logs-View"
+      ]
+    },
+    {
+      "name": "normal",
+      "role_name": "system-manager_normal",
+      "menus": [
+        "user_list-View"
+      ]
+    }
+  ]
+}

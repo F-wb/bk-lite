@@ -1,0 +1,812 @@
+/**
+ * 历史消息内容处理器
+ * 用于将历史会话中的 AG-UI 协议消息解析并渲染为 HTML
+ */
+
+import {
+  ApprovalRequest,
+  BrowserStepProgressData,
+  BrowserStepsHistory,
+  BrowserTaskReceivedData,
+  ConfigAnalysisReport,
+  ConfigDiffReport,
+  PlannedExecutionStepView,
+  RepairCommands,
+  ReportFileDownload,
+  UserChoiceRequest,
+  WikiCitation,
+} from '@/app/opspilot/types/global';
+import { initToolCallTooltips, renderErrorMessage, ToolCallInfo } from './toolCallRenderer';
+import { getOpspilotTranslate } from './i18n';
+import {
+  applyPlannedExecutionStep,
+  attachToolCallToCurrentStep,
+  plannedStepIndexFromToolEvent,
+  createPlannedExecutionState,
+  finalizePlannedExecutionSteps,
+  isFailedPlannedStepStatus,
+  isToolAssignedToPlannedStep,
+} from './plannedExecutionState';
+import { isToolResultErrorContent } from './toolResultStatus';
+import type { PlannedExecutionStepValue } from '@/app/opspilot/types/chat';
+import { isRecord, looksLikePlannedExecutionPayload, unwrapCustomValue } from './plannedExecutionPayload';
+
+const escapeNewlinesInStrings = (raw: string) => {
+  let result = '';
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+
+    if (escaped) {
+      result += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      result += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      result += ch;
+      continue;
+    }
+
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      result += ch;
+      continue;
+    }
+
+    if ((ch === '\n' || ch === '\r') && (inSingle || inDouble)) {
+      result += ch === '\n' ? '\\n' : '\\r';
+      continue;
+    }
+
+    result += ch;
+  }
+
+  return result;
+};
+
+const normalizePythonJson = (raw: string) => {
+  const escapedRaw = escapeNewlinesInStrings(raw);
+  let result = '';
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let token = '';
+
+  const flushToken = () => {
+    if (!token) return;
+    if (!inSingle && !inDouble) {
+      if (token === 'None') result += 'null';
+      else if (token === 'True') result += 'true';
+      else if (token === 'False') result += 'false';
+      else result += token;
+    } else {
+      result += token;
+    }
+    token = '';
+  };
+
+  for (let i = 0; i < escapedRaw.length; i += 1) {
+    const ch = escapedRaw[i];
+
+    if (inSingle || inDouble) {
+      if (escaped) {
+        result += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        result += ch;
+        escaped = true;
+        continue;
+      }
+      if (inSingle && ch === "'") {
+        result += '"';
+        inSingle = false;
+        continue;
+      }
+      if (inDouble && ch === '"') {
+        result += '"';
+        inDouble = false;
+        continue;
+      }
+      if (ch === '\n') {
+        result += '\\n';
+        continue;
+      }
+      if (ch === '\r') {
+        result += '\\r';
+        continue;
+      }
+      if (inSingle && ch === '"') {
+        result += '\\"';
+        continue;
+      }
+      result += ch;
+      continue;
+    }
+
+    if (ch === "'") {
+      flushToken();
+      inSingle = true;
+      result += '"';
+      continue;
+    }
+    if (ch === '"') {
+      flushToken();
+      inDouble = true;
+      result += '"';
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      token += ch;
+      continue;
+    }
+    flushToken();
+    result += ch;
+  }
+
+  flushToken();
+  return result;
+};
+
+const removeTrailingCommas = (raw: string) => {
+  let result = '';
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+
+    if (escaped) {
+      result += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      result += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      result += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      result += ch;
+      continue;
+    }
+
+    if (!inSingle && !inDouble && ch === ',') {
+      let j = i + 1;
+      while (j < raw.length && /\s/.test(raw[j])) j += 1;
+      if (raw[j] === ']' || raw[j] === '}') {
+        continue;
+      }
+    }
+
+    result += ch;
+  }
+
+  return result;
+};
+
+const parseJsonArray = (raw: string): any[] | null => {
+  const splitTopLevelObjects = (value: string) => {
+    const objects: string[] = [];
+    let inSingle = false;
+    let inDouble = false;
+    let escaped = false;
+    let depth = 0;
+    let startIndex = -1;
+
+    for (let i = 0; i < value.length; i += 1) {
+      const ch = value[i];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (ch === "'" && !inDouble) {
+        inSingle = !inSingle;
+        continue;
+      }
+
+      if (ch === '"' && !inSingle) {
+        inDouble = !inDouble;
+        continue;
+      }
+
+      if (inSingle || inDouble) continue;
+
+      if (ch === '{') {
+        if (depth === 0) startIndex = i;
+        depth += 1;
+        continue;
+      }
+
+      if (ch === '}') {
+        depth -= 1;
+        if (depth === 0 && startIndex >= 0) {
+          objects.push(value.slice(startIndex, i + 1));
+          startIndex = -1;
+        }
+      }
+    }
+
+    return objects;
+  };
+
+  const parseObjectsLenient = (value: string) => {
+    const objectSlices = splitTopLevelObjects(value);
+    if (!objectSlices.length) return null;
+    const parsed = objectSlices
+      .map(slice => {
+        const normalized = normalizePythonJson(slice);
+        const cleaned = removeTrailingCommas(normalized);
+        try {
+          return JSON.parse(cleaned);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    return parsed.length ? (parsed as any[]) : null;
+  };
+
+  const unwrapQuoted = (value: string) => {
+    let trimmed = value.trim();
+    if ((trimmed.startsWith('b"') && trimmed.endsWith('"')) || (trimmed.startsWith("b'") && trimmed.endsWith("'"))) {
+      trimmed = trimmed.slice(2);
+    }
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+      try {
+        const unwrapped = JSON.parse(trimmed);
+        return typeof unwrapped === 'string' ? unwrapped : trimmed;
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  };
+
+  const extractArraySlice = (value: string) => {
+    // 只裁顶层数组。对象里的 tools: [...] 不能当成事件列表，否则规划 JSON 会被解析成 ["get_current_time"]。
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('[')) {
+      return value;
+    }
+    const end = trimmed.lastIndexOf(']');
+    if (end > 0) {
+      return trimmed.slice(0, end + 1);
+    }
+    return value;
+  };
+
+  const tryParseArray = (value: string) => {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const unwrapped = extractArraySlice(unwrapQuoted(raw));
+  const cleanedRaw = removeTrailingCommas(escapeNewlinesInStrings(unwrapped));
+  const directParsed = tryParseArray(cleanedRaw);
+  if (directParsed) return directParsed;
+
+  const normalized = normalizePythonJson(unwrapped);
+  const cleanedNormalized = removeTrailingCommas(normalized);
+  const normalizedParsed = tryParseArray(cleanedNormalized);
+  if (normalizedParsed) return normalizedParsed;
+
+  return parseObjectsLenient(unwrapped) || parseObjectsLenient(normalized) || null;
+};
+
+const parseAttachmentToolResult = (content: string) => {
+  try {
+    return JSON.parse(content);
+  } catch {
+    const extractField = (field: string) => {
+      const match = content.match(new RegExp(`[\"']${field}[\"']\\s*:\\s*[\"']([^\"']+)[\"']`));
+      return match?.[1];
+    };
+
+    return {
+      filename: extractField('filename'),
+      file_url: extractField('file_url'),
+      mime_type: extractField('mime_type'),
+    };
+  }
+};
+
+const buildFromEvents = (events: any[], finalize = true) => {
+  const parts: string[] = [];
+  const toolCalls = new Map<string, ToolCallInfo>();
+  const reportFileDownloads: ReportFileDownload[] = [];
+  let currentText = '';
+  let thinking = '';
+  let isThinking = false;
+  let lastBlockType: string | null = null;
+  const steps: BrowserStepProgressData[] = [];
+  const agentSteps: any[] = [];
+  const skillViews: any[] = [];
+  let isRunning = false;
+  let lastStep: BrowserStepProgressData | null = null;
+  const pendingToolIds: string[] = [];
+  let plannedExecutionState = createPlannedExecutionState();
+  const wikiCitations: WikiCitation[] = [];
+
+  const flushToolCalls = () => {
+    if (pendingToolIds.length > 0) {
+      const idsStr = pendingToolIds.join(',');
+      if (parts.length > 0) {
+        parts.push(`\n\n<!--TOOL_CALLS:${idsStr}-->`);
+      } else {
+        parts.push(`<!--TOOL_CALLS:${idsStr}-->`);
+      }
+      pendingToolIds.length = 0;
+      lastBlockType = 'toolCall';
+    }
+  };
+
+  const upsertStep = (stepData: BrowserStepProgressData) => {
+    const existingIndex = steps.findIndex(s => s.step_number === stepData.step_number);
+    if (existingIndex >= 0) {
+      steps[existingIndex] = stepData;
+    } else {
+      steps.push(stepData);
+    }
+    steps.sort((a, b) => a.step_number - b.step_number);
+    lastStep = stepData;
+    isRunning = true;
+  };
+
+  const findLatestCallingToolCallId = (preferredToolName?: string) => {
+    const entries = Array.from(toolCalls.entries()).reverse();
+
+    if (preferredToolName) {
+      const matchedEntry = entries.find(([, tool]) => tool.status === 'calling' && tool.name === preferredToolName);
+      if (matchedEntry) {
+        return matchedEntry[0];
+      }
+    }
+
+    const latestCallingEntry = entries.find(([, tool]) => tool.status === 'calling');
+    return latestCallingEntry?.[0] || null;
+  };
+
+  events.forEach((msg: any) => {
+    switch (msg.type) {
+      case 'RUN_STARTED':
+        break;
+
+      case 'THINKING':
+        thinking += msg.delta || '';
+        isThinking = true;
+        break;
+
+      case 'TEXT_MESSAGE_CONTENT':
+        isThinking = false;
+        {
+          const plannedPayload = unwrapCustomValue(msg.delta);
+          const plannedKind = looksLikePlannedExecutionPayload(plannedPayload);
+          if (plannedKind === 'step') {
+            plannedExecutionState = applyPlannedExecutionStep(
+              plannedExecutionState,
+              plannedPayload as PlannedExecutionStepValue
+            );
+            break;
+          }
+          if (plannedKind === 'status') {
+            break;
+          }
+        }
+        // If pending tool calls exist and this is the start of new text, flush them
+        if (pendingToolIds.length > 0 && !currentText) {
+          flushToolCalls();
+        }
+        currentText += msg.delta || '';
+        break;
+
+      case 'TOOL_CALL_START':
+        isThinking = false;
+        if (currentText) {
+          // Flush pending tool calls before text
+          flushToolCalls();
+          if (parts.length > 0 && lastBlockType !== 'text') {
+            parts.push('\n\n' + currentText);
+          } else {
+            parts.push(currentText);
+          }
+          currentText = '';
+          lastBlockType = 'text';
+        }
+        toolCalls.set(msg.toolCallId, {
+          name: msg.toolCallName,
+          args: '',
+          status: 'completed',
+          result: undefined
+        });
+        plannedExecutionState = attachToolCallToCurrentStep(
+          plannedExecutionState,
+          msg.toolCallId,
+          plannedStepIndexFromToolEvent(msg)
+        );
+        break;
+
+      case 'TOOL_CALL_ARGS':
+        if (msg.toolCallId) {
+          const tool = toolCalls.get(msg.toolCallId);
+          if (tool) {
+            tool.args += msg.delta || '';
+          }
+        }
+        break;
+
+      case 'TOOL_CALL_RESULT':
+        if (msg.toolCallId) {
+          const tool = toolCalls.get(msg.toolCallId);
+          if (tool) {
+            tool.result = msg.content || '';
+            tool.status = isToolResultErrorContent(tool.result) ? 'error' : 'completed';
+            if (tool.name === 'generate_attachment_file') {
+              try {
+                const parsed = parseAttachmentToolResult(msg.content || '{}');
+                if (parsed?.file_url && parsed?.filename) {
+                  reportFileDownloads.push({
+                    download_id: `attachment_${msg.toolCallId}`,
+                    filename: parsed.filename,
+                    file_url: parsed.file_url,
+                    mime_type: parsed.mime_type || 'application/octet-stream',
+                    received_at: Date.now(),
+                  });
+                }
+              } catch {
+                // ignore invalid tool result payloads
+              }
+            }
+          }
+        }
+        break;
+
+      case 'TOOL_CALL_END':
+        if (msg.toolCallId && toolCalls.has(msg.toolCallId)) {
+          if (!isToolAssignedToPlannedStep(plannedExecutionState, msg.toolCallId)) {
+            if (plannedExecutionState.steps.length > 0) {
+              if (typeof console !== 'undefined' && typeof console.debug === 'function') {
+                console.debug('[planned-execution] unassigned tool call', msg.toolCallId);
+              }
+            } else {
+              pendingToolIds.push(msg.toolCallId);
+              lastBlockType = 'toolCall';
+            }
+          }
+        }
+        break;
+
+      case 'RUN_ERROR':
+      case 'ERROR':
+        isThinking = false;
+        if (currentText) {
+          parts.push(currentText);
+          currentText = '';
+        }
+        const errorMessage =
+        msg.message || getOpspilotTranslate()('chat.historyError', '执行过程中发生错误');
+        const errorHtml = renderErrorMessage(
+          errorMessage,
+          msg.type === 'RUN_ERROR' ? 'run_error' : 'error',
+          msg.code,
+          getOpspilotTranslate()
+        );
+        if (parts.length > 0) {
+          parts.push('\n\n' + errorHtml);
+        } else {
+          parts.push(errorHtml);
+        }
+        lastBlockType = 'error';
+        break;
+
+      case 'CUSTOM':
+        isThinking = false;
+        {
+          const customValue = unwrapCustomValue(msg.value);
+          const customName = msg.name || (isRecord(customValue) ? String(customValue.name || '') : '');
+          const plannedKind = looksLikePlannedExecutionPayload(customValue);
+          if (customName === 'stream_keepalive' || customName === 'planned_step_hidden_text') {
+            break;
+          }
+          if (customName === 'browser_step_progress' && customValue) {
+            upsertStep(customValue as BrowserStepProgressData);
+          } else if (customName === 'browser_task_received' && customValue) {
+            const browserTaskReceived = customValue as BrowserTaskReceivedData;
+            const toolCallId = findLatestCallingToolCallId(typeof browserTaskReceived.tool === 'string' ? browserTaskReceived.tool : undefined);
+            if (toolCallId) {
+              const tool = toolCalls.get(toolCallId);
+              if (tool) {
+                tool.browserTaskReceived = browserTaskReceived;
+              }
+            }
+          } else if (customName === 'agent_step_progress' && customValue) {
+            const data = customValue as any;
+            const key = `${data.agent_name || 'main'}_${data.step}`;
+            const existingIdx = agentSteps.findIndex(
+              (d: any) => `${d.agent_name || 'main'}_${d.step}` === key
+            );
+            if (existingIdx >= 0) {
+              agentSteps[existingIdx] = data;
+            } else {
+              agentSteps.push(data);
+            }
+          } else if (customName === 'sub_agent_progress' && customValue) {
+            const data = customValue as any;
+            const newStep = {
+              agent_name: data.agent_name,
+              step: 0,
+              max_steps: 0,
+              status: data.status,
+              description: data.description,
+            };
+            const existingIdx = agentSteps.findIndex(
+              (d: any) => d.agent_name === data.agent_name && (d.status === 'started' || d.status === 'running')
+            );
+            if (existingIdx >= 0 && (data.status === 'completed' || data.status === 'error')) {
+              agentSteps[existingIdx] = newStep;
+            } else {
+              agentSteps.push(newStep);
+            }
+          } else if (customName === 'skill_view' && customValue && Array.isArray((customValue as any).items)) {
+            skillViews.splice(0, skillViews.length, ...(customValue as any).items.filter((item: any) => item?.name));
+          } else if (customName === 'wiki_citations' && customValue) {
+            const items = Array.isArray((customValue as { citations?: WikiCitation[] }).citations)
+              ? (customValue as { citations: WikiCitation[] }).citations
+              : Array.isArray(customValue)
+                ? customValue
+                : [];
+            for (const item of items) {
+              if (item && typeof item.n === 'number' && item.id) {
+                wikiCitations.push(item);
+              }
+            }
+          } else if (customName === 'planned_execution_step' || plannedKind === 'step') {
+            const stepValue = customValue as PlannedExecutionStepValue;
+            plannedExecutionState = applyPlannedExecutionStep(plannedExecutionState, stepValue);
+            if (stepValue?.phase === 'end' && isFailedPlannedStepStatus(stepValue.status)) {
+              const step = plannedExecutionState.steps.find(
+                (item) => item.step_index === Number(stepValue.step_index)
+              );
+              const errorText =
+                (typeof stepValue.error === 'string' && stepValue.error.trim()) ||
+                step?.error ||
+                getOpspilotTranslate()('chat.plannedStep.abortedByCredentials', '步骤因凭据、权限或配置失败已中止');
+              for (const toolCallId of step?.toolCallIds || []) {
+                const tool = toolCalls.get(toolCallId);
+                if (!tool || tool.status !== 'calling') continue;
+                tool.status = 'error';
+                tool.result = errorText;
+              }
+            }
+          }
+        }
+        break;
+
+      case 'RUN_FINISHED':
+        isThinking = false;
+        if (steps.length > 0) {
+          isRunning = false;
+        }
+        plannedExecutionState = finalizePlannedExecutionSteps(plannedExecutionState);
+        break;
+
+      default: {
+        const plannedKind = looksLikePlannedExecutionPayload(msg);
+        if (plannedKind === 'step') {
+          plannedExecutionState = applyPlannedExecutionStep(
+            plannedExecutionState,
+            msg as PlannedExecutionStepValue
+          );
+        }
+        break;
+      }
+    }
+  });
+
+  // 输出剩余的工具调用占位
+  flushToolCalls();
+
+  if (currentText && !looksLikePlannedExecutionPayload(currentText)) {
+    if (parts.length > 0 && lastBlockType !== 'text') {
+      parts.push('\n\n' + currentText);
+    } else {
+      parts.push(currentText);
+    }
+  }
+
+  const contentText = parts.join('');
+  const browserStepsHistory: BrowserStepsHistory | null = steps.length
+    ? { steps: [...steps], isRunning: finalize ? false : isRunning }
+    : null;
+
+  if (finalize) {
+    plannedExecutionState = finalizePlannedExecutionSteps(plannedExecutionState);
+  }
+
+  const plannedExecutionSteps: PlannedExecutionStepView[] | undefined =
+    plannedExecutionState.steps.length > 0
+      ? plannedExecutionState.steps.map((step) => ({
+        step_index: step.step_index,
+        total_steps: step.total_steps,
+        objective: step.objective,
+        status: step.status,
+        toolCallIds: [...step.toolCallIds],
+        reusedPriorResult: step.reusedPriorResult,
+        error: step.error,
+      }))
+      : undefined;
+
+  return {
+    content: contentText,
+    thinking,
+    isThinking: finalize ? false : isThinking,
+    browserStepProgress: lastStep,
+    browserStepsHistory,
+    agentStepProgress: agentSteps.length > 0 ? agentSteps : undefined,
+    skillViews: skillViews.length > 0 ? skillViews : undefined,
+    reportFileDownloads: reportFileDownloads.length > 0 ? reportFileDownloads : undefined,
+    wikiCitations: wikiCitations.length > 0 ? wikiCitations : undefined,
+    plannedExecutionSteps,
+    isStreamingTools: finalize ? false : Boolean(plannedExecutionSteps?.some((s) => s.status === 'running')),
+    toolCalls: toolCalls.size > 0 ? Array.from(toolCalls.entries()).map(([id, info]) => ({
+      id, name: info.name, args: info.args, status: info.status as 'calling' | 'completed' | 'error', result: info.result
+    })) : undefined
+  };
+};
+
+/**
+ * 处理历史消息中的 bot 内容
+ * 解析 AG-UI 协议消息数组，渲染文本和工具调用
+ * @param content 原始消息内容（可能是 JSON 字符串）
+ * @param role 消息角色
+ * @returns 处理后的 HTML 内容
+ */
+export const processHistoryMessageContent = (content: string, role: string): string => {
+  // 确保工具调用事件处理器已初始化
+  if (typeof window !== 'undefined') {
+    initToolCallTooltips();
+  }
+
+  // 非 bot 消息直接返回
+  if (role !== 'bot' && role !== 'assistant') return typeof content === 'string' ? content : String(content ?? '');
+
+  if (Array.isArray(content)) {
+    return buildFromEvents(content, true).content;
+  }
+
+  if (typeof content !== 'string') {
+    if (content === null || content === undefined) return '';
+    if (typeof content === 'object') {
+      try {
+        return JSON.stringify(content);
+      } catch {
+        return String(content);
+      }
+    }
+    return String(content);
+  }
+
+  const parsedContent = parseJsonArray(content);
+  if (!parsedContent) return content;
+
+  return buildFromEvents(parsedContent, true).content;
+};
+
+export const processHistoryMessageWithExtras = (
+  content: unknown,
+  role: string
+): {
+  content: string;
+  thinking?: string;
+  isThinking?: boolean;
+  browserStepProgress?: BrowserStepProgressData | null;
+  browserStepsHistory?: BrowserStepsHistory | null;
+  agentStepProgress?: import('@/app/opspilot/types/global').AgentStepProgressData[];
+  skillViews?: import('@/app/opspilot/types/global').SkillViewItem[];
+  configDiffReports?: ConfigDiffReport[];
+  configAnalysisReports?: ConfigAnalysisReport[];
+  userChoiceRequests?: UserChoiceRequest[];
+  approvalRequests?: ApprovalRequest[];
+  repairCommands?: RepairCommands[];
+  reportFileDownloads?: ReportFileDownload[];
+  plannedExecutionSteps?: PlannedExecutionStepView[];
+  wikiCitations?: WikiCitation[];
+  isStreamingTools?: boolean;
+  toolCalls?: Array<{ id: string; name: string; args: string; status: 'calling' | 'completed' | 'error'; result?: string }>;
+} => {
+  if (role !== 'bot' && role !== 'assistant') {
+    return {
+      content: typeof content === 'string' ? content : String(content ?? ''),
+      thinking: '',
+      isThinking: false,
+      browserStepProgress: null,
+      browserStepsHistory: null,
+      reportFileDownloads: undefined,
+    };
+  }
+
+  if (Array.isArray(content)) {
+    return buildFromEvents(content, true);
+  }
+
+  if (content && typeof content === 'object') {
+    return buildFromEvents([content], true);
+  }
+
+  if (typeof content !== 'string') {
+    return {
+      content: content === null || content === undefined ? '' : String(content),
+      thinking: '',
+      isThinking: false,
+      browserStepProgress: null,
+      browserStepsHistory: null,
+      reportFileDownloads: undefined,
+    };
+  }
+
+  const parsedContent = parseJsonArray(content);
+  if (!parsedContent) {
+    return {
+      content,
+      thinking: '',
+      isThinking: false,
+      browserStepProgress: null,
+      browserStepsHistory: null,
+      reportFileDownloads: undefined,
+    };
+  }
+
+  if (
+    parsedContent.length > 0
+    && parsedContent.every((item) => typeof item === 'string')
+    && looksLikePlannedExecutionPayload(content)
+  ) {
+    return buildFromEvents([unwrapCustomValue(content)], true);
+  }
+
+  return buildFromEvents(parsedContent, true);
+};
+
+/**
+ * 批量处理历史消息列表
+ * @param messages 原始消息数组
+ * @returns 处理后的消息数组
+ */
+export const processHistoryMessages = (messages: any[]): any[] => {
+  return messages.map(msg => ({
+    ...msg,
+    content: processHistoryMessageContent(msg.content, msg.role)
+  }));
+};

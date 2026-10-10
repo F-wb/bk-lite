@@ -1,0 +1,18 @@
+.cloudregion :global(textarea#nest-messages_user_introduction) {
+   height: 108px !important;
+}
+
+.cloudregion :global(.crp) {
+   font-size: smaller;
+   color: var(--color-text-3);
+}
+
+.cloudregion :global(.textclip) {
+   overflow: hidden;
+   text-overflow: ellipsis;
+   white-space: wrap;
+}
+
+.cloudregion :global(.ant-dropdown-menu-item) {
+   margin-bottom: 3px !important;
+}

@@ -1,0 +1,94 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_stormshield"
+        config_type = "stormshield"
+        brand = "stormshield"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+# @bk_include_ifmib_table
+    # 标量：顶层 field GET 必须带实例 .0；禁止 table.field 采标量（walk 空）。
+    # ---- 内存：UCD-SNMP-MIB memTotalReal / memAvailReal，KB ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.2021.4.5.0"
+        name = "device_memory_total"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.2021.4.6.0"
+        name = "device_memory_free"
+    # ---- 会话 / VPN：snsASQStatsStatefulTcpConn / UdpConn、snsIPSECStatsSADMature ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.11256.1.12.1.23.0"
+        name = "firewall_tcp_connections"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.11256.1.12.1.33.0"
+        name = "firewall_udp_connections"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.11256.1.13.2.2.0"
+        name = "firewall_vpn_tunnels"
+    # ---- CPU：HOST-RESOURCES hrProcessorLoad，每核表列，table.field 禁止 .0 ----
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.25.3.3.1.2"
+        name = "usage"
+    # ---- STORMSHIELD-SYSTEM-MONITOR-MIB：CPU 温度 / 电源 / 风扇，表列禁止 .0 ----
+    [[inputs.snmp.table]]
+        name = "device_temperature"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.11256.1.10.7.1.2"
+        name = "celsius"
+    [[inputs.snmp.table]]
+        name = "device_psu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.11256.1.10.6.1.2"
+        name = "powered"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.11256.1.10.6.1.3"
+        name = "status"
+        is_tag = true
+    [[inputs.snmp.table]]
+        name = "device_fan"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.11256.1.10.9.1.2"
+        name = "descr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.11256.1.10.9.1.3"
+        name = "status"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.11256.1.10.9.1.4"
+        name = "rpm"

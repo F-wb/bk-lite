@@ -1,0 +1,47 @@
+import { useMemo } from 'react';
+import { useTranslation } from '@/utils/i18n';
+import PermissionWrapper from '@/components/permission';
+import type { MenuProps } from 'antd';
+
+export const useAssetMenuItems = (): MenuProps['items'] => {
+  const { t } = useTranslation();
+  return useMemo(
+    () => [
+      {
+        label: (
+          <PermissionWrapper
+            className="customMenuItem"
+            requiredPermissions={['Edit']}
+          >
+            {t('common.batchEdit')}
+          </PermissionWrapper>
+        ),
+        key: 'batchEdit',
+      },
+      {
+        label: (
+          <PermissionWrapper
+            className="customMenuItem"
+            requiredPermissions={['Delete']}
+          >
+            {t('common.batchDelete')}
+          </PermissionWrapper>
+        ),
+        key: 'batchDelete',
+        danger: true,
+      },
+      {
+        label: (
+          <PermissionWrapper
+            className="customMenuItem"
+            requiredPermissions={['Edit']}
+          >
+            {t('monitor.integrations.batchUpdateCollectConfig')}
+          </PermissionWrapper>
+        ),
+        key: 'batchUpdateCollectConfig',
+      },
+    ],
+    [t]
+  );
+};

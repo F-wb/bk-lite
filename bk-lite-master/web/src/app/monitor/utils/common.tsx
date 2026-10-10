@@ -1,0 +1,1056 @@
+import {
+  CascaderItem,
+  OriginOrganization,
+  OriginSubGroupItem,
+  SubGroupItem,
+  ListItem,
+  ViewQueryKeyValuePairs,
+  ChartData,
+  TreeItem,
+  TableDataItem,
+  TimeValuesProps,
+  ChartProps,
+  ObjectItem,
+  MetricItem,
+  ChartDataItem,
+  OrganizationNode
+} from '@/app/monitor/types';
+import { Group } from '@/types';
+import {
+  APPOINT_METRIC_IDS,
+  OBJECT_DEFAULT_ICON
+} from '@/app/monitor/constants';
+import {
+  getBaseObject,
+  isDerivativeObject
+} from '@/app/monitor/utils/monitorObject';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import dayjs from 'dayjs';
+
+// EE 端运行时注入的 BRANDS:由 web/scripts/prepare-enterprise.mjs 生成
+// /public/__enterprise-brands.js 由 next layout.tsx 的 defer script 加载后挂到这里。
+// 类型契约:每条 brand 的 match/label/icon 字段与下方 BRANDS 项同型。
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+  interface Window {
+    __ENTERPRISE_BRANDS?: Array<{ match: RegExp; label: string; icon?: string }>;
+  }
+}
+
+// 获取头像随机色
+export const getRandomColor = () => {
+  const colors = ['#875CFF', '#FF9214', '#00CBA6', '#1272FF'];
+  const randomIndex = Math.floor(Math.random() * colors.length);
+  return colors[randomIndex];
+};
+
+// 获取随机颜色
+export const generateUniqueRandomColor = (() => {
+  const generatedColors = new Set<string>();
+  return (): string => {
+    const letters = '0123456789ABCDEF';
+    let color;
+    do {
+      color = '#';
+      for (let i = 0; i < 6; i++) {
+        color += letters[Math.floor(Math.random() * 16)];
+      }
+    } while (generatedColors.has(color));
+    generatedColors.add(color);
+    return color;
+  };
+})();
+
+// 针对层级组件，当值为最后一级的value时的回显，需要找到其所有父value并转成的数组格式vaule
+export const findCascaderPath = (
+  nodes: CascaderItem[],
+  targetValue: string,
+  path: Array<string | number> = []
+): Array<string | number> => {
+  for (const node of nodes) {
+    // 如果找到目标值，返回当前路径加上目标值
+    if (node.value === targetValue) {
+      return [...path, node.value];
+    }
+    // 如果有子节点，递归查找
+    if (node.children) {
+      const result = findCascaderPath(node.children, targetValue, [
+        ...path,
+        node.value
+      ]);
+      // 如果在子节点中找到了目标值，返回结果
+      if (result.length) {
+        return result;
+      }
+    }
+  }
+  // 如果没有找到目标值，返回空数组
+  return [];
+};
+
+// 组织改造成联级数据
+export const convertArray = (
+  arr: Array<OriginOrganization | OriginSubGroupItem>
+): CascaderItem[] => {
+  const result: CascaderItem[] = [];
+  arr.forEach((item) => {
+    const newItem: CascaderItem = {
+      value: item.id,
+      label: item.name,
+      children: []
+    };
+    const subGroups: OriginSubGroupItem[] = item.subGroups;
+    if (subGroups && !!subGroups.length) {
+      newItem.children = convertArray(subGroups);
+    }
+    result.push(newItem);
+  });
+  return result;
+};
+
+// 用于查节点及其所有父级节点
+export const findNodeWithParents = (
+  nodes: OrganizationNode[],
+  id: string,
+  parent: OrganizationNode | null = null
+): OrganizationNode[] | null => {
+  for (const node of nodes) {
+    if (node.id === id) {
+      if (parent) {
+        const parentNodes = findNodeWithParents(nodes, parent.id);
+        return parentNodes ? [node, ...parentNodes] : [node];
+      }
+      return [node];
+    }
+    if (node.subGroups && node.subGroups.length > 0) {
+      const result = findNodeWithParents(node.subGroups, id, node);
+      if (result) {
+        return result;
+      }
+    }
+  }
+  return null;
+};
+
+// 过滤出所有给定ID的节点及其所有父级节点
+export const filterNodesWithAllParents = (
+  nodes: OrganizationNode[],
+  ids: string[]
+): OrganizationNode[] => {
+  const result: OrganizationNode[] = [];
+  const uniqueIds = new Set(ids);
+  for (const id of uniqueIds) {
+    const nodeWithParents = findNodeWithParents(nodes, id);
+    if (nodeWithParents) {
+      for (const node of nodeWithParents) {
+        if (!result.find((n) => n.id === node.id)) {
+          result.push(node);
+        }
+      }
+    }
+  }
+  return result;
+};
+
+// 根据分组id找出分组名称(单个id展示)
+export const findGroupNameById = (
+  arr: Array<SubGroupItem>,
+  value: unknown
+): string | null => {
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i].value === value) {
+      return arr[i].label || null;
+    }
+    if (arr[i].children && arr[i].children?.length) {
+      const label = findGroupNameById(arr[i]?.children || [], value);
+      if (label) {
+        return label;
+      }
+    }
+  }
+  return null;
+};
+
+// 根据分组id找出分组名称(多个id展示)
+export const showGroupName = (
+  groupIds: string[],
+  organizationList: Array<SubGroupItem>
+) => {
+  if (!groupIds?.length) return '--';
+  const groupNames: (string | null)[] = [];
+  groupIds.forEach((el) => {
+    groupNames.push(findGroupNameById(organizationList, Number(el)));
+  });
+  return groupNames.filter((item) => !!item).join(',') || '--';
+};
+
+// 图标中x轴的时间回显处理
+export const useFormatTime = () => {
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const formatTime = (timestamp: number, minTime: number, maxTime: number) => {
+    const totalTimeSpan = maxTime - minTime;
+    const time = new Date(timestamp * 1000) + '';
+    if (totalTimeSpan === 0) {
+      return convertToLocalizedTime(time, 'YYYY-MM-DD HH:mm:ss');
+    }
+    if (totalTimeSpan <= 24 * 60 * 60) {
+      // 如果时间跨度在一天以内，显示小时分钟
+      return convertToLocalizedTime(time, 'HH:mm:ss');
+    }
+    if (totalTimeSpan <= 30 * 24 * 60 * 60) {
+      // 如果时间跨度在一个月以内，显示月日
+      return convertToLocalizedTime(time, 'MM-DD HH:mm');
+    }
+    if (totalTimeSpan <= 365 * 24 * 60 * 60) {
+      // 如果时间跨度在一年以内，显示年月日
+      return convertToLocalizedTime(time, 'YYYY-MM-DD');
+    }
+    // 否则显示年月
+    return convertToLocalizedTime(time, 'YYYY-MM');
+  };
+  return { formatTime };
+};
+
+// 柱形图或者折线图单条线时，获取其最大值、最小值、平均值和最新值
+export const calculateMetrics = (
+  data: Record<string, number | null | undefined>[],
+  key = 'value1'
+) => {
+  if (!data || data.length === 0) return {};
+  const values = data
+    .map((item) => item[key])
+    .filter(
+      (val): val is number =>
+        typeof val === 'number' && !isNaN(val) && val !== null
+    );
+  if (values.length === 0) return {};
+
+  const maxValue = Math.max(...values);
+  const minValue = Math.min(...values);
+  const sumValue = values.reduce((sum, value) => sum + value, 0);
+  const avgValue = sumValue / values.length;
+  const latestValue = values[values.length - 1];
+  return {
+    maxValue,
+    minValue,
+    avgValue,
+    sumValue,
+    latestValue
+  };
+};
+
+// 树形组件根据 id 查 label（监控对象 name）。
+// TreeSelector 的 onNodeSelect 会 String(key)，而建树时常用数字 id 作 key，
+// 必须按字符串比较，否则查不到 name，策略模板等列表会整页空白。
+export const findLabelById = (
+  data: TreeItem[],
+  key: string | number
+): string | null => {
+  const target = String(key);
+  for (const node of data) {
+    if (String(node.key) === target) {
+      return node.label || null;
+    }
+    if (node.children) {
+      const result = findLabelById(node.children, key);
+      if (result) {
+        return result;
+      }
+    }
+  }
+  return null;
+};
+
+// 判断一个字符串是否是字符串的数组
+export const isStringArray = (input: string): boolean => {
+  try {
+    if (typeof input !== 'string') {
+      return false;
+    }
+    const parsed = JSON.parse(input);
+    if (!Array.isArray(parsed)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const matchEnumOption = (options: ListItem[], id: number | string) => {
+  const numericId = Number(id);
+  return options.find((item: ListItem) => {
+    if (item.id === id) return true;
+    if (!Number.isFinite(numericId)) return false;
+    return Number(item.id) === numericId;
+  });
+};
+
+// 根据指标枚举获取值
+export const getEnumValue = (metric: MetricItem, id: number | string) => {
+  const { unit: input = '', name } = metric || {};
+  if (!id && id !== 0) return '--';
+  if (isStringArray(input)) {
+    return matchEnumOption(JSON.parse(input), id)?.name || id;
+  }
+  return isNaN(+id) || APPOINT_METRIC_IDS.includes(name)
+    ? id
+    : (+id).toFixed(2);
+};
+
+// 根据指标枚举获取颜色值
+export const getEnumColor = (metric: MetricItem, id: number | string) => {
+  const { unit: input = '' } = metric || {};
+  if (isStringArray(input)) {
+    return matchEnumOption(JSON.parse(input), id)?.color || '';
+  }
+  return '';
+};
+
+export const transformTreeData = (nodes: Group[]): CascaderItem[] => {
+  return nodes.map((node) => {
+    const transformedNode: CascaderItem = {
+      value: node.id,
+      label: node.name,
+      children: []
+    };
+    if (node.children?.length) {
+      transformedNode.children = transformTreeData(node.children);
+    }
+    return transformedNode;
+  });
+};
+
+export const mergeViewQueryKeyValues = (
+  pairs: ViewQueryKeyValuePairs[]
+): string => {
+  const mergedObject: { [key: string]: Set<string> } = {};
+  pairs.forEach((pair) => {
+    (pair.keys || []).forEach((key, index) => {
+      const value = (pair.values || [])[index];
+      if (!mergedObject[key]) {
+        mergedObject[key] = new Set();
+      }
+      mergedObject[key].add(value);
+    });
+  });
+
+  // 值会被拼进 PromQL 正则匹配器 key=~"v1|v2",必须逐个转义正则元字符,
+  // 再转义 PromQL 字符串中的反斜杠和双引号,
+  // 否则含 . + ( ) 等字符的实例标识(如 IP/主机名)会被当作正则,匹配到错误/多余的序列,
+  // 含 " 的值还会直接破坏查询语法。
+  const escapeRegexValue = (v: string): string =>
+    v.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"');
+
+  const resultArray: string[] = [];
+  for (const key in mergedObject) {
+    const values = Array.from(mergedObject[key])
+      .map((v) => escapeRegexValue(String(v ?? '')))
+      .join('|');
+    resultArray.push(`${key}=~"${values}"`);
+  }
+
+  return resultArray.join(',');
+};
+
+export const renderChart = (
+  data: ChartDataItem[],
+  config: ChartProps[]
+): ChartData[] => {
+  const result: ChartData[] = [];
+  const target = config[0]?.dimensions || [];
+  const seriesKeyToValueKey = new Map<string, string>();
+  const getSeriesKey = (metric: Record<string, string>) => {
+    const identityKeys = Array.from(
+      new Set([
+        ...(config[0]?.instance_id_keys || []),
+        ...target.map((item) => item.name),
+      ])
+    );
+    const identityEntries = identityKeys
+      .filter((key) => Object.prototype.hasOwnProperty.call(metric || {}, key))
+      .map((key) => [key, metric[key]]);
+
+    return JSON.stringify(
+      (identityEntries.length ? identityEntries : Object.entries(metric || {}))
+        .sort(([left], [right]) => left.localeCompare(right))
+    );
+  };
+  const getValueKey = (metric: Record<string, string>) => {
+    const seriesKey = getSeriesKey(metric);
+    const existingKey = seriesKeyToValueKey.get(seriesKey);
+    if (existingKey) {
+      return existingKey;
+    }
+    const valueKey = `value${seriesKeyToValueKey.size + 1}`;
+    seriesKeyToValueKey.set(seriesKey, valueKey);
+    return valueKey;
+  };
+
+  data.forEach((item) => {
+    const valueKey = getValueKey(item.metric);
+    item.values.forEach(([timestamp, value]) => {
+      const numericValue = parseFloat(value);
+      if (!Number.isFinite(numericValue)) {
+        return;
+      }
+      const existing = result.find((entry) => entry.time === timestamp);
+      const detailValue = Object.entries(item.metric)
+        .map(([key, dimenValue]) => ({
+          name: key,
+          label: target.find((sec) => sec.name === key)?.description || key,
+          value: dimenValue
+        }))
+        .filter((item) => target.find((tex) => tex.name === item.name));
+      if (config[0]?.showInstName) {
+        detailValue.unshift({
+          name: 'instance_name',
+          label: 'Instance',
+          value:
+            config.find(
+              (detail) =>
+                JSON.stringify(detail.instance_id_values) ===
+                JSON.stringify(
+                  detail.instance_id_keys.reduce((pre, cur) => {
+                    return pre.concat(item.metric[cur] as any);
+                  }, [])
+                )
+            )?.instance_name || '--'
+        });
+      }
+      if (existing) {
+        existing[valueKey] = numericValue;
+        existing.seriesMetrics = {
+          ...(existing.seriesMetrics || {}),
+          [valueKey]: item.metric
+        };
+        if (!existing.details) {
+          existing.details = {};
+        }
+        if (!existing.details[valueKey]) {
+          existing.details[valueKey] = [];
+        }
+        existing.details[valueKey].push(...detailValue);
+      } else {
+        const details = {
+          [valueKey]: detailValue
+        };
+        result.push({
+          time: timestamp,
+          title: config[0]?.title || '--',
+          [valueKey]: numericValue,
+          seriesMetrics: {
+            [valueKey]: item.metric
+          },
+          details
+        });
+      }
+    });
+  });
+  return result.sort((left, right) => left.time - right.time);
+};
+
+export const findTreeParentKey = (
+  treeData: TreeItem[],
+  targetKey: React.Key
+): React.Key | null => {
+  let parentKey: React.Key | null = null;
+  const target = String(targetKey);
+  const loop = (nodes: TreeItem[], parent: React.Key | null) => {
+    for (const node of nodes) {
+      if (String(node.key) === target) {
+        parentKey = parent;
+        return;
+      }
+      if (node.children) {
+        loop(node.children, node.key); // 递归遍历子节点
+      }
+    }
+  };
+  loop(treeData, null); // 初始父节点为 null
+  return parentKey;
+};
+
+// 展示监控示例名称
+// 注意：objectItem 必须包含 level 字段，或者传入 objects 参数进行动态判断
+export const showInstName = (
+  objectItem: ObjectItem,
+  row: TableDataItem,
+  objects?: ObjectItem[]
+) => {
+  const isDerivative = objects
+    ? isDerivativeObject(objectItem, objects)
+    : isDerivativeObject(objectItem);
+  return (
+    (isDerivative ? row?.instance_id_values?.[1] : row?.instance_name) || '--'
+  );
+};
+
+/** Process 列表：从身份第二段取进程别名 process_name。 */
+export const showProcessName = (row: TableDataItem) => {
+  const processName = row?.instance_id_values?.[1];
+  if (processName != null && String(processName).trim() !== '') {
+    return String(processName);
+  }
+  return '--';
+};
+
+// 监控实例名称处理
+export const getBaseInstanceColumn = (config: {
+  row: ObjectItem;
+  objects: ObjectItem[];
+  t: any;
+  queryData?: any[];
+  ipFilterOptions?: string[];
+}) => {
+  const baseTarget = getBaseObject(config.row, config.objects);
+  const title = baseTarget?.display_name || config.t('monitor.source');
+  const isDerivative = isDerivativeObject(config.row, config.objects);
+  const renderAssetText = (value: unknown) => (
+    <EllipsisWithTooltip
+      text={value == null || value === '' ? '--' : String(value)}
+      className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
+    ></EllipsisWithTooltip>
+  );
+  const formatSummaryFact = (value: unknown) => {
+    if (!Array.isArray(value)) return value;
+    return value
+      .map((item) => {
+        if (item == null || typeof item !== 'object') return String(item);
+        const node = item as { id?: string; name?: string; ip?: string };
+        if (node.name && node.ip) return `${node.name} (${node.ip})`;
+        return node.name || node.ip || node.id || JSON.stringify(node);
+      })
+      .join(', ');
+  };
+  const columnItems: any = [
+    {
+      title: config.t('common.name'),
+      dataIndex: 'instance_name',
+      onCell: () => ({
+        style: {
+          minWidth: 150
+        }
+      }),
+      key: 'instance_name',
+      render: (_: unknown, record: TableDataItem) => {
+        const instanceName = showInstName(config.row, record, config.objects);
+        return (
+          <EllipsisWithTooltip
+            text={instanceName}
+            className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
+          ></EllipsisWithTooltip>
+        );
+      }
+    }
+  ];
+  const summaryColumns = [...(config.row.instance_summary_columns || [])].sort(
+    (left, right) => (left.order || 0) - (right.order || 0)
+  );
+  summaryColumns.forEach((column) => {
+    const isAssetIp = column.fact === 'asset.ip';
+    const ipFilters = (config.ipFilterOptions || [])
+      .map((ip) => String(ip || '').trim())
+      .filter(Boolean)
+      .map((ip) => ({ text: ip, value: ip }));
+    columnItems.push({
+      title: config.t(column.title),
+      dataIndex: ['summary_facts', column.fact],
+      key: `summary_fact:${column.fact}`,
+      onCell: () => ({ style: { minWidth: 150 } }),
+      ...(isAssetIp
+        ? {
+          filterMultiple: true,
+          filterSearch: true,
+          filterParam: 'asset.ip',
+          filters: ipFilters.length ? ipFilters : undefined
+        }
+        : {}),
+      render: (_: unknown, record: TableDataItem) =>
+        renderAssetText(formatSummaryFact(record.summary_facts?.[column.fact]))
+    });
+  });
+  // Process：名称列用接入实例名；另列展示进程别名；归属主机列头多选过滤。
+  if (config.row?.name === 'Process') {
+    const hostFilters = (config.queryData || [])
+      .map((item: TableDataItem) => ({
+        text: String(item.name || item.id || ''),
+        value: String(item.id ?? '')
+      }))
+      .filter((item) => item.value);
+    columnItems.splice(
+      1,
+      0,
+      {
+        title: config.t('monitor.views.processName'),
+        dataIndex: 'process_name',
+        key: 'process_name',
+        onCell: () => ({ style: { minWidth: 120 } }),
+        render: (_: unknown, record: TableDataItem) =>
+          renderAssetText(showProcessName(record))
+      },
+      {
+        title: config.t('monitor.views.hostName'),
+        dataIndex: 'base_instance_name',
+        key: 'base_instance_name',
+        onCell: () => ({ style: { minWidth: 150 } }),
+        filterMultiple: true,
+        filterSearch: true,
+        filters: hostFilters.length ? hostFilters : undefined,
+        render: (_: unknown, record: TableDataItem) => {
+          const instanceIdValue = record.instance_id_values?.[0];
+          let displayName = instanceIdValue || '--';
+          if (config.queryData && instanceIdValue) {
+            const matchedItem = config.queryData.find(
+              (item: TableDataItem) => item.id === instanceIdValue
+            );
+            if (matchedItem) {
+              displayName = matchedItem.name || matchedItem.id;
+            }
+          }
+          return renderAssetText(displayName);
+        }
+      }
+    );
+  }
+  if (isDerivative) {
+    const clusterFilters = (config.queryData || [])
+      .map((item: TableDataItem) => ({
+        text: String(item.name || item.id || ''),
+        value: String(item.id ?? '')
+      }))
+      .filter((item) => item.value);
+    columnItems.unshift({
+      title: title,
+      dataIndex: 'base_instance_name',
+
+      onCell: () => ({
+        style: {
+          minWidth: 150
+        }
+      }),
+      key: 'base_instance_name',
+      filterMultiple: true,
+      filters: clusterFilters.length ? clusterFilters : undefined,
+      render: (_: unknown, record: TableDataItem) => {
+        const instanceIdValue = record.instance_id_values?.[0];
+        let displayName = instanceIdValue || '--';
+        if (config.queryData && instanceIdValue) {
+          const matchedItem = config.queryData.find(
+            (item: TableDataItem) => item.id === instanceIdValue
+          );
+          if (matchedItem) {
+            displayName = matchedItem.name || matchedItem.id;
+          }
+        }
+        return (
+          <EllipsisWithTooltip
+            text={displayName}
+            className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
+          ></EllipsisWithTooltip>
+        );
+      }
+    });
+  }
+  return columnItems;
+};
+
+export const getIconByObjectName = (objectName = '', objects: ObjectItem[]) => {
+  return (
+    (objects.find((item) => item.name === objectName)?.icon as string) ||
+    OBJECT_DEFAULT_ICON
+  );
+};
+
+// 品牌专属采集模板/实例（如思科交换机）的品牌识别：按名称匹配 → 提供品牌标签（及可选 logo 图标）。
+// icon 可选：未提供时集成卡片回退到监控对象默认图标，仪表盘头部仍展示品牌文字标签。
+const BRANDS: { match: RegExp; label: string; icon?: string }[] = [
+  { match: /ciscosb|cisco\s*small\s*business/i, label: 'Cisco Small Business', icon: 'mm-ciscosb_ciscosb' },
+  { match: /^(?!.*san_cisco).*cisco/i, label: 'Cisco', icon: 'mm-cisco_思科' },
+  { match: /futurematrix/i, label: 'FutureMatrix', icon: 'mm-huawei_华为' },
+  { match: /huawei/i, label: 'Huawei', icon: 'mm-huawei_华为' },
+  { match: /snmp_aruba_instant|aruba\s*instant/i, label: 'Aruba Instant', icon: 'mm-aruba_aruba' },
+  { match: /snmp_aruba_wireless|wireless\s*aruba|aruba\s*aos/i, label: 'Aruba AOS', icon: 'mm-aruba_aruba' },
+  { match: /aruba/i, label: 'Aruba', icon: 'mm-aruba_aruba' },
+  { match: /juniper/i, label: 'Juniper', icon: 'mm-juniper_juniper' },
+  { match: /extreme/i, label: 'Extreme', icon: 'mm-extreme_extreme' },
+  { match: /avaya\s*ers|baystack|\bers[-\s]?[2-5]\d{3}\b/i, label: 'Avaya ERS' },
+  { match: /brocade/i, label: 'Brocade', icon: 'mm-brocade_brocade' },
+  { match: /snmp_nokia_router|router nokia|timos|\bsros\b|\b7705\b/i, label: 'Nokia', icon: 'mm-nokia_nokia' },
+  { match: /\bnokia\b|omniswitch/i, label: 'Nokia', icon: 'mm-nokia_nokia' },
+  { match: /alcatel|sr.?linux|srlinux|timos|\b7750\b|\b7450\b|\b7950\b/i, label: 'Alcatel-Lucent', icon: 'mm-alcatel_alcatel' },
+  { match: /mikrotik/i, label: 'MikroTik', icon: 'mm-mikrotik_mikrotik' },
+  { match: /dlink|d-link/i, label: 'D-Link', icon: 'mm-dlink_dlink' },
+  { match: /netgear/i, label: 'NETGEAR', icon: 'mm-netgear_netgear' },
+  { match: /linksys/i, label: 'Linksys' },
+  { match: /tplink|tp-link/i, label: 'TP-Link', icon: 'mm-tplink_tplink' },
+  { match: /zyxel/i, label: 'Zyxel', icon: 'mm-zyxel_zyxel' },
+  { match: /qtech/i, label: 'QTech', icon: 'mm-qtech_qtech' },
+  { match: /dellforce|force10|dell.?force/i, label: 'Dell Force10', icon: 'mm-dellforce_dellforce' },
+  { match: /hphpn|procurve|hp.?networking/i, label: 'HP ProCurve', icon: 'mm-hphpn_hphpn' },
+  { match: /\bpbi\b/i, label: 'PBI' },
+  { match: /fortinet|fortigate/i, label: 'Fortinet', icon: 'mm-fortinet_fortinet' },
+  { match: /checkpoint|check.?point/i, label: 'Check Point', icon: 'mm-checkpoint_checkpoint' },
+  { match: /\btbs\b|skylone/i, label: 'TBS' },
+  { match: /stormshield/i, label: 'Stormshield', icon: 'mm-stormshield_stormshield' },
+  { match: /paloalto|palo.?alto|pan.?os/i, label: 'Palo Alto', icon: 'mm-paloalto_paloalto' },
+  { match: /sonicwall|sonicos/i, label: 'SonicWall', icon: 'mm-sonicwall_sonicwall' },
+  { match: /watchguard|fireware/i, label: 'WatchGuard', icon: 'mm-watchguard_watchguard' },
+  { match: /pfsense/i, label: 'pfSense', icon: 'mm-pfsense_pfsense' },
+  { match: /opnsense/i, label: 'OPNsense', icon: 'mm-opnsense_opnsense' },
+  { match: /ipfire/i, label: 'IPFire' },
+  { match: /clavister/i, label: 'Clavister', icon: 'mm-clavister_clavister' },
+  { match: /genua/i, label: 'Genua', icon: 'mm-genua_genua' },
+  { match: /kerio/i, label: 'Kerio', icon: 'mm-kerio_kerio' },
+  { match: /sangfor|深信服/i, label: 'Sangfor', icon: 'mm-sangfor_sangfor' },
+  { match: /metaswitch|metaview/i, label: 'Metaswitch' },
+  { match: /topsec|天融信/i, label: 'Topsec', icon: 'mm-topsec_topsec' },
+  { match: /zorp/i, label: 'Zorp', icon: 'mm-zorp_zorp' },
+  { match: /ecreso|worldcast/i, label: 'Ecreso' },
+  { match: /\bf5\b|big-?ip/i, label: 'F5', icon: 'mm-f5_f5' },
+  { match: /hillstone|stoneos/i, label: 'Hillstone', icon: 'mm-hillstone_hillstone' },
+  { match: /sophos|\bxg\b|sfos|cyberoam/i, label: 'Sophos XG', icon: 'mm-sophos_sophos' },
+  { match: /neteye|leadsec|网御/i, label: 'Neteye', icon: 'mm-neteye_neteye' },
+  { match: /bluedon|蓝盾/i, label: 'Bluedon', icon: 'mm-bluedon_bluedon' },
+  { match: /mguard/i, label: 'mGuard' },
+  { match: /pulse\s*secure|ivanti|pulsesecure/i, label: 'Pulse Secure', icon: 'mm-pulsesecure_pulsesecure' },
+  { match: /\bdptech\b|迪普/i, label: 'DPtech', icon: 'mm-dptech_dptech' },
+  { match: /westone|卫士通/i, label: 'Westone', icon: 'mm-westone_westone' },
+  { match: /amaranten|安然/i, label: 'Amaranten', icon: 'mm-amaranten_amaranten' },
+  { match: /secworld|安世/i, label: 'Secworld', icon: 'mm-secworld_secworld' },
+  { match: /securepoint/i, label: 'Securepoint' },
+  { match: /superiority|超数/i, label: 'Superiority', icon: 'mm-superiority_superiority' },
+  { match: /westone|卫士通/i, label: 'Westone', icon: 'mm-westone_westone' },
+  { match: /harbour|港湾/i, label: 'Harbour Networks', icon: 'mm-harbour_harbour' },
+  { match: /aethra|dolcevita/i, label: 'Aethra', icon: 'mm-aethra_aethra' },
+  { match: /cloudgenix|prisma\s*sd-?wan/i, label: 'CloudGenix' },
+  { match: /relianoid|\bzva\b/i, label: 'RELIANOID', icon: 'mm-relianoid_relianoid' },
+  { match: /velocloud|vmware\s*sd-?wan|\bvce\b/i, label: 'VeloCloud', icon: 'mm-velocloud_velocloud' },
+  { match: /profline/i, label: 'Profline' },
+  { match: /viptela/i, label: 'Viptela', icon: 'mm-viptela_viptela' },
+  { match: /benu|benu\s*networks|\bmeg\d+/i, label: 'Benu Networks', icon: 'mm-benu_benu' },
+  { match: /forcepoint|stonesoft|stonegate|ngfw/i, label: 'Forcepoint', icon: 'mm-forcepoint_forcepoint' },
+  { match: /screenos|netscreen|\bssg\b/i, label: 'Juniper ScreenOS', icon: 'mm-screenos_screenos' },
+  { match: /barracuda/i, label: 'Barracuda', icon: 'mm-barracuda_barracuda' },
+  { match: /fireeye|trellix/i, label: 'FireEye' },
+  { match: /netscaler|citrix/i, label: 'Citrix NetScaler', icon: 'mm-netscaler_netscaler' },
+  { match: /\ba10\b|thunder|acos/i, label: 'A10 Thunder', icon: 'mm-a10_a10' },
+  { match: /fortiadc|fad\b/i, label: 'FortiADC', icon: 'mm-fortiadc_fortiadc' },
+  { match: /alteon|radware/i, label: 'Radware Alteon', icon: 'mm-alteon_alteon' },
+  { match: /kemp|loadmaster/i, label: 'Kemp LoadMaster', icon: 'mm-kemp_kemp' },
+  { match: /array networks|clickarray|loadbalance array/i, label: 'Array Networks', icon: 'mm-array_array' },
+  { match: /vyatta|vyos/i, label: 'Vyatta', icon: 'mm-vyatta_vyatta' },
+  { match: /\bnec\b|univerge|\bix[0-9]{3,4}\b/i, label: 'NEC', icon: 'mm-nec_nec' },
+  { match: /draytek|vigor/i, label: 'DrayTek', icon: 'mm-draytek_draytek' },
+  { match: /bintec/i, label: 'Bintec', icon: 'mm-bintec_bintec' },
+  { match: /cradlepoint|netcloud/i, label: 'Cradlepoint', icon: 'mm-cradlepoint_cradlepoint' },
+  { match: /peplink/i, label: 'Peplink', icon: 'mm-peplink_peplink' },
+  { match: /\baviat\b/i, label: 'Aviat Networks' },
+  { match: /pepwave/i, label: 'Pepwave', icon: 'mm-pepwave_pepwave' },
+  { match: /\bdigi\b|digi.?transport/i, label: 'Digi', icon: 'mm-digi_digi' },
+  { match: /oneaccess/i, label: 'OneAccess', icon: 'mm-oneaccess_oneaccess' },
+  { match: /teldat/i, label: 'Teldat', icon: 'mm-teldat_teldat' },
+  { match: /firebrick/i, label: 'FireBrick', icon: 'mm-firebrick_firebrick' },
+  { match: /venturi/i, label: 'Venturi Wireless' },
+  { match: /teltonika|rutos/i, label: 'Teltonika', icon: 'mm-teltonika_teltonika' },
+  { match: /versa|flexvnf|\bvos\b/i, label: 'Versa', icon: 'mm-versa_versa' },
+  { match: /viprinet/i, label: 'Viprinet', icon: 'mm-viprinet_viprinet' },
+  { match: /datacom|dmos/i, label: 'Datacom', icon: 'mm-datacom_datacom' },
+  { match: /eltex/i, label: 'Eltex', icon: 'mm-eltex_eltex' },
+  { match: /\bsnr\b|nag-mib/i, label: 'SNR', icon: 'mm-snr_snr' },
+  { match: /apresia/i, label: 'APRESIA', icon: 'mm-apresia_apresia' },
+  { match: /intelbras/i, label: 'Intelbras', icon: 'mm-intelbras_intelbras' },
+  { match: /nexans/i, label: 'Nexans', icon: 'mm-nexans_nexans' },
+  { match: /\btait\b|\btn9300\b/i, label: 'Tait' },
+  { match: /pica8|picos/i, label: 'Pica8', icon: 'mm-pica8_pica8' },
+  { match: /snmp_advantech_router|advantech|\beki\b|\bicr\b|conel/i, label: 'Advantech', icon: 'mm-advantech_advantech' },
+  { match: /etherwan/i, label: 'EtherWAN', icon: 'mm-etherwan_etherwan' },
+  { match: /sixnet|\bslx\b/i, label: 'Sixnet', icon: 'mm-sixnet_sixnet' },
+  { match: /allnet|\ball-sg\b/i, label: 'ALLNET', icon: 'mm-allnet_allnet' },
+  { match: /inovonics/i, label: 'Inovonics' },
+  { match: /redlion|red\s*lion|n-?tron/i, label: 'Red Lion', icon: 'mm-redlion_redlion' },
+  { match: /alaxala|\bax2[0-9]{3}s\b/i, label: 'Alaxala', icon: 'mm-alaxala_alaxala' },
+  { match: /transition\s*networks?|\bsispm\b|\bionmm\b/i, label: 'Transition Networks', icon: 'mm-transition_transition' },
+  { match: /antaira|aaxeon|\blmx\b/i, label: 'Antaira', icon: 'mm-antaira_antaira' },
+  { match: /xikestor|\bsks8300\b/i, label: 'XikeStor', icon: 'mm-xikestor_xikestor' },
+  { match: /tailyn/i, label: 'Tailyn' },
+  { match: /rubytech|ruby\s*tech|\bigs-?27|\bipgs-?27/i, label: 'RubyTech', icon: 'mm-rubytech_rubytech' },
+  { match: /kyland|\bsicom\b|\bkien\b/i, label: 'Kyland', icon: 'mm-kyland_kyland' },
+  { match: /\beltek\b|smartpack/i, label: 'Eltek' },
+  { match: /lantech/i, label: 'Lantech', icon: 'mm-lantech_lantech' },
+  { match: /\bakcp\b|sensorprobe|securityprobe/i, label: 'AKCP' },
+  { match: /\bwago\b|852-?1305/i, label: 'WAGO', icon: 'mm-wago_wago' },
+  { match: /weidmuller|weidmueller/i, label: 'Weidmuller', icon: 'mm-weidmuller_weidmuller' },
+  { match: /loop[\s_-]*telecom|\bam3440\b/i, label: 'Loop Telecom' },
+  { match: /asterfusion|asternos/i, label: 'AsterFusion', icon: 'mm-asterfusion_asterfusion' },
+  { match: /exalink|nexus\s*3550/i, label: 'ExaLINK' },
+  { match: /\batop\b|nimbl/i, label: 'ATOP', icon: 'mm-atop_atop' },
+  { match: /hw[\s_-]*group|\bste2?\b/i, label: 'HW group' },
+  { match: /\bcomtrol\b|rocketlinx|pepperl\+fuchs\s+comtrol/i, label: 'Comtrol RocketLinx', icon: 'mm-comtrol_rocketlinx' },
+  { match: /womaster/i, label: 'WoMaster', icon: 'mm-womaster_womaster' },
+  { match: /murrelektronik/i, label: 'Murrelektronik', icon: 'mm-murrelektronik_murrelektronik' },
+  { match: /powerdsine|microsemi\s*poe/i, label: 'PowerDsine' },
+  { match: /inhand/i, label: 'InHand Networks', icon: 'mm-inhand_inhand' },
+  { match: /wi-?tek|wireless-tek/i, label: 'Wi-Tek', icon: 'mm-witek_witek' },
+  { match: /\bcomet\b|websensor/i, label: 'COMET' },
+  { match: /multitech|multiconnect|\brcell\b/i, label: 'MultiTech', icon: 'mm-multitech_multitech' },
+  { match: /\bavici\b/i, label: 'Avici', icon: 'mm-avici_avici' },
+  { match: /hw[\s_-]*group|poseidon/i, label: 'HW group' },
+  { match: /unisphere|\berx\b/i, label: 'Unisphere', icon: 'mm-unisphere_unisphere' },
+  { match: /sensatronics/i, label: 'Sensatronics' },
+  { match: /waystream|asr[0-9]+|ftth/i, label: 'Waystream', icon: 'mm-waystream_waystream' },
+  { match: /tsntec|8148sc/i, label: 'TsnTec', icon: 'mm-tsntec_tsntec' },
+  { match: /\bmni\s*proteus\b|microwave\s*networks/i, label: 'Microwave Networks' },
+  { match: /6wind|\bvsr\b/i, label: '6WIND VSR', icon: 'mm-6wind_6wind' },
+  { match: /netelastic|flexbng/i, label: 'NetElastic' },
+  { match: /robustel|\br3000\b|\bmg460\b/i, label: 'Robustel', icon: 'mm-robustel_robustel' },
+  { match: /milesight|\bur3[257]\b/i, label: 'Milesight', icon: 'mm-milesight_milesight' },
+  { match: /\bge\s*mds\b|\bmds\s*orbit\b/i, label: 'GE MDS' },
+  { match: /sierra\s*wireless|airlink|\baleos\b/i, label: 'Sierra Wireless', icon: 'mm-sierrawireless_sierrawireless' },
+  { match: /netsure|emerson\s*energy/i, label: 'Emerson NetSure' },
+  { match: /netmodule/i, label: 'NetModule', icon: 'mm-netmodule_netmodule' },
+  { match: /engenius/i, label: 'EnGenius', icon: 'mm-engenius_engenius' },
+  { match: /aerohive|hiveap|hiveos/i, label: 'Aerohive', icon: 'mm-aerohive_aerohive' },
+  { match: /grandstream|\bgwn\d/i, label: 'Grandstream', icon: 'mm-grandstream_grandstream' },
+  { match: /\buhp\b/i, label: 'UHP' },
+  { match: /albentia|aerdocsis|wimax/i, label: 'Albentia', icon: 'mm-albentia_albentia' },
+  { match: /ligowave|ligo\s*wave|infinity/i, label: 'LigoWave', icon: 'mm-ligowave_ligowave' },
+  { match: /radwin|winlink/i, label: 'Radwin', icon: 'mm-radwin_radwin' },
+  { match: /mimosa|\bbfive\b|\bptmp\b/i, label: 'Mimosa', icon: 'mm-mimosa_mimosa' },
+  { match: /\bbats\b|\baats\b/i, label: 'BATS' },
+  { match: /phoenix\s*contact|fl\s*switch/i, label: 'Phoenix Contact', icon: 'mm-phoenixcontact_phoenixcontact' },
+  { match: /albentia|aerdocsis|wimax/i, label: 'Albentia', icon: 'mm-albentia_albentia' },
+  { match: /zdns|zddi|中国互联网研究院/i, label: 'ZDNS', icon: 'mm-zdns_zdns' },
+  { match: /arris|cadant|e6\s*cmts/i, label: 'ARRIS Cadant', icon: 'mm-arris_arris' },
+  { match: /vsolution|v-?sol|v1600d/i, label: 'V-SOL', icon: 'mm-vsolution_vsolution' },
+  { match: /dasan/i, label: 'DASAN', icon: 'mm-dasan_dasan' },
+  { match: /telco\s*systems|\bbatm\b|\bbinos\b|t-metro/i, label: 'Telco Systems', icon: 'mm-telco_telco' },
+  { match: /white\s*rabbit/i, label: 'CERN White Rabbit' },
+  { match: /zhone|\bdzs\b/i, label: 'Zhone DZS', icon: 'mm-zhone_zhone' },
+  { match: /utstarcom|utstar\s*com|\butstar\b/i, label: 'UTStarcom', icon: 'mm-utstarcom_utstarcom' },
+  { match: /raisecom|roap|iscom/i, label: 'Raisecom', icon: 'mm-raisecom_raisecom' },
+  { match: /calix|\be5-1\d\d\b/i, label: 'Calix' },
+  { match: /packetfront|\bdrg\b/i, label: 'PacketFront', icon: 'mm-packetfront_packetfront' },
+  { match: /c-?data|cdatatec/i, label: 'C-Data', icon: 'mm-cdata_cdata' },
+  { match: /casa( systems)?/i, label: 'Casa Systems', icon: 'mm-casa_casa' },
+  { match: /topvision|sumavision|数码视讯/i, label: 'Topvision', icon: 'mm-topvision_topvision' },
+  { match: /alvarion|breeze\s*access/i, label: 'Alvarion' },
+  { match: /icotera|kjaerulff/i, label: 'Icotera', icon: 'mm-icotera_icotera' },
+  { match: /ipinfusion|\bocnos\b/i, label: 'IP Infusion', icon: 'mm-ipinfusion_ipinfusion' },
+  { match: /omnitron|iconverter|netoutlook/i, label: 'Omnitron', icon: 'mm-omnitron_omnitron' },
+  { match: /\bubiquoss\b|ubiq-?uoss/i, label: 'Ubiquoss', icon: 'mm-ubiquoss_ubiquoss' },
+  { match: /smartbyte/i, label: 'SmartByte' },
+  { match: /nateks|megatrans|orion/i, label: 'Nateks', icon: 'mm-nateks_nateks' },
+  { match: /harmonic|nsg\s*pro|cableos/i, label: 'Harmonic', icon: 'mm-harmonic_harmonic' },
+  { match: /teleste|luminato/i, label: 'Teleste' },
+  { match: /\brad\b|rad\s*data|radcomms|etx|megaplex/i, label: 'RAD', icon: 'mm-rad_rad' },
+  { match: /blockbit/i, label: 'Blockbit', icon: 'mm-blockbit_blockbit' },
+  { match: /ascom|ip-?dect/i, label: 'Ascom', icon: 'mm-ascom_ascom' },
+  { match: /zmtel|greenpacket/i, label: 'Zmtel' },
+  { match: /parks/i, label: 'Parks', icon: 'mm-parks_parks' },
+  { match: /\bpbn\b|pacific broadband/i, label: 'PBN' },
+  { match: /airos(?![a-z])|airmax(?![a-z])/i, label: 'Ubiquiti airOS', icon: 'mm-ubiquiti_ubiquiti' },
+  { match: /ubiquiti|ubnt|edgeswitch/i, label: 'Ubiquiti', icon: 'mm-ubiquiti_ubiquiti' },
+  { match: /ruijie|reyee|\brg-?nos\b/i, label: 'Ruijie', icon: 'mm-ruijie_ruijie' },
+  { match: /\bzte\b|zxr10/i, label: 'ZTE', icon: 'mm-zte_zte' },
+  { match: /omniswitch|alcatel.?os|\baos\b/i, label: 'Alcatel OmniSwitch', icon: 'mm-omniswitch_omniswitch' },
+  { match: /\bterra\b/i, label: 'TERRA' },
+  { match: /yamaha|\brtx\d|\bnvr\d|\bfwx\d|\bvrx\b|\bswx\b/i, label: 'Yamaha', icon: 'mm-yamaha_yamaha' },
+  { match: /arista|\beos\b|dcs-/i, label: 'Arista', icon: 'mm-arista_arista' },
+  { match: /mellanox|nvidia|spectrum|onyx|mlnx|\bsn[0-9]{4}\b/i, label: 'Mellanox', icon: 'mm-mellanox_mellanox' },
+  { match: /allied|awplus|aw\+|at-/i, label: 'Allied Telesis', icon: 'mm-alliedtelesis_alliedtelesis' },
+  { match: /\bmsm\b|colubris|hpmsm/i, label: 'HPE MSM' },
+  { match: /os10|smartfabric|\bz9[0-9]|powerswitch/i, label: 'Dell OS10', icon: 'mm-dellos10_dellos10' },
+  { match: /cnos|lenovo|thinksystem|\bne[0-9]{4}\b/i, label: 'Lenovo CNOS', icon: 'mm-lenovocnos_lenovocnos' },
+  { match: /fortiswitch|fsw|fortinet.*switch/i, label: 'FortiSwitch', icon: 'mm-fortiswitch_fortiswitch' },
+  { match: /fiberhome|烽火|\bwri\b/i, label: 'FiberHome', icon: 'mm-fiberhome_fiberhome' },
+  { match: /furukawa|\bfelolt/i, label: 'Furukawa' },
+  { match: /\bh3c\b|comware|hh3c/i, label: 'H3C', icon: 'mm-h3c_h3c' },
+  { match: /hirschmann|belden|\brs[234]0\b|greyhound/i, label: 'Hirschmann', icon: 'mm-hirschmann_hirschmann' },
+  { match: /3com|a3com/i, label: '3Com', icon: 'mm-3com_3com' },
+  { match: /adtran|netvanta|adtran.?aos/i, label: 'Adtran', icon: 'mm-adtran_adtran' },
+  { match: /lancom|lcos/i, label: 'LANCOM', icon: 'mm-lancom_lancom' },
+  { match: /cumulus/i, label: 'Cumulus Linux', icon: 'mm-cumulus_cumulus' },
+  { match: /kymata/i, label: 'Kymata' },
+  { match: /\bdcn\b|digital.?china/i, label: 'DCN', icon: 'mm-dcn_dcn' },
+  { match: /edgecore/i, label: 'Edgecore', icon: 'mm-edgecore_edgecore' },
+  { match: /enterasys|dragon/i, label: 'Enterasys', icon: 'mm-enterasys_enterasys' },
+  { match: /\bfs\b|fs\.com/i, label: 'FS', icon: 'mm-fs_fs' },
+  { match: /garretcom|garrettcom/i, label: 'GarretCom', icon: 'mm-garretcom_garretcom' },
+  { match: /\bgcom\b|greentech|greennet/i, label: 'GCOM' },
+  { match: /korenix/i, label: 'Korenix', icon: 'mm-korenix_korenix' },
+  { match: /positron/i, label: 'Positron' },
+  { match: /microsens/i, label: 'Microsens', icon: 'mm-microsens_microsens' },
+  { match: /moxa/i, label: 'Moxa', icon: 'mm-moxa_moxa' },
+  { match: /netonix/i, label: 'Netonix', icon: 'mm-netonix_netonix' },
+  { match: /planet/i, label: 'PLANET', icon: 'mm-planet_planet' },
+  { match: /quanta|\bqnos\b/i, label: 'Quanta' },
+  { match: /pluribus|netvisor/i, label: 'Pluribus', icon: 'mm-pluribus_pluribus' },
+  { match: /ruggedcom/i, label: 'Ruggedcom', icon: 'mm-ruggedcom_ruggedcom' },
+  { match: /scalance/i, label: 'SCALANCE', icon: 'mm-scalance_scalance' },
+  { match: /westermo/i, label: 'Westermo', icon: 'mm-westermo_westermo' },
+  { match: /\bmpb\b|mpbc/i, label: 'MPB Communications' },
+  { match: /audiocodes/i, label: 'AudioCodes', icon: 'mm-audiocodes_audiocodes' },
+  { match: /ribbon|sonus|genband/i, label: 'Ribbon', icon: 'mm-ribbon_ribbon' },
+  { match: /acme\s*packet|acmepacket/i, label: 'Acme Packet', icon: 'mm-acmepacket_acmepacket' },
+  { match: /ignite\s*net|metrolinq/i, label: 'IgniteNet' },
+  { match: /patton|smartnode/i, label: 'Patton', icon: 'mm-patton_patton' },
+  { match: /innovaphone/i, label: 'Innovaphone', icon: 'mm-innovaphone_innovaphone' },
+  { match: /mitel|mivoice|3300\s*icp/i, label: 'Mitel', icon: 'mm-mitel_mitel' },
+  { match: /polycom|\bpoly\s*(phone|lens)\b/i, label: 'Polycom', icon: 'mm-polycom_polycom' },
+  { match: /\bsnom\b/i, label: 'Snom' },
+  { match: /yeastar/i, label: 'Yeastar', icon: 'mm-yeastar_yeastar' },
+  { match: /zenitel|vingtor|stentofon/i, label: 'Zenitel', icon: 'mm-zenitel_zenitel' },
+  { match: /dialogic|img\s*2020/i, label: 'Dialogic', icon: 'mm-voice_gateway_语音网关' },
+  { match: /sangoma|vega/i, label: 'Sangoma Vega', icon: 'mm-sangoma_sangoma' },
+  { match: /addpac|\bap(?:26[0-9]{2}|mg[0-9]{3,4})\b/i, label: 'AddPac', icon: 'mm-addpac_addpac' },
+  { match: /switchvox/i, label: 'Switchvox' },
+  { match: /opengear/i, label: 'Opengear', icon: 'mm-opengear_opengear' },
+  { match: /avocent|cyclades|\bacs[0-9]{3,4}\b/i, label: 'Avocent ACS', icon: 'mm-avocent_avocent' },
+  { match: /perle|iolan|\bscg[0-9]*\b/i, label: 'Perle IOLAN', icon: 'mm-perle_perle' },
+  { match: /raritan|dominion\s*sx|\bsx\s*ii\b/i, label: 'Raritan SX', icon: 'mm-raritan_raritan' },
+  { match: /lantronix|\bslc\s*8000\b|\bemg\s*(?:7500|8500)\b/i, label: 'Lantronix SLC', icon: 'mm-lantronix_lantronix' },
+  { match: /infoblox/i, label: 'Infoblox', icon: 'mm-infoblox_infoblox' },
+  { match: /gigamon|gigavue/i, label: 'Gigamon', icon: 'mm-gigamon_gigamon' },
+  { match: /hikvision|hik-?vision|海康/i, label: 'Hikvision' },
+  { match: /bluecat|bcn-|ddi/i, label: 'BlueCat', icon: 'mm-bluecat_bluecat' },
+  { match: /meinberg|lantime/i, label: 'Meinberg', icon: 'mm-meinberg_meinberg' },
+  { match: /ionodes/i, label: 'IONODES' },
+  { match: /endace/i, label: 'Endace', icon: 'mm-endace_endace' },
+  { match: /deva\s*broadcast|\bdeva\b/i, label: 'DEVA Broadcast', icon: 'mm-deva_deva' },
+  { match: /endrun|sonoma|tempus/i, label: 'EndRun', icon: 'mm-endrun_endrun' },
+  { match: /spectracom|orolia|securesync|netclock/i, label: 'Spectracom', icon: 'mm-spectracom_spectracom' },
+  { match: /jacarta|interseptor/i, label: 'Jacarta', icon: 'mm-jacarta_jacarta' },
+  { match: /asentria|siteboss/i, label: 'Asentria', icon: 'mm-asentria_asentria' },
+  { match: /server\s*technology|servertech|sentry3/i, label: 'Server Technology', icon: 'mm-servertech_servertech' },
+  { match: /synaccess|netbooter|synlink/i, label: 'Synaccess' },
+  { match: /enlogic|en2\.?0/i, label: 'Enlogic', icon: 'mm-enlogic_enlogic' },
+  { match: /rittal|cmc\s*iii/i, label: 'Rittal', icon: 'mm-rittal_rittal' },
+  { match: /gude|expert\s*power\s*control/i, label: 'Gude', icon: 'mm-gude_gude' },
+  { match: /\baten\b/i, label: 'ATEN' },
+  { match: /geist|blackbird|watchdog/i, label: 'Geist', icon: 'mm-geist_geist' },
+  { match: /procera|packetlogic|sandvine/i, label: 'Procera' },
+  { match: /panduit/i, label: 'Panduit', icon: 'mm-panduit_panduit' },
+  { match: /dataprobe|iboot/i, label: 'Dataprobe', icon: 'mm-dataprobe_dataprobe' },
+  { match: /apc|schneider\s*electric|powernet/i, label: 'APC', icon: 'mm-apc_apc' },
+  { match: /cyber\s*power/i, label: 'CyberPower' },
+  { match: /eaton|powerware|xups/i, label: 'Eaton', icon: 'mm-eaton_eaton' },
+  { match: /papouch/i, label: 'Papouch' },
+  { match: /tripp\s*lite|poweralert|webcardlx|snmpwebcard/i, label: 'Tripp Lite', icon: 'mm-tripplite_tripplite' },
+  { match: /allot|netxplorer|netexplorer/i, label: 'Allot', icon: 'mm-allot_allot' },
+  { match: /cordex|alpha\s*technologies/i, label: 'Alpha Technologies' },
+  { match: /efficient\s*ip|solidserver/i, label: 'EfficientIP', icon: 'mm-efficientip_efficientip' },
+  { match: /nomadix|ag-?2000w/i, label: 'Nomadix', icon: 'mm-nomadix_nomadix' },
+  { match: /dahua|大华/i, label: 'Dahua' },
+  { match: /airspan|air4g|air5g|airharmony|airvelocity/i, label: 'Airspan', icon: 'mm-airspan_airspan' },
+  { match: /freewave|zumlink/i, label: 'FreeWave' },
+  { match: /acksys|airlink|waveos/i, label: 'ACKSYS', icon: 'mm-acksys_acksys' },
+  { match: /last\s*mile\s*gear|\bctm\b/i, label: 'Last Mile Gear' },
+  { match: /\bxirrus\b/i, label: 'Xirrus', icon: 'mm-xirrus_xirrus' },
+  { match: /ruckus|zonedirector|\bsmartzone\b/i, label: 'Ruckus', icon: 'mm-ruckus_ruckus' },
+  { match: /\bmeru\b/i, label: 'Meru' },
+  { match: /prosoft|radiolinx|\brlx2?\b|icx35/i, label: 'ProSoft Technology', icon: 'mm-prosoft_prosoft' },
+  { match: /socomec|net\s*vision/i, label: 'Socomec', icon: 'mm-socomec_socomec' },
+  { match: /liebert|vertiv/i, label: 'Liebert', icon: 'mm-liebert_liebert' },
+  { match: /wiesemann|\bw&t\b|web-?thermo/i, label: 'W&T' },
+  { match: /wti|western\s*telematic/i, label: 'WTI', icon: 'mm-wti_wti' },
+  { match: /\bnti\b|enviromux/i, label: 'NTI ENVIROMUX', icon: 'mm-nti_nti' },
+  { match: /\bgwd\b|gwtt|gw-?epon/i, label: 'GWD' },
+  { match: /gigamon|gigavue/i, label: 'Gigamon' },
+  { match: /genie\s*atm|genie\s*networks/i, label: 'Genie Networks' },
+  { match: /accedian|skylight|metronid/i, label: 'Accedian', icon: 'mm-accedian_accedian' },
+  { match: /cradlepoint|netcloud/i, label: 'Cradlepoint' },
+  { match: /ciena/i, label: 'Ciena', icon: 'mm-ciena_ciena' },
+  { match: /\bcyan\b/i, label: 'Cyan' },
+  { match: /saf\s*tehnika|saftehnika|integra-[a-z0-9]+/i, label: 'SAF Tehnika', icon: 'mm-saftehnika_saftehnika' },
+  { match: /\bmrv\b|optidriver|in-?reach/i, label: 'MRV', icon: 'mm-mrv_mrv' },
+  { match: /marconi/i, label: 'Marconi', icon: 'mm-marconi_marconi' },
+  { match: /glassway|nscrtv|\bedfa\b|\beydfa\b/i, label: 'Glassway' },
+  { match: /alcoma/i, label: 'Alcoma', icon: 'mm-alcoma_alcoma' },
+  { match: /montclair/i, label: 'Montclair' },
+  { match: /\bsiae\b|microelettronica/i, label: 'SIAE Microelettronica', icon: 'mm-siae_siae' },
+  { match: /packetlight|packet\s*light|pl-[0-9a-z-]+/i, label: 'PacketLight', icon: 'mm-packetlight_packetlight' },
+  { match: /\beci\b|eci\s*telecom/i, label: 'ECI' },
+  { match: /pan\s*dacom|pandacom/i, label: 'Pan Dacom', icon: 'mm-pandacom_pandacom' },
+  { match: /tachyon|\btna\s*300|tna30x/i, label: 'Tachyon', icon: 'mm-tachyon_tachyon' },
+  { match: /\bxkl\b|dxmos|dqt400|dqm400/i, label: 'XKL', icon: 'mm-xkl_xkl' },
+  { match: /siklu|etherhaul|multihaul/i, label: 'Siklu', icon: 'mm-siklu_siklu' },
+  { match: /sub10|liberator/i, label: 'Sub10 Systems' },
+  { match: /4rf|aprisa/i, label: '4RF Aprisa', icon: 'mm-4rf_4rf' },
+  { match: /viavi|jdsu|acterna/i, label: 'Viavi', icon: 'mm-viavi_viavi' },
+  { match: /\bwisi\b|tangram/i, label: 'WISI' },
+  { match: /sycamore/i, label: 'Sycamore', icon: 'mm-sycamore_sycamore' },
+  { match: /deltanet|lambdatrail/i, label: 'DeltaNet' },
+  { match: /\bredline\b/i, label: 'Redline', icon: 'mm-redline_redline' },
+  { match: /bktel/i, label: 'BKTel' },
+  { match: /dragon\s*wave|dragonwave|airpair/i, label: 'DragonWave', icon: 'mm-dragonwave_dragonwave' },
+  { match: /ericsson/i, label: 'Ericsson', icon: 'mm-ericsson_ericsson' },
+  { match: /ekinops/i, label: 'Ekinops', icon: 'mm-ekinops_ekinops' },
+  { match: /alpine\s*opto|alpineoe/i, label: 'Alpine Optoelectronics' },
+  { match: /infinera|coriant|groove/i, label: 'Infinera', icon: 'mm-infinera_infinera' },
+  { match: /bridgewave|flexport|fe80/i, label: 'BridgeWave', icon: 'mm-bridgewave_bridgewave' },
+  { match: /huber\s*\+?\s*suhner|cubo\s*mini|cube\s*optics/i, label: 'Huber+Suhner Cubo', icon: 'mm-hubersuhner_hubersuhner' },
+  { match: /fibrolan|falcon(?!stor)/i, label: 'Fibrolan', icon: 'mm-fibrolan_fibrolan' },
+  { match: /fiber\s*road/i, label: 'FiberRoad' },
+  { match: /smartoptics/i, label: 'Smartoptics', icon: 'mm-smartoptics_smartoptics' },
+  { match: /racom|\bray\b/i, label: 'RACOM', icon: 'mm-racom_racom' },
+  { match: /\bbti\b|bti8\d\d/i, label: 'BTI' },
+  { match: /ifotec/i, label: 'Ifotec', icon: 'mm-ifotec_ifotec' },
+  { match: /\badva\b|snmp_adva|fsp\s*(150|3000)/i, label: 'ADVA', icon: 'mm-adva_adva' },
+  { match: /exalt|ex-i|exaltcom/i, label: 'Exalt', icon: 'mm-exalt_exalt' },
+  { match: /fibernet|xmux/i, label: 'Fibernet' },
+  { match: /bdcom/i, label: 'BDCOM', icon: 'mm-bdcom_bdcom' },
+  { match: /cambium/i, label: 'Cambium', icon: 'mm-cambium_cambium' },
+  { match: /exinda|gfi\s*exos/i, label: 'Exinda / GFI ExOS', icon: 'mm-exinda_exinda' },
+  { match: /bluecoat|blue\s*coat|symantec\s*edge|edge\s*swg|proxysg|broadcom\s*proxy/i, label: 'Blue Coat / Symantec Edge SWG / Broadcom ProxySG', icon: 'mm-bluecoat_bluecoat' },
+  { match: /proxim/i, label: 'Proxim', icon: 'mm-proxim_proxim' },
+  { match: /riverbed|steelhead/i, label: 'Riverbed SteelHead' }
+];
+
+// 失败降级:window undefined / __ENTERPRISE_BRANDS 缺失 → 返回 [],等价走纯 CE BRANDS。
+const getEnterpriseBrands = (): Array<{ match: RegExp; label: string; icon?: string }> => {
+  if (typeof window !== 'undefined' && Array.isArray(window.__ENTERPRISE_BRANDS)) {
+    return window.__ENTERPRISE_BRANDS;
+  }
+  return [];
+};
+
+const brandIconCache = new Map<string, string | undefined>();
+const brandLabelCache = new Map<string, string | undefined>();
+
+// 按插件名取品牌 logo 图标;命中 CE BRANDS 或运行时注入的 EE __ENTERPRISE_BRANDS 任一即返回。
+// 失败降级:都未命中 → undefined,调用方回退到监控对象 icon。
+export const getPluginBrandIcon = (pluginName = ''): string | undefined => {
+  if (brandIconCache.has(pluginName)) {
+    return brandIconCache.get(pluginName);
+  }
+  const all = [...BRANDS, ...getEnterpriseBrands()];
+  const icon = all.find((brand) => brand.match.test(pluginName))?.icon;
+  brandIconCache.set(pluginName, icon);
+  return icon;
+};
+
+// 按名称(实例名/插件名)取品牌标签,用于仪表盘头部标识;同 getPluginBrandIcon 拼接策略。
+export const getBrandLabel = (text = ''): string | undefined => {
+  if (brandLabelCache.has(text)) {
+    return brandLabelCache.get(text);
+  }
+  const all = [...BRANDS, ...getEnterpriseBrands()];
+  const label = all.find((brand) => brand.match.test(text))?.label;
+  brandLabelCache.set(text, label);
+  return label;
+};
+
+export const getRecentTimeRange = (timeValues: TimeValuesProps) => {
+  if (timeValues.originValue) {
+    const beginTime: number = dayjs()
+      .subtract(timeValues.originValue, 'minute')
+      .valueOf();
+    const lastTime: number = dayjs().valueOf();
+    return [beginTime, lastTime];
+  }
+  return timeValues.timeRange;
+};

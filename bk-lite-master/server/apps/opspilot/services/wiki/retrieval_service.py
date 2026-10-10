@@ -1,0 +1,1266 @@
+"""检索与问答(P3 核心)。
+
+MVP 检索:对知识页面(标题+正文)与资料摘要做关键词匹配 + 简单打分,跨 DB 可用;
+pgvector 语义检索为后期可选增强(P6),不在此处。
+问答:检索 Top-N 页面 → metis chain 带页面上下文作答 → 返回引用页面,可追溯到资料。
+"""
+
+import hashlib
+import json
+import math
+import re
+
+from django.core.cache import cache
+
+from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.metis.llm.chain.entity import BasicLLMRequest
+from apps.opspilot.metis.llm.common.llm_client_factory import LLMClientFactory
+from apps.opspilot.models import LLMModel, Material, PageVersion, WikiGenerationIndexEntry
+from apps.opspilot.services.llm_context_budget import working_budget_for_model
+from apps.opspilot.services.wiki.active_generation_query_service import (
+    assert_read_scope_current,
+    bind_read_scope,
+    directory_scope_ids,
+    page_queryset,
+    page_snapshot,
+)
+from apps.opspilot.services.wiki.embed_cache import embed_texts_cached
+from apps.opspilot.services.wiki.embedding_service import cosine, rrf_fuse
+from apps.opspilot.services.wiki.generation_navigation_service import BODY_INDEX_SEP, indexable_body_excerpt, split_index_search_text
+from apps.opspilot.services.wiki.title_service import title_identity_key
+from apps.opspilot.services.wiki.wiki_budget_service import estimate_tokens
+
+_BODY_TOKEN_WEIGHT = 1
+_MAX_BODY_TERM_HITS = 8
+_FIELD_TERM_CAP = 2
+_VECTOR_RELEVANT_RANK = 8
+_STRONG_SCORE_RATIO = 0.5
+_WEAK_SCORE_RATIO = 0.45
+
+
+def _has_cjk(text):
+    return any("一" <= ch <= "鿿" for ch in text)
+
+
+def _tokenize(query):
+    """分词:空白/标点切分;CJK 长词补充二元组(bigram),以适配中文无空格查询。"""
+    terms = set()
+    for tok in re.split(r"[\s,，。;；、:：!！?？]+", (query or "").strip().lower()):
+        tok = tok.strip()
+        if not tok:
+            continue
+        terms.add(tok)
+        if _has_cjk(tok) and len(tok) > 2:
+            for i in range(len(tok) - 1):
+                terms.add(tok[i : i + 2])
+    return [t for t in terms if t]
+
+
+def _score(text, terms):
+    """Coverage score: each term counts at most `_FIELD_TERM_CAP` times per field."""
+    text = (text or "").lower()
+    return sum(min(text.count(t), _FIELD_TERM_CAP) for t in terms if t)
+
+
+def _distinct_term_hits(text, terms):
+    text = (text or "").lower()
+    return sum(1 for term in terms if term and term in text)
+
+
+def _idf_weight(term, df, n_docs):
+    if n_docs <= 0:
+        return 1.0
+    return math.log((n_docs + 1) / ((df.get(term, 0) or 0) + 1)) + 1.0
+
+
+def _entry_document_blob(entry, excerpt=""):
+    return "\n".join(
+        [
+            entry.title or "",
+            " ".join(entry.aliases or []),
+            " ".join(entry.tags or []),
+            " ".join(entry.keywords or []),
+            " ".join(entry.headings or []),
+            " ".join(entry.entities or []),
+            entry.summary or "",
+            excerpt or "",
+        ]
+    ).lower()
+
+
+def _term_document_frequency(entries, terms, loaded_bodies):
+    n_docs = len(entries)
+    df = {term: 0 for term in terms if term}
+    if not df or n_docs <= 0:
+        return n_docs, df
+    for entry in entries:
+        blob = _entry_document_blob(entry, _body_excerpt_for_entry(entry, loaded_bodies))
+        for term in df:
+            if term in blob:
+                df[term] += 1
+    return n_docs, df
+
+
+def _weighted_field_hits(text, terms, df, n_docs, *, cap=_FIELD_TERM_CAP):
+    text = (text or "").lower()
+    total = 0.0
+    for term in terms:
+        if not term:
+            continue
+        count = text.count(term)
+        if not count:
+            continue
+        total += min(count, cap) * _idf_weight(term, df, n_docs)
+    return total
+
+
+def _weighted_distinct_hits(text, terms, df, n_docs, *, cap=_MAX_BODY_TERM_HITS):
+    text = (text or "").lower()
+    weights = [_idf_weight(term, df, n_docs) for term in terms if term and term in text]
+    weights.sort(reverse=True)
+    return sum(weights[:cap])
+
+
+def _matched_terms(terms, *texts):
+    text = "\n".join(texts or "").lower()
+    return [term for term in terms if term and term in text]
+
+
+def _keyword_explanation(score, terms, *texts):
+    return {
+        "matched_by": ["keyword"],
+        "keyword_score": score,
+        "matched_terms": _matched_terms(terms, *texts),
+    }
+
+
+_SNIPPET_SECTION_RE = re.compile(r"(?m)^(?:#{1,6}\s+\S.*|\d+\.\s+\S.*)$")
+_SNIPPET_MAX_ANCHORS_PER_TERM = 8
+_SNIPPET_ANCHOR_BUCKET = 48
+_SNIPPET_SECTION_LOOKBACK = 500
+
+
+def _snippet_term_weight(term):
+    """Longer query tokens are more specific than CJK bigrams."""
+
+    return max(len(term or ""), 1)
+
+
+def _snippet_window_score(lowered, start, end, terms):
+    window = lowered[start:end]
+    return sum(_snippet_term_weight(term) for term in terms if term and term.casefold() in window)
+
+
+def _snippet_candidate_anchors(lowered, terms):
+    """Collect anchor positions, preferring longer term hits over early bigrams."""
+
+    ranked_terms = sorted({term for term in terms if term}, key=len, reverse=True)
+    anchors = []
+    seen_buckets = set()
+    for term in ranked_terms:
+        needle = term.casefold()
+        count = 0
+        start_at = 0
+        while count < _SNIPPET_MAX_ANCHORS_PER_TERM:
+            idx = lowered.find(needle, start_at)
+            if idx < 0:
+                break
+            bucket = idx // _SNIPPET_ANCHOR_BUCKET
+            if bucket not in seen_buckets:
+                seen_buckets.add(bucket)
+                anchors.append(idx)
+            start_at = idx + max(len(needle), 1)
+            count += 1
+    return anchors
+
+
+def _snap_snippet_start(text, start, *, lookback=_SNIPPET_SECTION_LOOKBACK):
+    """Pull window start back to the nearest heading / numbered item when nearby."""
+
+    if start <= 0:
+        return 0
+    region_start = max(0, start - lookback)
+    region = text[region_start:start]
+    matches = list(_SNIPPET_SECTION_RE.finditer(region))
+    if not matches:
+        return start
+    return region_start + matches[-1].start()
+
+
+def _format_snippet_window(text, start, end):
+    prefix = "..." if start else ""
+    suffix = "..." if end < len(text) else ""
+    return f"{prefix}{text[start:end].strip()}{suffix}"
+
+
+def _dynamic_snippet(body, terms, *, radius=1000):
+    """Extract a retrieval excerpt around the densest query match window.
+
+    Prefer long-token / exact phrase anchors over the earliest CJK bigram (which often
+    sits in titles or metadata tables). Snap the window start to a nearby heading so
+    section context enters the QA prompt. Default window is ~2000 chars.
+    """
+    text = body or ""
+    if not text:
+        return ""
+    clean_terms = [term for term in terms if term]
+    if not clean_terms:
+        return text[: radius * 2].strip()
+
+    lowered = text.casefold()
+    anchors = _snippet_candidate_anchors(lowered, clean_terms)
+    if not anchors:
+        return text[: radius * 2].strip()
+
+    best = None
+    for position in anchors:
+        raw_start = max(0, position - radius)
+        end = min(len(text), position + radius)
+        start = _snap_snippet_start(text, raw_start)
+        if end - start > radius * 2:
+            start = max(0, end - radius * 2)
+            start = _snap_snippet_start(text, start)
+        score = _snippet_window_score(lowered, start, end, clean_terms)
+        # Prefer denser windows; on ties take the earlier one (stable / readable).
+        candidate = (score, -start, start, end)
+        if best is None or candidate > best:
+            best = candidate
+
+    _score, _neg_start, start, end = best
+    return _format_snippet_window(text, start, end)
+
+
+def _best_heading_path(headings, terms):
+    """Pick the heading that overlaps the most specific query terms."""
+
+    best = ""
+    best_score = 0
+    for heading in headings or []:
+        text = str(heading or "").strip()
+        if not text:
+            continue
+        lowered = text.casefold()
+        score = sum(_snippet_term_weight(term) for term in terms if term and term.casefold() in lowered)
+        if score > best_score:
+            best_score = score
+            best = text
+    return best
+
+
+_FALLBACK_PREFIX = "未使用模型生成回答（知识库未配置模型或模型调用失败）。" "以下为相关页面摘录，用于验证检索是否正常：\n\n"
+
+
+def _fallback_answer(contexts):
+    top = contexts[0]
+    images = [item for item in (top.get("images") or []) if item]
+    image_block = ""
+    if images:
+        image_block = "\n\n附图：\n" + "\n".join(images)
+    return f"{_FALLBACK_PREFIX}根据《{top['title']}》：\n{top['snippet']}{image_block}"
+
+
+def _body_excerpt_for_entry(entry, loaded_bodies=None):
+    _nav, stored = split_index_search_text(getattr(entry, "search_text", "") or "")
+    if stored:
+        return stored
+    if loaded_bodies:
+        return loaded_bodies.get(getattr(entry, "page_version_id", None), "") or ""
+    return ""
+
+
+def _load_missing_body_excerpts(entries):
+    missing_ids = [entry.page_version_id for entry in entries if BODY_INDEX_SEP not in (entry.search_text or "")]
+    if not missing_ids:
+        return {}
+    loaded = {}
+    for pk, body in PageVersion.objects.filter(pk__in=missing_ids).values_list("pk", "body").iterator(chunk_size=200):
+        loaded[pk] = indexable_body_excerpt(body)
+    return loaded
+
+
+def _index_score(entry, terms, query, *, body_excerpt="", idf=None, n_docs=0):
+    df = idf or {}
+    title = entry.title or ""
+    aliases = " ".join(entry.aliases or [])
+    tags = " ".join(entry.tags or [])
+    headings = " ".join(entry.headings or [])
+    keywords = " ".join(entry.keywords or [])
+    entities = " ".join(entry.entities or [])
+    summary = entry.summary or ""
+    normalized_query = title_identity_key(query)
+    exact = bool(normalized_query) and normalized_query in {
+        entry.normalized_title,
+        *(title_identity_key(alias) for alias in (entry.aliases or [])),
+    }
+    excerpt = body_excerpt or _body_excerpt_for_entry(entry)
+    score = (
+        _weighted_field_hits(title, terms, df, n_docs) * 12
+        + _weighted_field_hits(aliases, terms, df, n_docs) * 10
+        + _weighted_field_hits(tags, terms, df, n_docs) * 5
+        + _weighted_field_hits(keywords, terms, df, n_docs) * 5
+        + _weighted_field_hits(entities, terms, df, n_docs) * 4
+        + _weighted_field_hits(headings, terms, df, n_docs) * 3
+        + _weighted_field_hits(summary, terms, df, n_docs) * 2
+        + _weighted_field_hits(entry.page_type, terms, df, n_docs)
+        + _weighted_distinct_hits(excerpt, terms, df, n_docs) * _BODY_TOKEN_WEIGHT
+    )
+    if exact:
+        score += 100
+    return score, exact
+
+
+def _generation_search_cache_key(scope, query, directory_ids, top_k):
+    payload = json.dumps(
+        {
+            "query": str(query or ""),
+            "directory_ids": sorted(directory_ids) if directory_ids is not None else None,
+            "top_k": int(top_k),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return f"wiki:generation-index-search:v4:{scope.generation_id}:{digest}"
+
+
+def _generation_index_search(scope, terms, *, query, directory_ids, top_k):
+    cache_key = _generation_search_cache_key(
+        scope,
+        query,
+        directory_ids,
+        top_k,
+    )
+    cached = cache.get(cache_key)
+    if isinstance(cached, list):
+        return cached
+    queryset = WikiGenerationIndexEntry.objects.filter(
+        generation_id=scope.generation_id,
+    )
+    if directory_ids is not None:
+        queryset = queryset.filter(directory_id__in=directory_ids)
+    entries = list(queryset.order_by("page_id"))
+    loaded_bodies = _load_missing_body_excerpts(entries)
+    n_docs, df = _term_document_frequency(entries, terms, loaded_bodies)
+    ranked = []
+    for entry in entries:
+        score, exact = _index_score(
+            entry,
+            terms,
+            query,
+            body_excerpt=_body_excerpt_for_entry(entry, loaded_bodies),
+            idf=df,
+            n_docs=n_docs,
+        )
+        if score <= 0:
+            continue
+        ranked.append((score, exact, entry))
+    ranked.sort(key=lambda item: (-item[0], not item[1], item[2].normalized_title, item[2].page_id))
+    selected = ranked[:top_k]
+    top_score = selected[0][0] if selected else 0
+    second_score = selected[1][0] if len(selected) > 1 else 0
+    high_confidence = bool(selected) and (
+        selected[0][1] or (top_score > 0 and (len(selected) == 1 or top_score >= max(second_score * 1.8, second_score + 1e-6)))
+    )
+    versions = PageVersion.objects.in_bulk([entry.page_version_id for _score_value, _exact, entry in selected])
+    results = []
+    for score, exact, entry in selected:
+        page_version = versions.get(entry.page_version_id)
+        if page_version is None:
+            logger.warning(
+                "wiki generation index references a missing page version generation=%s entry=%s version=%s",
+                scope.generation_id,
+                entry.pk,
+                entry.page_version_id,
+            )
+            continue
+        results.append(
+            {
+                "kind": "page",
+                "id": entry.page_id,
+                "page_version_id": entry.page_version_id,
+                "title": entry.title,
+                "snippet": _dynamic_snippet(page_version.body, terms),
+                "score": score,
+                "generation_id": scope.generation_id,
+                "directory_id": entry.directory_id,
+                "directory_key": entry.directory_key,
+                "directory_breadcrumb": list(entry.directory_breadcrumb or []),
+                "heading_path": _best_heading_path(entry.headings, terms),
+                "route_confidence": "high" if high_confidence else "low",
+                "explanation": {
+                    **_keyword_explanation(score, terms, entry.search_text),
+                    "matched_by": ["generation_index"],
+                    "exact_title_or_alias": exact,
+                    "index_fingerprint": entry.content_fingerprint,
+                },
+            }
+        )
+    cache.set(cache_key, results, timeout=300)
+    return results
+
+
+def search(
+    knowledge_base,
+    query,
+    top_k=5,
+    *,
+    directory_id=None,
+    include_descendants=False,
+    read_scope=None,
+):
+    """Search compact generation Index first, loading bodies only for candidates."""
+
+    scope = read_scope or bind_read_scope(knowledge_base)
+    directory_ids = directory_scope_ids(
+        knowledge_base,
+        directory_id=directory_id,
+        include_descendants=include_descendants,
+        read_scope=scope,
+    )
+    terms = _tokenize(query)
+    if scope.generation_id is not None:
+        results = _generation_index_search(
+            scope,
+            terms,
+            query=query,
+            directory_ids=directory_ids,
+            top_k=top_k,
+        )
+        assert_read_scope_current(scope)
+        return results
+
+    results = []
+    pages = page_queryset(
+        knowledge_base,
+        statuses=("active",),
+        directory_ids=directory_ids,
+        read_scope=scope,
+    ).order_by("id")
+    for page in pages:
+        snapshot = page_snapshot(page, knowledge_base=knowledge_base)
+        body = snapshot.body
+        title = snapshot.title
+        score = _score(title, terms) * 5 + _score(body, terms)
+        if score > 0:
+            results.append(
+                {
+                    "kind": "page",
+                    "id": page.id,
+                    "page_version_id": snapshot.page_version_id,
+                    "title": title,
+                    "snippet": _dynamic_snippet(body, terms),
+                    "score": score,
+                    "generation_id": snapshot.generation_id,
+                    "directory_id": snapshot.directory_id,
+                    "directory_key": snapshot.directory_key,
+                    "directory_breadcrumb": list(snapshot.directory_breadcrumb),
+                    "heading_path": "",
+                    "route_confidence": "direct_fallback",
+                    "explanation": _keyword_explanation(score, terms, title, body),
+                }
+            )
+
+    if directory_ids is None:
+        for material in Material.objects.filter(knowledge_base=knowledge_base).exclude(ai_summary=""):
+            score = _score(material.ai_summary, terms) + _score(material.name, terms) * 2
+            if score > 0:
+                results.append(
+                    {
+                        "kind": "material_summary",
+                        "id": material.id,
+                        "title": material.name,
+                        "snippet": _dynamic_snippet(material.ai_summary, terms),
+                        "score": score,
+                        "generation_id": scope.generation_id,
+                        "directory_id": None,
+                        "directory_key": "",
+                        "directory_breadcrumb": [],
+                        "heading_path": "",
+                        "route_confidence": "direct_fallback",
+                        "explanation": _keyword_explanation(score, terms, material.name, material.ai_summary),
+                    }
+                )
+
+    results.sort(key=lambda result: result["score"], reverse=True)
+    results = results[:top_k]
+    assert_read_scope_current(scope)
+    return results
+
+
+def _hit_key(hit):
+    return f"{hit['kind']}:{hit['id']}"
+
+
+def _stored_vector_hits(
+    knowledge_base,
+    query,
+    top_k,
+    embed_fn=None,
+    *,
+    directory_id=None,
+    include_descendants=False,
+    read_scope=None,
+):
+    """Recall pages by cosine against stored summary embeddings. Query is embedded once."""
+    scope = read_scope or bind_read_scope(knowledge_base)
+    directory_ids = directory_scope_ids(
+        knowledge_base,
+        directory_id=directory_id,
+        include_descendants=include_descendants,
+        read_scope=scope,
+    )
+    pages = page_queryset(
+        knowledge_base,
+        statuses=("active",),
+        directory_ids=directory_ids,
+        read_scope=scope,
+    ).select_related("current_version")
+    indexed = []
+    for page in pages:
+        snapshot = page_snapshot(page, knowledge_base=knowledge_base)
+        version = snapshot.page_version
+        vec = getattr(version, "embedding", None) if version is not None else None
+        if not vec:
+            continue
+        indexed.append((page, snapshot, vec))
+    if not indexed:
+        assert_read_scope_current(scope)
+        return []
+    embed = embed_fn or (lambda texts: embed_texts_cached(texts, knowledge_base.embed_provider))
+    qvecs = embed([query])
+    if not qvecs or not qvecs[0]:
+        assert_read_scope_current(scope)
+        return []
+    qv = qvecs[0]
+    ranked = []
+    for page, snapshot, vec in indexed:
+        score = cosine(qv, vec)
+        if score <= 0:
+            continue
+        ranked.append((score, page, snapshot))
+    ranked.sort(key=lambda item: (-item[0], item[1].id))
+    results = []
+    for rank, (score, page, snapshot) in enumerate(ranked[:top_k], start=1):
+        body = snapshot.body or ""
+        results.append(
+            {
+                "kind": "page",
+                "id": page.id,
+                "page_version_id": snapshot.page_version_id,
+                "title": snapshot.title,
+                "snippet": body[:2000],
+                "score": score,
+                "generation_id": snapshot.generation_id,
+                "directory_id": snapshot.directory_id,
+                "directory_key": snapshot.directory_key,
+                "directory_breadcrumb": list(snapshot.directory_breadcrumb),
+                "heading_path": "",
+                "route_confidence": "vector",
+                "explanation": {
+                    "matched_by": ["vector"],
+                    "vector_score": score,
+                    "semantic_rank": rank,
+                },
+            }
+        )
+    assert_read_scope_current(scope)
+    return results
+
+
+def hybrid_search(
+    knowledge_base,
+    query,
+    top_k=5,
+    candidate_k=20,
+    embed_fn=None,
+    *,
+    directory_id=None,
+    include_descendants=False,
+    read_scope=None,
+):
+    """混合检索:关键词召回 ∪ 存量摘要向量召回 → RRF。无向量时回退关键词。
+
+    embed_fn(texts)->List[vector] 只用于查询向量;默认走知识库的 EmbedProvider。
+    """
+    kw_candidates = search(
+        knowledge_base,
+        query,
+        top_k=candidate_k,
+        directory_id=directory_id,
+        include_descendants=include_descendants,
+        read_scope=read_scope,
+    )
+    sem_candidates = _stored_vector_hits(
+        knowledge_base,
+        query,
+        candidate_k,
+        embed_fn=embed_fn,
+        directory_id=directory_id,
+        include_descendants=include_descendants,
+        read_scope=read_scope,
+    )
+    if not kw_candidates and not sem_candidates:
+        return []
+    if not sem_candidates:
+        return kw_candidates[:top_k]
+
+    by_key = {}
+    kw_rank = []
+    for candidate in kw_candidates:
+        key = _hit_key(candidate)
+        by_key[key] = dict(candidate)
+        kw_rank.append(key)
+    sem_rank = []
+    vector_score_by_key = {}
+    for candidate in sem_candidates:
+        key = _hit_key(candidate)
+        sem_rank.append(key)
+        vector_score_by_key[key] = candidate.get("score") or 0
+        if key not in by_key:
+            by_key[key] = dict(candidate)
+    rank_lists = [kw_rank, sem_rank] if kw_rank else [sem_rank]
+    fused = rrf_fuse(rank_lists, top_k=top_k)
+    keyword_ranks = {key: rank for rank, key in enumerate(kw_rank, start=1)}
+    semantic_ranks = {key: rank for rank, key in enumerate(sem_rank, start=1)}
+    kw_keys = set(kw_rank)
+    sem_keys = set(sem_rank)
+
+    results = []
+    for key in fused:
+        item = dict(by_key[key])
+        explanation = dict(item.get("explanation") or {})
+        matched_by = [item_name for item_name in (explanation.get("matched_by") or []) if item_name]
+        if key in kw_keys and "keyword" not in matched_by and "generation_index" not in matched_by:
+            matched_by.append("keyword")
+        if key in sem_keys and "vector" not in matched_by:
+            matched_by.append("vector")
+        explanation.update(
+            {
+                "matched_by": matched_by,
+                "keyword_rank": keyword_ranks.get(key),
+                "semantic_rank": semantic_ranks.get(key),
+                "vector_score": vector_score_by_key.get(key, explanation.get("vector_score") or 0),
+                "fusion": "rrf",
+            }
+        )
+        item["explanation"] = explanation
+        results.append(item)
+    return results
+
+
+def _qa_basic_llm_request(llm, prompt, *, max_output_tokens):
+    """Build a BasicLLMRequest with the same protocol/vendor wiring as wiki build."""
+    derived = working_budget_for_model(llm, scene_output_default=max_output_tokens)
+    vendor_type = ""
+    if getattr(llm, "vendor_id", None):
+        vendor_type = str(getattr(llm.vendor, "vendor_type", "") or "")
+    protocol_type = getattr(llm, "protocol_type", None) or "openai"
+    return BasicLLMRequest(
+        openai_api_base=llm.openai_api_base,
+        openai_api_key=llm.openai_api_key,
+        model=llm.model_name,
+        temperature=0.2,
+        max_output_tokens=derived.output_reserve_tokens,
+        user_message=prompt,
+        protocol_type=protocol_type,
+        vendor_type=vendor_type,
+        extra_config={
+            "input_working_tokens": derived.input_working_tokens,
+            "context_window_tokens": derived.window_tokens,
+        },
+    )
+
+
+def _answer_with_llm(query, contexts, llm_model_id, *, max_output_tokens):
+    if not llm_model_id:
+        return None
+    try:
+        llm = LLMModel.objects.select_related("vendor").get(id=llm_model_id)
+        # 上下文用 [n] 编号,与智能体对话路径 wiki_citations 的 [n] 引用一致,
+        # 让前端 WikiCitations.referenced 过滤逻辑(c.n != null ? [n] : title)直接命中。
+        # 否则 LLM 用 [引用: 标题] 时,前端按 title 模糊匹配容易因简化/缩写导致空列表。
+        prompt = _build_qa_prompt(query, contexts)
+        request = _qa_basic_llm_request(llm, prompt, max_output_tokens=max_output_tokens)
+        input_working = int((request.extra_config or {}).get("input_working_tokens") or 0)
+        if input_working and estimate_tokens(prompt) > input_working:
+            return None
+        answer = (
+            LLMClientFactory.invoke_isolated(
+                request,
+                [{"role": "user", "content": prompt}],
+            )
+            or ""
+        ).strip()
+        return {
+            "answer": answer,
+            "finish_reason": (request.extra_config or {}).get("_isolated_finish_reason") or "",
+            "output_truncated": bool((request.extra_config or {}).get("_isolated_output_truncated")),
+        }
+    except Exception:
+        logger.exception("wiki 问答 LLM 调用失败")
+        return None
+
+
+def _build_qa_context_block(index, hit):
+    """Build one numbered context block, including displayable image markdown."""
+
+    from apps.opspilot.services.wiki.parsed_media_service import rewrite_media_urls_for_display
+
+    snippet = rewrite_media_urls_for_display(hit.get("snippet") or "")
+    parts = [f"[{index}]\n# {hit.get('title') or ''}\n{snippet}"]
+    images = [item for item in (hit.get("images") or []) if item]
+    if images:
+        parts.append("附图（回答中请原样输出下列 Markdown 图片，前端可渲染；禁止改写为「无法展示」）：")
+        parts.extend(images)
+    return "\n".join(parts)
+
+
+def _build_qa_prompt(query, contexts):
+    ctx_text = "\n\n".join(_build_qa_context_block(i + 1, c) for i, c in enumerate(contexts))
+    return (
+        "你是企业知识库助手。只能依据下面提供的知识页面与资料摘要回答问题。\n"
+        "规则：\n"
+        "1. 优先使用知识页面;回答末尾用 [n] 标注引用(n 与上文 [n] 一致)。\n"
+        "2. 上下文中的「附图」是可直接展示的 Markdown 图片。当用户询问流程/流程图/步骤，"
+        "或附图与问题相关时，必须在回答正文中原样输出这些 `![...](...)` 行；"
+        "禁止改写为「无法展示」「无法直接展示」「图片形式存在」等说法；不要编造未出现的图。\n"
+        "3. 若上下文没有直接支撑问题结论的信息,必须明确回复："
+        "知识库中暂无相关资料,无法回答该问题。\n"
+        "4. 禁止借助常识补全、翻译、创作、编造制度条款或操作步骤;"
+        "禁止把仅共享个别关键词的无关文档当成依据。\n\n"
+        f"# 上下文\n{ctx_text}\n\n# 问题\n{query}\n"
+    )
+
+
+def _hit_relevance_score(hit):
+    try:
+        return float(hit.get("score") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _hit_matched_terms(hit):
+    explanation = hit.get("explanation") or {}
+    terms = explanation.get("matched_terms") or []
+    return [term for term in terms if term]
+
+
+def _hit_matched_by(hit):
+    matched_by = (hit.get("explanation") or {}).get("matched_by") or []
+    if isinstance(matched_by, str):
+        return [matched_by]
+    return [item for item in matched_by if item]
+
+
+def _is_graph_expansion(hit):
+    return "graph" in _hit_matched_by(hit)
+
+
+# Question/filler tokens that routinely produce keyword near-misses.
+_GENERIC_MATCH_TERMS = frozenset(
+    {
+        "知识",
+        "资料",
+        "相关",
+        "使用",
+        "如何",
+        "怎么",
+        "什么",
+        "哪些",
+        "为何",
+        "为什么",
+        "请问",
+        "介绍",
+        "说明",
+        "问题",
+        "查询",
+        "一下",
+        "the",
+        "a",
+        "an",
+        "of",
+        "to",
+        "in",
+        "for",
+        "and",
+        "or",
+        "is",
+        "are",
+        "what",
+        "how",
+        "why",
+        "which",
+        "please",
+    }
+)
+
+
+def _is_distinctive_term(term):
+    token = str(term or "").strip().lower()
+    if not token or token in _GENERIC_MATCH_TERMS:
+        return False
+    if _has_cjk(token):
+        return len(token) >= 2
+    return len(token) >= 3
+
+
+def _distinctive_matched_terms(hit):
+    return [term for term in _hit_matched_terms(hit) if _is_distinctive_term(term)]
+
+
+def _distinctive_terms_in_title(hit, terms):
+    title = (hit.get("title") or "").lower()
+    if not title:
+        return False
+    return any(str(term).lower() in title for term in terms)
+
+
+def _semantic_rank(hit):
+    rank = (hit.get("explanation") or {}).get("semantic_rank")
+    try:
+        return int(rank)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_vector_relevant(hit):
+    if "vector" not in _hit_matched_by(hit):
+        return False
+    rank = _semantic_rank(hit)
+    return rank is None or rank <= _VECTOR_RELEVANT_RANK
+
+
+def _is_relevant_hit(hit, *, top_score=None, min_strong_score=100, min_weak_score=60, min_weak_terms=2):
+    """Drop keyword near-misses that only share generic tokens (e.g. 知识).
+
+    Vector recall hits are kept by semantic rank, not keyword score.
+    Graph hops stay relevant here; `_filter_relevant_contexts` keeps those aligned
+    to a surviving seed.
+    """
+    if _is_graph_expansion(hit):
+        return True
+    if _is_vector_relevant(hit):
+        return True
+    if (hit.get("explanation") or {}).get("exact_title_or_alias"):
+        return True
+    score = _hit_relevance_score(hit)
+    if score >= min_strong_score:
+        return True
+    distinctive = _distinctive_matched_terms(hit)
+    if not distinctive:
+        return False
+    if _distinctive_terms_in_title(hit, distinctive):
+        return True
+    peak = top_score if top_score and top_score > 0 else None
+    strong_cut = peak * _STRONG_SCORE_RATIO if peak else min_strong_score
+    weak_cut = peak * _WEAK_SCORE_RATIO if peak else min_weak_score
+    if score >= strong_cut:
+        return True
+    needed = 1 if min_weak_terms else 0
+    return score >= weak_cut and len(distinctive) >= needed
+
+
+def _page_hit_id(hit):
+    if hit.get("kind") not in (None, "page"):
+        return None
+    return hit.get("id")
+
+
+def _graph_source_id(hit):
+    return (hit.get("explanation") or {}).get("graph_source_id")
+
+
+def _filter_relevant_contexts(contexts):
+    hits = list(contexts or [])
+    direct = [hit for hit in hits if not _is_graph_expansion(hit)]
+    top_score = max((_hit_relevance_score(hit) for hit in direct), default=0)
+    seeds = []
+    graph_hits = []
+    for hit in hits:
+        if _is_graph_expansion(hit):
+            graph_hits.append(hit)
+        elif _is_relevant_hit(hit, top_score=top_score):
+            seeds.append(hit)
+    kept_page_ids = {page_id for page_id in (_page_hit_id(hit) for hit in seeds) if page_id is not None}
+    aligned_graph = []
+    remaining = list(graph_hits)
+    progressed = True
+    while remaining and progressed:
+        progressed = False
+        still_pending = []
+        for hit in remaining:
+            if _graph_source_id(hit) in kept_page_ids:
+                aligned_graph.append(hit)
+                page_id = _page_hit_id(hit)
+                if page_id is not None:
+                    kept_page_ids.add(page_id)
+                progressed = True
+            else:
+                still_pending.append(hit)
+        remaining = still_pending
+    keep = {id(hit) for hit in seeds}
+    keep.update(id(hit) for hit in aligned_graph)
+    return [hit for hit in hits if id(hit) in keep]
+
+
+def _adapt_context_k(
+    hits,
+    *,
+    max_k=5,
+    strong_score=100.0,
+    gap_ratio=0.45,
+    weak_score=60.0,
+):
+    """Shrink filtered contexts before LLM, preserving retrieval order.
+
+    Direct / vector hits stay eligible even when cosine scores are not on the
+    keyword scale. Graph neighbors are only kept if they still remain after
+    the caller reserved slots for direct hits.
+    """
+    if not hits:
+        return []
+    ranked = list(hits)
+    try:
+        max_k = max(1, int(max_k or 1))
+    except (TypeError, ValueError):
+        max_k = 5
+
+    top = ranked[0]
+    top_score = _hit_relevance_score(top)
+    top_exact = bool((top.get("explanation") or {}).get("exact_title_or_alias"))
+    top_strong = top_exact or _is_vector_relevant(top) or top_score >= float(strong_score)
+    kept = [top]
+
+    for hit in ranked[1:]:
+        if len(kept) >= max_k:
+            break
+        score = _hit_relevance_score(hit)
+        exact = bool((hit.get("explanation") or {}).get("exact_title_or_alias"))
+        vector_keep = _is_vector_relevant(hit)
+        is_strong = exact or vector_keep or (top_score > 0 and score >= top_score * _STRONG_SCORE_RATIO) or score >= float(strong_score)
+        is_weak = (
+            (not exact)
+            and (not vector_keep)
+            and ((top_score > 0 and score < top_score * _WEAK_SCORE_RATIO) or (top_score <= 0 and score < float(weak_score)))
+        )
+        close = top_score > 0 and score >= top_score * float(gap_ratio)
+
+        if top_strong:
+            if len(kept) >= 2:
+                if top_score > 0 and score < top_score * float(gap_ratio) and not vector_keep:
+                    break
+                if top_exact and is_weak:
+                    break
+                if not (is_strong or close):
+                    break
+            else:
+                if top_score > 0 and score < top_score * float(gap_ratio) and not is_strong:
+                    break
+                if top_exact and is_weak:
+                    break
+
+        kept.append(hit)
+    return kept
+
+
+def default_retrieval_mode(knowledge_base, retrieval_mode=None):
+    mode = (retrieval_mode or "").strip().lower()
+    if mode in {"keyword", "hybrid"}:
+        return mode
+    if getattr(knowledge_base, "embed_provider_id", None):
+        return "hybrid"
+    return "keyword"
+
+
+def _qa_retrieval_mode(knowledge_base, retrieval_mode=None):
+    return default_retrieval_mode(knowledge_base, retrieval_mode)
+
+
+def _prepare_answer_context(
+    knowledge_base,
+    query,
+    llm_model_id=None,
+    top_k=5,
+    *,
+    directory_id=None,
+    include_descendants=False,
+    retrieval_mode=None,
+    embed_fn=None,
+):
+    from apps.opspilot.services.wiki.wiki_budget_service import WikiBudgetExceeded, load_wiki_budget_config
+    from apps.opspilot.services.wiki.wiki_context_service import build_context
+
+    config = load_wiki_budget_config()
+    context_result = build_context(
+        [knowledge_base.pk],
+        query,
+        top_k=top_k,
+        per_kb=top_k,
+        directory_id=directory_id,
+        include_descendants=include_descendants,
+        llm_model_id=llm_model_id,
+        retrieval_mode=_qa_retrieval_mode(knowledge_base, retrieval_mode),
+        embed_fn=embed_fn,
+    )
+    contexts = _adapt_context_k(_filter_relevant_contexts(context_result["hits"]), max_k=top_k)
+    # Keep citations aligned with surviving contexts when ids are present.
+    kept_ids = {(c.get("kind"), c.get("id")) for c in contexts}
+    citations = [cite for cite in (context_result.get("citations") or []) if (cite.get("kind"), cite.get("id")) in kept_ids or not kept_ids]
+    if not contexts:
+        return {
+            "empty": True,
+            "config": config,
+            "contexts": [],
+            "citations": [],
+            "context_result": context_result,
+        }
+    used_calls = int((context_result["budget"].get("llm_budget") or {}).get("used_calls") or 0)
+    if llm_model_id and used_calls >= config.qa_max_llm_calls:
+        raise WikiBudgetExceeded(
+            "wiki_llm_call_budget_exceeded",
+            "知识库问答 LLM 调用次数已达到上限",
+            details=context_result["budget"],
+        )
+    return {
+        "empty": False,
+        "config": config,
+        "contexts": contexts,
+        "citations": citations,
+        "context_result": context_result,
+    }
+
+
+def stream_answer(
+    knowledge_base,
+    query,
+    llm_model_id=None,
+    top_k=5,
+    *,
+    directory_id=None,
+    include_descendants=False,
+    retrieval_mode=None,
+    embed_fn=None,
+):
+    """Yield SSE-oriented events: status / meta / delta / done / error.
+
+    Emits an early ``status`` frame before retrieval finishes so clients and
+    proxies see the stream start immediately (retrieval + overview can take seconds).
+    """
+    # 先推一帧，避免检索/overview 阻塞期间客户端以为接口是一次性返回。
+    yield {"event": "status", "phase": "retrieving"}
+    prepared = _prepare_answer_context(
+        knowledge_base,
+        query,
+        llm_model_id=llm_model_id,
+        top_k=top_k,
+        directory_id=directory_id,
+        include_descendants=include_descendants,
+        retrieval_mode=retrieval_mode,
+        embed_fn=embed_fn,
+    )
+    if prepared["empty"]:
+        empty_answer = "知识库中暂无相关资料,无法回答该问题。"
+        yield {
+            "event": "meta",
+            "mode": "empty",
+            "citations": [],
+            "contexts": [],
+        }
+        yield {"event": "delta", "text": empty_answer}
+        yield {
+            "event": "done",
+            "answer": empty_answer,
+            "finish_reason": "",
+            "output_truncated": False,
+            "mode": "empty",
+        }
+        return
+
+    contexts = prepared["contexts"]
+    citations = prepared["citations"]
+    config = prepared["config"]
+
+    if not llm_model_id:
+        answer_text = _fallback_answer(contexts)
+        yield {
+            "event": "meta",
+            "mode": "fallback",
+            "citations": citations,
+            "contexts": contexts,
+            "warning_code": "wiki_answer_fallback",
+            "warning": "未使用模型生成回答，以下为检索到的页面摘录",
+        }
+        yield {"event": "delta", "text": answer_text}
+        yield {
+            "event": "done",
+            "answer": answer_text,
+            "finish_reason": "",
+            "output_truncated": False,
+            "mode": "fallback",
+            "warning_code": "wiki_answer_fallback",
+            "warning": "未使用模型生成回答，以下为检索到的页面摘录",
+        }
+        return
+
+    try:
+        llm = LLMModel.objects.select_related("vendor").get(id=llm_model_id)
+    except LLMModel.DoesNotExist:
+        answer_text = _fallback_answer(contexts)
+        yield {
+            "event": "meta",
+            "mode": "fallback",
+            "citations": citations,
+            "contexts": contexts,
+            "warning_code": "wiki_answer_fallback",
+            "warning": "未使用模型生成回答，以下为检索到的页面摘录",
+        }
+        yield {"event": "delta", "text": answer_text}
+        yield {
+            "event": "done",
+            "answer": answer_text,
+            "finish_reason": "",
+            "output_truncated": False,
+            "mode": "fallback",
+            "warning_code": "wiki_answer_fallback",
+            "warning": "未使用模型生成回答，以下为检索到的页面摘录",
+        }
+        return
+
+    prompt = _build_qa_prompt(query, contexts)
+    request = _qa_basic_llm_request(
+        llm,
+        prompt,
+        max_output_tokens=config.qa_max_output_tokens,
+    )
+    yield {
+        "event": "meta",
+        "mode": "llm",
+        "citations": citations,
+        "contexts": contexts,
+    }
+    yield {"event": "status", "phase": "generating"}
+    parts = []
+    try:
+        for chunk in LLMClientFactory.stream_isolated(
+            request,
+            [{"role": "user", "content": prompt}],
+        ):
+            if not chunk:
+                continue
+            parts.append(chunk)
+            yield {"event": "delta", "text": chunk}
+    except Exception as exc:
+        logger.exception("wiki 问答 LLM 流式调用失败")
+        if parts:
+            yield {
+                "event": "error",
+                "message": str(exc) or "wiki 问答 LLM 流式调用失败",
+            }
+            answer_text = "".join(parts).strip()
+            finish_reason = (request.extra_config or {}).get("_isolated_finish_reason") or ""
+            output_truncated = bool((request.extra_config or {}).get("_isolated_output_truncated"))
+            done = {
+                "event": "done",
+                "answer": answer_text,
+                "finish_reason": finish_reason,
+                "output_truncated": output_truncated,
+                "mode": "llm",
+            }
+            if output_truncated:
+                done["warning_code"] = "wiki_answer_output_truncated"
+                done["warning"] = "回答达到输出 token 上限，内容可能不完整"
+            yield done
+            return
+        answer_text = _fallback_answer(contexts)
+        yield {
+            "event": "error",
+            "message": str(exc) or "wiki 问答 LLM 流式调用失败",
+            "fallback": True,
+        }
+        yield {"event": "delta", "text": answer_text}
+        yield {
+            "event": "done",
+            "answer": answer_text,
+            "finish_reason": "",
+            "output_truncated": False,
+            "mode": "fallback",
+            "warning_code": "wiki_answer_fallback",
+            "warning": "未使用模型生成回答，以下为检索到的页面摘录",
+        }
+        return
+
+    answer_text = "".join(parts).strip()
+    finish_reason = (request.extra_config or {}).get("_isolated_finish_reason") or ""
+    output_truncated = bool((request.extra_config or {}).get("_isolated_output_truncated"))
+    done = {
+        "event": "done",
+        "answer": answer_text,
+        "finish_reason": finish_reason,
+        "output_truncated": output_truncated,
+        "mode": "llm",
+    }
+    if output_truncated:
+        done["warning_code"] = "wiki_answer_output_truncated"
+        done["warning"] = "回答达到输出 token 上限，内容可能不完整"
+    yield done
+
+
+def answer(
+    knowledge_base,
+    query,
+    llm_model_id=None,
+    top_k=5,
+    *,
+    directory_id=None,
+    include_descendants=False,
+    retrieval_mode=None,
+    embed_fn=None,
+):
+    """问答试用:复用 generation 查询预算后执行一次有界回答。"""
+    prepared = _prepare_answer_context(
+        knowledge_base,
+        query,
+        llm_model_id=llm_model_id,
+        top_k=top_k,
+        directory_id=directory_id,
+        include_descendants=include_descendants,
+        retrieval_mode=retrieval_mode,
+        embed_fn=embed_fn,
+    )
+    if prepared["empty"]:
+        return {"answer": "知识库中暂无相关资料,无法回答该问题。", "citations": [], "contexts": [], "mode": "empty"}
+
+    contexts = prepared["contexts"]
+    citations = prepared["citations"]
+    config = prepared["config"]
+    llm_result = _answer_with_llm(
+        query,
+        contexts,
+        llm_model_id,
+        max_output_tokens=config.qa_max_output_tokens,
+    )
+    mode = "llm"
+    if llm_result is None:
+        # 无模型/失败时的兜底:回显最相关页面摘要,保证可追溯
+        mode = "fallback"
+        llm_result = {
+            "answer": _fallback_answer(contexts),
+            "finish_reason": "",
+            "output_truncated": False,
+        }
+    result = {
+        "answer": llm_result["answer"],
+        "citations": citations,
+        "contexts": contexts,
+        "mode": mode,
+        "finish_reason": llm_result["finish_reason"],
+        "output_truncated": llm_result["output_truncated"],
+    }
+    if mode == "fallback":
+        result["warning_code"] = "wiki_answer_fallback"
+        result["warning"] = "未使用模型生成回答，以下为检索到的页面摘录"
+    elif llm_result["output_truncated"]:
+        result["warning_code"] = "wiki_answer_output_truncated"
+        result["warning"] = "回答达到输出 token 上限，内容可能不完整"
+    return result

@@ -1,0 +1,8 @@
+.attrLayout :global(.ant-card-body) {
+  padding: 16px !important;
+}
+
+.attrLayout :global(section) {
+  flex: 1 1 0%;
+  min-width: 0;
+}

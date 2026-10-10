@@ -1,0 +1,325 @@
+"""MonitorAlertViewSet / MonitorEventViewSet 视图规格测试。
+
+权限规则 RPC mock 为放行；S3 边界 stub；AlertLifecycleNotifier mock。
+"""
+
+import pytest
+
+from apps.monitor.models import MonitorAlert, MonitorAlertMetricSnapshot, MonitorEvent, MonitorEventRawData
+from apps.monitor.models.monitor_object import MonitorObject
+from apps.monitor.models.monitor_policy import MonitorPolicy, PolicyOrganization
+
+pytestmark = pytest.mark.django_db
+
+BASE = "/api/v1/monitor"
+
+
+@pytest.fixture
+def grant_all(db, mocker):
+    from apps.system_mgmt.models import Group
+
+    Group.objects.get_or_create(id=1, defaults={"name": "Default Team", "parent_id": 0})
+    # 两个 ViewSet 共享策略权限根。
+    mocker.patch(
+        "apps.monitor.views.monitor_alert.get_permissions_rules",
+        return_value={"data": {"all": {"team": [1]}}, "team": [1]},
+    )
+    mocker.patch(
+        "apps.core.utils.current_team_scope.SystemMgmt.get_authorized_groups_scoped",
+        return_value={"result": True, "data": [1]},
+    )
+
+
+@pytest.fixture
+def stub_s3(mocker):
+    mocker.patch(
+        "apps.core.fields.s3_json_field.S3JSONField._upload_to_s3",
+        return_value="2026/01/01/fake.json.gz",
+    )
+    mocker.patch(
+        "apps.core.fields.s3_json_field.S3JSONField._load_from_s3",
+        return_value=[],
+    )
+
+
+def _policy(**overrides):
+    obj = MonitorObject.objects.create(name="AlertViewObj", level="base")
+    values = {
+        "monitor_object": obj,
+        "name": "p",
+        "algorithm": "max",
+        "query_condition": {},
+        "source": {},
+        "group_by": [],
+    }
+    values.update(overrides)
+    policy = MonitorPolicy.objects.create(organizations=[1], **values)
+    PolicyOrganization.objects.create(policy=policy, organization=1)
+    return policy
+
+
+def _alert(policy, **kwargs):
+    kwargs.setdefault("organizations", [1])
+    return MonitorAlert.objects.create(policy_id=policy.id, **kwargs)
+
+
+class TestGetSnapshots:
+    def test_alert_not_found(self, api_client, grant_all):
+        api_client.cookies["current_team"] = "1"
+        resp = api_client.get(f"{BASE}/api/monitor_alert/snapshots/999999/")
+        assert resp.status_code == 404
+
+    def test_no_snapshot_returns_empty(self, api_client, grant_all):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy(
+            metric_unit="bytes",
+            calculation_unit="bytes",
+            threshold_unit="kibibytes",
+        )
+        alert = _alert(policy, monitor_instance_id="h1", status="new")
+        resp = api_client.get(f"{BASE}/api/monitor_alert/snapshots/{alert.id}/")
+        assert resp.status_code == 200
+        body = resp.json()["data"]
+        assert body["snapshots"] == []
+        assert body["chart_unit"] == "kibibytes"
+        assert body["alert_info"]["id"] == alert.id
+
+    def test_no_snapshot_legacy_policy_falls_back_to_calculation_unit(
+        self, api_client, grant_all
+    ):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy(
+            metric_unit="bytes",
+            calculation_unit="kibibytes",
+            threshold_unit="",
+        )
+        alert = MonitorAlert.objects.create(
+            policy_id=policy.id, organizations=[1], monitor_instance_id="h1", status="new"
+        )
+
+        resp = api_client.get(
+            f"{BASE}/api/monitor_alert/snapshots/{alert.id}/"
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["data"]["chart_unit"] == "kibibytes"
+
+    def test_converts_snapshot_copy_to_threshold_unit(
+        self, api_client, grant_all, mocker
+    ):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy(
+            metric_unit="bytes",
+            calculation_unit="bytes",
+            threshold_unit="kibibytes",
+        )
+        alert = MonitorAlert.objects.create(
+            policy_id=policy.id, organizations=[1], monitor_instance_id="h1", status="new"
+        )
+        source_snapshots = [
+            {
+                "type": "event",
+                "raw_data": {"values": [[1, "2048"], [2, None]]},
+            }
+        ]
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._load_from_s3",
+            return_value=source_snapshots,
+        )
+        MonitorAlertMetricSnapshot.objects.create(
+            alert=alert,
+            policy_id=policy.id,
+            monitor_instance_id="h1",
+        )
+
+        resp = api_client.get(
+            f"{BASE}/api/monitor_alert/snapshots/{alert.id}/"
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()["data"]
+        assert body["chart_unit"] == "kibibytes"
+        assert body["snapshots"][0]["raw_data"]["values"] == [
+            [1, "2.0"],
+            [2, None],
+        ]
+        assert source_snapshots[0]["raw_data"]["values"] == [
+            [1, "2048"],
+            [2, None],
+        ]
+
+    def test_returns_snapshot_data(self, api_client, grant_all, mocker):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy()
+        alert = _alert(policy, monitor_instance_id="h1", status="new")
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._load_from_s3",
+            return_value=[{"type": "info", "raw_data": {"v": 1}}],
+        )
+        MonitorAlertMetricSnapshot.objects.create(
+            alert=alert, policy_id=policy.id, monitor_instance_id="h1",
+        )
+        resp = api_client.get(f"{BASE}/api/monitor_alert/snapshots/{alert.id}/")
+        assert resp.status_code == 200
+        snaps = resp.json()["data"]["snapshots"]
+        assert snaps and snaps[0]["type"] == "info"
+
+    def test_percent_compare_uses_result_unit_as_chart_unit(
+        self, api_client, grant_all
+    ):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy(
+            metric_unit="bytes",
+            calculation_unit="bytes",
+            threshold_unit="kibibytes",
+            compare_mode="previous_window",
+            compare_value_kind="percent",
+        )
+        alert = _alert(policy, monitor_instance_id="h1", status="new")
+        resp = api_client.get(f"{BASE}/api/monitor_alert/snapshots/{alert.id}/")
+        assert resp.status_code == 200
+        assert resp.json()["data"]["chart_unit"] == "percent"
+
+
+class TestAlertUpdateClose:
+    def test_close_new_alert(self, api_client, grant_all, mocker, django_capture_on_commit_callbacks):
+        api_client.cookies["current_team"] = "1"
+        notifier = mocker.patch("apps.monitor.views.monitor_alert.AlertLifecycleNotifier")
+        policy = _policy()
+        alert = _alert(policy, monitor_instance_id="h1", status="new")
+        with django_capture_on_commit_callbacks(execute=True):
+            resp = api_client.patch(
+                f"{BASE}/api/monitor_alert/{alert.id}/",
+                {"status": "closed"}, format="json",
+            )
+        assert resp.status_code == 200
+        alert.refresh_from_db()
+        assert alert.status == "closed"
+        assert alert.operator == "testuser"
+        assert alert.operation_logs[-1]["action"] == "closed"
+        notifier.return_value.notify_alerts.assert_called_once()
+        closed_events = MonitorEvent.objects.filter(alert_id=alert.id, action=MonitorEvent.Action.CLOSED)
+        assert closed_events.count() == 1
+        assert MonitorAlertMetricSnapshot.objects.filter(alert_id=alert.id).count() == 0
+
+        resp = api_client.patch(
+            f"{BASE}/api/monitor_alert/{alert.id}/",
+            {"status": "closed"}, format="json",
+        )
+        assert resp.status_code == 200
+        assert MonitorEvent.objects.filter(alert_id=alert.id, action=MonitorEvent.Action.CLOSED).count() == 1
+        notifier.return_value.notify_alerts.assert_called_once()
+
+    def test_close_recovered_alert_does_not_create_closed_event(self, api_client, grant_all, mocker):
+        api_client.cookies["current_team"] = "1"
+        mocker.patch("apps.monitor.views.monitor_alert.AlertLifecycleNotifier")
+        policy = _policy()
+        alert = MonitorAlert.objects.create(
+            policy_id=policy.id, organizations=[1], monitor_instance_id="h1", status="recovered"
+        )
+        resp = api_client.patch(
+            f"{BASE}/api/monitor_alert/{alert.id}/",
+            {"status": "closed"}, format="json",
+        )
+        assert resp.status_code == 200
+        assert MonitorEvent.objects.filter(alert_id=alert.id, action=MonitorEvent.Action.CLOSED).count() == 0
+
+
+class TestAlertListNoticeUsersDisplay:
+    def test_list_enriches_notice_users_display(self, api_client, grant_all):
+        from apps.system_mgmt.models import User
+
+        api_client.cookies["current_team"] = "1"
+        user = User.objects.create(
+            username="notifier1",
+            display_name="通知人甲",
+            email="notifier1@example.com",
+            password="x",
+        )
+        policy = _policy(notice=True, notice_users=[user.id])
+        MonitorAlert.objects.create(
+            policy_id=policy.id, organizations=[1],
+            monitor_instance_id="h1",
+            status="new",
+            notice_users=[user.id],
+            content="memory high",
+        )
+
+        resp = api_client.get(
+            f"{BASE}/api/monitor_alert/",
+            {"status_in": "new", "page": 1, "page_size": 20},
+        )
+
+        assert resp.status_code == 200
+        results = resp.json()["data"]["results"]
+        assert results
+        assert results[0]["notice_users_display"] == ["通知人甲(notifier1)"]
+
+
+class TestGetEvents:
+    def test_alert_not_found(self, api_client, grant_all):
+        api_client.cookies["current_team"] = "1"
+        resp = api_client.get(f"{BASE}/api/monitor_event/query/999999/")
+        assert resp.status_code == 404
+
+    def test_returns_events(self, api_client, grant_all):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy()
+        alert = _alert(policy, monitor_instance_id="h1", status="new")
+        MonitorEvent.objects.create(
+            id="ev1", alert_id=alert.id, policy_id=policy.id,
+            monitor_instance_id="h1", level="critical", value=9.0, content="c",
+            action=MonitorEvent.Action.TRIGGERED,
+        )
+        resp = api_client.get(f"{BASE}/api/monitor_event/query/{alert.id}/")
+        assert resp.status_code == 200
+        body = resp.json()["data"]
+        assert body["count"] == 1
+        assert body["results"][0]["level"] == "critical"
+        assert body["results"][0]["action"] == MonitorEvent.Action.TRIGGERED
+
+    def test_returns_legacy_events_without_action(self, api_client, grant_all):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy()
+        alert = _alert(policy, monitor_instance_id="h1", status="new")
+        MonitorEvent.objects.create(
+            id="ev-legacy", alert_id=alert.id, policy_id=policy.id,
+            monitor_instance_id="h1", level="warning", value=3.0, content="old",
+        )
+        resp = api_client.get(f"{BASE}/api/monitor_event/query/{alert.id}/")
+        assert resp.status_code == 200
+        body = resp.json()["data"]
+        assert body["count"] == 1
+        assert body["results"][0]["action"] == ""
+
+
+class TestGetRawData:
+    def test_event_not_found(self, api_client, grant_all):
+        api_client.cookies["current_team"] = "1"
+        resp = api_client.get(f"{BASE}/api/monitor_event/raw_data/999999/")
+        assert resp.status_code == 404
+
+    def test_no_raw_data_returns_empty(self, api_client, grant_all):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy()
+        MonitorEvent.objects.create(
+            id="ev2", policy_id=policy.id, monitor_instance_id="h1", level="info", content="",
+        )
+        resp = api_client.get(f"{BASE}/api/monitor_event/raw_data/ev2/")
+        assert resp.status_code == 200
+        assert resp.json()["data"] == {}
+
+    def test_returns_raw_data(self, api_client, grant_all, stub_s3, mocker):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy()
+        event = MonitorEvent.objects.create(
+            id="ev3", policy_id=policy.id, monitor_instance_id="h1", level="info", content="",
+        )
+        MonitorEventRawData.objects.create(event=event, data={"v": 42})
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._load_from_s3",
+            return_value={"v": 42},
+        )
+        resp = api_client.get(f"{BASE}/api/monitor_event/raw_data/ev3/")
+        assert resp.status_code == 200
+        assert resp.json()["data"] == {"v": 42}

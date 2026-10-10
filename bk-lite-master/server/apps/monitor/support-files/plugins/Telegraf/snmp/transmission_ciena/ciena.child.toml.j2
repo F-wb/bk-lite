@@ -1,0 +1,117 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_ciena"
+        config_type = "ciena"
+        brand = "ciena"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+# @bk_include_ifmib_table
+    # ---- CES/SAOS 机箱 CPU：cienaCesChassisCPUHealthCurrMeasurement，每槽位 cpu-Usage，直接 0-100% ----
+    # OID 1.3.6.1.4.1.1271.2.1.5.1.2.1.4.5.1.4。按槽位走表 → device_cpu_usage。不绑定 6500 Packet-Optical。
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.1271.2.1.5.1.2.1.4.5.1.4"
+        name = "usage"
+    # ---- CES/SAOS 机箱内存：cienaCesChassisMemoryHealthCurrMeasurement，当前值单位 KB ----
+    # OID 1.3.6.1.4.1.1271.2.1.5.1.2.1.4.24.1.4。表内无已用/总量配对，不臆造内存使用率标量。
+    [[inputs.snmp.table]]
+        name = "device_memory"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.1271.2.1.5.1.2.1.4.24.1.4"
+        name = "used"
+    # ---- CES/SAOS 电源：cienaCesChassisPowerSupplyState（table.field 不带 .0，索引为电源槽位）----
+    # OID 1.3.6.1.4.1.1271.2.1.5.1.2.1.1.1.1.2：online(1)/faulted(2)/offline(3)/uninstalled(4)，下方 starlark 归一。
+    [[inputs.snmp.table]]
+        name = "device_psu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.1271.2.1.5.1.2.1.1.1.1.2"
+        name = "state"
+    # ---- CES/SAOS 风扇：cienaCesChassisFanStatus（table.field 不带 .0，索引为 风扇托盘.风扇）----
+    # OID 1.3.6.1.4.1.1271.2.1.5.1.2.1.2.1.1.3：ok(1)/pending(2)/rpm-warning(3)/uninstalled(4)/unknown(99)，下方 starlark 归一。
+    [[inputs.snmp.table]]
+        name = "device_fan"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.1271.2.1.5.1.2.1.2.1.1.3"
+        name = "state"
+    # ---- CES/SAOS 模块温度：cienaCesChassisModuleTempHealthCurrMeasurement（table.field 不带 .0，索引为 传感器.槽位）----
+    # OID 1.3.6.1.4.1.1271.2.1.5.1.2.1.4.13.1.4，Unsigned32，单位 ℃ → device_temperature_celsius。
+    [[inputs.snmp.table]]
+        name = "device_temperature"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.1271.2.1.5.1.2.1.4.13.1.4"
+        name = "celsius"
+# ---- 光模块光功率 / 激光偏置电流未纳入。----
+
+# ---- 电源状态归一：online(1)/uninstalled(4 空槽)→1(正常)保留行，faulted(2)/offline(3)→2(异常)；其它值丢弃。----
+[[processors.starlark]]
+    namepass = ["device_psu"]
+    source = '''
+def apply(metric):
+    state = metric.fields.get("state")
+    if state == 1 or state == 4:
+        metric.fields["state"] = 1
+    elif state == 2 or state == 3:
+        metric.fields["state"] = 2
+    else:
+        return None
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["ciena"]
+
+# ---- 风扇状态归一：ok(1)/uninstalled(4 空槽)→1(正常)保留行，rpm-warning(3)→2(异常)，unknown(99)→3(未知)；pending(2，统计未就绪)与其它值丢弃。----
+[[processors.starlark]]
+    namepass = ["device_fan"]
+    source = '''
+def apply(metric):
+    state = metric.fields.get("state")
+    if state == 1 or state == 4:
+        metric.fields["state"] = 1
+    elif state == 3:
+        metric.fields["state"] = 2
+    elif state == 99:
+        metric.fields["state"] = 3
+    else:
+        return None
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["ciena"]

@@ -1,0 +1,272 @@
+"""rpc.monitor 转发契约测试。
+
+覆盖 Monitor（permission/NATS 形态）与 MonitorOperationAnaRpc（OperationAnalysisRpc）
+两个客户端的方法名 + 参数转发契约。替换 self.client 为记录器，不触达真实 NATS。
+"""
+
+import pydantic.root_model  # noqa
+import pytest
+
+from apps.rpc.monitor import Monitor, MonitorOperationAnaRpc
+
+pytestmark = pytest.mark.unit
+
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def run(self, method_name, *args, **kwargs):
+        self.calls.append((method_name, args, kwargs))
+        return {"result": True}
+
+
+def _last(rec):
+    return rec.calls[-1]
+
+
+@pytest.fixture
+def monitor(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    m = Monitor(is_local_client=False)
+    m.client = _Recorder()
+    return m
+
+
+@pytest.fixture
+def ana_rpc():
+    rpc = MonitorOperationAnaRpc()
+    rpc.client = _Recorder()
+    return rpc
+
+
+def test_monitor_get_module_data(monitor):
+    monitor.get_module_data(module="cpu", page=1)
+    assert _last(monitor.client) == ("get_monitor_module_data", (), {"module": "cpu", "page": 1})
+
+
+def test_monitor_get_module_list(monitor):
+    monitor.get_module_list(module="cpu")
+    assert _last(monitor.client) == ("get_monitor_module_list", (), {"module": "cpu"})
+
+
+def test_monitor_ingest_from_source(monitor):
+    monitor.ingest_client = monitor.client
+    monitor.ingest_from_source(source_module="node_mgmt", allowed_org_ids=[1])
+    assert _last(monitor.client) == (
+        "monitor_ingest_from_source",
+        (),
+        {"params": {"source_module": "node_mgmt", "allowed_org_ids": [1]}},
+    )
+
+
+def test_monitor_list_cmdb_bind_candidates(monitor):
+    monitor.ingest_client = monitor.client
+    monitor.list_cmdb_bind_candidates(object_name="Host", query="web", allowed_org_ids=[1])
+    assert _last(monitor.client) == (
+        "monitor_list_cmdb_bind_candidates",
+        (),
+        {"params": {"object_name": "Host", "query": "web", "allowed_org_ids": [1]}},
+    )
+
+
+def test_monitor_bind_cmdb_id(monitor):
+    monitor.ingest_client = monitor.client
+    monitor.bind_cmdb_id(monitor_id="m-1", cmdb_id="ci-1", object_name="Host", allowed_org_ids=[1])
+    assert _last(monitor.client) == (
+        "monitor_bind_cmdb_id",
+        (),
+        {"params": {"monitor_id": "m-1", "cmdb_id": "ci-1", "object_name": "Host", "allowed_org_ids": [1]}},
+    )
+
+
+def test_monitor_clear_cmdb_id(monitor):
+    monitor.ingest_client = monitor.client
+    monitor.clear_cmdb_id(monitor_id="m-1", expected_cmdb_id="ci-1", allowed_org_ids=[1])
+    assert _last(monitor.client) == (
+        "monitor_clear_cmdb_id",
+        (),
+        {"params": {"monitor_id": "m-1", "expected_cmdb_id": "ci-1", "allowed_org_ids": [1]}},
+    )
+
+
+def test_monitor_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    m = Monitor(is_local_client=True)
+    assert m.client.path == "apps.monitor.nats.permission"
+    assert m.ingest_client.path == "apps.monitor.nats.monitor"
+
+
+def test_create_monitor_object_type(ana_rpc):
+    ana_rpc.create_monitor_object_type({"name": "t"}, user_info={"team": 1})
+    assert _last(ana_rpc.client) == (
+        "create_monitor_object_type",
+        (),
+        {"data": {"name": "t"}, "user_info": {"team": 1}},
+    )
+
+
+def test_create_monitor_object(ana_rpc):
+    ana_rpc.create_monitor_object({"x": 1})
+    assert _last(ana_rpc.client) == ("create_monitor_object", (), {"data": {"x": 1}})
+
+
+def test_create_monitor_plugin(ana_rpc):
+    ana_rpc.create_monitor_plugin({"p": 1})
+    assert _last(ana_rpc.client) == ("create_monitor_plugin", (), {"data": {"p": 1}})
+
+
+def test_create_metric_group(ana_rpc):
+    ana_rpc.create_metric_group({"g": 1})
+    assert _last(ana_rpc.client) == ("create_metric_group", (), {"data": {"g": 1}})
+
+
+def test_create_metric(ana_rpc):
+    ana_rpc.create_metric({"m": 1})
+    assert _last(ana_rpc.client) == ("create_metric", (), {"data": {"m": 1}})
+
+
+def test_create_monitor_policy(ana_rpc):
+    ana_rpc.create_monitor_policy({"pol": 1})
+    assert _last(ana_rpc.client) == ("create_monitor_policy", (), {"data": {"pol": 1}})
+
+
+def test_search_monitor_policies(ana_rpc):
+    ana_rpc.search_monitor_policies("demo-host-cpu-high", user_info={"team": 1})
+    assert _last(ana_rpc.client) == (
+        "search_monitor_policies",
+        (),
+        {"name": "demo-host-cpu-high", "user_info": {"team": 1}},
+    )
+
+
+def test_delete_monitor_policy(ana_rpc):
+    ana_rpc.delete_monitor_policy(9, user_info={"team": 1})
+    assert _last(ana_rpc.client) == (
+        "delete_monitor_policy",
+        (),
+        {"policy_id": 9, "user_info": {"team": 1}},
+    )
+
+
+def test_monitor_objects(ana_rpc):
+    ana_rpc.monitor_objects(user_info={"team": 2})
+    assert _last(ana_rpc.client) == ("monitor_objects", (), {"user_info": {"team": 2}})
+
+
+def test_monitor_object_instance_count(ana_rpc):
+    ana_rpc.monitor_object_instance_count()
+    assert _last(ana_rpc.client) == ("monitor_object_instance_count", (), {})
+
+
+def test_license_monitor_instance_count(ana_rpc):
+    ana_rpc.license_instance_count()
+    assert _last(ana_rpc.client) == ("license_monitor_instance_count", (), {})
+
+
+def test_monitor_metrics_具名monitor_obj_id(ana_rpc):
+    ana_rpc.monitor_metrics("obj1", extra=1)
+    assert _last(ana_rpc.client) == ("monitor_metrics", (), {"monitor_obj_id": "obj1", "extra": 1})
+
+
+def test_monitor_object_instances(ana_rpc):
+    ana_rpc.monitor_object_instances("obj2", user_info={"team": 1})
+    assert _last(ana_rpc.client) == (
+        "monitor_object_instances",
+        (),
+        {"monitor_obj_id": "obj2", "user_info": {"team": 1}},
+    )
+
+
+def test_monitor_instance_metrics(ana_rpc):
+    qd = {"monitor_obj_id": "o", "instance_id": "i"}
+    ana_rpc.monitor_instance_metrics(qd)
+    assert _last(ana_rpc.client) == ("monitor_instance_metrics", (), {"query_data": qd})
+
+
+def test_query_monitor_data_by_metric(ana_rpc):
+    qd = {"metric": "cpu"}
+    ana_rpc.query_monitor_data_by_metric(qd)
+    assert _last(ana_rpc.client) == ("query_monitor_data_by_metric", (), {"query_data": qd})
+
+
+def test_query_monitor_alert_segments(ana_rpc):
+    qd = {"monitor_obj_id": "o"}
+    ana_rpc.query_monitor_alert_segments(qd)
+    assert _last(ana_rpc.client) == ("query_monitor_alert_segments", (), {"query_data": qd})
+
+
+def test_query_latest_active_alerts(ana_rpc):
+    qd = {"limit": 5}
+    ana_rpc.query_latest_active_alerts(qd)
+    assert _last(ana_rpc.client) == ("query_latest_active_alerts", (), {"query_data": qd})
+
+
+def test_query_latest_interface_metrics(ana_rpc):
+    ana_rpc.query_latest_interface_metrics(["mon-1", "mon-2"])
+    assert _last(ana_rpc.client) == (
+        "query_latest_interface_metrics",
+        (),
+        {"instance_ids": ["mon-1", "mon-2"]},
+    )
+
+
+def test_get_host_instance_list(ana_rpc):
+    ana_rpc.get_host_instance_list(user_info={"team": 1})
+    assert _last(ana_rpc.client) == ("get_host_instance_list", (), {"user_info": {"team": 1}})
+
+
+def test_get_host_metric_range(ana_rpc):
+    ana_rpc.get_host_metric_range(instance_ids=["host-a"], metric_type="cpu")
+    assert _last(ana_rpc.client) == (
+        "get_host_metric_range",
+        (),
+        {"instance_ids": ["host-a"], "metric_type": "cpu"},
+    )
+
+
+def test_get_host_resource_snapshot(ana_rpc):
+    ana_rpc.get_host_resource_snapshot(instance_ids=["host-a"])
+    assert _last(ana_rpc.client) == ("get_host_resource_snapshot", (), {"instance_ids": ["host-a"]})
+
+
+def test_get_host_resource_top(ana_rpc):
+    ana_rpc.get_host_resource_top("cpu", instance_ids=["host-a"])
+    assert _last(ana_rpc.client) == (
+        "get_host_resource_top",
+        (),
+        {"metric_type": "cpu", "instance_ids": ["host-a"]},
+    )
+
+
+def test_get_monitor_instance_list(ana_rpc):
+    ana_rpc.get_monitor_instance_list(user_info={"team": 1}, protocol="netflow")
+    assert _last(ana_rpc.client) == (
+        "get_monitor_instance_list",
+        (),
+        {"user_info": {"team": 1}, "protocol": "netflow"},
+    )
+
+
+def test_query_metric_series(ana_rpc):
+    ana_rpc.query_metric_series(metric="device_flow_bytes_rate", mode="range", instance_ids=["sw-1"])
+    assert _last(ana_rpc.client) == (
+        "query_metric_series",
+        (),
+        {"metric": "device_flow_bytes_rate", "mode": "range", "instance_ids": ["sw-1"]},
+    )
+
+
+def test_get_zombie_host_report(ana_rpc):
+    ana_rpc.get_zombie_host_report(inst_uuids=["u1"], time=10080)
+    assert _last(ana_rpc.client) == (
+        "get_zombie_host_report",
+        (),
+        {"inst_uuids": ["u1"], "time": 10080},
+    )
+
+
+def test_monitor_operation_ana_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "1")
+    rpc = MonitorOperationAnaRpc()
+    assert rpc.client.path == "apps.monitor.nats.monitor"

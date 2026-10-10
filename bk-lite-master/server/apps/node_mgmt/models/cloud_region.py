@@ -1,0 +1,62 @@
+from django.db import models
+from apps.core.models.maintainer_info import MaintainerInfo
+from apps.core.models.time_info import TimeInfo
+from apps.node_mgmt.constants.database import CloudRegionConstants
+
+
+class CloudRegion(TimeInfo, MaintainerInfo):
+    name = models.CharField(unique=True, max_length=100, verbose_name="云区域名称")
+    introduction = models.TextField(blank=True, verbose_name="云区域介绍")
+    proxy_address = models.CharField(max_length=255, blank=True, default="", verbose_name="代理地址")
+    pending_proxy_address = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        default=None,
+        verbose_name="待生效代理地址",
+    )
+    pending_proxy_address_created_at = models.DateTimeField(
+        blank=True,
+        null=True,
+        verbose_name="代理地址变更发起时间",
+    )
+
+    @property
+    def is_default(self) -> bool:
+        return (
+            self.id == CloudRegionConstants.DEFAULT_CLOUD_REGION_ID
+            or self.name == CloudRegionConstants.DEFAULT_CLOUD_REGION_NAME
+        )
+
+    class Meta:
+        verbose_name = "云区域"
+        verbose_name_plural = "云区域"
+
+
+class SidecarEnv(models.Model):
+    key = models.CharField(max_length=100)
+    value = models.TextField(default="", verbose_name="变量内容")
+    type = models.CharField(max_length=20, default="")
+    description = models.TextField(blank=True, verbose_name="描述")
+    cloud_region = models.ForeignKey(CloudRegion, default=1, on_delete=models.CASCADE, verbose_name="云区域")
+    is_pre = models.BooleanField(default=False, verbose_name="是否预置变量")
+
+    class Meta:
+        verbose_name = "Sidecar环境变量"
+        verbose_name_plural = "Sidecar环境变量"
+        unique_together = ('key', 'cloud_region')
+
+
+class CloudRegionService(models.Model):
+    cloud_region = models.ForeignKey(CloudRegion, on_delete=models.CASCADE, verbose_name="云区域")
+    name = models.CharField(max_length=100, verbose_name="服务名称")
+    deployed_status = models.SmallIntegerField(default=0, verbose_name="部署状态")
+    deployed_message = models.TextField(blank=True, verbose_name="部署信息")
+    status = models.CharField(max_length=50, verbose_name="服务状态")
+    message = models.TextField(blank=True, verbose_name="服务信息")
+    description = models.TextField(blank=True, verbose_name="服务描述")
+
+    class Meta:
+        verbose_name = "云区域服务"
+        verbose_name_plural = "云区域服务"
+        unique_together = ('cloud_region', 'name')

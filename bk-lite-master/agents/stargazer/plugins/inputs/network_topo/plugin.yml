@@ -1,0 +1,24 @@
+name: network_topo
+version: 2.1.0
+category: network
+metadata:
+  display_name: SNMP 网络设备拓扑
+  description: SNMP 网络设备拓扑采集插件，支持 LLDP、华为 NDP、CDP、FDB 和 ARP
+  author: WeOps
+  tags:
+  - network
+  - network
+  cloud_protocol: false
+  model_id: network_topo
+executors:
+  protocol:
+    type: protocol
+    execution_mode: async
+    capacity_group: network_topology
+    collector:
+      module: plugins.inputs.network_topo.snmp_topo
+      class: SnmpTopo
+    target_policy:
+      mode: snmp
+      port: 161
+default_executor: protocol

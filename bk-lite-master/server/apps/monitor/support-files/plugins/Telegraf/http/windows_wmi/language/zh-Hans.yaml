@@ -1,0 +1,93 @@
+Windows WMI:
+  desc: 通过 Stargazer 的 WMI/DCOM 远程采集 Windows 主机 CPU、内存、磁盘和网络指标。
+  name: Windows 主机采集（WMI）
+monitor_object:
+  Host: 主机
+monitor_object_type:
+  OS: 操作系统
+monitor_object_metric:
+  Host:
+    cpu_usage_total:
+      name: CPU使用率
+      desc: 反映主机整体 CPU 的使用情况，表示非空闲时间在总 CPU 时间中的占比，用于衡量系统的整体计算压力。持续高位通常意味着 CPU 资源成为系统瓶颈。
+    system_uptime:
+      name: 系统运行时长
+      desc: 表示主机自上次启动以来的持续运行时间（秒），用于观察主机稳定性和识别异常重启。
+    diskio_io_util:
+      name: 磁盘IO使用率
+      desc: 表示磁盘设备处于忙碌状态的时间占比，用于衡量磁盘 I/O 资源的整体利用情况。持续高位通常意味着磁盘 I/O 成为性能瓶颈。
+    disk_read_latency:
+      name: 磁盘读出延迟
+      desc: 表示单次磁盘读取操作的平均耗时（毫秒），来自 AvgDiskSecPerRead。
+    disk_write_latency:
+      name: 磁盘写入延迟
+      desc: 表示单次磁盘写入操作的平均耗时（毫秒），来自 AvgDiskSecPerWrite。
+    diskio_writes_rate:
+      name: 磁盘写入IOPS
+      desc: 表示磁盘每秒完成的写入操作次数，用于衡量写入请求的并发强度和 I/O 压力。
+    diskio_write_bytes_rate:
+      name: 磁盘写入速率
+      desc: 表示磁盘单位时间内写入的数据量，用于评估磁盘写入吞吐能力。
+    diskio_reads_rate:
+      name: 磁盘读出IOPS
+      desc: 表示磁盘每秒完成的读取操作次数，用于衡量读请求的并发程度和 I/O 压力。
+    diskio_read_bytes_rate:
+      name: 磁盘读出速率
+      desc: 表示磁盘单位时间内读取的数据量，用于评估磁盘读取吞吐能力。
+    disk_total:
+      name: 磁盘总空间
+      desc: 表示磁盘或文件系统的总容量，用于容量规划与资源管理。
+    disk_free:
+      name: 磁盘剩余空间
+      desc: 表示磁盘或文件系统当前可用的剩余容量，用于监控磁盘空间风险。
+    disk_used_percent:
+      name: 磁盘使用率
+      desc: 表示磁盘已使用空间占总容量的比例，是磁盘容量监控的核心指标。
+    processes_running:
+      name: 进程总数
+      desc: Windows 进程表中的进程总数量，不是 Linux 运行队列长度。
+    mem_total:
+      name: 内存总量
+      desc: 表示系统可使用的物理内存总容量，是内存资源评估的基础指标。
+    mem_available:
+      name: 可用内存
+      desc: 表示系统在不触发明显性能下降的情况下，可分配给应用使用的内存容量。
+    mem_used_percent:
+      name: 内存使用率
+      desc: 表示已使用内存占总内存的比例，用于评估系统的内存压力水平。
+    net_packets_recv_rate:
+      name: 网络接收包速率
+      desc: 表示网络接口单位时间内接收的数据包数量，用于衡量网络包级流量情况。
+    net_packets_sent_rate:
+      name: 网络发送包速率
+      desc: 表示网络接口单位时间内发送的数据包数量。
+    net_bytes_recv_rate:
+      name: 网络接收吞吐速率
+      desc: 表示网络接口单位时间内接收的数据量，用于评估网络接收带宽使用情况。
+    net_bytes_sent_rate:
+      name: 网络发送吞吐速率
+      desc: 表示网络接口单位时间内发送的数据量，用于评估网络发送带宽使用情况。
+    net_err_in_rate:
+      name: 网络接收错误包速率
+      desc: 表示网络接口单位时间内接收到的错误数据包数量，用于监控网络质量。
+    net_err_out_rate:
+      name: 网络发送错误包速率
+      desc: 表示网络接口单位时间内发送失败的错误数据包数量。
+    net_drop_in_rate:
+      name: 网络接收丢包速率
+      desc: 表示网络接口单位时间内被丢弃的接收数据包数量，用于评估网络拥塞或异常情况。
+    net_drop_out_rate:
+      name: 网络发送丢包速率
+      desc: 表示网络接口单位时间内被丢弃的发送数据包数量。
+monitor_object_metric_group:
+  Host:
+    CPU: CPU
+    System: 系统
+    Disk IO: 磁盘 IO
+    Disk: 磁盘
+    Process: 进程
+    Processes: 进程
+    Memory: 内存
+    Net: 网络
+    Network: 网络
+    Nvidia GPU: Nvidia GPU

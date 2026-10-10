@@ -1,0 +1,167 @@
+{
+  "client_id": "alarm",
+  "name": "Alarm",
+  "url": "/alarm/incidents",
+  "description": "app.alarm",
+  "tags": [
+    "tag.unified_alarm",
+    "tag.smart_noise_reduction",
+    "tag.incident_escalation",
+    "tag.auto_dispatch"
+  ],
+  "menus": [
+    {
+      "name": "Incidents",
+      "children": [
+        {
+          "id": "Incidents",
+          "name": "Incidents",
+          "operation": [
+            "View",
+            "Edit",
+            "Delete"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Alarms",
+      "children": [
+        {
+          "id": "Alarms",
+          "name": "Alarms",
+          "operation": [
+            "View",
+            "Edit",
+            "Delete"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Integration",
+      "children": [
+        {
+          "id": "Integration",
+          "name": "Integration",
+          "operation": [
+            "View",
+            "Detail"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Settings",
+      "children": [
+        {
+          "id": "correlation_rules",
+          "name": "Correlation Rules",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "alert_assign",
+          "name": "Alert Assign",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "notification_templates",
+          "name": "Notification Templates",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete",
+            "Test"
+          ]
+        },
+        {
+          "id": "shield_strategy",
+          "name": "Shield Strategy",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "alert_enrichment",
+          "name": "Alert Enrichment",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "global_config",
+          "name": "Global Config",
+          "operation": [
+            "View",
+            "Edit"
+          ]
+        },
+        {
+          "id": "operation_log",
+          "name": "Operation Log",
+          "operation": [
+            "View"
+          ]
+        },
+        {
+          "id": "action_rules",
+          "name": "Alert Actions",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "action_records",
+          "name": "Action Records",
+          "operation": [
+            "View"
+          ]
+        }
+      ]
+    }
+  ],
+  "icon": "alarm",
+  "roles": [
+    {
+      "name": "admin",
+      "role_name": "alarm_admin",
+      "menus": []
+    },
+    {
+      "name": "normal",
+      "role_name": "alarm_normal",
+      "menus": [
+        "Incidents-View",
+        "Integration-View",
+        "Alarms-View",
+        "correlation_rules-View",
+        "alert_assign-View",
+        "notification_templates-View",
+        "shield_strategy-View",
+        "alert_enrichment-View",
+        "action_rules-View",
+        "action_records-View"
+      ]
+    }
+  ]
+}

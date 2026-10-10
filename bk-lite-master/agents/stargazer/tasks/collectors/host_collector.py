@@ -1,0 +1,753 @@
+# -- coding: utf-8 --
+import asyncio
+import importlib
+import json
+import logging
+import re
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+from urllib.parse import unquote
+
+from core.logger import safe_log_value
+
+from .base_collector import BaseCollector
+from .disk_filter import should_collect_disk
+
+logger = logging.getLogger("stargazer.host_collector")
+
+ANSIBLE_FAILURE_TEXT_MAX_CHARS = 200
+ANSIBLE_ADHOC_FAILED_LOG_TEMPLATE = (
+    "[Host Collector] event=ansible_adhoc_failed host=%s error=%s "
+    "host_status=%s exit_code=%s stderr=%s stderr_missing=%s "
+    "failed_stage=callback_process error_type=%s"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(r"(?i)\b(password|passwd|secret|token|authorization|passphrase|" r"private_key(?:_content)?)\s*[:=]\s*\S+")
+_PEM_BLOCK_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_AUTH_FAILURE_MARKERS = (
+    "permission denied",
+    "authentication",
+    "auth fail",
+    "invalid user",
+    "sshpass",
+)
+_UNREACHABLE_MARKERS = (
+    "unreachable",
+    "connection timed out",
+    "connection refused",
+    "no route to host",
+    "name or service not known",
+)
+
+
+def encode_ansible_raw_module_args(command: str) -> str:
+    """把 raw 命令编码成 Ansible adhoc `-a` 可安全解析的 JSON。
+
+    AdHocCLI 对非 JSON 的 `-a` 会走 ``parse_kv`` / ``split_args``。AIX ksh
+    heredoc 和脚本正文里的引号会触发
+    ``failed at splitting arguments, either an unbalanced jinja2 block or quotes``
+    （进程退出码 4），SSH 根本不会发生。JSON ``{"_raw_params": "..."}`` 走
+    ``from_yaml(..., json_only=True)``，跳过引号拆分。
+    """
+    return json.dumps({"_raw_params": command}, ensure_ascii=False)
+
+
+def _url_decode_secret(value: Any, credential_encoding: Any = "url") -> str:
+    """还原前端对 encrypted 字段做的 encodeURIComponent。
+
+    Web 端在提交时对标记为 encrypted 的字段（密码、SSH 私钥、passphrase）统一做了
+    encodeURIComponent。这些值对于"拼进 URL"的插件是正确的，但主机远程采集是把它们
+    直接当作 SSH/WinRM 凭据使用，必须先解码还原，否则像 ``CW@roger1117!@#`` 会以
+    ``CW%40roger1117!%40%23`` 的形式送达，导致认证失败。
+
+    解码是 encodeURIComponent 的逆运算，且 round-trip 安全：原文里的 ``%`` 会被前端
+    编码成 ``%25``，因此 unquote 不会误伤含字面 ``%`` 的口令。
+    """
+    if not value:
+        return value
+    if str(credential_encoding or "url").strip().lower() in {"plain", "raw", "none"}:
+        return str(value)
+    return unquote(str(value))
+
+
+SCRIPTS_DIR = Path(__file__).parent / "scripts"
+MONITOR_SCRIPTS_DIR = Path(__file__).parent / "monitor_scripts"
+
+VALID_MODULES = {"cpu", "mem", "disk", "net", "diskio", "processes", "system"}
+HOST_REMOTE_CALLBACK_REQUEST_TIMEOUT = 60
+LINUX_SCRIPT_WRAPPER_EOF = "STARGAZER_HOST_COLLECT_EOF"
+LINUX_SCRIPT_WRAPPER_PREFIX = "LC_ALL=C LANG=C bash --noprofile --norc"
+# 与 Host AIX/FreeBSD/HP-UX/Solaris Remote 看板、display_fields、collectTypes 取并集。
+# 采集模块按 OS 延迟导入；本 PR 不携带其它 Remote 插件树，模块存在时即可调度。
+HOST_REMOTE_OS_TYPES = frozenset({"aix", "freebsd", "hpux", "solaris"})
+SUPPORTED_OS_TYPES = {"linux", "windows", *HOST_REMOTE_OS_TYPES}
+SSH_OS_TYPES = frozenset({"linux", *HOST_REMOTE_OS_TYPES})
+DEBUG_SCRAPE_OS_TYPES = frozenset({"freebsd", "hpux", "solaris"})
+# module, wrap_attr, parse_attr — 名称对齐各 Remote 采集模块导出。
+_REMOTE_OS_MONITOR_SPECS: Dict[str, Tuple[str, str, str]] = {
+    "aix": ("aix_os_monitor", "wrap_ksh_collect", "parse_aix_metrics_to_prometheus"),
+    "freebsd": ("freebsd_os_monitor", "wrap_sh_collect", "parse_freebsd_metrics_to_prometheus"),
+    "hpux": ("hpux_os_monitor", "wrap_ksh_collect", "parse_hpux_metrics_to_prometheus"),
+    "solaris": ("solaris_os_monitor", "wrap_ksh_collect", "parse_solaris_metrics_to_prometheus"),
+}
+
+
+def _load_remote_os_monitor(os_type: str):
+    spec = _REMOTE_OS_MONITOR_SPECS[os_type]
+    try:
+        return importlib.import_module(f"{__package__ or 'tasks.collectors'}.{spec[0]}")
+    except ImportError as exc:
+        raise ValueError(f"unsupported os_type: {os_type}") from exc
+
+
+def sanitize_ansible_failure_text(value: Any, *, max_length: int = ANSIBLE_FAILURE_TEXT_MAX_CHARS) -> str:
+    text = _PEM_BLOCK_RE.sub("[omitted]", str(value or ""))
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1=[omitted]", text)
+    return safe_log_value(text, max_length=max_length)
+
+
+def _lookup_host_result(result: Dict[str, Any], host: str) -> Dict[str, Any]:
+    task_result = result.get("result")
+    expected_host = str(host or "").strip()
+    if isinstance(task_result, list):
+        for item in task_result:
+            if isinstance(item, dict) and str(item.get("host") or "") == expected_host:
+                return item
+        for item in task_result:
+            if isinstance(item, dict):
+                return item
+    if isinstance(task_result, dict):
+        hosts_result = task_result.get("contacted", task_result)
+        if isinstance(hosts_result, dict):
+            host_data = hosts_result.get(expected_host)
+            if isinstance(host_data, dict):
+                return host_data
+            for item in hosts_result.values():
+                if isinstance(item, dict):
+                    return item
+    return {}
+
+
+def extract_ansible_failure_summary(result: Dict[str, Any], host: str) -> Dict[str, Any]:
+    payload = result if isinstance(result, dict) else {}
+    error = payload.get("error") or payload.get("message") or "Ansible adhoc failed"
+    host_result = _lookup_host_result(payload, host)
+    summary_meta = payload.get("result_summary")
+    if not isinstance(summary_meta, dict):
+        summary_meta = {}
+    raw_status = str(host_result.get("raw_status") or summary_meta.get("failure_status") or host_result.get("status") or "")
+    exit_code = host_result.get("exit_code")
+    if exit_code is None:
+        exit_code = host_result.get("rc", summary_meta.get("failure_exit_code"))
+    stderr = str(host_result.get("stderr") or host_result.get("error_message") or summary_meta.get("failure_stderr") or "")
+    sanitized_stderr = sanitize_ansible_failure_text(stderr)
+    return {
+        "error": sanitize_ansible_failure_text(error),
+        "host_status": sanitize_ansible_failure_text(raw_status, max_length=32),
+        "exit_code": "" if exit_code in (None, "") else str(exit_code),
+        "stderr": sanitized_stderr,
+        "stderr_missing": not bool(sanitized_stderr),
+    }
+
+
+def classify_ansible_failure(summary: Dict[str, Any]) -> str:
+    host_status = str(summary.get("host_status") or "").upper()
+    text = " ".join(str(summary.get(key) or "") for key in ("error", "stderr", "host_status")).lower()
+    if host_status.startswith("UNREACHABLE"):
+        return "target_unreachable"
+    if any(marker in text for marker in _AUTH_FAILURE_MARKERS):
+        return "authentication_failed"
+    if any(marker in text for marker in _UNREACHABLE_MARKERS):
+        return "target_unreachable"
+    return "collection_failed"
+
+
+def format_ansible_failure_message(summary: Dict[str, Any]) -> str:
+    parts = [f"Host collection failed: {summary.get('error') or 'Ansible adhoc failed'}"]
+    if summary.get("host_status"):
+        parts.append(f"host_status={summary['host_status']}")
+    if summary.get("exit_code"):
+        parts.append(f"exit_code={summary['exit_code']}")
+    if summary.get("stderr"):
+        parts.append(f"stderr={summary['stderr']}")
+    else:
+        parts.append("stderr_missing=true")
+    return "; ".join(parts)
+
+
+def build_script(
+    os_type: str,
+    modules: List[str],
+    monitor_type: str | None = None,
+    config_type: str | None = None,
+) -> str:
+    os_type = str(os_type or "").strip().lower()
+    spec = _REMOTE_OS_MONITOR_SPECS.get(os_type)
+    if spec:
+        module = _load_remote_os_monitor(os_type)
+        return getattr(module, spec[1])()
+    if os_type not in {"linux", "windows"}:
+        raise ValueError(f"unsupported os_type: {os_type}")
+    base_dir = SCRIPTS_DIR / ("linux" if os_type == "linux" else "windows")
+    monitor_base_dir = MONITOR_SCRIPTS_DIR / ("linux" if os_type == "linux" else "windows")
+    ext = ".sh" if os_type == "linux" else ".ps1"
+
+    parts = [_read_script(base_dir / f"header{ext}")]
+    for mod in modules:
+        script_file = base_dir / f"{mod}{ext}"
+        if monitor_type == "host" and mod == "disk":
+            monitor_script_file = monitor_base_dir / f"{mod}{ext}"
+            if monitor_script_file.exists():
+                script_file = monitor_script_file
+        if script_file.exists():
+            parts.append(_read_script(script_file))
+    parts.append(_read_script(base_dir / f"footer{ext}"))
+    body = "\n".join(parts)
+
+    if os_type == "linux":
+        body = f"{LINUX_SCRIPT_WRAPPER_PREFIX} <<'{LINUX_SCRIPT_WRAPPER_EOF}'\n" f"{body}\n" f"{LINUX_SCRIPT_WRAPPER_EOF}\n"
+
+    return body
+
+
+def _read_script(path: Path) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _adhoc_stdout_preview(result: Dict[str, Any]) -> str:
+    task_result = result.get("result", {})
+    if isinstance(task_result, str):
+        return task_result
+    if isinstance(task_result, list):
+        chunks = []
+        for host_data in task_result:
+            if isinstance(host_data, dict) and host_data.get("stdout"):
+                chunks.append(str(host_data.get("stdout") or ""))
+        return "\n".join(chunks)
+    if isinstance(task_result, dict):
+        hosts_result = task_result.get("contacted", task_result)
+        if isinstance(hosts_result, dict):
+            chunks = []
+            for host_data in hosts_result.values():
+                if isinstance(host_data, dict) and host_data.get("stdout"):
+                    chunks.append(str(host_data.get("stdout") or ""))
+            return "\n".join(chunks)
+    return ""
+
+
+def _extract_json_payload(stdout: str) -> str:
+    start = None
+    depth = 0
+    in_string = False
+    escape = False
+
+    for idx, char in enumerate(stdout):
+        if start is None:
+            if char == "{":
+                start = idx
+                depth = 1
+                in_string = False
+                escape = False
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = stdout[start : idx + 1]
+                try:
+                    json.loads(candidate)
+                except json.JSONDecodeError:
+                    start = None
+                    continue
+                return candidate
+
+    return stdout
+
+
+def _metrics_json_failure_message(host: str, stdout: str, err: json.JSONDecodeError) -> str:
+    opening = stdout.find("{")
+    unclosed = opening >= 0 and _extract_json_payload(stdout) == stdout
+    logger.error(
+        "[Host Collector] JSON parse failed for %s: %s. stdout_len=%s unclosed=%s preview=%s",
+        host,
+        err,
+        len(stdout),
+        unclosed,
+        stdout[:500],
+    )
+    if unclosed:
+        return f"Failed to parse metrics JSON from {host}: incomplete JSON " f"(stdout_len={len(stdout)}, unclosed=true)"
+    return f"Failed to parse metrics JSON from {host}: {err}"
+
+
+def _escape_prometheus_label_value(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _format_prometheus_labels(**labels: Any) -> str:
+    return ",".join(f'{key}="{_escape_prometheus_label_value(value)}"' for key, value in labels.items())
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _metric_value(data: Dict[str, Any], *keys: str, default: Any = 0) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return default
+
+
+def _append_gauge(lines: List[str], name: str, labels: str, value: Any, timestamp: int, help_text: str = "") -> None:
+    lines.append(f"# HELP {name} {help_text or name}")
+    lines.append(f"# TYPE {name} gauge")
+    lines.append(f"{name}{{{labels}}} {value} {timestamp}")
+
+
+def _append_gauge_if_present(
+    lines: List[str],
+    name: str,
+    labels: str,
+    data: Dict[str, Any],
+    *keys: str,
+    timestamp: int,
+    help_text: str = "",
+) -> None:
+    value = _metric_value(data, *keys, default=None)
+    if value is None:
+        return
+    _append_gauge(lines, name, labels, value, timestamp, help_text)
+
+
+def parse_metrics_to_prometheus(
+    data: Dict[str, Any],
+    instance_id: str,
+    os_type: str,
+    timestamp: int | None = None,
+    *,
+    disk_include_fstypes: Any = None,
+    disk_exclude_fstypes: Any = None,
+) -> str:
+    lines = []
+    timestamp = int(timestamp) if timestamp is not None else int(time.time() * 1000)
+    base_labels = _format_prometheus_labels(instance_id=instance_id, os_type=os_type)
+
+    if "cpu" in data:
+        cpu = data["cpu"]
+        _append_gauge_if_present(
+            lines, "host_cpu_usage_percent", base_labels, cpu, "usage_percent", timestamp=timestamp, help_text="CPU usage percentage"
+        )
+        _append_gauge_if_present(lines, "cpu_usage_total", base_labels, cpu, "usage_percent", timestamp=timestamp, help_text="CPU usage percentage")
+        _append_gauge_if_present(
+            lines, "cpu_usage_user_total", base_labels, cpu, "usage_user_percent", timestamp=timestamp, help_text="CPU user usage percentage"
+        )
+        _append_gauge_if_present(
+            lines, "cpu_usage_system_total", base_labels, cpu, "usage_system_percent", timestamp=timestamp, help_text="CPU system usage percentage"
+        )
+        _append_gauge_if_present(
+            lines, "cpu_usage_iowait_total", base_labels, cpu, "usage_iowait_percent", timestamp=timestamp, help_text="CPU iowait usage percentage"
+        )
+        _append_gauge_if_present(
+            lines, "cpu_usage_irq_total", base_labels, cpu, "usage_irq_percent", timestamp=timestamp, help_text="CPU irq usage percentage"
+        )
+        _append_gauge_if_present(
+            lines, "cpu_usage_steal_total", base_labels, cpu, "usage_steal_percent", timestamp=timestamp, help_text="CPU steal usage percentage"
+        )
+        _append_gauge(lines, "host_cpu_core_count", base_labels, cpu.get("core_count", 0), timestamp, "CPU core count")
+        _append_gauge_if_present(lines, "host_cpu_load_1m", base_labels, cpu, "load_1m", timestamp=timestamp, help_text="CPU load 1 minute")
+        _append_gauge_if_present(lines, "host_cpu_load_5m", base_labels, cpu, "load_5m", timestamp=timestamp, help_text="CPU load 5 minutes")
+        _append_gauge_if_present(lines, "host_cpu_load_15m", base_labels, cpu, "load_15m", timestamp=timestamp, help_text="CPU load 15 minutes")
+        _append_gauge_if_present(lines, "system_load1", base_labels, cpu, "load_1m", timestamp=timestamp, help_text="System load 1 minute")
+        _append_gauge_if_present(lines, "system_load5", base_labels, cpu, "load_5m", timestamp=timestamp, help_text="System load 5 minutes")
+        _append_gauge_if_present(lines, "system_load15", base_labels, cpu, "load_15m", timestamp=timestamp, help_text="System load 15 minutes")
+
+    if "mem" in data:
+        mem = data["mem"]
+        _append_gauge_if_present(lines, "host_mem_total_bytes", base_labels, mem, "total_bytes", timestamp=timestamp, help_text="Memory total_bytes")
+        _append_gauge_if_present(lines, "host_mem_used_bytes", base_labels, mem, "used_bytes", timestamp=timestamp, help_text="Memory used_bytes")
+        _append_gauge_if_present(
+            lines, "host_mem_available_bytes", base_labels, mem, "available_bytes", timestamp=timestamp, help_text="Memory available_bytes"
+        )
+        _append_gauge_if_present(
+            lines, "host_mem_swap_total_bytes", base_labels, mem, "swap_total_bytes", timestamp=timestamp, help_text="Memory swap_total_bytes"
+        )
+        _append_gauge_if_present(
+            lines, "host_mem_swap_used_bytes", base_labels, mem, "swap_used_bytes", timestamp=timestamp, help_text="Memory swap_used_bytes"
+        )
+        total_bytes = _metric_value(mem, "total_bytes", default=None)
+        available_bytes = _metric_value(mem, "available_bytes", default=None)
+        used_percent = mem.get("used_percent")
+        if used_percent is None and total_bytes and available_bytes is not None:
+            used_percent = round(((float(total_bytes) - float(available_bytes)) / float(total_bytes)) * 100, 2)
+        if used_percent is not None:
+            _append_gauge(lines, "host_mem_used_percent", base_labels, used_percent, timestamp, "Memory used percent")
+            _append_gauge(lines, "mem_used_percent", base_labels, used_percent, timestamp, "Memory used percent")
+        _append_gauge_if_present(lines, "mem_total", base_labels, mem, "total_bytes", timestamp=timestamp, help_text="Memory total bytes")
+        _append_gauge_if_present(lines, "mem_available", base_labels, mem, "available_bytes", timestamp=timestamp, help_text="Memory available bytes")
+        swap_total = float(mem.get("swap_total_bytes", 0) or 0)
+        swap_used = float(mem.get("swap_used_bytes", 0) or 0)
+        swap_free = _metric_value(mem, "swap_free_bytes", default=None)
+        if swap_free is None and (swap_total or swap_used):
+            swap_free = max(swap_total - swap_used, 0)
+        if swap_free is not None:
+            _append_gauge(lines, "mem_swap_free", base_labels, swap_free, timestamp, "Swap free bytes")
+        _append_gauge_if_present(lines, "mem_cached", base_labels, mem, "cached_bytes", timestamp=timestamp, help_text="Cached memory bytes")
+        _append_gauge_if_present(lines, "mem_shared", base_labels, mem, "shared_bytes", timestamp=timestamp, help_text="Shared memory bytes")
+        _append_gauge_if_present(lines, "mem_buffered", base_labels, mem, "buffered_bytes", timestamp=timestamp, help_text="Buffered memory bytes")
+
+    if "disk" in data:
+        disks = data["disk"]
+        if isinstance(disks, list):
+            for disk in disks:
+                mount = disk.get("mount", "unknown")
+                path = disk.get("path") or mount
+                fstype = disk.get("fstype") or ""
+                if not should_collect_disk(
+                    fstype,
+                    include_fstypes=disk_include_fstypes,
+                    exclude_fstypes=disk_exclude_fstypes,
+                ):
+                    continue
+                disk_labels = f"{base_labels},{_format_prometheus_labels(mount=mount, path=path, fstype=fstype)}"
+                total = disk.get("total_bytes", 0)
+                used = disk.get("used_bytes", 0)
+                free = _metric_value(disk, "free_bytes", "available_bytes", default=max(float(total or 0) - float(used or 0), 0))
+                used_percent = disk.get("used_percent", 0)
+                _append_gauge(lines, "host_disk_total_bytes", disk_labels, total, timestamp, "Disk total bytes")
+                _append_gauge(lines, "host_disk_used_bytes", disk_labels, used, timestamp, "Disk used bytes")
+                _append_gauge(lines, "host_disk_used_percent", disk_labels, used_percent, timestamp, "Disk used percent")
+                _append_gauge(lines, "disk_total", disk_labels, total, timestamp, "Disk total bytes")
+                _append_gauge(lines, "disk_free", disk_labels, free, timestamp, "Disk free bytes")
+                _append_gauge(lines, "disk_used_percent", disk_labels, used_percent, timestamp, "Disk used percent")
+                _append_gauge_if_present(
+                    lines,
+                    "disk_inodes_used_percent",
+                    disk_labels,
+                    disk,
+                    "inodes_used_percent",
+                    timestamp=timestamp,
+                    help_text="Disk inode used percent",
+                )
+
+    if "net" in data:
+        nets = data["net"]
+        if isinstance(nets, list):
+            for net in nets:
+                iface = net.get("interface", "unknown")
+                net_labels = f"{base_labels},{_format_prometheus_labels(interface=iface)}"
+                _append_gauge(lines, "host_net_rx_bytes", net_labels, net.get("rx_bytes", 0), timestamp, "Network received bytes")
+                _append_gauge(lines, "host_net_tx_bytes", net_labels, net.get("tx_bytes", 0), timestamp, "Network transmitted bytes")
+                _append_gauge(lines, "host_net_rx_errors", net_labels, net.get("rx_errors", 0), timestamp, "Network receive errors")
+                _append_gauge(lines, "host_net_tx_errors", net_labels, net.get("tx_errors", 0), timestamp, "Network transmit errors")
+                _append_gauge(lines, "net_bytes_recv", net_labels, net.get("rx_bytes", 0), timestamp, "Network received bytes counter")
+                _append_gauge(lines, "net_bytes_sent", net_labels, net.get("tx_bytes", 0), timestamp, "Network transmitted bytes counter")
+                _append_gauge(lines, "net_packets_recv", net_labels, net.get("rx_packets", 0), timestamp, "Network received packets counter")
+                _append_gauge(lines, "net_packets_sent", net_labels, net.get("tx_packets", 0), timestamp, "Network transmitted packets counter")
+                _append_gauge(lines, "net_err_in", net_labels, net.get("rx_errors", 0), timestamp, "Network receive errors counter")
+                _append_gauge(lines, "net_err_out", net_labels, net.get("tx_errors", 0), timestamp, "Network transmit errors counter")
+                _append_gauge(lines, "net_drop_in", net_labels, net.get("rx_drops", 0), timestamp, "Network receive drops counter")
+                _append_gauge(lines, "net_drop_out", net_labels, net.get("tx_drops", 0), timestamp, "Network transmit drops counter")
+                _append_gauge(lines, "net_bytes_recv_total", net_labels, net.get("rx_bytes", 0), timestamp, "Network received bytes counter")
+                _append_gauge(lines, "net_bytes_sent_total", net_labels, net.get("tx_bytes", 0), timestamp, "Network transmitted bytes counter")
+                _append_gauge(lines, "net_packets_recv_total", net_labels, net.get("rx_packets", 0), timestamp, "Network received packets counter")
+                _append_gauge(lines, "net_packets_sent_total", net_labels, net.get("tx_packets", 0), timestamp, "Network transmitted packets counter")
+                _append_gauge(lines, "net_err_in_total", net_labels, net.get("rx_errors", 0), timestamp, "Network receive errors counter")
+                _append_gauge(lines, "net_err_out_total", net_labels, net.get("tx_errors", 0), timestamp, "Network transmit errors counter")
+                _append_gauge(lines, "net_drop_in_total", net_labels, net.get("rx_drops", 0), timestamp, "Network receive drops counter")
+                _append_gauge(lines, "net_drop_out_total", net_labels, net.get("tx_drops", 0), timestamp, "Network transmit drops counter")
+
+    if "diskio" in data and isinstance(data["diskio"], list):
+        for diskio in data["diskio"]:
+            device = diskio.get("device", "unknown")
+            diskio_labels = f"{base_labels},{_format_prometheus_labels(device=device)}"
+            _append_gauge(lines, "diskio_reads_total", diskio_labels, diskio.get("reads", 0), timestamp, "Disk reads counter")
+            _append_gauge(lines, "diskio_writes_total", diskio_labels, diskio.get("writes", 0), timestamp, "Disk writes counter")
+            _append_gauge(lines, "diskio_read_bytes_total", diskio_labels, diskio.get("read_bytes", 0), timestamp, "Disk read bytes counter")
+            _append_gauge(lines, "diskio_write_bytes_total", diskio_labels, diskio.get("write_bytes", 0), timestamp, "Disk write bytes counter")
+            _append_gauge_if_present(
+                lines, "diskio_io_time_ms", diskio_labels, diskio, "io_time_ms", timestamp=timestamp, help_text="Disk IO time ms"
+            )
+            _append_gauge_if_present(
+                lines, "diskio_io_util", diskio_labels, diskio, "io_util_percent", timestamp=timestamp, help_text="Disk IO utilization percent"
+            )
+            _append_gauge_if_present(
+                lines, "diskio_read_time_ms", diskio_labels, diskio, "read_time_ms", timestamp=timestamp, help_text="Disk read time ms counter"
+            )
+            _append_gauge_if_present(
+                lines, "diskio_write_time_ms", diskio_labels, diskio, "write_time_ms", timestamp=timestamp, help_text="Disk write time ms counter"
+            )
+            _append_gauge_if_present(
+                lines, "disk_read_latency", diskio_labels, diskio, "read_latency_ms", timestamp=timestamp, help_text="Disk read latency ms"
+            )
+            _append_gauge_if_present(
+                lines, "disk_write_latency", diskio_labels, diskio, "write_latency_ms", timestamp=timestamp, help_text="Disk write latency ms"
+            )
+
+    if "processes" in data and isinstance(data["processes"], dict):
+        processes = data["processes"]
+        for key in ("running", "blocked", "zombies", "sleeping"):
+            _append_gauge_if_present(lines, f"processes_{key}", base_labels, processes, key, timestamp=timestamp, help_text=f"Processes {key}")
+
+    if "system" in data and isinstance(data["system"], dict):
+        system = data["system"]
+        _append_gauge(lines, "system_uptime", base_labels, system.get("uptime_seconds", 0), timestamp, "System uptime seconds")
+        _append_gauge_if_present(
+            lines, "system_load1", base_labels, system, "load1", "load_1m", timestamp=timestamp, help_text="System load 1 minute"
+        )
+        _append_gauge_if_present(
+            lines, "system_load5", base_labels, system, "load5", "load_5m", timestamp=timestamp, help_text="System load 5 minutes"
+        )
+        _append_gauge_if_present(
+            lines, "system_load15", base_labels, system, "load15", "load_15m", timestamp=timestamp, help_text="System load 15 minutes"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+class HostCollector(BaseCollector):
+    def _resolve_modules(self) -> List[str]:
+        raw_modules = self.params.get("metrics_modules", "cpu,mem,disk,net")
+        if isinstance(raw_modules, (list, tuple)):
+            module_items = raw_modules
+        else:
+            module_items = str(raw_modules).split(",")
+        modules = [str(m).strip() for m in module_items if str(m).strip() in VALID_MODULES]
+        if not modules:
+            modules = ["cpu", "mem", "disk", "net"]
+        return modules
+
+    def _resolve_execution_config(self) -> Dict[str, Any]:
+        host = self.params["host"]
+        os_type = str(self.params.get("os_type", "linux") or "linux").strip().lower()
+        if os_type not in SUPPORTED_OS_TYPES:
+            raise ValueError(f"unsupported os_type: {os_type}")
+        username = self.params["username"]
+        raw_port = self.params.get("port")
+        ssh_like = os_type in SSH_OS_TYPES
+        port = int(raw_port) if raw_port not in (None, "") else (22 if ssh_like else 5986)
+        ansible_node_id = self.params["ansible_node_id"]
+        if os_type in _REMOTE_OS_MONITOR_SPECS:
+            execute_timeout = getattr(_load_remote_os_monitor(os_type), "COMMAND_EXECUTE_TIMEOUT")
+        else:
+            execute_timeout = 60  # 脚本执行上限硬编码；表单 timeout 由框架作单对象预算
+
+        modules = self._resolve_modules()
+        credential_encoding = self.params.get("credential_encoding") or self.params.get("credentials_encoding") or "url"
+
+        if os_type in DEBUG_SCRAPE_OS_TYPES:
+            logger.debug("[Host Collector] host=%s, os=%s, modules=%s", host, os_type, modules)
+        else:
+            logger.info("[Host Collector] host=%s, os=%s, modules=%s", host, os_type, modules)
+
+        script = build_script(
+            os_type,
+            modules,
+            monitor_type=self.params.get("monitor_type"),
+        )
+
+        connection = "ssh" if ssh_like else "winrm"
+        module = "raw" if ssh_like else "win_shell"
+        module_args = encode_ansible_raw_module_args(script) if ssh_like else script
+
+        host_credential = {
+            "host": host,
+            "user": username,
+            "connection": connection,
+            "port": port,
+        }
+        if ssh_like:
+            auth_type = self.params.get("auth_type", "password") or "password"
+            if auth_type == "private_key":
+                private_key_content = self.params.get("private_key_content")
+                if private_key_content:
+                    host_credential["private_key_content"] = _url_decode_secret(private_key_content, credential_encoding)
+                private_key_passphrase = self.params.get("private_key_passphrase")
+                if private_key_passphrase:
+                    host_credential["private_key_passphrase"] = _url_decode_secret(private_key_passphrase, credential_encoding)
+            else:
+                host_credential["password"] = _url_decode_secret(self.params.get("password", ""), credential_encoding)
+        else:
+            host_credential["password"] = _url_decode_secret(self.params.get("password", ""), credential_encoding)
+            host_credential["winrm_scheme"] = self.params.get("winrm_scheme") or "https"
+            host_credential["winrm_transport"] = self.params.get("winrm_transport") or "ntlm"
+            host_credential["winrm_cert_validation"] = _as_bool(
+                self.params.get("winrm_cert_validation"),
+                default=False,
+            )
+
+        host_credentials = [host_credential]
+
+        return {
+            "host": host,
+            "os_type": os_type,
+            "ansible_node_id": ansible_node_id,
+            "host_credentials": host_credentials,
+            "module": module,
+            "module_args": module_args,
+            "execute_timeout": execute_timeout,
+        }
+
+    def _resolve_callback_timeout(self) -> int:
+        os_type = str(self.params.get("os_type", "") or "").strip().lower()
+        if os_type in _REMOTE_OS_MONITOR_SPECS:
+            execute_timeout = getattr(_load_remote_os_monitor(os_type), "COMMAND_EXECUTE_TIMEOUT")
+            return int(self.params.get("host_remote_callback_timeout", execute_timeout))
+        return int(
+            self.params.get(
+                "host_remote_callback_timeout",
+                HOST_REMOTE_CALLBACK_REQUEST_TIMEOUT,
+            )
+        )
+
+    async def submit_collection(self, task_id: str, callback_subject: str, callback_payload: Dict[str, Any]) -> Dict[str, Any]:
+        callback = dict(callback_payload or {})
+        callback.update(
+            {
+                "subject": callback_subject,
+                "timeout": self._resolve_callback_timeout(),
+            }
+        )
+        return await self._execute_collection(
+            callback=callback,
+            task_id=task_id,
+        )
+
+    async def _execute_collection(self, callback: Dict[str, Any] | None = None, task_id: str | None = None) -> Dict[str, Any]:
+        from core.infra.ansible_rpc import ansible_adhoc
+
+        config = await asyncio.to_thread(self._resolve_execution_config)
+        return await ansible_adhoc(
+            ansible_node_id=config["ansible_node_id"],
+            host_credentials=config["host_credentials"],
+            module=config["module"],
+            module_args=config["module_args"],
+            execute_timeout=config["execute_timeout"],
+            callback=callback,
+            task_id=task_id,
+        )
+
+    def process_adhoc_result(self, result: Dict[str, Any]) -> str:
+        host = self.params["host"]
+        os_type = self.params.get("os_type", "linux")
+
+        if not result.get("success"):
+            summary = extract_ansible_failure_summary(result, host)
+            error_type = classify_ansible_failure(summary)
+            logger.error(
+                ANSIBLE_ADHOC_FAILED_LOG_TEMPLATE,
+                host,
+                summary["error"],
+                summary["host_status"] or "-",
+                summary["exit_code"] or "-",
+                summary["stderr"] or "-",
+                summary["stderr_missing"],
+                error_type,
+            )
+            raise RuntimeError(format_ansible_failure_message(summary))
+
+        stdout = self._extract_stdout(result)
+        if not stdout or not stdout.strip():
+            logger.error(f"[Host Collector] Empty stdout from {host}, result keys: {list(result.keys())}")
+            raise RuntimeError(f"Host collection returned empty stdout for {host}")
+
+        cleaned_stdout = stdout.strip()
+
+        try:
+            metrics_data = json.loads(cleaned_stdout)
+        except json.JSONDecodeError as e:
+            extracted_payload = _extract_json_payload(cleaned_stdout)
+            if extracted_payload != cleaned_stdout:
+                try:
+                    metrics_data = json.loads(extracted_payload)
+                except json.JSONDecodeError:
+                    raise RuntimeError(_metrics_json_failure_message(host, cleaned_stdout, e)) from e
+            else:
+                raise RuntimeError(_metrics_json_failure_message(host, cleaned_stdout, e)) from e
+
+        instance_id = self.params.get("tags", {}).get("instance_id", host)
+        callback_timestamp = self.params.get("callback_timestamp")
+        os_key = str(os_type or "linux").strip().lower()
+        spec = _REMOTE_OS_MONITOR_SPECS.get(os_key)
+        if spec:
+            parse_metrics = getattr(_load_remote_os_monitor(os_key), spec[2])
+            prometheus_metrics = parse_metrics(
+                metrics_data,
+                instance_id,
+                os_key,
+                int(callback_timestamp) if callback_timestamp is not None else int(time.time() * 1000),
+            )
+        else:
+            prometheus_metrics = parse_metrics_to_prometheus(
+                metrics_data,
+                instance_id,
+                os_type,
+                timestamp=callback_timestamp,
+                disk_include_fstypes=self.params.get("disk_include_fstypes"),
+                disk_exclude_fstypes=self.params.get("disk_exclude_fstypes"),
+            )
+
+        if os_key in DEBUG_SCRAPE_OS_TYPES:
+            logger.debug("[Host Collector] Completed: host=%s, metrics_size=%s", host, len(prometheus_metrics))
+        else:
+            logger.info(f"[Host Collector] Completed: host={host}, metrics_size={len(prometheus_metrics)}")
+        return prometheus_metrics
+
+    async def collect(self) -> str:
+        result = await self._execute_collection()
+        return await asyncio.to_thread(self.process_adhoc_result, result)
+
+    def _extract_stdout(self, result: Dict[str, Any]) -> str:
+        task_result = result.get("result", {})
+        if isinstance(task_result, str):
+            return task_result
+        if isinstance(task_result, list):
+            expected_host = self.params.get("host")
+            for host_data in task_result:
+                if not isinstance(host_data, dict):
+                    continue
+                stdout = host_data.get("stdout", "")
+                host_key = host_data.get("host", "")
+                if stdout and host_key == expected_host:
+                    return stdout
+                if not stdout:
+                    logger.warning(
+                        f"[Host Collector] No stdout for host_key={host_key}, "
+                        f"status={host_data.get('status')}, stderr={host_data.get('stderr', '')[:200]}"
+                    )
+            raise RuntimeError(f"Host collection result missing expected host {expected_host}")
+        if isinstance(task_result, dict):
+            hosts_result = task_result.get("contacted", task_result)
+            for host_key, host_data in hosts_result.items():
+                if isinstance(host_data, dict):
+                    stdout = host_data.get("stdout", "")
+                    if not stdout:
+                        logger.warning(
+                            f"[Host Collector] No stdout for host_key={host_key}, "
+                            f"rc={host_data.get('rc')}, stderr={host_data.get('stderr', '')[:200]}"
+                        )
+                    return stdout
+            logger.warning(f"[Host Collector] No contacted hosts in result, keys: {list(hosts_result.keys())}")
+            return json.dumps(task_result)
+        return str(task_result)

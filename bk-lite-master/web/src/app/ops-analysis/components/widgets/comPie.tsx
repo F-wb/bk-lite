@@ -1,0 +1,230 @@
+import React, { useRef, useCallback, useMemo, useState } from 'react';
+import ReactEcharts from 'echarts-for-react';
+import { Spin } from 'antd';
+import { randomColorForLegend } from '@/app/ops-analysis/utils/randomColorForChart';
+import { ChartDataTransformer } from '@/app/ops-analysis/utils/chartDataTransform';
+import {
+  getOpsChartColorsByMode,
+  getOpsChartThemeByMode,
+  isScreenChartThemeMode,
+  resolveOpsChartThemeName,
+} from '@/app/ops-analysis/utils/chartTheme';
+import ChartLegend from '@/app/ops-analysis/components/chartLegend';
+import { isSameChartLegendSelection } from '@/components/chart-legend/selection';
+import WidgetState from '@/app/ops-analysis/components/widget-state';
+import type {
+  ScreenRenderContext,
+  ValueConfig,
+} from '@/app/ops-analysis/types/dashBoard';
+import {
+  getScreenWidgetScale,
+  scaleScreenMetric,
+} from './shared/screenMetrics';
+import { useEchartsFinishedReady } from '@/app/ops-analysis/hooks/useEchartsFinishedReady';
+import { formatVisibleChartValue } from '@/app/ops-analysis/utils/chartValueFormat';
+import { useTranslation } from '@/utils/i18n';
+
+interface OsPieProps {
+  rawData: any;
+  loading?: boolean;
+  onReady?: (ready: boolean) => void;
+  config?: ValueConfig;
+  screenRenderContext?: ScreenRenderContext;
+}
+
+const OsPie: React.FC<OsPieProps> = ({
+  rawData,
+  loading = false,
+  onReady,
+  config,
+  screenRenderContext,
+}) => {
+  const { t } = useTranslation();
+  const pieTotalLabel = t('dashboard.pieTotal');
+  const chartRef = useRef<any>(null);
+  const themeName = resolveOpsChartThemeName();
+  const usesScreenChartTheme = isScreenChartThemeMode(config?.chartThemeMode);
+  const chartTheme = useMemo(
+    () => getOpsChartThemeByMode(config?.chartThemeMode),
+    [config?.chartThemeMode],
+  );
+  const chartColors = useMemo(
+    () =>
+      usesScreenChartTheme
+        ? getOpsChartColorsByMode(config?.chartThemeMode, themeName)
+        : randomColorForLegend(themeName),
+    [config?.chartThemeMode, themeName, usesScreenChartTheme],
+  );
+  const widgetScale = getScreenWidgetScale(screenRenderContext);
+  const [legendSelected, setLegendSelected] = useState<Record<string, boolean>>({});
+
+  const handleLegendChange = useCallback((selected: Record<string, boolean>) => {
+    setLegendSelected((prev) =>
+      isSameChartLegendSelection(prev, selected) ? prev : selected,
+    );
+  }, []);
+
+  const chartData = useMemo(
+    () => ChartDataTransformer.transformToPieData(rawData, {
+      dimensionField: config?.dimensionField,
+      valueField: config?.valueField,
+    }),
+    [config?.dimensionField, config?.valueField, rawData],
+  );
+  const isDataReady = chartData.some(
+    (item) => Number.isFinite(item.value) && item.value > 0,
+  );
+  const showLegend = isDataReady;
+  const { onEvents } = useEchartsFinishedReady({
+    loading,
+    isDataReady,
+    onReady,
+  });
+  const option = useMemo(() => ({
+    color: chartColors,
+    animation: true,
+    calculable: true,
+    title: { show: false },
+    tooltip: {
+      trigger: 'item',
+      enterable: true,
+      confine: true,
+      backgroundColor: chartTheme.tooltipBackgroundColor,
+      borderWidth: 1,
+      borderColor: chartTheme.tooltipBorderColor,
+      extraCssText: `box-shadow: ${chartTheme.tooltipShadow};`,
+      textStyle: {
+        fontSize: scaleScreenMetric(12, screenRenderContext),
+        color: chartTheme.tooltipTextColor,
+      },
+      formatter: function (params: any) {
+        const percent = params.percent || 0;
+        const tooltipPaddingY = scaleScreenMetric(4, screenRenderContext);
+        const tooltipPaddingX = scaleScreenMetric(8, screenRenderContext);
+        const tooltipGap = scaleScreenMetric(4, screenRenderContext);
+        const markerSize = scaleScreenMetric(10, screenRenderContext);
+        const markerGap = scaleScreenMetric(6, screenRenderContext);
+        return `
+          <div style="padding: ${tooltipPaddingY}px ${tooltipPaddingX}px;">
+            <div style="margin-bottom: ${tooltipGap}px; font-weight: bold;">${params.seriesName}</div>
+            <div style="display: flex; align-items: center;">
+              <span style="display: inline-block; width: ${markerSize}px; height: ${markerSize}px; background-color: ${params.color}; border-radius: 50%; margin-right: ${markerGap}px;"></span>
+              <span>${params.name}: ${formatVisibleChartValue(params.value, config)} (${percent.toFixed(1)}%)</span>
+            </div>
+          </div>
+        `;
+      },
+    },
+    legend: {
+      show: false,
+      selected: legendSelected,
+    },
+    series: [
+      {
+        name: '',
+        type: 'pie',
+        center: ['50%', '50%'],
+        radius: ['50%', '78%'],
+        avoidLabelOverlap: false,
+        selectedMode: 'single',
+        label: {
+          show: true,
+          position: 'center',
+          formatter: function () {
+            const total = (chartData || []).reduce(
+              (sum: number, item: any) => sum + item.value,
+              0,
+            );
+            return `{title|${pieTotalLabel}}\n{value|${formatVisibleChartValue(total, config)}}`;
+          },
+          rich: {
+            title: {
+              fontSize: scaleScreenMetric(14, screenRenderContext),
+              color: chartTheme.pieTitleColor,
+              lineHeight: scaleScreenMetric(20, screenRenderContext),
+            },
+            value: {
+              fontSize: scaleScreenMetric(24, screenRenderContext),
+              fontWeight: 'bold',
+              color: chartTheme.pieValueColor,
+              lineHeight: scaleScreenMetric(32, screenRenderContext),
+            },
+          },
+        },
+        labelLine: {
+          show: false,
+          length: scaleScreenMetric(10, screenRenderContext),
+          length2: scaleScreenMetric(15, screenRenderContext),
+          smooth: true,
+        },
+        itemStyle: {
+          borderRadius: scaleScreenMetric(2, screenRenderContext),
+          borderColor: chartTheme.pieBorderColor,
+          borderWidth: scaleScreenMetric(1, screenRenderContext),
+          shadowBlur: usesScreenChartTheme
+            ? scaleScreenMetric(chartTheme.pieShadowBlur, screenRenderContext)
+            : 0,
+          shadowColor: usesScreenChartTheme
+            ? chartTheme.pieShadowColor
+            : 'transparent',
+        },
+        emphasis: {
+          focus: 'none',
+          scaleSize: scaleScreenMetric(5, screenRenderContext),
+        },
+        data: chartData || [],
+      },
+    ],
+  }), [
+    chartColors,
+    chartData,
+    chartTheme,
+    config,
+    legendSelected,
+    pieTotalLabel,
+    screenRenderContext,
+    usesScreenChartTheme,
+  ]);
+
+  if (loading) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center">
+        <Spin size="small" />
+      </div>
+    );
+  }
+
+  if (!isDataReady || !chartData || chartData.length === 0) {
+    return <WidgetState />;
+  }
+
+  return (
+    <div className="h-full flex">
+      {/* 图表区域 */}
+      <div className="flex-1 min-w-0">
+        <ReactEcharts
+          ref={chartRef}
+          option={option}
+          notMerge={true}
+          onEvents={onEvents}
+          style={{ height: '100%', width: '100%' }}
+        />
+      </div>
+
+      {/* 图例区域 - 带百分比 */}
+      {showLegend && (
+        <ChartLegend
+          data={chartData.map((item: any) => ({ name: item.name, value: item.value }))}
+          colors={chartColors}
+          layout="vertical"
+          showPercent={true}
+          textColor={usesScreenChartTheme ? chartTheme.axisLabelColor : undefined}
+          scale={widgetScale}
+          onSelectionChange={handleLegendChange}
+        />
+      )}
+    </div>
+  );
+};
+
+export default OsPie;

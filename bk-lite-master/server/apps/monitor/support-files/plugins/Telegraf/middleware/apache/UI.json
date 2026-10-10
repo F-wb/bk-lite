@@ -1,0 +1,120 @@
+{
+  "object_name": "Apache",
+  "instance_type": "apache",
+  "collect_type": "middleware",
+  "config_type": [
+    "apache"
+  ],
+  "collector": "Telegraf",
+  "instance_id": "{{cloud_region}}_{{url}}",
+  "form_fields": [
+    {
+      "name": "monitor_url",
+      "label": "URL",
+      "type": "input",
+      "required": true,
+      "visible_in": "edit",
+      "editable": false,
+      "description": "监控的目标网址链接，以检测其可用性和性能",
+      "guide_short": "Apache mod_status 的可机读 URL，必须以 ?auto 结尾，例如 http://10.0.0.5/server-status?auto；返回 Key: Value 文本。",
+      "guide_short_en": "Machine-readable Apache mod_status URL including ?auto, such as http://10.0.0.5/server-status?auto. The endpoint must return Key: Value text.",
+      "widget_props": {
+        "placeholder": "http://localhost/server-status?auto"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.urls[0]"
+      },
+      "label_en": "URL"
+    },
+    {
+      "name": "interval",
+      "label": "间隔",
+      "type": "inputNumber",
+      "required": true,
+      "default_value": 60,
+      "description": "监控数据的采集时间间隔（单位：秒）",
+      "guide_short": "Telegraf inputs.apache 采集周期，单位秒，默认 60；过短会反复抓 mod_status。",
+      "guide_short_en": "Telegraf inputs.apache collection interval in seconds; the default is 60. Short intervals repeatedly query mod_status.",
+      "widget_props": {
+        "min": 1,
+        "precision": 0,
+        "placeholder": "间隔",
+        "addonAfter": "s",
+        "placeholder_en": "Interval"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.interval",
+        "to_form": {
+          "regex": "^(\\d+)s$"
+        },
+        "to_api": {
+          "suffix": "s"
+        }
+      },
+      "label_en": "Interval",
+      "description_en": "Collection time interval (unit: seconds)"
+    }
+  ],
+  "table_columns": [
+    {
+      "name": "node_ids",
+      "label": "节点",
+      "type": "select",
+      "required": true,
+      "widget_props": {
+        "placeholder": "请选择节点",
+        "placeholder_en": "Please select node"
+      },
+      "enable_row_filter": false,
+      "label_en": "Node"
+    },
+    {
+      "name": "url",
+      "label": "URL",
+      "type": "input",
+      "required": true,
+      "widget_props": {
+        "placeholder": "http://localhost/server-status?auto"
+      },
+      "rules": [
+        {
+          "type": "pattern",
+          "pattern": "^(http|https)://.*",
+          "message": "URL必须以http://或https://开头",
+          "excel_formula": "OR(LEFT({{CELL}},7)=\"http://\",LEFT({{CELL}},8)=\"https://\")"
+        }
+      ],
+      "change_handler": {
+        "type": "simple",
+        "source_fields": [
+          "url"
+        ],
+        "target_field": "instance_name"
+      },
+      "label_en": "URL"
+    },
+    {
+      "name": "instance_name",
+      "label": "实例名称",
+      "type": "input",
+      "required": true,
+      "widget_props": {
+        "placeholder": "实例名称",
+        "disabled": false,
+        "placeholder_en": "Instance Name"
+      },
+      "label_en": "Instance Name"
+    },
+    {
+      "name": "group_ids",
+      "label": "组",
+      "type": "group_select",
+      "required": false,
+      "widget_props": {
+        "placeholder": "请选择组",
+        "placeholder_en": "Please select group"
+      },
+      "label_en": "Group"
+    }
+  ]
+}

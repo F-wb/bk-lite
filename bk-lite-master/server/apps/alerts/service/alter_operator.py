@@ -1,0 +1,714 @@
+# -- coding: utf-8 --
+# @File: alter_operator.py
+# @Time: 2025/5/28 16:31
+# @Author: windyzhao
+
+from django.db import transaction
+from django.utils import timezone
+
+from apps.alerts.constants.constants import AlertOperate, AlertStatus, LogAction, LogTargetType
+from apps.alerts.models.alert_operator import AlertAssignment
+from apps.alerts.models.models import Alert
+from apps.alerts.utils.operator_log import record_operator_log
+from apps.alerts.utils.operator_scope import validate_alert_assignees, validate_usernames_in_groups
+from apps.core.logger import alert_logger as logger
+
+
+class AlertOperator(object):
+    """
+    告警操作类 做告警的操作
+    完成手动的过程：
+    待响应——处理中——关闭
+    未分派——待响应——处理中——关闭
+    待响应——处理中——转派——待响应——处理中——关闭
+    未分派——待响应——处理中——转派——待响应——处理中——关闭
+    待响应——超级用户转派——待响应（替换处理人，不经过认领）
+    """
+
+    def __init__(self, user, allowed_alert_ids=None, *, api_close=False, is_superuser=False):
+        self.user = user
+        self.status_map = dict(AlertStatus.CHOICES)
+        self.allowed_alert_ids = None if allowed_alert_ids is None else {str(item) for item in allowed_alert_ids}
+        self.api_close = bool(api_close)
+        self.is_superuser = bool(is_superuser)
+
+    def _is_alert_allowed(self, alert_id: str) -> bool:
+        if self.allowed_alert_ids is None:
+            return True
+        return str(alert_id) in self.allowed_alert_ids
+
+    def operate(self, action: str, alert_id: str, data: dict) -> dict:
+        """
+        执行告警操作
+        :param alert_id: 告警ID
+        :param action: 操作类型
+        :param data: 附加数据
+        :return: 操作结果
+        """
+        logger.info(
+            "[AlertOperator] 用户 %s 开始执行告警操作: action=%s, alert_id=%s",
+            self.user,
+            action,
+            alert_id,
+        )
+
+        # 查找对应的操作方法
+        func = getattr(self, f"_{action}_alert", None)
+        if not func:
+            logger.error("[AlertOperator] 不支持的操作类型: %s", action)
+            raise ValueError(f"Unsupported action: {action}")
+
+        if not self._is_alert_allowed(alert_id):
+            logger.warning("[AlertOperator] 用户 %s 无权限操作告警: alert_id=%s", self.user, alert_id)
+            return {"result": False, "message": "您没有权限操作此告警", "data": {}}
+
+        try:
+            result = func(alert_id, data)
+            logger.info(
+                "[AlertOperator] 告警操作执行成功: action=%s, alert_id=%s, result=%s",
+                action,
+                alert_id,
+                result,
+            )
+            return result
+        except Exception as e:
+            logger.error(
+                "[AlertOperator] 告警操作执行失败: action=%s, alert_id=%s, error=%s",
+                action,
+                alert_id,
+                e,
+                exc_info=True,
+            )
+            raise
+
+    @staticmethod
+    def get_alert(alert_id) -> Alert:
+        """
+        获取告警对象并加锁，告警不存在时抛出 Alert.DoesNotExist
+        """
+        return Alert.objects.select_for_update().get(alert_id=alert_id)
+
+    def _create_reminder_record(self, alert: Alert, assignment):
+        """创建提醒记录（assignment 已由调用方查出并校验 is_active）"""
+        try:
+            from apps.alerts.service.reminder_service import ReminderService
+
+            ReminderService.create_reminder_task(alert, assignment)
+        except Exception:
+            logger.exception("[AlertOperator] 创建提醒记录失败: alert_id=%s", alert.alert_id)
+
+    def _stop_reminder_tasks(self, alert: Alert):
+        """停止告警的提醒任务"""
+        try:
+            from apps.alerts.service.reminder_service import ReminderService
+
+            ReminderService.stop_reminder_task(alert)
+        except Exception as e:
+            logger.error("[AlertOperator] 停止提醒任务失败: %s", e, exc_info=True)
+
+    def _ensure_reminder_tasks(self, alert: Alert, assignment_id: str = None):
+        """恢复或创建告警的提醒任务"""
+        try:
+            from apps.alerts.service.reminder_service import ReminderService
+
+            normalized_assignment_id = None
+            if assignment_id not in (None, ""):
+                try:
+                    normalized_assignment_id = int(assignment_id)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[AlertOperator] 提醒任务恢复失败，assignment_id 非法: alert_id=%s, assignment_id=%s",
+                        alert.alert_id,
+                        assignment_id,
+                    )
+
+            ReminderService.ensure_reminder_task(alert, assignment_id=normalized_assignment_id)
+        except Exception as e:
+            logger.error("[AlertOperator] 恢复提醒任务失败: %s", e, exc_info=True)
+
+    def _create_escalation_task(self, alert: Alert, assignment):
+        """分派时创建升级任务（assignment 已由调用方查出并校验 is_active）"""
+        try:
+            from apps.alerts.service.escalation_service import EscalationService
+
+            EscalationService.create_escalation_task(alert, assignment)
+        except Exception:
+            logger.exception("[AlertOperator] 创建升级任务失败: alert_id=%s", alert.alert_id)
+
+    def _stop_escalation_tasks(self, alert: Alert):
+        """认领/解决/关闭后停止升级任务"""
+        try:
+            from apps.alerts.service.escalation_service import EscalationService
+
+            EscalationService.stop_escalation_task(alert)
+        except Exception as e:
+            logger.error("[AlertOperator] 停止升级任务失败: %s", e, exc_info=True)
+
+    def _reset_escalation_tasks(self, alert: Alert, assignment_id: str = None):
+        """改派后升级计时重置到第一层"""
+        try:
+            from apps.alerts.service.escalation_service import EscalationService
+
+            assignment = None
+            if assignment_id not in (None, ""):
+                assignment = AlertAssignment.objects.filter(id=assignment_id, is_active=True).first()
+            EscalationService.reset_escalation_task(alert, assignment)
+        except Exception as e:
+            logger.error("[AlertOperator] 重置升级任务失败: %s", e, exc_info=True)
+
+    def _assign_alert(self, alert_id: str, data: dict) -> dict:
+        """
+        分派告警：未分派 -> 待响应
+        """
+        logger.info("[AlertOperator] 开始分派告警: alert_id=%s", alert_id)
+
+        with transaction.atomic():
+            try:
+                alert = self.get_alert(alert_id)
+            except Alert.DoesNotExist:
+                logger.error("[AlertOperator] 告警不存在: alert_id=%s", alert_id)
+                return {"result": False, "message": "告警不存在", "data": {}}
+
+            # 检查当前状态
+            if alert.status != AlertStatus.UNASSIGNED:
+                logger.warning(
+                    "[AlertOperator] 告警状态不符合分派条件: alert_id=%s, current_status=%s",
+                    alert_id,
+                    alert.status,
+                )
+                return {
+                    "result": False,
+                    "message": f"告警当前状态为{alert.get_status_display()}，无法进行分派操作",
+                    "data": {},
+                }
+
+            # 获取分派人信息
+            assignee = data.get("assignee", [])
+
+            if not assignee:
+                return {"result": False, "message": "请指定处理人", "data": {}}
+
+            assignee_scope_group_ids = data.get("assignee_scope_group_ids")
+            if assignee_scope_group_ids is None:
+                assignee, validation_message = validate_alert_assignees(alert, assignee)
+            else:
+                assignee, validation_message = validate_usernames_in_groups(
+                    assignee,
+                    set(assignee_scope_group_ids),
+                    "分派目标",
+                )
+            if validation_message:
+                return {"result": False, "message": validation_message, "data": {}}
+
+            # 更新告警状态和处理人
+            alert.status = AlertStatus.PENDING
+            alert.operate = AlertOperate.ASSIGN
+            alert.operator = assignee
+            alert.updated_at = timezone.now()
+            alert.save()
+
+            # 创建提醒记录（一次查出策略对象，复用给提醒/升级/通知，避免重复查询）
+            assignment_id = data.get("assignment_id")  # 分派策略ID
+            assignment = None
+            if assignment_id:
+                assignment = AlertAssignment.objects.filter(id=assignment_id, is_active=True).first()
+                if assignment:
+                    self._create_reminder_record(alert, assignment)
+                    self._create_escalation_task(alert, assignment)
+                else:
+                    logger.error("[AlertOperator] 分派策略不存在或未激活: assignment_id=%s", assignment_id)
+
+            from apps.alerts.action.engine import ActionEngine
+
+            transaction.on_commit(lambda aid=alert.alert_id: ActionEngine.dispatch_async(aid, "assigned"))
+
+            # 通知分流：auto-dispatch(有策略)严格按策略配置发送；
+            # manual(无有效策略)使用当前团队唯一的告警操作通知模板。
+            if assignment:
+                notify_param = self.format_assignment_notify_data(assignment, assignee, alert)
+            else:
+                notify_param = self.format_notify_data(assignee, alert)
+            if notify_param:
+                from apps.alerts.common.notify.dispatcher import enqueue_notifications
+
+                enqueue_notifications(notify_param)
+            else:
+                logger.warning(
+                    "[AlertOperator] 分派通知无可用渠道，未发送！alert_id=%s, assignee=%s, assignment_id=%s",
+                    alert_id,
+                    assignee,
+                    assignment_id,
+                )
+
+            logger.info(
+                "[AlertOperator] 告警分派成功: alert_id=%s, assignee=%s, 状态变更: %s -> %s",
+                alert_id,
+                assignee,
+                AlertStatus.UNASSIGNED,
+                AlertStatus.PENDING,
+            )
+
+            log_data = {
+                "action": LogAction.MODIFY,
+                "target_type": LogTargetType.ALERT,
+                "operator": self.user,
+                "operator_object": "告警处理-分派",
+                "target_id": alert.alert_id,
+                "overview": (
+                    f"告警分派成功, 处理人[{assignee}] 告警[{alert.title}]"
+                    f"状态变更: {self.status_map[AlertStatus.UNASSIGNED]} -> {self.status_map[AlertStatus.PENDING]}"
+                ),
+            }
+            self.operator_log(log_data)
+
+            return {
+                "result": True,
+                "message": "告警分派成功",
+                "data": {
+                    "alert_id": alert_id,
+                    "status": alert.status,
+                    "operator": alert.operator,
+                    # TODO(timezone): 2026-07-27 时区统一改动——从带偏移 ISO 改为用户时区裸串。
+                    # 若下游有依赖 ISO 格式的解析逻辑（如导出/第三方集成），需确认兼容性。
+                    "updated_at": timezone.localtime(alert.updated_at).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            }
+
+    def _acknowledge_alert(self, alert_id: str, data: dict) -> dict:
+        """
+        认领告警：待响应 -> 处理中
+        :param alert_id: 告警ID
+        :param data: 附加数据
+        :return: 操作结果
+        """
+        logger.info("[AlertOperator] 开始认领告警: alert_id=%s", alert_id)
+
+        with transaction.atomic():
+            try:
+                alert = self.get_alert(alert_id)
+            except Alert.DoesNotExist:
+                logger.error("[AlertOperator] 告警不存在: alert_id=%s", alert_id)
+                return {"result": False, "message": "告警不存在", "data": {}}
+
+            # 检查当前状态是否为待响应
+            if alert.status != AlertStatus.PENDING:
+                logger.warning(
+                    "[AlertOperator] 告警状态不符合认领条件: alert_id=%s, current_status=%s",
+                    alert_id,
+                    alert.status,
+                )
+                return {
+                    "result": False,
+                    "message": f"告警当前状态为{alert.get_status_display()}，无法进行认领操作",
+                    "data": {},
+                }
+
+            # 检查是否有权限认领（是否在处理人列表中）
+            if self.user not in alert.operator:
+                logger.warning(
+                    "[AlertOperator] 用户无权限认领告警: alert_id=%s, user=%s, operators=%s",
+                    alert_id,
+                    self.user,
+                    alert.operator,
+                )
+                return {"result": False, "message": "您没有权限认领此告警", "data": {}}
+
+            # 更新告警状态
+            alert.status = AlertStatus.PROCESSING
+            alert.operate = AlertOperate.ACKNOWLEDGE
+            alert.updated_at = timezone.now()
+            alert.save()
+
+            from apps.alerts.action.engine import ActionEngine
+
+            transaction.on_commit(lambda aid=alert.alert_id: ActionEngine.dispatch_async(aid, "acknowledged"))
+
+            logger.info(
+                "[AlertOperator] 告警认领成功: alert_id=%s, user=%s, 状态变更: %s -> %s",
+                alert_id,
+                self.user,
+                AlertStatus.PENDING,
+                AlertStatus.PROCESSING,
+            )
+
+            # 停止相关的提醒任务
+            self._stop_reminder_tasks(alert)
+            self._stop_escalation_tasks(alert)
+
+            log_data = {
+                "action": LogAction.MODIFY,
+                "target_type": LogTargetType.ALERT,
+                "operator": self.user,
+                "operator_object": "告警处理-认领",
+                "target_id": alert.alert_id,
+                "overview": (
+                    f"告警认领成功, 认领人[{self.user}] 告警[{alert.title}]"
+                    f"状态变更: {self.status_map[AlertStatus.PENDING]} -> {self.status_map[AlertStatus.PROCESSING]}"
+                ),
+            }
+            self.operator_log(log_data)
+
+            return {
+                "result": True,
+                "message": "告警认领成功",
+                "data": {
+                    "alert_id": alert_id,
+                    "status": alert.status,
+                    "updated_at": timezone.localtime(alert.updated_at).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            }
+
+    def _reassign_alert(self, alert_id: str, data: dict) -> dict:
+        """
+        转派告警：处理中由当前处理人转派为待响应；待响应仅平台超级用户可直接换人且状态保持待响应。
+        :param alert_id: 告警ID
+        :param data: 包含新处理人信息的数据
+        :return: 操作结果
+        """
+        logger.info("[AlertOperator] 开始转派告警: alert_id=%s", alert_id)
+
+        with transaction.atomic():
+            try:
+                alert = self.get_alert(alert_id)
+            except Alert.DoesNotExist:
+                logger.error("[AlertOperator] 告警不存在: alert_id=%s", alert_id)
+                return {"result": False, "message": "告警不存在", "data": {}}
+
+            can_reassign_pending = alert.status == AlertStatus.PENDING and self.is_superuser
+            can_reassign_processing = alert.status == AlertStatus.PROCESSING and self.user in alert.operator
+            if not (can_reassign_pending or can_reassign_processing):
+                if alert.status == AlertStatus.PROCESSING:
+                    logger.warning(
+                        "[AlertOperator] 用户无权限转派告警: alert_id=%s, user=%s, operators=%s",
+                        alert_id,
+                        self.user,
+                        alert.operator,
+                    )
+                    return {"result": False, "message": "您没有权限转派此告警", "data": {}}
+                logger.warning(
+                    "[AlertOperator] 告警状态不符合转派条件: alert_id=%s, current_status=%s",
+                    alert_id,
+                    alert.status,
+                )
+                return {
+                    "result": False,
+                    "message": f"告警当前状态为{alert.get_status_display()}，无法进行转派操作",
+                    "data": {},
+                }
+
+            # 获取新的处理人信息
+            new_assignee = data.get("assignee", [])
+            if not new_assignee:
+                logger.warning("[AlertOperator] 转派操作缺少新处理人信息: alert_id=%s", alert_id)
+                return {"result": False, "message": "请指定新的处理人", "data": {}}
+
+            new_assignee, validation_message = validate_alert_assignees(alert, new_assignee)
+            if validation_message:
+                return {"result": False, "message": validation_message, "data": {}}
+
+            old_assignee = alert.operator.copy()
+            old_status = alert.status
+
+            # 更新告警状态和处理人
+            alert.status = AlertStatus.PENDING
+            alert.operate = AlertOperate.REASSIGN
+            alert.operator = new_assignee
+            alert.updated_at = timezone.now()
+            alert.save()
+
+            from apps.alerts.action.engine import ActionEngine
+
+            transaction.on_commit(lambda aid=alert.alert_id: ActionEngine.dispatch_async(aid, "reassigned"))
+
+            logger.info(
+                "[AlertOperator] 告警转派成功: alert_id=%s, old_assignee=%s, new_assignee=%s, 状态变更: %s -> %s",
+                alert_id,
+                old_assignee,
+                new_assignee,
+                old_status,
+                AlertStatus.PENDING,
+            )
+
+            notify_param = self.format_notify_data(
+                new_assignee,
+                alert,
+                scene="reassignment",
+                previous_assignee=old_assignee,
+            )
+            if notify_param:
+                from apps.alerts.common.notify.dispatcher import enqueue_notifications
+
+                enqueue_notifications(notify_param)
+            else:
+                logger.warning(
+                    "[AlertOperator] 未找到有效的告警操作通知配置，通知失败！alert_id=%s, assignee=%s",
+                    alert_id,
+                    new_assignee,
+                )
+
+            assignment_id = data.get("assignment_id")
+            self._ensure_reminder_tasks(alert, assignment_id)
+            self._reset_escalation_tasks(alert, assignment_id)
+
+            log_data = {
+                "action": LogAction.MODIFY,
+                "target_type": LogTargetType.ALERT,
+                "operator": self.user,
+                "operator_object": "告警处理-转派",
+                "target_id": alert.alert_id,
+                "overview": (
+                    f"告警转派成功, 转派处理人[{new_assignee}] 告警[{alert.title}]"
+                    f"状态变更: {self.status_map[old_status]} -> {self.status_map[AlertStatus.PENDING]}"
+                ),
+            }
+            self.operator_log(log_data)
+
+            return {
+                "result": True,
+                "message": "告警转派成功",
+                "data": {
+                    "alert_id": alert_id,
+                    "status": alert.status,
+                    "old_operator": old_assignee,
+                    "new_operator": alert.operator,
+                    "updated_at": timezone.localtime(alert.updated_at).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            }
+
+    def _close_alert(self, alert_id: str, data: dict) -> dict:
+        """
+        关闭告警：默认仅处理中且须为当前处理人；API 关闭模式允许待响应/处理中且不校验处理人
+        :param alert_id: 告警ID
+        :param data: 附加数据（可包含关闭原因等）
+        :return: 操作结果
+        """
+        logger.info("[AlertOperator] 开始关闭告警: alert_id=%s", alert_id)
+
+        with transaction.atomic():
+            try:
+                alert = self.get_alert(alert_id)
+            except Alert.DoesNotExist:
+                logger.error("[AlertOperator] 告警不存在: alert_id=%s", alert_id)
+                return {"result": False, "message": "告警不存在", "data": {}}
+
+            allowed_close_statuses = (AlertStatus.PENDING, AlertStatus.PROCESSING) if self.api_close else (AlertStatus.PROCESSING,)
+            if alert.status not in allowed_close_statuses:
+                logger.warning(
+                    "[AlertOperator] 告警状态不符合关闭条件: alert_id=%s, current_status=%s",
+                    alert_id,
+                    alert.status,
+                )
+                return {
+                    "result": False,
+                    "message": f"告警当前状态为{alert.get_status_display()}，无法进行关闭操作",
+                    "data": {},
+                }
+
+            if not self.api_close and self.user not in alert.operator:
+                logger.warning(
+                    "[AlertOperator] 用户无权限关闭告警: alert_id=%s, user=%s, operators=%s",
+                    alert_id,
+                    self.user,
+                    alert.operator,
+                )
+                return {"result": False, "message": "您没有权限关闭此告警", "data": {}}
+
+            close_reason = data.get("reason", "告警已处理完成")
+            previous_status = alert.status
+
+            # 更新告警状态
+            alert.status = AlertStatus.CLOSED
+            alert.operate = AlertOperate.CLOSE
+            alert.updated_at = timezone.now()
+            Alert.stamp_closed_at(alert, alert.updated_at)
+            alert.save()
+
+            from apps.alerts.action.engine import ActionEngine
+
+            transaction.on_commit(lambda aid=alert.alert_id: ActionEngine.dispatch_async(aid, "closed"))
+
+            logger.info(
+                "[AlertOperator] 告警关闭成功: alert_id=%s, user=%s, reason=%s, 状态变更: %s -> %s",
+                alert_id,
+                self.user,
+                close_reason,
+                previous_status,
+                AlertStatus.CLOSED,
+            )
+
+            log_data = {
+                "action": LogAction.MODIFY,
+                "target_type": LogTargetType.ALERT,
+                "operator": self.user,
+                "operator_object": "告警处理-关闭",
+                "target_id": alert.alert_id,
+                "overview": (f"告警关闭成功, 告警[{alert.title}]" f"状态变更: {self.status_map[previous_status]} -> {self.status_map[AlertStatus.CLOSED]}"),
+            }
+            self.operator_log(log_data)
+
+            return {
+                "result": True,
+                "message": "告警关闭成功",
+                "data": {
+                    "alert_id": alert_id,
+                    "status": alert.status,
+                    "close_reason": close_reason,
+                    "updated_at": timezone.localtime(alert.updated_at).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            }
+
+    def _resolve_alert(self, alert_id: str, data: dict) -> dict:
+        """
+        处理告警：处理中 -> 已处理
+        :param alert_id: 告警ID
+        :param data: 附加数据（可包含处理说明等）
+        :return: 操作结果
+        """
+        logger.info("[AlertOperator] 开始处理告警: alert_id=%s", alert_id)
+
+        with transaction.atomic():
+            try:
+                alert = self.get_alert(alert_id)
+            except Alert.DoesNotExist:
+                logger.error("[AlertOperator] 告警不存在: alert_id=%s", alert_id)
+                return {"result": False, "message": "告警不存在", "data": {}}
+
+            # 检查当前状态是否为处理中
+            if alert.status != AlertStatus.PROCESSING:
+                logger.warning(
+                    "[AlertOperator] 告警状态不符合处理条件: alert_id=%s, current_status=%s",
+                    alert_id,
+                    alert.status,
+                )
+                return {
+                    "result": False,
+                    "message": f"告警当前状态为{alert.get_status_display()}，无法标记为已处理",
+                    "data": {},
+                }
+
+            # 检查是否有权限处理（是否为当前处理人）
+            if self.user not in alert.operator:
+                logger.warning(
+                    "[AlertOperator] 用户无权限处理告警: alert_id=%s, user=%s, operators=%s",
+                    alert_id,
+                    self.user,
+                    alert.operator,
+                )
+                return {"result": False, "message": "您没有权限处理此告警", "data": {}}
+
+            # 记录处理说明
+            resolve_note = data.get("note", "告警问题已解决")
+
+            # 更新告警状态
+            alert.status = AlertStatus.RESOLVED
+            alert.updated_at = timezone.now()
+            Alert.stamp_closed_at(alert, alert.updated_at)
+            alert.save()
+
+            from apps.alerts.action.engine import ActionEngine
+
+            transaction.on_commit(lambda aid=alert.alert_id: ActionEngine.dispatch_async(aid, "resolved"))
+
+            logger.info(
+                "[AlertOperator] 告警处理成功: alert_id=%s, user=%s, note=%s, 状态变更: %s -> %s",
+                alert_id,
+                self.user,
+                resolve_note,
+                AlertStatus.PROCESSING,
+                AlertStatus.RESOLVED,
+            )
+
+            log_data = {
+                "action": LogAction.MODIFY,
+                "target_type": LogTargetType.ALERT,
+                "operator": self.user,
+                "operator_object": "告警处理-已处理",
+                "target_id": alert.alert_id,
+                "overview": f"告警处理成功, 告警[{alert.title}]状态变更: {self.status_map[AlertStatus.PROCESSING]} -> {self.status_map[AlertStatus.RESOLVED]}",
+            }
+            self.operator_log(log_data)
+
+            return {
+                "result": True,
+                "message": "告警处理成功",
+                "data": {
+                    "alert_id": alert_id,
+                    "status": alert.status,
+                    "resolve_note": resolve_note,
+                    "updated_at": timezone.localtime(alert.updated_at).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            }
+
+    def format_notify_data(self, assignee, alert, scene="assignment", previous_assignee=None):
+        """
+        格式化通知数据。走统一通知出口,返回 sync_notify 期望的 list[dict];
+        无渠道或无接收人 → 返回 []。
+        """
+        from apps.alerts.common.notify.dispatcher import build_channel_params
+        from apps.alerts.notification_templates.operation import get_alert_operation_channel
+
+        selected_channel = get_alert_operation_channel(alert)
+        if not selected_channel:
+            return []
+        actor_name = "系统" if str(self.user).lower() == "system" else str(self.user or "系统")
+        receiver_names = "、".join(str(item) for item in assignee)
+        previous_receiver_names = "、".join(str(item) for item in (previous_assignee or []))
+        if scene == "reassignment":
+            action_summary = f"该告警已由 {actor_name} 从 {previous_receiver_names or '—'} 转派给 {receiver_names}，" "请新的处理人及时认领并处理。"
+        else:
+            action_summary = f"该告警已由 {actor_name} 分派给 {receiver_names}，请及时认领并处理。"
+        action_time = getattr(alert, "updated_at", None)
+        if action_time:
+            if timezone.is_aware(action_time):
+                action_time = timezone.localtime(action_time)
+            action_time = action_time.strftime("%Y-%m-%d %H:%M:%S")
+        return build_channel_params(
+            list(assignee),
+            [selected_channel],
+            [alert],
+            alert.alert_id,
+            scene=scene,
+            notification_context={
+                "action_summary": action_summary,
+                "actor_name": actor_name,
+                "previous_receiver_names": previous_receiver_names,
+                "action_time": action_time or "",
+            },
+        )
+
+    def format_assignment_notify_data(self, assignment, assignee, alert):
+        """auto-dispatch：严格按分派策略勾选的通知方式(notify_channels)构造通知，
+        勾哪个发哪个(含 opspilot)；无策略 / 无渠道 / 无接收人 → 返回 []。"""
+        from apps.alerts.common.notify.dispatcher import build_channel_params
+
+        if not assignment:
+            logger.info("[AlertNotify] 分派通知: 无有效策略, 不发送, alert_id=%s", alert.alert_id)
+            return []
+        channels = assignment.notify_channels or []
+        # 自动分派操作人是系统(SYSTEM_OPERATOR_USER)，按策略配置的全部人员通知，
+        # 不排除操作人——否则与系统同名(如 admin)的收件人会被过滤导致不发。
+        user_list = list(assignee)
+        logger.info(
+            "[AlertNotify] 分派通知构造: alert_id=%s, assignment_id=%s, team=%s, notify_channels=%s, 接收人=%s",
+            alert.alert_id,
+            assignment.id,
+            alert.team,
+            channels,
+            user_list,
+        )
+        params = build_channel_params(user_list, channels, [alert], alert.alert_id, scene="assignment")
+        logger.info(
+            "[AlertNotify] 分派通知构造结果: alert_id=%s, 参数数=%s, 渠道=%s",
+            alert.alert_id,
+            len(params),
+            [(p.get("channel_type"), p.get("channel_id")) for p in params],
+        )
+        return params
+
+    @staticmethod
+    def operator_log(log_data: dict):
+        """
+        记录告警操作日志
+        :param log_data: 日志数据字典
+        """
+        record_operator_log(**log_data)

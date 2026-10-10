@@ -1,0 +1,597 @@
+'use client';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
+import {
+  Input,
+  Button,
+  Select,
+  Tag,
+  Tabs,
+  Spin,
+  Tooltip,
+  Checkbox
+} from 'antd';
+import useApiClient from '@/utils/request';
+import { useTranslation } from '@/utils/i18n';
+import Icon from '@/components/icon';
+import { getRecentTimeRange } from '@/app/log/utils/common';
+import {
+  ColumnItem,
+  ModalRef,
+  Pagination,
+  TableDataItem,
+  UserItem,
+  TabItem,
+  TimeSelectorDefaultValue,
+  TimeValuesProps
+} from '@/app/log/types';
+import { ObjectItem } from '@/app/log/types/event';
+import { AlertOutlined } from '@ant-design/icons';
+import { FiltersConfig } from '@/app/log/types/event';
+import CustomTable from '@/components/custom-table';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import TimeSelector from '@/components/time-selector';
+import Collapse from '@/components/collapse';
+import StackedBarChart from '@/app/log/components/charts/stackedBarChart';
+import AlertDetail from './alertDetail';
+import AlertHandlerActions from './alertHandlerActions';
+import { formatAlertHandlers } from './alertHandlerUtils';
+import {
+  createAlertRefreshQuerySnapshot,
+  resolveAlertRefreshQuery,
+  updateAlertRefreshQuerySnapshot
+} from './alertRefreshQuery';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import { useAlarmTabs } from '@/app/log/hooks/event';
+import dayjs from 'dayjs';
+import { useCommon } from '@/app/log/context/common';
+import alertStyle from './index.module.scss';
+import { LEVEL_MAP } from '@/app/log/constants';
+import { useLevelList, useStateMap } from '@/app/log/hooks/event';
+import useLogEventApi from '@/app/log/api/event';
+import useLogIntegrationApi from '@/app/log/api/integration';
+import { cloneDeep } from 'lodash';
+import UserAvatar from '@/components/user-avatar';
+import { useHabitExpanded } from '@/hooks/useHabitExpanded';
+import useLogUserHabitApi, {
+  LOG_ALERT_CHART_HABIT_KEY
+} from '@/app/log/api/userHabit';
+const { Search } = Input;
+const { Option } = Select;
+
+const Alert: React.FC = () => {
+  const { isLoading } = useApiClient();
+  const { getLogAlert, getLogAlertStats } = useLogEventApi();
+  const { getCollectTypes } = useLogIntegrationApi();
+  const { getUserHabit, saveUserHabit } = useLogUserHabitApi();
+  const { t } = useTranslation();
+  const STATE_MAP = useStateMap();
+  const LEVEL_LIST = useLevelList();
+  const tabs: TabItem[] = useAlarmTabs();
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const commonContext = useCommon();
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const detailRef = useRef<ModalRef>(null);
+  const alertAbortControllerRef = useRef<AbortController | null>(null);
+  const alertRequestIdRef = useRef<number>(0);
+  const chartAbortControllerRef = useRef<AbortController | null>(null);
+  const chartRequestIdRef = useRef<number>(0);
+  const userList: UserItem[] = commonContext?.userList || [];
+  const [searchText, setSearchText] = useState<string>('');
+  const [tableLoading, setTableLoading] = useState<boolean>(false);
+  const [chartLoading, setChartLoading] = useState<boolean>(false);
+  const [tableData, setTableData] = useState<TableDataItem[]>([]);
+  const [pagination, setPagination] = useState<Pagination>({
+    current: 1,
+    total: 0,
+    pageSize: 20
+  });
+  const [frequence, setFrequence] = useState<number>(0);
+  const [timeValues, setTimeValues] = useState<TimeValuesProps>({
+    timeRange: [],
+    originValue: 10080
+  });
+  const timeDefaultValue = (useRef<TimeSelectorDefaultValue>({
+    selectValue: 10080,
+    rangePickerVaule: null
+  })?.current || {}) as any;
+  const [filters, setFilters] = useState<FiltersConfig>({
+    level: [],
+    state: []
+  });
+  const [activeTab, setActiveTab] = useState<string>('activeAlarms');
+  const [myAlert, setMyAlert] = useState(false);
+  const querySnapshotRef = useRef(
+    createAlertRefreshQuerySnapshot({
+      activeTab: 'activeAlarms',
+      filters: { level: [], state: [] },
+      myAlert: false
+    }).current
+  );
+  updateAlertRefreshQuerySnapshot(querySnapshotRef, {
+    activeTab,
+    filters,
+    myAlert
+  });
+  const [chartData, setChartData] = useState<Record<string, any>[]>([]);
+  const loadChartHabit = useCallback(
+    () => getUserHabit(LOG_ALERT_CHART_HABIT_KEY),
+    [getUserHabit]
+  );
+  const saveChartHabit = useCallback(
+    (value: { expanded: boolean }) =>
+      saveUserHabit(LOG_ALERT_CHART_HABIT_KEY, value),
+    [saveUserHabit]
+  );
+  const [chartExpanded, onChartToggle] = useHabitExpanded({
+    enabled: !isLoading,
+    load: loadChartHabit,
+    save: saveChartHabit
+  });
+  const [objects, setObjects] = useState<ObjectItem[]>([]);
+
+  const columns: ColumnItem[] = [
+    {
+      title: t('log.event.level'),
+      dataIndex: 'level',
+      key: 'level',
+      render: (_, { level }) => (
+        <Tag icon={<AlertOutlined />} color={LEVEL_MAP[level] as string}>
+          {LEVEL_LIST.find((item) => item.value === level)?.label || '--'}
+        </Tag>
+      )
+    },
+    {
+      title: t('common.time'),
+      dataIndex: 'updated_at',
+      key: 'updated_at',
+      sorter: (a: any, b: any) => a.id - b.id,
+      render: (_, { updated_at }) => (
+        <>{updated_at ? convertToLocalizedTime(updated_at) : '--'}</>
+      )
+    },
+    {
+      title: t('log.event.alertName'),
+      dataIndex: 'alert_name',
+      key: 'alert_name'
+    },
+    {
+      title: t('log.event.alertType'),
+      dataIndex: 'alert_type',
+      key: 'alert_type',
+      render: (_, { alert_type }) => (
+        <EllipsisWithTooltip
+          className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
+          text={
+            alert_type === 'keyword'
+              ? t('log.event.keywordAlert')
+              : t('log.event.aggregationAlert')
+          }
+        />
+      )
+    },
+    {
+      title: t('log.event.state'),
+      dataIndex: 'status',
+      key: 'status',
+      render: (_, { status }) => (
+        <Tag color={status === 'new' ? 'blue' : 'var(--color-text-4)'}>
+          {STATE_MAP[status]}
+        </Tag>
+      )
+    },
+    {
+      title: t('log.event.notify'),
+      dataIndex: 'notify',
+      key: 'notify',
+      render: (_, record) => (
+        <>{t(`log.event.${record.notice ? 'notified' : 'unnotified'}`)}</>
+      )
+    },
+    {
+      title: t('log.event.handler'),
+      dataIndex: 'handlers',
+      key: 'handlers',
+      render: (_: unknown, record: TableDataItem) => {
+        const text = formatAlertHandlers(
+          record.handlers,
+          record.handlers_display,
+          userList
+        );
+        return text !== '--' ? (
+          <UserAvatar userName={text} size="small" />
+        ) : (
+          <>--</>
+        );
+      }
+    },
+    {
+      title: t('common.action'),
+      key: 'action',
+      dataIndex: 'action',
+      width: 280,
+      fixed: 'right',
+      render: (_, record) => (
+        <>
+          <Button
+            className="mr-[10px]"
+            type="link"
+            onClick={() => openAlertDetail(record)}
+          >
+            {t('common.detail')}
+          </Button>
+          <AlertHandlerActions
+            record={record}
+            closeText={t('common.close')}
+            onSuccess={onRefresh}
+          />
+        </>
+      )
+    }
+  ];
+
+  const isActiveAlarm = useMemo(() => {
+    return activeTab === 'activeAlarms';
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (!frequence) {
+      clearTimer();
+      return;
+    }
+    timerRef.current = setInterval(() => {
+      getAssetInsts('timer');
+      getChartData('timer');
+    }, frequence);
+    return () => {
+      clearTimer();
+    };
+  }, [
+    frequence,
+    timeValues,
+    searchText,
+    pagination.current,
+    pagination.pageSize
+  ]);
+
+  useEffect(() => {
+    if (isLoading) return;
+    getAssetInsts('refresh');
+  }, [isLoading, timeValues, pagination.current, pagination.pageSize]);
+
+  useEffect(() => {
+    if (isLoading) return;
+    getChartData('refresh');
+  }, [isLoading, timeValues]);
+
+  useEffect(() => {
+    if (isLoading) return;
+    getObjects();
+  }, [isLoading]);
+
+  useEffect(() => {
+    return () => {
+      cancelAllRequests();
+    };
+  }, []);
+
+  const changeTab = (val: string) => {
+    clearData();
+    setActiveTab(val);
+    const filtersConfig = {
+      level: [],
+      state: []
+    };
+    setFilters(filtersConfig);
+    setSearchText('');
+    updateAlertRefreshQuerySnapshot(querySnapshotRef, {
+      activeTab: val,
+      filters: filtersConfig,
+      myAlert
+    });
+    getAssetInsts('refresh', { tab: val, filtersConfig, text: 'clear' });
+    getChartData('refresh', { tab: val, filtersConfig });
+  };
+
+  const getObjects = async () => {
+    try {
+      const data: ObjectItem[] = await getCollectTypes();
+      setObjects(data);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const clearTimer = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+  };
+
+  const getParams = (tab: string, filtersMap: FiltersConfig, mine = myAlert) => {
+    const recentTimeRange = getRecentTimeRange(timeValues);
+    const isActive = tab === 'activeAlarms';
+    const params = {
+      status: isActive ? 'new' : 'closed',
+      levels: filtersMap.level.join(','),
+      content: searchText || '',
+      page: pagination.current,
+      page_size: pagination.pageSize,
+      end_event_time: isActive ? '' : dayjs(recentTimeRange[0]).toISOString(),
+      start_event_time: isActive ? '' : dayjs(recentTimeRange[1]).toISOString(),
+      ...(mine ? { my_alert: 1 } : {})
+    };
+    return params;
+  };
+
+  const handleTableChange = (pagination: any) => {
+    setPagination(pagination);
+  };
+
+  const getAssetInsts = async (
+    type: string,
+    extra?: {
+      text?: string;
+      tab?: string;
+      filtersConfig?: FiltersConfig;
+      myAlert?: boolean;
+    }
+  ) => {
+    alertAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    alertAbortControllerRef.current = abortController;
+    const currentRequestId = ++alertRequestIdRef.current;
+    const { activeTab: tab, filters: filtersMap, myAlert: mine } =
+      resolveAlertRefreshQuery(querySnapshotRef, extra);
+    const params: any = getParams(tab, filtersMap, mine);
+    if (extra?.text === 'clear') {
+      params.content = '';
+    }
+    try {
+      setTableLoading(type !== 'timer');
+      const data = await getLogAlert(params, {
+        signal: abortController.signal
+      });
+      if (currentRequestId !== alertRequestIdRef.current) return;
+      setTableData(data.items || []);
+      setPagination((pre) => ({
+        ...pre,
+        total: data.count
+      }));
+    } finally {
+      if (currentRequestId === alertRequestIdRef.current) {
+        setTableLoading(false);
+      }
+    }
+  };
+
+  const getChartData = async (
+    type: string,
+    extra?: {
+      tab?: string;
+      filtersConfig?: FiltersConfig;
+      myAlert?: boolean;
+    }
+  ) => {
+    chartAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    chartAbortControllerRef.current = abortController;
+    const currentRequestId = ++chartRequestIdRef.current;
+    const { activeTab: tab, filters: filtersMap, myAlert: mine } =
+      resolveAlertRefreshQuery(querySnapshotRef, extra);
+    const params = getParams(tab, filtersMap, mine);
+    const chartParams: any = cloneDeep(params);
+    delete chartParams.page;
+    delete chartParams.page_size;
+    chartParams.content = '';
+    try {
+      setChartLoading(type !== 'timer');
+      const data = await getLogAlertStats(chartParams, {
+        signal: abortController.signal
+      });
+      if (currentRequestId !== chartRequestIdRef.current) return;
+      const chartList = (data.time_series || []).map((item: TableDataItem) => {
+        const levels = {
+          critical: 0,
+          warning: 0,
+          error: 0
+        };
+        return {
+          ...Object.assign(levels, item.levels),
+          time: convertToLocalizedTime(item.time_start)
+        };
+      });
+      setChartData(chartList);
+    } finally {
+      if (currentRequestId === chartRequestIdRef.current) {
+        setChartLoading(false);
+      }
+    }
+  };
+
+  const onFrequenceChange = (val: number) => {
+    setFrequence(val);
+  };
+
+  const onRefresh = () => {
+    getAssetInsts('refresh');
+    getChartData('refresh');
+  };
+
+  const openAlertDetail = (row: TableDataItem) => {
+    detailRef.current?.showModal({
+      title: t('log.event.alertDetail'),
+      type: 'add',
+      form: row
+    });
+  };
+
+  const onTimeChange = (val: number[], originValue: number | null) => {
+    setTimeValues({
+      timeRange: val,
+      originValue
+    });
+  };
+
+  const onFilterChange = (
+    checkedValues: string[],
+    field: keyof FiltersConfig
+  ) => {
+    const filtersConfig = cloneDeep(filters);
+    filtersConfig[field] = checkedValues;
+    setFilters(filtersConfig);
+    updateAlertRefreshQuerySnapshot(querySnapshotRef, {
+      activeTab,
+      filters: filtersConfig,
+      myAlert
+    });
+    getAssetInsts('refresh', { filtersConfig });
+    getChartData('refresh', { filtersConfig });
+  };
+
+  const handleSearch = (text: string) => {
+    setSearchText(text);
+    getAssetInsts('refresh', { text: text || 'clear' });
+  };
+
+  const clearData = () => {
+    setTableData([]);
+    setChartData([]);
+  };
+
+  const cancelAllRequests = () => {
+    alertAbortControllerRef.current?.abort();
+    chartAbortControllerRef.current?.abort();
+  };
+
+  return (
+    <div className="w-full">
+      <div className={alertStyle.alertNoTree}>
+        <div className={alertStyle.alarmList}>
+          <Tabs activeKey={activeTab} items={tabs} onChange={changeTab} />
+          <div className={alertStyle.searchCondition}>
+            <div className={alertStyle.condition}>
+              <ul className="flex">
+                <li className="mr-[8px]">
+                  <span className="mr-[8px] text-[14px] text-[var(--color-text-3)]">
+                    {t('log.event.level')}
+                  </span>
+                  <Select
+                    style={{ width: 200 }}
+                    dropdownStyle={{ width: 130 }}
+                    showSearch
+                    allowClear
+                    mode="multiple"
+                    optionFilterProp="label"
+                    maxTagCount="responsive"
+                    value={filters.level}
+                    onChange={(val) => onFilterChange(val, 'level')}
+                  >
+                    {LEVEL_LIST.map((item) => (
+                      <Option
+                        key={item.value}
+                        value={item.value}
+                        label={item.label}
+                      >
+                        <Tag
+                          icon={<AlertOutlined />}
+                          color={LEVEL_MAP[item.value as string] as string}
+                        >
+                          {LEVEL_LIST.find((tex) => tex.value === item.value)
+                            ?.label || '--'}
+                        </Tag>
+                      </Option>
+                    ))}
+                  </Select>
+                </li>
+              </ul>
+              <TimeSelector
+                defaultValue={timeDefaultValue}
+                onlyRefresh={isActiveAlarm}
+                onChange={onTimeChange}
+                onFrequenceChange={onFrequenceChange}
+                onRefresh={onRefresh}
+              />
+            </div>
+          </div>
+          <Spin spinning={chartLoading}>
+            <div className={alertStyle.chartWrapper}>
+              <Collapse
+                title={t('log.event.distributionMap')}
+                icon={
+                  <Tooltip
+                    placement="top"
+                    title={t(`log.event.${activeTab}MapTips`)}
+                  >
+                    <span className="cursor-pointer">
+                      <Icon
+                        type="a-shuoming2"
+                        className="text-[14px] text-[var(--color-text-3)]"
+                      />
+                    </span>
+                  </Tooltip>
+                }
+                isOpen={chartExpanded}
+                onToggle={onChartToggle}
+              >
+                <div className={alertStyle.chart}>
+                  <StackedBarChart data={chartData} colors={LEVEL_MAP as any} />
+                </div>
+              </Collapse>
+            </div>
+          </Spin>
+          <div className={alertStyle.table}>
+            <div className="mb-[10px] flex items-center gap-3">
+              <Search
+                allowClear
+                className="w-[240px]"
+                placeholder={t('common.searchPlaceHolder')}
+                value={searchText}
+                enterButton
+                onChange={(e) => setSearchText(e.target.value)}
+                onSearch={handleSearch}
+              />
+              <Checkbox
+                checked={myAlert}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setMyAlert(checked);
+                  updateAlertRefreshQuerySnapshot(querySnapshotRef, {
+                    activeTab,
+                    filters,
+                    myAlert: checked
+                  });
+                  getAssetInsts('refresh', { myAlert: checked });
+                  getChartData('refresh', { myAlert: checked });
+                }}
+              >
+                {t('log.event.myAlert')}
+              </Checkbox>
+            </div>
+            <CustomTable
+              className="w-full"
+              scroll={{
+                y: chartExpanded
+                  ? 'calc(100vh - 606px)'
+                  : 'calc(100vh - 496px)',
+                x: 'max-content'
+              }}
+              columns={columns}
+              dataSource={tableData}
+              pagination={pagination}
+              loading={tableLoading}
+              rowKey="id"
+              onChange={handleTableChange}
+            />
+          </div>
+        </div>
+      </div>
+      <AlertDetail
+        ref={detailRef}
+        objects={objects}
+        userList={userList}
+        onSuccess={() => getAssetInsts('refresh')}
+      />
+    </div>
+  );
+};
+
+export default Alert;

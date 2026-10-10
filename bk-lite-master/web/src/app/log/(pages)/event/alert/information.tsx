@@ -1,0 +1,305 @@
+'use client';
+import React, { useMemo } from 'react';
+import { Descriptions } from 'antd';
+import {
+  TableDataItem,
+  Organization
+} from '@/app/log/types';
+import { useTranslation } from '@/utils/i18n';
+import informationStyle from './index.module.scss';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import { showGroupName } from '@/app/log/utils/common';
+import { useCommon } from '@/app/log/context/common';
+import { Button } from 'antd';
+import { LEVEL_MAP } from '@/app/log/constants';
+import { useLevelList } from '@/app/log/hooks/event';
+import CustomTable from '@/components/custom-table';
+import { FilterItem } from '@/app/log/types/integration';
+import { buildLogAlertRawColumns } from './rawLogColumns';
+import { formatUserDisplayName } from '@/utils/userDisplay';
+import AlertHandlerActions from './alertHandlerActions';
+import { formatAlertHandlers } from './alertHandlerUtils';
+
+const Information: React.FC<TableDataItem> = ({
+  formData,
+  userList,
+  onClose,
+  rawData = []
+}) => {
+  const { t } = useTranslation();
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const LEVEL_LIST = useLevelList();
+  const commonContext = useCommon();
+  const organizationList: Organization[] =
+    commonContext?.authOrganizations || [];
+
+  const isAggregate = useMemo(
+    () => formData.alert_type === 'aggregate',
+    [formData]
+  );
+
+  const isClosed = useMemo(() => formData.status === 'closed', [formData]);
+
+  const activeColumns = useMemo(() => {
+    return buildLogAlertRawColumns({
+      isAggregate,
+      showFields: formData.show_fields,
+      rawData,
+      renderTime: convertToLocalizedTime
+    });
+  }, [convertToLocalizedTime, formData.show_fields, isAggregate, rawData]);
+
+  const buildVictoriaLogsQuery = () => {
+    try {
+      const alertCondition = formData.alert_condition;
+      if (!alertCondition) return '';
+      const { query, group_by, rule } = alertCondition;
+      const baseQuery = query || '*';
+      // 首先构建基础过滤查询（不包含聚合函数的条件）
+      const filterConditions: string[] = [];
+      const aggregateConditions: any[] = [];
+      if (rule?.conditions?.length) {
+        rule.conditions.forEach((condition: FilterItem) => {
+          const { field, op, value, func } = condition;
+          // 如果有聚合函数，放入聚合条件处理
+          if (func && ['count', 'sum', 'max', 'min', 'avg'].includes(func)) {
+            aggregateConditions.push(condition);
+          } else {
+            // 普通字段过滤条件
+            let fieldCondition = '';
+            switch (op) {
+              case '=':
+                fieldCondition = `${field}:"${value}"`;
+                break;
+              case '!=':
+                fieldCondition = `!${field}:"${value}"`;
+                break;
+              case '>':
+                fieldCondition = `${field}:>${value}`;
+                break;
+              case '<':
+                fieldCondition = `${field}:<${value}`;
+                break;
+              case 'in':
+                fieldCondition = `${field}:*${value}*`;
+                break;
+              case 'nin':
+                fieldCondition = `!${field}:*${value}*`;
+                break;
+              default:
+                fieldCondition = `${field}:"${value}"`;
+            }
+            filterConditions.push(fieldCondition);
+          }
+        });
+      }
+      // 构建基础查询部分
+      let victoriaQuery = baseQuery;
+      if (filterConditions.length > 0) {
+        const filterStr =
+          rule?.mode === 'and'
+            ? filterConditions.join(' AND ')
+            : filterConditions.join(' OR ');
+        if (victoriaQuery === '*' || !victoriaQuery) {
+          victoriaQuery = filterStr;
+        } else {
+          victoriaQuery = `(${victoriaQuery}) AND (${filterStr})`;
+        }
+      }
+      // 处理 group_by 字段 - 确保这些字段存在
+      if (group_by && group_by.length > 0) {
+        const groupByConditions = group_by.map((field: string) => `${field}:*`);
+        const groupByStr = groupByConditions.join(' AND ');
+        if (victoriaQuery === '*' || !victoriaQuery) {
+          victoriaQuery = groupByStr;
+        } else {
+          victoriaQuery = `(${victoriaQuery}) AND (${groupByStr})`;
+        }
+      }
+      // 如果有聚合条件或group_by，构建 stats 管道
+      if (aggregateConditions.length > 0 || (group_by && group_by.length > 0)) {
+        const statsExpressions: string[] = [];
+        // 添加聚合函数表达式
+        aggregateConditions.forEach((condition: FilterItem) => {
+          const { field, func } = condition;
+          let aggregateExpr = '';
+          switch (func) {
+            case 'count':
+              if (field === '*' || !field) {
+                aggregateExpr = 'count()';
+              } else {
+                aggregateExpr = `count(${field})`;
+              }
+              break;
+            case 'sum':
+              aggregateExpr = `sum(${field})`;
+              break;
+            case 'max':
+              aggregateExpr = `max(${field})`;
+              break;
+            case 'min':
+              aggregateExpr = `min(${field})`;
+              break;
+            case 'avg':
+              aggregateExpr = `avg(${field})`;
+              break;
+          }
+          if (aggregateExpr) {
+            statsExpressions.push(aggregateExpr);
+          }
+        });
+        // 如果没有聚合表达式但有group_by，添加count()
+        if (statsExpressions.length === 0 && group_by && group_by.length > 0) {
+          statsExpressions.push('count()');
+        }
+        // 构建完整的stats查询 - 正确的语法应该是 | stats by (fields) functions
+        if (statsExpressions.length > 0) {
+          if (group_by && group_by.length > 0) {
+            // 有group by的情况
+            victoriaQuery += ` | stats by (${group_by.join(
+              ', '
+            )}) ${statsExpressions.join(', ')}`;
+          } else {
+            // 没有group by的情况
+            victoriaQuery += ` | stats ${statsExpressions.join(', ')}`;
+          }
+        }
+      }
+      return victoriaQuery;
+    } catch (error) {
+      console.error('Error building VictoriaLogs query:', error);
+      return '';
+    }
+  };
+
+  const checkDetail = () => {
+    const logGroups = Array.isArray(formData.log_groups)
+      ? formData.log_groups.filter(Boolean)
+      : [];
+    const params = {
+      query: formData.alert_condition?.query as string,
+      startTime: String(
+        +new Date(convertToLocalizedTime(formData.start_event_time))
+      ),
+      endTime: String(
+        isClosed
+          ? +new Date(convertToLocalizedTime(formData.end_event_time))
+          : +new Date()
+      )
+    };
+    if (isAggregate) {
+      params.query = buildVictoriaLogsQuery();
+    }
+    const queryString = new URLSearchParams([
+      ...Object.entries(params),
+      ...logGroups.map((group) => ['log_groups', String(group)])
+    ]).toString();
+    const url = `/log/search?${queryString}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
+  const showNotifiers = (row: TableDataItem) => {
+    return (
+      (row.notice_users || [])
+        .map((item: string) => formatUserDisplayName(item, userList))
+        .join(',') || '--'
+    );
+  };
+
+  return (
+    <div className={informationStyle.information}>
+      <Descriptions title={t('log.event.information')} column={2} bordered>
+        <Descriptions.Item label={t('common.time')}>
+          {formData.updated_at
+            ? convertToLocalizedTime(formData.updated_at)
+            : '--'}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('log.event.level')}>
+          <div
+            className={informationStyle.level}
+            style={{
+              borderLeft: `4px solid ${LEVEL_MAP[formData.level]}`
+            }}
+          >
+            <span
+              style={{
+                color: LEVEL_MAP[formData.level] as string
+              }}
+            >
+              {LEVEL_LIST.find((item) => item.value === formData.level)
+                ?.label || '--'}
+            </span>
+          </div>
+        </Descriptions.Item>
+        <Descriptions.Item label={t('log.event.firstAlertTime')}>
+          {formData.start_event_time
+            ? convertToLocalizedTime(formData.start_event_time)
+            : '--'}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('log.integration.collectType')} span={3}>
+          {formData.collect_type_name || '--'}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('log.event.alertType')}>
+          {isAggregate
+            ? t('log.event.aggregationAlert')
+            : t('log.event.keywordAlert')}
+        </Descriptions.Item>
+        {isAggregate && (
+          <Descriptions.Item label={t('log.event.aggregateFields')}>
+            {(formData.alert_condition?.group_by || []).join(',') || '--'}
+          </Descriptions.Item>
+        )}
+        <Descriptions.Item label={t('common.organizations')}>
+          {showGroupName(formData.organizations || [], organizationList)}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('log.event.strategyName')}>
+          {formData.policy_name || '--'}
+        </Descriptions.Item>
+        {isClosed && (
+          <Descriptions.Item label={t('log.event.alertEndTime')}>
+            {formData.end_event_time
+              ? convertToLocalizedTime(formData.end_event_time)
+              : '--'}
+          </Descriptions.Item>
+        )}
+        <Descriptions.Item label={t('log.event.notify')}>
+          {t(`log.event.${formData.notice ? 'notified' : 'unnotified'}`)}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('log.event.handler')}>
+          {formatAlertHandlers(formData.handlers, formData.handlers_display, userList)}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('log.event.notifier')}>
+          {showNotifiers(formData)}
+        </Descriptions.Item>
+      </Descriptions>
+      <div className="mt-4 flex justify-between">
+        <AlertHandlerActions
+          record={formData}
+          closeText={t('common.close')}
+          requiredPermissions={['Operate', 'Detail']}
+          onSuccess={onClose}
+        />
+        <Button type="link" onClick={checkDetail}>
+          {' '}
+          {t('log.event.seeMore')}
+        </Button>
+      </div>
+      <div className="mt-4">
+        <div>
+          <h3 className="font-[600] text-[16px] mb-[15px]">
+            {t('log.event.originalLog')}
+          </h3>
+          <CustomTable
+            scroll={{ y: '400px', x: '840px' }}
+            virtual
+            columns={activeColumns}
+            dataSource={rawData}
+            rowKey="id"
+          />
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Information;

@@ -1,0 +1,844 @@
+import pytest
+from django.test import RequestFactory
+from django.utils import timezone
+
+from apps.monitor.models import CollectDetectTask, MonitorObject, MonitorPlugin, MonitorPluginConfigTemplate
+from apps.monitor.serializers.plugin import MonitorPluginSerializer
+from apps.monitor.services.collect_detect import CollectDetectService
+from apps.monitor.services.plugin import MonitorPluginService
+from apps.monitor.services.collect_detect_runtime import (
+    build_telegraf_detect_execution,
+    render_preflight_telegraf_config,
+    sanitize_execution_result,
+)
+from apps.node_mgmt.models import CloudRegion, Collector, Node
+
+
+def create_collect_detect_node(
+    *,
+    node_id: str,
+    operating_system: str,
+    executable_path: str,
+    create_collector: bool = True,
+):
+    cloud_region, _ = CloudRegion.objects.get_or_create(id=1, defaults={"name": "collect-detect-test"})
+    node = Node.objects.create(
+        id=node_id,
+        name=node_id,
+        ip="127.0.0.1",
+        operating_system=operating_system,
+        cpu_architecture="x86_64",
+        collector_configuration_directory=(r"C:\fusion-collectors\etc\telegraf.d" if operating_system == "windows" else "/etc/telegraf/telegraf.d"),
+        cloud_region=cloud_region,
+    )
+    if create_collector:
+        Collector.objects.create(
+            id=f"telegraf-{operating_system}-collect-detect",
+            name="Telegraf",
+            service_type="exec",
+            node_operating_system=operating_system,
+            cpu_architecture="x86_64",
+            executable_path=executable_path,
+            execute_parameters="--config %s",
+        )
+    return node
+
+
+def create_collect_detect_case(*, node_id: str, collect_type: str = "cpu"):
+    plugin = MonitorPlugin.objects.create(
+        name=f"{collect_type}-{node_id}",
+        collector="Telegraf",
+        collect_type=collect_type,
+        support_collect_detect=True,
+    )
+    MonitorPluginConfigTemplate.objects.create(
+        plugin=plugin,
+        type=collect_type,
+        config_type=collect_type,
+        file_type="toml",
+        content=f"[[inputs.{collect_type}]]\n",
+    )
+    return CollectDetectTask.objects.create(
+        status="pending",
+        phase="validate",
+        monitor_plugin_id=plugin.id,
+        monitor_object_id=1,
+        collector="Telegraf",
+        collect_type=collect_type,
+        node_id=node_id,
+        request_fingerprint=f"fp-{node_id}",
+        created_by="admin",
+        organization=3,
+    )
+
+
+@pytest.mark.django_db
+def test_monitor_plugin_defaults_collect_detect_disabled():
+    monitor_object = MonitorObject.objects.create(name="Host")
+    plugin = MonitorPlugin.objects.create(
+        name="Host(Telegraf)",
+        collector="Telegraf",
+        collect_type="host",
+    )
+    plugin.monitor_object.add(monitor_object)
+
+    assert plugin.support_collect_detect is False
+
+
+def test_monitor_tasks_package_registers_collect_detect_task():
+    from apps.monitor import tasks
+
+    assert tasks.run_collect_detect_task.name == "apps.monitor.tasks.collect_detect.run_collect_detect_task"
+
+
+@pytest.mark.django_db
+def test_monitor_plugin_serializer_exposes_collect_detect_capability():
+    plugin = MonitorPlugin.objects.create(
+        name="Ping(Telegraf)",
+        collector="Telegraf",
+        collect_type="ping",
+        support_collect_detect=True,
+    )
+
+    data = MonitorPluginSerializer(plugin).data
+
+    assert data["support_collect_detect"] is True
+
+
+@pytest.mark.django_db
+def test_ui_template_by_params_exposes_collect_detect_capability():
+    monitor_object = MonitorObject.objects.create(name="MySQL")
+    plugin = MonitorPlugin.objects.create(
+        name="MySQL",
+        collector="Telegraf",
+        collect_type="mysql",
+        template_type="builtin",
+        support_collect_detect=True,
+    )
+    plugin.monitor_object.add(monitor_object)
+    MonitorPluginConfigTemplate.objects.create(
+        plugin=plugin,
+        type="mysql",
+        config_type="mysql",
+        file_type="toml",
+        content="[[inputs.mysql]]\n",
+    )
+    from apps.monitor.models import MonitorPluginUITemplate
+
+    MonitorPluginUITemplate.objects.create(
+        plugin=plugin,
+        content={"collector": "Telegraf", "collect_type": "mysql"},
+    )
+
+    data = MonitorPluginService.get_ui_template_by_params(
+        "Telegraf",
+        "mysql",
+        monitor_object.id,
+    )
+
+    assert data["support_collect_detect"] is True
+
+
+@pytest.mark.django_db
+def test_plugin_import_persists_collect_detect_capability():
+    MonitorPluginService.import_monitor_plugin(
+        {
+            "plugin": "HTTP",
+            "plugin_desc": "HTTP check",
+            "collector": "Telegraf",
+            "collect_type": "http",
+            "support_collect_detect": True,
+            "name": "Website",
+            "description": "Website",
+            "metrics": [],
+        }
+    )
+
+    plugin = MonitorPlugin.objects.get(name="HTTP")
+
+    assert plugin.support_collect_detect is True
+
+
+@pytest.mark.django_db
+def test_collect_detect_task_stores_sanitized_execution_message():
+    task = CollectDetectTask.objects.create(
+        status="failed",
+        phase="execute_once",
+        monitor_plugin_id=1,
+        monitor_object_id=2,
+        collector="Telegraf",
+        collect_type="snmp",
+        node_id="node-1",
+        instance_key="row-1",
+        request_fingerprint="fp-1",
+        created_by="admin",
+        organization=3,
+        result={
+            "summary": "SNMP authentication failed",
+            "stdout": "",
+            "stderr": "authentication failed",
+            "exit_code": 1,
+            "duration_ms": 352,
+        },
+    )
+
+    task.refresh_from_db()
+
+    assert task.status == "failed"
+    assert task.phase == "execute_once"
+    assert task.result["stderr"] == "authentication failed"
+
+
+def test_render_preflight_telegraf_config_replaces_real_outputs():
+    template = """
+[[inputs.mysql]]
+  servers = ["{{ username }}:${PASSWORD__{{ config_id }}}@tcp({{ host }}:{{ port }})/"]
+
+[[outputs.http]]
+  url = "https://example.com/write"
+"""
+
+    rendered = render_preflight_telegraf_config(
+        template,
+        {
+            "config_id": "detect-1",
+            "username": "root",
+            "host": "127.0.0.1",
+            "port": 3306,
+        },
+    )
+
+    assert "[[inputs.mysql]]" in rendered
+    assert "[[outputs.http]]" not in rendered
+    assert "[[outputs.file]]" in rendered
+    assert 'files = ["stdout"]' in rendered
+
+
+def test_build_telegraf_detect_execution_keeps_linux_behavior():
+    command, shell = build_telegraf_detect_execution(
+        operating_system="linux",
+        executable_path="/opt/fusion-collectors/bin/telegraf",
+        config_file_name="bklite-detect.toml",
+        config_content="[[inputs.cpu]]\n",
+    )
+
+    assert shell == "sh"
+    assert "/opt/fusion-collectors/bin/telegraf --once --config /tmp/bklite-detect.toml" in command
+    assert "rm -f /tmp/bklite-detect.toml" in command
+
+
+def test_build_telegraf_detect_execution_uses_powershell_on_windows():
+    command, shell = build_telegraf_detect_execution(
+        operating_system="windows",
+        executable_path=r"C:\fusion-collectors\bin\telegraf.exe",
+        config_file_name="bklite-detect.toml",
+        config_content="[[inputs.win_perf_counters]]\n",
+    )
+
+    assert shell == "powershell"
+    assert "$env:TEMP" in command
+    assert r"C:\fusion-collectors\bin\telegraf.exe" in command
+    assert "--once --config $configPath" in command
+    assert "FromBase64String" in command
+    assert "WriteAllBytes" in command
+    assert "finally" in command
+    assert "Remove-Item" in command
+    assert "/tmp" not in command
+    assert "trap" not in command
+    assert "rm -f" not in command
+
+
+def test_build_telegraf_detect_execution_rejects_unknown_operating_system():
+    with pytest.raises(ValueError, match="不支持的节点操作系统: darwin"):
+        build_telegraf_detect_execution(
+            operating_system="darwin",
+            executable_path="/opt/telegraf",
+            config_file_name="bklite-detect.toml",
+            config_content="[[inputs.cpu]]\n",
+        )
+
+
+def test_sanitize_execution_result_redacts_and_truncates_output():
+    result = sanitize_execution_result(
+        {
+            "success": False,
+            "result": "password=top-secret\n" + ("x" * 9000),
+            "error": "token=abc123",
+            "code": "execution_failure",
+        },
+        sensitive_values=["top-secret", "abc123"],
+        output_limit=120,
+    )
+
+    assert result["success"] is False
+    assert result["exit_code"] == 1
+    assert "top-secret" not in result["stdout"]
+    assert "abc123" not in result["stderr"]
+    assert result["stdout_truncated"] is True
+
+
+def test_sanitize_execution_result_accepts_string_stdout():
+    result = sanitize_execution_result("cpu,host=node usage_idle=99")
+
+    assert result["success"] is True
+    assert result["stdout"] == "cpu,host=node usage_idle=99"
+    assert result["stderr"] == ""
+    assert result["exit_code"] == 0
+
+
+@pytest.mark.django_db
+def test_create_collect_detect_task_requires_supported_plugin():
+    plugin = MonitorPlugin.objects.create(
+        name="JMX",
+        collector="JMX",
+        collect_type="jmx",
+        support_collect_detect=False,
+    )
+
+    with pytest.raises(ValueError, match="不支持采集检测"):
+        CollectDetectService.create_task(
+            {
+                "monitor_plugin_id": plugin.id,
+                "monitor_object_id": 1,
+                "node_id": "node-1",
+                "instance": {"host": "127.0.0.1"},
+                "env": {},
+            },
+            user=type("User", (), {"username": "admin"})(),
+            organization=3,
+        )
+
+
+@pytest.mark.django_db
+def test_create_collect_detect_task_stores_sanitized_snapshot_and_dispatches(monkeypatch):
+    plugin = MonitorPlugin.objects.create(
+        name="MySQL",
+        collector="Telegraf",
+        collect_type="mysql",
+        support_collect_detect=True,
+    )
+    dispatched = {}
+    monkeypatch.setattr(
+        "apps.monitor.tasks.collect_detect.run_collect_detect_task.delay",
+        lambda task_id, runtime_payload: dispatched.update(task_id=task_id, runtime_payload=runtime_payload),
+    )
+
+    task = CollectDetectService.create_task(
+        {
+            "monitor_plugin_id": plugin.id,
+            "monitor_object_id": 1,
+            "node_id": "node-1",
+            "instance_key": "mysql-1",
+            "instance": {"host": "127.0.0.1", "password": "top-secret"},
+            "env": {"PASSWORD__detect": "top-secret"},
+        },
+        user=type("User", (), {"username": "admin"})(),
+        organization=3,
+    )
+
+    assert task.status == "pending"
+    assert task.request_snapshot["instance"]["password"] == "***"
+    assert dispatched["task_id"] == task.id
+    assert dispatched["runtime_payload"]["instance"]["password"] == "top-secret"
+    assert "top-secret" not in str(task.request_snapshot)
+
+
+@pytest.mark.django_db
+def test_run_collect_detect_task_executes_telegraf_once(monkeypatch):
+    create_collect_detect_node(
+        node_id="node-1",
+        operating_system="linux",
+        executable_path="/opt/fusion-collectors/bin/telegraf",
+    )
+    plugin = MonitorPlugin.objects.create(
+        name="MySQL",
+        collector="Telegraf",
+        collect_type="mysql",
+        support_collect_detect=True,
+    )
+    MonitorPluginConfigTemplate.objects.create(
+        plugin=plugin,
+        type="mysql",
+        config_type="mysql",
+        file_type="toml",
+        content='[[inputs.mysql]]\n  servers = ["{{ username }}:${PASSWORD__{{ config_id }}}@tcp({{ host }}:{{ port }})/"]\n',
+    )
+    task = CollectDetectTask.objects.create(
+        status="pending",
+        phase="validate",
+        monitor_plugin_id=plugin.id,
+        monitor_object_id=1,
+        collector="Telegraf",
+        collect_type="mysql",
+        node_id="node-1",
+        request_fingerprint="fp-1",
+        created_by="admin",
+        organization=3,
+    )
+    executed = {}
+
+    class FakeExecutor:
+        def __init__(self, node_id):
+            executed["node_id"] = node_id
+
+        def execute_local(self, command, timeout=60, shell=None, env=None):
+            executed.update(command=command, timeout=timeout, shell=shell, env=env)
+            return {"success": True, "result": "mysql_up value=1", "error": ""}
+
+    monkeypatch.setattr("apps.monitor.services.collect_detect.Executor", FakeExecutor)
+
+    result = CollectDetectService.run_task(
+        task.id,
+        {
+            "instance": {
+                "config_id": "detect",
+                "username": "root",
+                "host": "127.0.0.1",
+                "port": 3306,
+            },
+            "env": {"PASSWORD__detect": "top-secret"},
+            "timeout": 30,
+        },
+    )
+
+    task.refresh_from_db()
+    assert result["success"] is True
+    assert task.status == "success"
+    assert "telegraf --once --config" in executed["command"]
+    assert "[[outputs.file]]" in executed["command"]
+    assert executed["env"] == {"PASSWORD__detect": "top-secret"}
+    assert "top-secret" not in str(task.result)
+
+
+@pytest.mark.django_db
+def test_run_collect_detect_task_derives_sensitive_instance_env(monkeypatch):
+    create_collect_detect_node(
+        node_id="node-1",
+        operating_system="linux",
+        executable_path="/opt/fusion-collectors/bin/telegraf",
+    )
+    plugin = MonitorPlugin.objects.create(
+        name="MySQL",
+        collector="Telegraf",
+        collect_type="mysql",
+        support_collect_detect=True,
+    )
+    MonitorPluginConfigTemplate.objects.create(
+        plugin=plugin,
+        type="mysql",
+        config_type="mysql",
+        file_type="toml",
+        content='[[inputs.mysql]]\n  servers = ["root:${PASSWORD__{{ config_id }}}@tcp({{ host }}:3306)/"]\n',
+    )
+    task = CollectDetectTask.objects.create(
+        status="pending",
+        phase="validate",
+        monitor_plugin_id=plugin.id,
+        monitor_object_id=1,
+        collector="Telegraf",
+        collect_type="mysql",
+        node_id="node-1",
+        request_fingerprint="fp-1",
+        created_by="admin",
+        organization=3,
+    )
+    executed = {}
+
+    class FakeExecutor:
+        def __init__(self, node_id):
+            executed["node_id"] = node_id
+
+        def execute_local(self, command, timeout=60, shell=None, env=None):
+            executed.update(command=command, env=env)
+            return {"success": True, "result": "mysql_up value=1", "error": ""}
+
+    monkeypatch.setattr("apps.monitor.services.collect_detect.Executor", FakeExecutor)
+
+    CollectDetectService.run_task(
+        task.id,
+        {
+            "instance": {
+                "config_id": "detect",
+                "host": "127.0.0.1",
+                "password": "top-secret",
+            },
+            "env": {},
+        },
+    )
+
+    assert executed["env"] == {"PASSWORD__detect": "top-secret"}
+    assert "top-secret" not in executed["command"]
+
+
+@pytest.mark.django_db
+def test_run_collect_detect_task_renders_selected_config_templates(monkeypatch):
+    create_collect_detect_node(
+        node_id="node-1",
+        operating_system="linux",
+        executable_path="/opt/fusion-collectors/bin/telegraf",
+    )
+    plugin = MonitorPlugin.objects.create(
+        name="Host",
+        collector="Telegraf",
+        collect_type="host",
+        support_collect_detect=True,
+    )
+    MonitorPluginConfigTemplate.objects.create(
+        plugin=plugin,
+        type="cpu",
+        config_type="cpu",
+        file_type="toml",
+        content="[[inputs.cpu]]\n  percpu = true\n",
+    )
+    MonitorPluginConfigTemplate.objects.create(
+        plugin=plugin,
+        type="mem",
+        config_type="mem",
+        file_type="toml",
+        content="[[inputs.mem]]\n",
+    )
+    task = CollectDetectTask.objects.create(
+        status="pending",
+        phase="validate",
+        monitor_plugin_id=plugin.id,
+        monitor_object_id=1,
+        collector="Telegraf",
+        collect_type="host",
+        node_id="node-1",
+        request_fingerprint="fp-1",
+        created_by="admin",
+        organization=3,
+    )
+    executed = {}
+
+    class FakeExecutor:
+        def __init__(self, node_id):
+            executed["node_id"] = node_id
+
+        def execute_local(self, command, timeout=60, shell=None, env=None):
+            executed.update(command=command)
+            return {"success": True, "result": "cpu value=1\nmem value=1", "error": ""}
+
+    monkeypatch.setattr("apps.monitor.services.collect_detect.Executor", FakeExecutor)
+
+    CollectDetectService.run_task(
+        task.id,
+        {
+            "instance": {
+                "config_id": "detect",
+                "metric_type": ["cpu", "mem"],
+            },
+            "env": {},
+        },
+    )
+
+    assert "[[inputs.cpu]]" in executed["command"]
+    assert "[[inputs.mem]]" in executed["command"]
+    assert executed["command"].count("[[outputs.file]]") == 1
+
+
+@pytest.mark.django_db
+def test_run_collect_detect_task_uses_windows_collector_and_powershell(monkeypatch):
+    create_collect_detect_node(
+        node_id="node-win",
+        operating_system="windows",
+        executable_path=r"C:\fusion-collectors\bin\telegraf.exe",
+    )
+    task = create_collect_detect_case(node_id="node-win")
+    executed = {}
+
+    class FakeExecutor:
+        def __init__(self, node_id):
+            executed["node_id"] = node_id
+
+        def execute_local(self, command, timeout=60, shell=None, env=None):
+            executed.update(command=command, shell=shell, env=env)
+            return {"success": True, "result": "win_cpu value=1", "error": ""}
+
+    monkeypatch.setattr("apps.monitor.services.collect_detect.Executor", FakeExecutor)
+    result = CollectDetectService.run_task(task.id, {"instance": {}, "env": {}, "timeout": 30})
+
+    assert result["success"] is True
+    assert executed["node_id"] == "node-win"
+    assert executed["shell"] == "powershell"
+    assert r"C:\fusion-collectors\bin\telegraf.exe" in executed["command"]
+    assert "/opt/fusion-collectors/bin/telegraf" not in executed["command"]
+
+
+@pytest.mark.django_db
+def test_run_collect_detect_task_fails_when_windows_collector_is_missing(monkeypatch):
+    create_collect_detect_node(
+        node_id="node-win-missing",
+        operating_system="windows",
+        executable_path=r"C:\fusion-collectors\bin\telegraf.exe",
+        create_collector=False,
+    )
+    task = create_collect_detect_case(node_id="node-win-missing")
+    executor_called = False
+
+    class FakeExecutor:
+        def __init__(self, node_id):
+            nonlocal executor_called
+            executor_called = True
+
+    monkeypatch.setattr("apps.monitor.services.collect_detect.Executor", FakeExecutor)
+    result = CollectDetectService.run_task(task.id, {"instance": {}, "env": {}})
+
+    assert result["success"] is False
+    assert "未找到适用的 Telegraf 采集器" in result["stderr"]
+    assert executor_called is False
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("node_id", "operating_system", "expected_error"),
+    [
+        ("node-missing", None, "采集节点不存在"),
+        ("node-unsupported", "darwin", "不支持的节点操作系统: darwin"),
+    ],
+)
+def test_run_collect_detect_task_rejects_missing_or_unsupported_node(
+    monkeypatch,
+    node_id,
+    operating_system,
+    expected_error,
+):
+    if operating_system:
+        create_collect_detect_node(
+            node_id=node_id,
+            operating_system=operating_system,
+            executable_path="/opt/telegraf",
+            create_collector=False,
+        )
+    task = create_collect_detect_case(node_id=node_id)
+    executor_called = False
+
+    class FakeExecutor:
+        def __init__(self, executor_node_id):
+            nonlocal executor_called
+            executor_called = True
+
+    monkeypatch.setattr("apps.monitor.services.collect_detect.Executor", FakeExecutor)
+    result = CollectDetectService.run_task(task.id, {"instance": {}, "env": {}})
+
+    assert result["success"] is False
+    assert expected_error in result["stderr"]
+    assert executor_called is False
+
+
+@pytest.mark.django_db
+def test_collect_detect_viewset_create_returns_task(monkeypatch):
+    from apps.monitor.views.collect_detect import CollectDetectViewSet
+
+    created = type("Task", (), {"id": 9, "status": "pending"})()
+    calls = []
+
+    def ensure_access(request, payload):
+        calls.append(("access", payload["node_id"]))
+        return {"current_team": 3}
+
+    def create_task(payload, user, organization):
+        calls.append(("create", payload["node_id"]))
+        return created
+
+    monkeypatch.setattr(
+        "apps.monitor.views.collect_detect._ensure_collect_detect_access",
+        ensure_access,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "apps.monitor.views.collect_detect.CollectDetectService.create_task",
+        create_task,
+    )
+    request = RequestFactory().post(
+        "/monitor/api/collect_detect/",
+        data={"monitor_plugin_id": 1, "monitor_object_id": 2, "node_id": "node-1"},
+        content_type="application/json",
+    )
+    request.user = type("User", (), {"username": "admin", "domain": "default", "is_superuser": True, "group_list": []})()
+    request.COOKIES["current_team"] = "3"
+    monkeypatch.setattr("apps.monitor.views.collect_detect.WebUtils.response_success", staticmethod(lambda data=None: data))
+
+    response = CollectDetectViewSet().create(request)
+
+    assert response == {"task_id": 9, "status": "pending"}
+    assert calls == [("access", "node-1"), ("create", "node-1")]
+
+
+@pytest.mark.django_db
+def test_create_collect_detect_task_caps_timeout(monkeypatch):
+    plugin = MonitorPlugin.objects.create(
+        name="MySQL",
+        collector="Telegraf",
+        collect_type="mysql",
+        support_collect_detect=True,
+    )
+    dispatched = {}
+    monkeypatch.setattr(
+        "apps.monitor.tasks.collect_detect.run_collect_detect_task.delay",
+        lambda task_id, runtime_payload: dispatched.update(task_id=task_id, runtime_payload=runtime_payload),
+    )
+
+    CollectDetectService.create_task(
+        {
+            "monitor_plugin_id": plugin.id,
+            "monitor_object_id": 1,
+            "node_id": "node-1",
+            "timeout": 9999,
+            "instance": {"host": "127.0.0.1"},
+        },
+        user=type("User", (), {"username": "admin"})(),
+        organization=3,
+    )
+
+    assert dispatched["runtime_payload"]["timeout"] == 600
+
+
+@pytest.mark.django_db
+def test_collect_detect_viewset_retrieve_returns_task_result(monkeypatch):
+    from apps.monitor.views.collect_detect import CollectDetectViewSet
+    from apps.system_mgmt.models import Group
+
+    team = Group.objects.create(name="collect-detect-retrieve", parent_id=0)
+
+    task = CollectDetectTask.objects.create(
+        status="failed",
+        phase="execute_once",
+        monitor_plugin_id=1,
+        monitor_object_id=2,
+        collector="Telegraf",
+        collect_type="mysql",
+        node_id="node-1",
+        request_fingerprint="fp-1",
+        created_by="admin",
+        organization=team.id,
+        result={"success": False, "stdout": "", "stderr": "authentication failed", "exit_code": 1},
+    )
+    request = RequestFactory().get(f"/monitor/api/collect_detect/{task.id}/")
+    request.user = type("User", (), {"username": "admin", "domain": "default", "is_superuser": True, "group_list": []})()
+    request.COOKIES["current_team"] = str(team.id)
+    monkeypatch.setattr(
+        "apps.core.utils.current_team_scope.SystemMgmt.get_authorized_groups_scoped",
+        lambda *args, **kwargs: {"result": True, "data": [team.id]},
+    )
+    monkeypatch.setattr("apps.monitor.views.collect_detect.WebUtils.response_success", staticmethod(lambda data=None: data))
+
+    response = CollectDetectViewSet().retrieve(request, pk=task.id)
+
+    assert response["id"] == task.id
+    assert response["status"] == "failed"
+    assert response["result"]["stderr"] == "authentication failed"
+
+
+@pytest.mark.django_db
+def test_collect_detect_viewset_retrieve_hides_other_user_task(monkeypatch):
+    from apps.monitor.views.collect_detect import CollectDetectViewSet
+    from apps.system_mgmt.models import Group
+
+    team = Group.objects.create(name="collect-detect-hide", parent_id=0)
+
+    task = CollectDetectTask.objects.create(
+        status="failed",
+        phase="execute_once",
+        monitor_plugin_id=1,
+        monitor_object_id=2,
+        collector="Telegraf",
+        collect_type="mysql",
+        node_id="node-1",
+        request_fingerprint="fp-1",
+        created_by="other",
+        organization=team.id,
+        result={"success": False, "stdout": "", "stderr": "authentication failed", "exit_code": 1},
+    )
+    request = RequestFactory().get(f"/monitor/api/collect_detect/{task.id}/")
+    request.user = type("User", (), {"username": "admin", "domain": "default", "is_superuser": False, "group_list": []})()
+    request.COOKIES["current_team"] = str(team.id)
+    monkeypatch.setattr(
+        "apps.core.utils.current_team_scope.SystemMgmt.get_authorized_groups_scoped",
+        lambda *args, **kwargs: {"result": True, "data": [team.id]},
+    )
+    monkeypatch.setattr(
+        "apps.monitor.views.collect_detect.WebUtils.response_error",
+        staticmethod(lambda message, status_code=400: {"message": message, "status_code": status_code}),
+    )
+
+    response = CollectDetectViewSet().retrieve(request, pk=task.id)
+
+    assert response == {"message": "任务不存在或无权访问", "status_code": 404}
+
+
+def _detect_task(**kwargs):
+    payload = {
+        "status": "success",
+        "phase": "parse_output",
+        "monitor_plugin_id": 1,
+        "monitor_object_id": 1,
+        "collector": "Telegraf",
+        "collect_type": "cpu",
+        "node_id": "n1",
+        "request_fingerprint": kwargs.pop("request_fingerprint", "fp-detect"),
+        "created_by": "admin",
+        "organization": 1,
+        "finished_at": timezone.now(),
+    }
+    payload.update(kwargs)
+    return CollectDetectTask.objects.create(**payload)
+
+
+@pytest.mark.django_db
+def test_purge_deletes_old_terminal_tasks_and_keeps_active_ones():
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    now = timezone.now()
+    stale = now - timedelta(days=31)
+    fresh = now - timedelta(hours=1)
+    stale_success = _detect_task(status="success", finished_at=stale, request_fingerprint="stale-success")
+    stale_failed = _detect_task(status="failed", finished_at=stale, request_fingerprint="stale-failed")
+    fresh_success = _detect_task(status="success", finished_at=fresh, request_fingerprint="fresh-success")
+    running = _detect_task(status="running", finished_at=stale, request_fingerprint="running")
+    pending = _detect_task(status="pending", finished_at=None, request_fingerprint="pending")
+
+    deleted = CollectDetectService.purge_terminal_tasks(now=now)
+
+    assert deleted == 2
+    remaining = set(CollectDetectTask.objects.values_list("id", flat=True))
+    assert remaining == {fresh_success.id, running.id, pending.id}
+    assert stale_success.id not in remaining
+    assert stale_failed.id not in remaining
+
+
+@pytest.mark.django_db
+def test_purge_respects_batch_size(settings):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    now = timezone.now()
+    stale = now - timedelta(days=31)
+    first = _detect_task(status="success", finished_at=stale, request_fingerprint="batch-1")
+    second = _detect_task(status="failed", finished_at=stale, request_fingerprint="batch-2")
+    settings.COLLECT_DETECT_TASK_CLEANUP_BATCH_SIZE = 1
+
+    deleted = CollectDetectService.purge_terminal_tasks(now=now)
+
+    assert deleted == 1
+    assert CollectDetectTask.objects.filter(id__in=[first.id, second.id]).count() == 1
+
+
+@pytest.mark.django_db
+def test_purge_can_be_disabled(settings):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    now = timezone.now()
+    stale = now - timedelta(days=31)
+    task = _detect_task(status="success", finished_at=stale, request_fingerprint="disabled")
+    settings.COLLECT_DETECT_TASK_CLEANUP_ENABLED = False
+
+    deleted = CollectDetectService.purge_terminal_tasks(now=now)
+
+    assert deleted == 0
+    assert CollectDetectTask.objects.filter(id=task.id).exists()

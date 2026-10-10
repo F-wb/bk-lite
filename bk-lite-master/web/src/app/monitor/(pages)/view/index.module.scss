@@ -1,0 +1,97 @@
+.view {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+
+    .tree {
+        height: 100%;
+        min-height: 0;
+        padding: 20px 10px 10px 10px;
+        background: var(--color-bg-1);
+        overflow-y: auto;
+    }
+
+    .table {
+        flex: 1 1 0%;
+        min-width: 0;
+        max-width: 100%;
+        padding: 20px;
+        background: var(--color-bg-1);
+        height: 100%;
+        min-height: 0;
+        overflow: hidden;
+    }
+}
+
+.view :global(.ant-progress-outer) {
+    flex-direction: row-reverse;
+}
+
+.view :global(.ant-progress-text-outer) {
+    margin: 0 0 0 10px !important;
+}
+
+.detail {
+    display: flex;
+    width: 100%;
+    height: 100%;
+
+    .leftSide {
+        width: 200px;
+        height: calc(100vh - 90px);
+        margin-right: 16px;
+        display: flex;
+        flex-direction: column;
+
+        .topIntro {
+            padding: 10px;
+            display: flex;
+            align-items: center;
+            background: var(--color-bg-1);
+            height: 80px;
+            border-radius: 4px;
+        }
+
+        .menu {
+            background: var(--color-bg-1);
+            margin-top: 16px;
+            padding: 20px 10px;
+            flex: 1;
+            min-height: 0;
+            border-radius: 4px;
+            overflow-y: auto;
+        }
+    }
+
+    .rightSide {
+        flex: 1;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+        background-color: var(--color-bg-1);
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        min-height: calc(100vh - 90px);
+    }
+
+    .rightHeader {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+}
+
+.detail .leftSide .menu :global(.custom-tabs) {
+    width: 100%;
+}
+
+.detail .leftSide .menu :global(.custom-tabs .ant-segmented-item) {
+    margin-bottom: 4px;
+}

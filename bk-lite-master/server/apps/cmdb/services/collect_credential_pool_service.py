@@ -1,0 +1,202 @@
+import copy
+from uuid import uuid4
+
+from apps.core.exceptions.base_app_exception import BaseAppException
+
+
+class CollectCredentialPoolService:
+    """负责凭据池 normalize、校验、diff 和回滚压平。"""
+
+    MAX_POOL_SIZE = 3
+    VAULT_CORE_FIELDS = {
+        "username",
+        "user",
+        "password",
+        "auth_method",
+        "authType",
+        "private_key",
+        "passphrase",
+        "access_key",
+        "secret_key",
+        "accessKey",
+        "accessSecret",
+        "access_secret",
+        "secret_id",
+        "client_id",
+        "client_secret",
+        "tenant_id",
+        "token",
+        "community",
+        "security_level",
+        "level",
+        "auth_protocol",
+        "auth_password",
+        "priv_protocol",
+        "priv_password",
+        "integrity",
+        "authkey",
+        "privacy",
+        "privkey",
+        "enable_password",
+        "user_domain_name",
+        "extra",
+        "secret",
+    }
+
+    @classmethod
+    def vault_managed_fields(cls, item):
+        # SSH 和平台账户均不管理特权密码，由采集任务加密保存。
+        if item.get("vault_type_key") in {"platform_api", "ssh"}:
+            return cls.VAULT_CORE_FIELDS - {"enable_password"}
+        return cls.VAULT_CORE_FIELDS
+
+    @classmethod
+    def normalize_pool(cls, raw_credential):
+        """将 dict | list[dict] 统一为有序凭据列表，并补齐 credential_id。"""
+        if raw_credential in (None, ""):
+            return []
+
+        if isinstance(raw_credential, dict):
+            raw_pool = [raw_credential]
+        elif isinstance(raw_credential, list):
+            raw_pool = raw_credential
+        else:
+            raise BaseAppException("采集凭据格式错误！")
+
+        normalized_pool = []
+        for item in raw_pool:
+            if not isinstance(item, dict):
+                raise BaseAppException("采集凭据格式错误！")
+            normalized_item = copy.deepcopy(item)
+            source = normalized_item.get("credential_source") or "inline"
+            if source not in {"inline", "vault"}:
+                raise BaseAppException("采集凭据来源错误！")
+            if source == "vault":
+                if not isinstance(normalized_item.get("vault_credential_id"), str) or not normalized_item["vault_credential_id"].strip():
+                    raise BaseAppException("请选择已有凭据！")
+                normalized_item["credential_source"] = "vault"
+                for field in cls.vault_managed_fields(normalized_item):
+                    normalized_item.pop(field, None)
+                if normalized_item.get("vault_type_key") == "snmp" or "snmp_port" in normalized_item:
+                    normalized_item.pop("version", None)
+            elif normalized_item.get("vault_credential_id"):
+                raise BaseAppException("一次性认证不能引用已有凭据！")
+            else:
+                normalized_item.pop("vault_type_key", None)
+                normalized_item.pop("vault_actor_context", None)
+            normalized_item.setdefault("credential_id", cls._new_credential_id())
+            normalized_item.setdefault("credential_version", 1)
+            normalized_pool.append(normalized_item)
+        return normalized_pool
+
+    @classmethod
+    def validate_pool_shape(cls, pool, *, max_size=MAX_POOL_SIZE):
+        """校验凭据池数量与字段结构。max_size=None 表示不限制数量（扫描生成路径）。"""
+        if not pool:
+            raise BaseAppException("采集凭据不能为空！")
+        if max_size is not None and len(pool) > max_size:
+            raise BaseAppException("采集凭据最多支持3组！")
+        for item in pool:
+            if not isinstance(item, dict):
+                raise BaseAppException("采集凭据格式错误！")
+        if any(item.get("credential_source") == "vault" for item in pool):
+            # 仓库候选只保存引用和动态字段；不同来源不能用旧的同字段集合规则比较。
+            for index, item in enumerate(pool):
+                if item.get("credential_source") == "vault" and not item.get("vault_credential_id"):
+                    raise BaseAppException(f"第 {index + 1} 组凭据缺少已有凭据 ID！")
+                if item.get("credential_source") != "vault" and item.get("version"):
+                    cls._validate_snmp_credential(item, index)
+            return
+
+        # 仅 SNMP：凭据自带 version 字段（SSH/数据库/云等均不含），按各自版本校验必填项，
+        # 允许 v2/v2c/v3 在同一任务内混用；其他采集类型维持原"字段结构一致"约束不变。
+        if all(item.get("version") for item in pool):
+            for index, item in enumerate(pool):
+                cls._validate_snmp_credential(item, index)
+            return
+
+        expected_keys = None
+        for item in pool:
+            item_keys = set(item.keys()) - {"credential_id", "credential_version"}
+            if expected_keys is None:
+                expected_keys = item_keys
+                continue
+            if item_keys != expected_keys:
+                raise BaseAppException("同一任务的采集凭据字段必须保持一致！")
+
+    @classmethod
+    def _validate_snmp_credential(cls, cred, index):
+        """按 SNMP 版本校验单条凭据必填项，规则与 agent 侧 SnmpAuth.validate 对齐。"""
+        label = f"第 {index + 1} 组凭据"
+        version = str(cred.get("version", "")).strip().lower()
+        if version in ("v2", "v2c"):
+            if not cred.get("community"):
+                raise BaseAppException(f"{label}（{version}）缺少团体字！")
+        elif version == "v3":
+            if not cred.get("username"):
+                raise BaseAppException(f"{label}（v3）缺少用户名！")
+            level = str(cred.get("level", "")).strip().lower()
+            if level in ("authnopriv", "authpriv") and (not cred.get("integrity") or not cred.get("authkey")):
+                raise BaseAppException(f"{label}（v3/{level}）缺少认证算法或认证密钥！")
+            if level == "authpriv" and (not cred.get("privacy") or not cred.get("privkey")):
+                raise BaseAppException(f"{label}（v3/authPriv）缺少加密算法或加密密钥！")
+        else:
+            raise BaseAppException(f"{label} 的 SNMP 版本 {version or '(空)'} 不支持！")
+
+    @staticmethod
+    def diff_pool(old_pool, new_pool):
+        """返回 (added_ids, removed_ids, edited_ids)，排序变化不算编辑。"""
+        old_map = {
+            item.get("credential_id"): {k: v for k, v in item.items() if k not in {"credential_id", "credential_version"}}
+            for item in old_pool
+            if isinstance(item, dict) and item.get("credential_id")
+        }
+        new_map = {
+            item.get("credential_id"): {k: v for k, v in item.items() if k not in {"credential_id", "credential_version"}}
+            for item in new_pool
+            if isinstance(item, dict) and item.get("credential_id")
+        }
+
+        old_ids = set(old_map.keys())
+        new_ids = set(new_map.keys())
+
+        added_ids = sorted(new_ids - old_ids)
+        removed_ids = sorted(old_ids - new_ids)
+        edited_ids = sorted(credential_id for credential_id in (old_ids & new_ids) if old_map[credential_id] != new_map[credential_id])
+        return added_ids, removed_ids, edited_ids
+
+    @classmethod
+    def assign_versions(cls, old_pool, new_pool):
+        """凭据内容编辑只递增该凭据版本；新增/重排不清空其他凭据状态。"""
+
+        old_normalized = cls.normalize_pool(old_pool)
+        old_map = {item["credential_id"]: item for item in old_normalized}
+        _added, _removed, edited = cls.diff_pool(old_normalized, new_pool)
+        edited_ids = set(edited)
+        versioned = []
+        for item in new_pool:
+            current = copy.deepcopy(item)
+            old = old_map.get(current.get("credential_id"))
+            if old is None:
+                current["credential_version"] = 1
+            elif current.get("credential_id") in edited_ids:
+                current["credential_version"] = int(old.get("credential_version") or 1) + 1
+            else:
+                current["credential_version"] = int(old.get("credential_version") or 1)
+            versioned.append(current)
+        return versioned
+
+    @classmethod
+    def flatten_pool_to_primary(cls, raw_credential):
+        """回滚前将凭据池压平成首个凭据对象。"""
+        pool = cls.normalize_pool(raw_credential)
+        if not pool:
+            return {}
+        primary = copy.deepcopy(pool[0])
+        primary.pop("credential_id", None)
+        primary.pop("credential_version", None)
+        return primary
+
+    @staticmethod
+    def _new_credential_id():
+        return f"cred_{uuid4().hex[:12]}"

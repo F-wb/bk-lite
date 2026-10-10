@@ -1,0 +1,265 @@
+import asyncio
+import base64
+
+import pytest
+from plugins.inputs.network_config_file.network_config_file_info import (
+    NetworkConfigFileInfo,
+    decode_http_header_commands,
+    resolve_cli_transport,
+    validate_safe_command,
+)
+
+INSTANCE_UUID = "123e4567-e89b-42d3-a456-426614174000"
+
+
+def test_validate_safe_command_allows_display_saved_configuration():
+    assert validate_safe_command("display saved-configuration") == "display saved-configuration"
+
+
+@pytest.mark.parametrize("command", ["reload", "configure terminal", "write erase", "delete flash:/x"])
+def test_validate_safe_command_rejects_dangerous_commands(command):
+    with pytest.raises(ValueError, match="高危"):
+        validate_safe_command(command)
+
+
+def test_merge_outputs_keeps_command_boundaries():
+    merged = NetworkConfigFileInfo.merge_command_outputs(
+        [
+            {"command": "show running-config", "output": "line1"},
+            {"command": "show version", "output": "line2"},
+        ]
+    )
+
+    assert "===== command: show running-config =====" in merged
+    assert "line1" in merged
+    assert "===== command: show version =====" in merged
+    assert "line2" in merged
+
+
+class FakeResponse:
+    def __init__(self, result, *, failed=False):
+        self.result = result
+        self.failed = failed
+
+
+class FakeNetConnect:
+    def __init__(self):
+        self.enabled = False
+        self.commands = []
+        self.opened = False
+        self.closed = False
+
+    async def open(self):
+        self.opened = True
+
+    async def close(self):
+        self.closed = True
+
+    async def acquire_priv(self, privilege):
+        assert privilege == "privilege_exec"
+        self.enabled = True
+
+    async def send_command(self, command, **kwargs):
+        self.commands.append(command)
+        return FakeResponse(f"output for {command}")
+
+
+def _base_params(**extra):
+    params = {
+        "host": "10.0.0.1",
+        "username": "admin",
+        "password": "secret",
+        "device_type": "cisco_ios",
+        "commands": "show running-config",
+        "config_name": "running-config",
+        "collect_task_id": "42",
+        "target_model_id": "switch",
+        "protocol_version": "2",
+        "target_instance_uuid": INSTANCE_UUID,
+    }
+    params.update(extra)
+    return params
+
+
+def test_header_encoded_commands_decode_to_plain_lines():
+    encoded = "b64:" + base64.urlsafe_b64encode(b"show running-config\nshow version").decode()
+    plugin = NetworkConfigFileInfo(_base_params(commands=encoded))
+    assert plugin._commands() == ["show running-config", "show version"]
+    assert decode_http_header_commands("show version") == "show version"
+
+
+def test_collect_builds_success_payload(monkeypatch):
+    fake = FakeNetConnect()
+    monkeypatch.setattr(
+        "plugins.inputs.network_config_file.network_config_file_info.AsyncScrapli",
+        lambda **kwargs: fake,
+    )
+    plugin = NetworkConfigFileInfo(
+        _base_params(
+            enable_password="enable-secret",
+            need_enable="true",
+            commands="show running-config\nshow version",
+        )
+    )
+
+    result = asyncio.run(plugin.list_all_resources())
+
+    assert result["success"] is True
+    payload = result["result"]
+    assert payload["status"] == "success"
+    assert payload["protocol_version"] == "2"
+    assert payload["instance_uuid"] == INSTANCE_UUID
+    assert "instance_id" not in payload
+    assert payload["file_name"] == "running-config"
+    decoded = base64.b64decode(payload["content_base64"]).decode()
+    assert "output for show running-config" in decoded
+    assert "output for show version" in decoded
+    assert fake.enabled is True
+    assert fake.opened is True
+    assert fake.closed is True
+
+
+def test_collect_enables_privilege_mode_when_enable_password_is_present(monkeypatch):
+    fake = FakeNetConnect()
+    monkeypatch.setattr(
+        "plugins.inputs.network_config_file.network_config_file_info.AsyncScrapli",
+        lambda **kwargs: fake,
+    )
+    plugin = NetworkConfigFileInfo(_base_params(enable_password="enable-secret"))
+
+    result = asyncio.run(plugin.list_all_resources())
+
+    assert result["success"] is True
+    assert fake.enabled is True
+
+
+def test_collect_skips_privilege_mode_without_enable_password(monkeypatch):
+    fake = FakeNetConnect()
+    monkeypatch.setattr(
+        "plugins.inputs.network_config_file.network_config_file_info.AsyncScrapli",
+        lambda **kwargs: fake,
+    )
+    plugin = NetworkConfigFileInfo(_base_params())
+
+    result = asyncio.run(plugin.list_all_resources())
+
+    assert result["success"] is True
+    assert fake.enabled is False
+
+
+def test_collect_returns_error_when_one_command_fails(monkeypatch):
+    class FailingNetConnect(FakeNetConnect):
+        async def send_command(self, command, **kwargs):
+            if command == "show bad":
+                return FakeResponse("Invalid input detected", failed=True)
+            return FakeResponse("ok")
+
+    fake = FailingNetConnect()
+    monkeypatch.setattr(
+        "plugins.inputs.network_config_file.network_config_file_info.AsyncScrapli",
+        lambda **kwargs: fake,
+    )
+    plugin = NetworkConfigFileInfo(_base_params(commands="show version\nshow bad"))
+
+    result = asyncio.run(plugin.list_all_resources())
+
+    assert result["success"] is False
+    assert "show bad" in result["result"]["cmdb_collect_error"]
+    assert "Invalid input" in result["result"]["cmdb_collect_error"]
+    assert fake.closed is True
+
+
+def test_close_failure_does_not_override_successful_collection(monkeypatch):
+    class CloseFailingConnect(FakeNetConnect):
+        async def close(self):
+            raise OSError("close failed")
+
+    fake = CloseFailingConnect()
+    monkeypatch.setattr(
+        "plugins.inputs.network_config_file.network_config_file_info.AsyncScrapli",
+        lambda **kwargs: fake,
+    )
+    plugin = NetworkConfigFileInfo(_base_params())
+
+    result = asyncio.run(plugin.list_all_resources())
+
+    assert result["success"] is True
+
+
+def test_connect_params_skip_host_key_check_for_task_selected_targets():
+    plugin = NetworkConfigFileInfo(_base_params())
+
+    connect_params = plugin._connect_params()
+
+    assert connect_params["platform"] == "cisco_iosxe"
+    assert connect_params["transport"] == "asyncssh"
+    assert connect_params["port"] == 22
+    assert connect_params["auth_strict_key"] is False
+    assert "ssh_known_hosts_file" not in connect_params
+
+
+@pytest.mark.parametrize(
+    ("extra", "transport", "port", "cli_protocol"),
+    [
+        ({}, "asyncssh", 22, "ssh"),
+        ({"transport_protocol": "ssh"}, "asyncssh", 22, "ssh"),
+        ({"transport_protocol": "telnet"}, "asynctelnet", 23, "telnet"),
+        ({"transport_protocol": "TELNET"}, "asynctelnet", 23, "telnet"),
+        ({"transport_protocol": "asynctelnet"}, "asynctelnet", 23, "telnet"),
+        ({"protocol": "telnet"}, "asynctelnet", 23, "telnet"),
+        ({"transport_protocol": "telnet", "port": 2323}, "asynctelnet", 2323, "telnet"),
+        ({"transport_protocol": "invalid"}, "asyncssh", 22, "ssh"),
+        ({"transport_protocol": ""}, "asyncssh", 22, "ssh"),
+        ({"protocol": "2"}, "asyncssh", 22, "ssh"),
+        ({"protocol": "https"}, "asyncssh", 22, "ssh"),
+        ({"device_type": "huawei", "transport_protocol": "telnet"}, "asynctelnet", 23, "telnet"),
+    ],
+)
+def test_connect_params_resolve_transport_protocol(extra, transport, port, cli_protocol):
+    plugin = NetworkConfigFileInfo(_base_params(**extra))
+
+    connect_params = plugin._connect_params()
+    resolved = resolve_cli_transport(plugin.params)
+
+    assert resolved[0] == cli_protocol
+    assert connect_params["transport"] == transport
+    assert connect_params["port"] == port
+    if extra.get("device_type") == "huawei":
+        assert connect_params["platform"] == "huawei_vrp"
+    else:
+        assert connect_params["platform"] == "cisco_iosxe"
+
+
+def test_close_failure_scrapli_not_opened_does_not_override_success(monkeypatch):
+    class ScrapliConnectionNotOpened(Exception):
+        pass
+
+    class CloseFailingConnect(FakeNetConnect):
+        async def close(self):
+            raise ScrapliConnectionNotOpened("attempted to close unopened connection")
+
+    fake = CloseFailingConnect()
+    monkeypatch.setattr(
+        "plugins.inputs.network_config_file.network_config_file_info.AsyncScrapli",
+        lambda **kwargs: fake,
+    )
+    plugin = NetworkConfigFileInfo(_base_params(transport_protocol="telnet"))
+
+    result = asyncio.run(plugin.list_all_resources())
+
+    assert result["success"] is True
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"protocol_version": "1", "target_instance_uuid": INSTANCE_UUID},
+        {"protocol_version": "2", "target_instance_id": "101"},
+        {"protocol_version": "2", "target_instance_uuid": "101"},
+    ],
+)
+def test_success_payload_rejects_invalid_identity_protocol(params):
+    plugin = NetworkConfigFileInfo({**params, "config_name": "running-config"})
+
+    with pytest.raises(ValueError):
+        plugin._success_payload("cfg")

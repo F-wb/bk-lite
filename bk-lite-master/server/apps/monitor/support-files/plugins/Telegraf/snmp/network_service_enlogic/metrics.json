@@ -1,0 +1,228 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_enlogic",
+  "plugin": "NetworkService Enlogic PDU SNMP",
+  "plugin_desc": "Enlogic PDU SNMP child template for network-service devices under Enlogic PEN 38446. Interface traffic is supplied by the shared NetworkService SNMP IF-MIB floor rather than a plugin-side ifHC expansion. Proven private increments are pduUnitStatusActivePower as pdu_active_power_watts, pduInputPhaseStatusCurrent plus the numeric phase ID as pdu_phase_current_amps scaled by /100, optional pduInputPhaseStatusVoltage in volts and pduInputPhaseStatusActivePower in Watts, pduOutletMeteredStatusCurrent plus outlet name as pdu_outlet_current_amps scaled by /100, and pduExternalSensorStatusHighPrecisionValue as env_temperature_celsius (type=temperature/1 and units=degreeC/1, tenths) or env_humidity_percent (type=humidity/2 and units=percent/3, tenths). CPU and memory scalars are not invented. Smart Cabinet tables are not collected. ENLOGIC-PDU2-MIB uses the same tree and is not walked a second time. Supported brands/models - Enlogic PDUs that expose ENLOGIC-PDU-MIB under PEN 38446 and standard IF-MIB.",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='network_service', collect_type='snmp_enlogic'}) by (instance_id)",
+  "name": "NetworkService",
+  "icon": "mm-network_service_网络服务",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='network_service'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "pdu_active_power_watts",
+    "pdu_phase_current_amps",
+    "env_temperature_celsius",
+    "env_humidity_percent"
+  ],
+  "metrics": [
+    {
+      "metric_group": "Power",
+      "name": "pdu_active_power_watts",
+      "query": "pdu_active_power_watts{instance_type='network_service', __$labels__}",
+      "display_name": "PDU Active Power",
+      "data_type": "Number",
+      "unit": "watts",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "PDU unit index"
+        },
+        {
+          "name": "pdu_unit",
+          "description": "PDU unit name"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "PDU unit active power in Watts from pduUnitStatusActivePower (1.3.6.1.4.1.38446.1.2.4.1.4) with pduUnitStatusName (1.3.6.1.4.1.38446.1.2.4.1.2). The SNMP value is already in Watts."
+    },
+    {
+      "metric_group": "Power",
+      "name": "pdu_phase_current_amps",
+      "query": "pdu_phase_current_amps{instance_type='network_service', __$labels__} / 100",
+      "display_name": "PDU Phase Current",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "Input phase index"
+        },
+        {
+          "name": "phase",
+          "description": "Input phase ID"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Per-phase input current in amperes from pduInputPhaseStatusCurrent (1.3.6.1.4.1.38446.1.3.4.1.5) with pduInputPhaseStatusCount (1.3.6.1.4.1.38446.1.3.4.1.2). The SNMP value is hundredths of amperes, so the query divides by 100."
+    },
+    {
+      "metric_group": "Power",
+      "name": "pdu_phase_voltage_volts",
+      "query": "pdu_phase_voltage_volts{instance_type='network_service', __$labels__}",
+      "display_name": "PDU Phase Voltage",
+      "data_type": "Number",
+      "unit": "volts",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "Input phase index"
+        },
+        {
+          "name": "phase",
+          "description": "Input phase ID"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Per-phase input voltage in volts from pduInputPhaseStatusVoltage (1.3.6.1.4.1.38446.1.3.4.1.6). The SNMP value is already in volts."
+    },
+    {
+      "metric_group": "Power",
+      "name": "pdu_phase_power_watts",
+      "query": "pdu_phase_power_watts{instance_type='network_service', __$labels__}",
+      "display_name": "PDU Phase Power",
+      "data_type": "Number",
+      "unit": "watts",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "Input phase index"
+        },
+        {
+          "name": "phase",
+          "description": "Input phase ID"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Per-phase active power in Watts from pduInputPhaseStatusActivePower (1.3.6.1.4.1.38446.1.3.4.1.7). The SNMP value is already in Watts."
+    },
+    {
+      "metric_group": "Power",
+      "name": "pdu_outlet_current_amps",
+      "query": "pdu_outlet_current_amps{instance_type='network_service', __$labels__} / 100",
+      "display_name": "PDU Outlet Current",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "Outlet index"
+        },
+        {
+          "name": "outlet",
+          "description": "Outlet name"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Per-outlet load current in amperes from pduOutletMeteredStatusCurrent (1.3.6.1.4.1.38446.1.5.9.1.5) with pduOutletMeteredStatusName (1.3.6.1.4.1.38446.1.5.9.1.3). The SNMP value is hundredths of amperes, so the query divides by 100."
+    },
+    {
+      "metric_group": "Environment",
+      "name": "env_temperature_celsius",
+      "query": "env_temperature_celsius{instance_type='network_service', sensor_type=\"1\", sensor_units=\"1\", __$labels__} / 10",
+      "display_name": "Environment Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "Temperature sensor index"
+        },
+        {
+          "name": "sensor",
+          "description": "Temperature sensor name"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Per-sensor external temperature in degrees Celsius from pduExternalSensorStatusHighPrecisionValue (1.3.6.1.4.1.38446.1.6.4.1.8). Rows are kept when pduExternalSensorNamePlateType (1.3.6.1.4.1.38446.1.6.2.1.6) is temperature (1) and pduExternalSensorNamePlateUnits (1.3.6.1.4.1.38446.1.6.2.1.7) is degreeC (1). The SNMP value is tenths of a degree, so the query divides by 10."
+    },
+    {
+      "metric_group": "Environment",
+      "name": "env_humidity_percent",
+      "query": "env_humidity_percent{instance_type='network_service', sensor_type=\"2\", sensor_units=\"3\", __$labels__} / 10",
+      "display_name": "Environment Humidity",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "Humidity sensor index"
+        },
+        {
+          "name": "sensor",
+          "description": "Humidity sensor name"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Per-sensor external relative humidity in percent from the same pduExternalSensorStatusHighPrecisionValue column (1.3.6.1.4.1.38446.1.6.4.1.8). Rows are kept when pduExternalSensorNamePlateType is humidity (2) and pduExternalSensorNamePlateUnits is percent (3). The SNMP value is tenths, so the query divides by 10."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCInOctets",
+      "query": "rate(interface_ifHCInOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Incoming Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the average rate of inbound bytes received over the past 5 minutes, based on the 64-bit ifHCInOctets counter which does not wrap on high-speed interfaces."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCOutOctets",
+      "query": "rate(interface_ifHCOutOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Outgoing Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the average rate of outbound bytes sent over the past 5 minutes, based on the 64-bit ifHCOutOctets counter which does not wrap on high-speed interfaces."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='network_service', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
+    }
+  ]
+}

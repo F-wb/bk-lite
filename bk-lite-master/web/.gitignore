@@ -1,0 +1,75 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# Ignore all node_modules directories
+node_modules/
+
+# dependencies
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/playwright-report/
+/test-results/
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env files (can opt-in for committing if needed)
+.env*.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+tsconfig.lint.json
+
+# npm 和 yarn lock
+package-lock.json
+yarn.lock
+
+.history
+
+.idea/
+*storybook.log
+storybook-static/*
+
+# public locales and menus
+/public/locales/*
+/public/menus/*
+/public/app/*
+
+server.cert
+server.csr
+server.js
+server.key
+
+.env.local
+
+deploy/docker-compose/conf/nats/nats.conf
+
+# Next.js 本机自动生成的 agent 规则文件
+/AGENTS.md
+/CLAUDE.md
+
+# temporary hide nested app node_modules during type-check
+.typecheck-nm-hidden/

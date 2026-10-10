@@ -1,0 +1,124 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_enterasys"
+        config_type = "enterasys"
+        brand = "enterasys"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB) + 64-bit HC ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- ENTERASYS-RESOURCE-UTILIZATION-MIB (PEN 5624, etsysResourceUtilizationMIB 1.3.6.1.4.1.5624.1.2.49) ----
+    # CPU: etsysResourceCpuTable …49.1.1.1，行索引 = entPhysicalIndex.etsysResourceCpuId，table.field 不带 .0。
+    # etsysResourceCpuLoad5min …49.1.1.1.1.4 为 ResourceUtilization（0-1000 = 百分比 ×10），下方 starlark ÷10 换算为百分比。
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.5624.1.2.49.1.1.1.1.4"
+        name = "usage"
+        conversion = "int"
+    # 内存: etsysResourceStorageTable …49.1.3.1，行索引 = entPhysicalIndex.etsysResourceStorageType.etsysResourceStorageTypeID，
+    # table.field 不带 .0。StorageType 为不可读的索引列，由下方 starlark 从行索引第二段判断，只保留 ram(2) 行。
+    # etsysResourceStorageDescr .1.3 作 descr 标签；Size .1.4 / Available .1.5 单位 KB，starlark ×1024 换算为字节。
+    [[inputs.snmp.table]]
+        name = "device_memory"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.5624.1.2.49.1.3.1.1.3"
+        name = "descr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.5624.1.2.49.1.3.1.1.4"
+        name = "total"
+        conversion = "int"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.5624.1.2.49.1.3.1.1.5"
+        name = "free"
+        conversion = "int"
+# ---- 温度/风扇/电源：SecureStack 在 PEN 5624 下没有已核实的环境对象 → N/A，不采。----
+
+[[processors.starlark]]
+    namepass = ["device_cpu"]
+    source = '''
+def apply(metric):
+    raw = metric.fields.get("usage")
+    if raw == None:
+        return None
+    value = int(raw)
+    if value < 0 or value > 1000:
+        return None
+    metric.fields["usage"] = value / 10.0
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["enterasys"]
+
+[[processors.starlark]]
+    namepass = ["device_memory"]
+    source = '''
+def apply(metric):
+    parts = str(metric.tags.get("index", "")).split(".")
+    if len(parts) < 3 or parts[-2] != "2":
+        return None
+    total = metric.fields.get("total")
+    free = metric.fields.get("free")
+    if total == None or free == None:
+        return None
+    total = int(total) * 1024
+    free = int(free) * 1024
+    if total <= 0 or free > total:
+        return None
+    metric.fields["total"] = total
+    metric.fields["free"] = free
+    metric.fields["used"] = total - free
+    metric.fields["usage"] = (total - free) * 100.0 / total
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["enterasys"]

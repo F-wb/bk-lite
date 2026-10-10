@@ -1,0 +1,62 @@
+Wireless ACKSYS SNMP:
+  name: ACKSYS（Telegraf）
+  desc: 面向 ACKSYS 无线设备的 SNMP 监控模板,可采集 每端口入向流量速率、每端口出向流量速率、运行时长、堆内存字节、主板温度、双路电源状态、AP
+    客户端数和网桥 RSSI（企业号 PEN 28097）。
+monitor_object:
+  Wireless: 无线设备
+monitor_object_type:
+  Network Device: 网络设备
+monitor_object_metric:
+  Wireless:
+    snmp_uptime:
+      name: 系统运行时间
+      desc: 该指标表示设备自上次启动以来的运行时间（来自 sysUpTime）。通过监测设备运行时间，网络管理员可以了解设备的稳定性与可靠性，识别潜在的重启或故障问题。
+    interface_ifHCInOctets:
+      name: 接口接收流量速率
+      desc: 此指标表示过去5分钟内接收到的字节数的平均速率（来自 64 位 IF-MIB ifHCInOctets 计数器，ifXTable），单位为字节每秒。64
+        位计数器可避免 32 位 ifInOctets 在高速口上快速回绕，使流量速率更准确。
+    interface_ifHCOutOctets:
+      name: 接口发送流量速率
+      desc: 该指标计算过去5分钟内发送的字节数的平均速率（来自 64 位 IF-MIB ifHCOutOctets 计数器，ifXTable），单位为字节每秒。64
+        位计数器可避免 32 位 ifOutOctets 在高速口上快速回绕，使流量速率更准确。
+    device_total_incoming_traffic:
+      name: 设备接收总流量速率
+      desc: 此指标表示整个设备在过去5分钟内接收到的总字节流量的平均速率（按所有接口的 64 位 ifHCInOctets 汇总），单位为字节每秒。帮助管理员获取整个设备的接收流量情况，支持总体流量监控与容量规划。
+    device_total_outgoing_traffic:
+      name: 设备发送总流量速率
+      desc: 此指标表示整个设备在过去5分钟内发送的总字节流量的平均速率（按所有接口的 64 位 ifHCOutOctets 汇总），单位为字节每秒。帮助管理员评估整个系统的发送性能，进行更有效的流量管理与优化。
+    heap_free_bytes:
+      name: 堆空闲量
+      desc: ACKSYS WaveOS 当前可用堆内存字节数。空闲量持续偏低表示内存压力，可能影响无线转发或管理服务。
+    heap_total_bytes:
+      name: 堆总量
+      desc: ACKSYS WaveOS 堆内存总字节数。与空闲量一起作为堆使用率的分母。
+    heap_low_water_bytes:
+      name: 堆低水位
+      desc: ACKSYS WaveOS 堆空闲低水位字节数，记录自上次复位以来观察到的最低空闲堆，用于发现瞬时内存压力。
+    device_memory_usage:
+      name: 堆使用率
+      desc: 由堆总量与空闲字节推导的 ACKSYS WaveOS 堆使用率，单位为百分比。持续偏高表示堆内存压力，而不是伪造的 CPU 或通用内存百分比。
+    device_temperature_celsius:
+      name: 温度
+      desc: ACKSYS 主板传感器 0 的温度，原始值为毫摄氏度，查询时除以 1000 转为摄氏度。读数不高于 -274000 毫摄氏度表示传感器不可用。温度过高可能表示机箱温升或射频硬件热压力。
+    device_psu_state:
+      name: 电源线 1 状态
+      desc: ACKSYS 工业无线设备电源线 1 的运行状态，原始码 powerOn/powerOff 归一为正常或异常。双路供电机型的第二路见备用电源状态。
+    device_psu_state_backup:
+      name: 电源线 2 状态
+      desc: ACKSYS 工业无线设备电源线 2 的运行状态，原始码 powerOn/powerOff 归一为正常或异常。
+    wireless_client_count:
+      name: 关联客户端数
+      desc: ACKSYS 接入点当前关联的无线客户端数量。该标量在接入点模式下有效；逐客户端 RSSI 表不采集。
+    wireless_signal_strength:
+      name: 网桥 RSSI
+      desc: ACKSYS 网桥模式下对端连接的 RSSI（dBm）。该标量在网桥模式下有效；接入点逐客户端 RSSI 为行表，不采集。
+monitor_object_metric_group:
+  Wireless:
+    Base: 基础
+    Traffic: 流量
+    Wireless: 无线
+    Memory: 内存
+    Temperature: 温度
+    Hardware Status: 硬件状态

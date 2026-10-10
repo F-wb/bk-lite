@@ -1,0 +1,18 @@
+{
+  "name": "snmp_trap",
+  "collector": "Snmptrapd",
+  "icon": "mm-hardwareDevice_硬件设备",
+  "description": "Collects SNMP Trap messages from network devices",
+  "default_query": "collect_type: snmp_trap | last 1 by (_time) partition by (node_ip)",
+  "display_category": "general",
+  "attrs": [
+    "collect_type",
+    "collector",
+    "event_type",
+    "node_ip",
+    "timestamp",
+    "collect_timestamp",
+    "received_at",
+    "message"
+  ]
+}

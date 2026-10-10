@@ -1,0 +1,593 @@
+"""MonitorPolicyScan 编排器规格测试。
+
+聚焦实例映射/基准映射构建、来源解析、步骤错误处理、快照触发条件、前置检查。
+子服务方法通过 mocker.patch.object 隔离，断言编排契约。
+"""
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from apps.monitor.models import (
+    MonitorAlert,
+    MonitorAlertMetricSnapshot,
+    MonitorEvent,
+    MonitorInstance,
+    MonitorInstanceOrganization,
+    PolicyInstanceBaseline,
+)
+from apps.monitor.models.monitor_object import MonitorObject
+from apps.monitor.models.monitor_policy import MonitorPolicy
+from apps.monitor.serializers.monitor_alert import MonitorAlertSerializer
+from apps.monitor.tasks.services.policy_scan import metric_query as metric_query_module
+from apps.monitor.tasks.services.policy_scan.scanner import MonitorPolicyScan
+
+pytestmark = pytest.mark.django_db
+
+
+def _make_policy(obj, source=None, **kwargs):
+    base = dict(
+        monitor_object=obj,
+        name="p1",
+        algorithm="max",
+        query_condition={"type": "pmq", "query": "up"},
+        source=source if source is not None else {"type": "instance", "values": []},
+        group_by=["instance_id"],
+        enable_alerts=["threshold"],
+        last_run_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    base.update(kwargs)
+    return MonitorPolicy.objects.create(**base)
+
+
+def _make_obj():
+    return MonitorObject.objects.create(name="ScanObj", level="base", instance_id_keys=["instance_id"])
+
+
+class TestBuildInstancesMap:
+    def test_no_source_empty(self):
+        obj = _make_obj()
+        policy = _make_policy(obj, source={})
+        scan = MonitorPolicyScan(policy)
+        assert scan.instances_map == {}
+
+    def test_instance_source(self):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h1',)", name="主机1", monitor_object=obj)
+        policy = _make_policy(obj, source={"type": "instance", "values": ["('h1',)"]})
+        scan = MonitorPolicyScan(policy)
+        assert scan.instances_map == {"('h1',)": "主机1"}
+
+    def test_instance_source_accepts_logical_id(self):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h1',)", name="主机1", monitor_object=obj)
+        policy = _make_policy(obj, source={"type": "instance", "values": ["h1"]})
+        scan = MonitorPolicyScan(policy)
+        assert scan.instances_map == {"('h1',)": "主机1"}
+
+    def test_organization_source(self):
+        obj = _make_obj()
+        inst = MonitorInstance.objects.create(id="('h2',)", name="主机2", monitor_object=obj)
+        MonitorInstanceOrganization.objects.create(monitor_instance=inst, organization=5)
+        policy = _make_policy(obj, source={"type": "organization", "values": [5]})
+        scan = MonitorPolicyScan(policy)
+        assert scan.instances_map == {"('h2',)": "主机2"}
+
+    def test_deleted_instance_excluded(self):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h3',)", name="主机3", monitor_object=obj, is_deleted=True)
+        policy = _make_policy(obj, source={"type": "instance", "values": ["('h3',)"]})
+        scan = MonitorPolicyScan(policy)
+        assert scan.instances_map == {}
+
+    def test_derivative_object_builds_parent_name_map(self):
+        parent = MonitorObject.objects.create(name="ClusterObj", level="base", instance_id_keys=["instance_id"])
+        child = MonitorObject.objects.create(
+            name="PodObj",
+            level="derivative",
+            parent=parent,
+            instance_id_keys=["instance_id", "pod"],
+        )
+        MonitorInstance.objects.create(id="('cluster-a',)", name="生产集群", monitor_object=parent)
+        child_id = "('cluster-a', 'orders-7f9')"
+        MonitorInstance.objects.create(id=child_id, name="orders-7f9", monitor_object=child)
+        policy = _make_policy(child, source={"type": "instance", "values": [child_id]})
+
+        scan = MonitorPolicyScan(policy)
+
+        assert scan.parent_instances_map == {"('cluster-a',)": "生产集群"}
+
+
+class TestGetInstanceListBySource:
+    def test_unknown_type_returns_empty(self):
+        obj = _make_obj()
+        policy = _make_policy(obj, source={})
+        scan = MonitorPolicyScan(policy)
+        assert scan._get_instance_list_by_source("bogus", ["x"]) == []
+
+    def test_base_logical_id_expands_to_storage_key(self):
+        obj = _make_obj()
+        policy = _make_policy(obj, source={})
+        scan = MonitorPolicyScan(policy)
+        assert scan._get_instance_list_by_source("instance", ["prod-cluster"]) == [
+            "prod-cluster",
+            "('prod-cluster',)",
+        ]
+
+    def test_derivative_tuple_id_stays_idempotent(self):
+        obj = _make_obj()
+        policy = _make_policy(obj, source={})
+        scan = MonitorPolicyScan(policy)
+        child_id = "('prod-cluster', 'nginx')"
+        assert scan._get_instance_list_by_source("instance", [child_id]) == [child_id]
+
+    def test_child_name_does_not_expand_to_parent_child_tuple(self):
+        obj = _make_obj()
+        policy = _make_policy(obj, source={})
+        scan = MonitorPolicyScan(policy)
+        assert scan._get_instance_list_by_source("instance", ["nginx"]) == [
+            "nginx",
+            "('nginx',)",
+        ]
+
+
+class TestBuildBaselinesMap:
+    def test_maps_metric_to_monitor_instance(self):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h1',)", name="主机1", monitor_object=obj)
+        policy = _make_policy(obj, source={"type": "instance", "values": ["('h1',)"]})
+        PolicyInstanceBaseline.objects.create(
+            policy=policy,
+            monitor_instance_id="('h1',)",
+            metric_instance_id="('h1','eth0')",
+        )
+        scan = MonitorPolicyScan(policy)
+        assert scan.baselines_map == {"('h1','eth0')": "('h1',)"}
+
+
+class TestExecuteStep:
+    def test_success_returns_result(self):
+        obj = _make_obj()
+        scan = MonitorPolicyScan(_make_policy(obj, source={}))
+        ok, result = scan._execute_step("step", lambda: 42)
+        assert ok is True and result == 42
+
+    def test_failure_swallowed_non_critical(self):
+        obj = _make_obj()
+        scan = MonitorPolicyScan(_make_policy(obj, source={}))
+
+        def boom():
+            raise RuntimeError("x")
+
+        ok, result = scan._execute_step("step", boom)
+        assert ok is False and result is None
+
+    def test_failure_reraised_when_critical(self):
+        obj = _make_obj()
+        scan = MonitorPolicyScan(_make_policy(obj, source={}))
+
+        def boom():
+            raise RuntimeError("x")
+
+        with pytest.raises(RuntimeError):
+            scan._execute_step("step", boom, critical=True)
+
+
+class TestPreCheck:
+    def test_source_but_no_instances_returns_false(self):
+        obj = _make_obj()
+        policy = _make_policy(obj, source={"type": "instance", "values": ["('missing',)"]})
+        scan = MonitorPolicyScan(policy)
+        assert scan._pre_check() is False
+
+    def test_passes_and_sets_instance_key(self, mocker):
+        obj = _make_obj()
+        policy = _make_policy(obj, source={})
+        scan = MonitorPolicyScan(policy)
+        spy = mocker.patch.object(scan.metric_query_service, "set_monitor_obj_instance_key")
+        assert scan._pre_check() is True
+        spy.assert_called_once()
+
+
+class TestRecordSnapshots:
+    def test_skips_when_no_active_alerts(self, mocker):
+        obj = _make_obj()
+        scan = MonitorPolicyScan(_make_policy(obj, source={}))
+        spy = mocker.patch.object(scan.snapshot_recorder, "record_snapshots_for_active_alerts")
+        scan._record_snapshots(info_events=[], event_objs=[], new_alerts=[])
+        spy.assert_not_called()
+
+    def test_records_when_active_and_data(self, mocker):
+        obj = _make_obj()
+        scan = MonitorPolicyScan(_make_policy(obj, source={}))
+        spy = mocker.patch.object(scan.snapshot_recorder, "record_snapshots_for_active_alerts")
+        scan._record_snapshots(info_events=[], event_objs=[], new_alerts=["a"])
+        spy.assert_called_once()
+
+
+class TestRun:
+    def test_run_orchestrates_collect_and_create(self, mocker):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h1',)", name="主机1", monitor_object=obj)
+        policy = _make_policy(obj, source={"type": "instance", "values": ["('h1',)"]})
+        scan = MonitorPolicyScan(policy)
+        mocker.patch.object(scan.metric_query_service, "set_monitor_obj_instance_key")
+        mocker.patch.object(
+            scan.alert_detector,
+            "detect_threshold_alerts",
+            return_value=([], [], []),
+        )
+        mocker.patch.object(scan.alert_detector, "count_events")
+        mocker.patch.object(scan.alert_detector, "recover_threshold_alerts", return_value=[])
+        mocker.patch.object(
+            scan.metric_query_service,
+            "query_existence_metrics",
+            return_value={"data": {"result": []}},
+        )
+        create = mocker.patch.object(
+            scan.event_alert_manager,
+            "create_events_and_alerts",
+            return_value=([], []),
+        )
+        scan.run()
+        # 无事件 → create_events_and_alerts 不应被调用（events 为空走 early return）
+        create.assert_not_called()
+
+
+class TestSyncBaselinesFromExistence:
+    def test_creates_baseline_when_comparison_empty_but_existence_has_row(self, mocker):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h1',)", name="主机1", monitor_object=obj)
+        policy = _make_policy(
+            obj,
+            source={"type": "instance", "values": ["('h1',)"]},
+            compare_mode="offset_1h",
+            compare_value_kind="percent",
+            period={"type": "min", "value": 5},
+        )
+        scan = MonitorPolicyScan(policy)
+        existence = {
+            "data": {
+                "result": [
+                    {"metric": {"instance_id": "h1"}, "values": [[100, "12"]]},
+                ]
+            }
+        }
+        comparison = {"data": {"result": []}}
+        mocker.patch.object(scan.metric_query_service, "set_monitor_obj_instance_key")
+        mocker.patch.object(
+            scan.metric_query_service,
+            "query_existence_metrics",
+            return_value=existence,
+        )
+        mocker.patch.object(
+            scan.metric_query_service,
+            "query_comparison_metrics",
+            return_value=comparison,
+        )
+        mocker.patch.object(
+            scan.metric_query_service,
+            "convert_metric_values",
+            side_effect=lambda data: data,
+        )
+        mocker.patch.object(
+            scan.metric_query_service,
+            "query_overlay_last_values",
+            return_value=({}, {}),
+        )
+        mocker.patch.object(
+            scan.event_alert_manager,
+            "create_events_and_alerts",
+            return_value=([], []),
+        )
+
+        scan.run()
+
+        assert set(
+            PolicyInstanceBaseline.objects.filter(policy_id=policy.id).values_list(
+                "metric_instance_id",
+                "monitor_instance_id",
+            )
+        ) == {("('h1',)", "('h1',)")}
+
+
+class TestPodAlertEndToEnd:
+    """用隔离测试库和 VictoriaMetrics mock 验证 Pod 告警完整生命周期。"""
+
+    def test_child_names_and_no_data_aggregation_lifecycle(self, mocker):
+        parent = MonitorObject.objects.create(
+            name="K3SCluster",
+            level="base",
+            instance_id_keys=["instance_id"],
+        )
+        pod_object = MonitorObject.objects.create(
+            name="K3SPod",
+            level="derivative",
+            parent=parent,
+            instance_id_keys=["instance_id", "pod"],
+        )
+        MonitorInstance.objects.create(
+            id="('cluster-a',)",
+            name="生产集群",
+            monitor_object=parent,
+        )
+        pod_id = "('cluster-a', 'orders-7f9')"
+        MonitorInstance.objects.create(
+            id=pod_id,
+            name="orders-7f9",
+            monitor_object=pod_object,
+        )
+
+        phase = {"result": []}
+
+        def mock_victoriametrics(*args, **kwargs):
+            return {"data": {"result": phase["result"]}}
+
+        mocker.patch.object(
+            metric_query_module,
+            "VictoriaMetricsAPI",
+        ).return_value.query_range.side_effect = lambda *args, **kwargs: {
+            "data": {"result": phase["result"]}
+        }
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._upload_to_s3",
+            return_value="2026/01/01/mock.json.gz",
+        )
+        mocker.patch("apps.monitor.tasks.services.policy_scan.snapshot_recorder." "SnapshotRecorder.record_snapshots_for_active_alerts")
+        mocker.patch("apps.monitor.tasks.services.policy_scan.alert_detector." "AlertLifecycleNotifier.notify_alerts")
+
+        query_condition = {
+            "type": "pmq",
+            "query": "kube_pod_container_status_ready",
+            "instance_id_keys": ["instance_id", "pod"],
+        }
+        common = {
+            "monitor_object": pod_object,
+            "algorithm": "max",
+            "query_condition": query_condition,
+            "source": {"type": "instance", "values": [pod_id]},
+            "group_by": ["instance_id", "pod", "container"],
+            "period": {"type": "min", "value": 5},
+            "notice": False,
+            "last_run_time": datetime(2026, 8, 1, 9, 55, tzinfo=timezone.utc),
+        }
+
+        threshold_policy = MonitorPolicy.objects.create(
+            **common,
+            name="Pod Ready 阈值",
+            alert_name="$parent_resource_name/$resource_name Pod Ready 超阈值",
+            threshold=[{"method": ">", "value": 0.5, "level": "critical"}],
+            enable_alerts=["threshold"],
+        )
+        phase["result"] = [
+            {
+                "metric": {
+                    "instance_id": "cluster-a",
+                    "pod": "orders-7f9",
+                    "container": "api",
+                },
+                "values": [[1785558900, "1"]],
+            }
+        ]
+
+        MonitorPolicyScan(threshold_policy).run()
+
+        threshold_alert = MonitorAlert.objects.get(policy_id=threshold_policy.id)
+        threshold_payload = MonitorAlertSerializer(threshold_alert).data
+        assert threshold_payload["monitor_instance_id"] == pod_id
+        assert threshold_payload["monitor_instance_name"] == "orders-7f9"
+        assert threshold_payload["content"] == "生产集群/orders-7f9 Pod Ready 超阈值"
+
+        no_data_policy = MonitorPolicy.objects.create(
+            **common,
+            name="Pod Ready 无数据",
+            no_data_period={"type": "min", "value": 10},
+            no_data_recovery_period={"type": "min", "value": 10},
+            no_data_level="critical",
+            no_data_alert_name="$parent_resource_name/$resource_name Pod Ready 无数据",
+            enable_alerts=["no_data"],
+        )
+        baselines = [
+            "('cluster-a', 'orders-7f9', 'api')",
+            "('cluster-a', 'orders-7f9', 'worker')",
+        ]
+        PolicyInstanceBaseline.objects.bulk_create(
+            [
+                PolicyInstanceBaseline(
+                    policy=no_data_policy,
+                    monitor_instance_id=pod_id,
+                    metric_instance_id=metric_instance_id,
+                )
+                for metric_instance_id in baselines
+            ]
+        )
+
+        # 两个容器同时无数据：按维度各开一张 Alert，各写一条 triggered。
+        phase["result"] = []
+        MonitorPolicyScan(no_data_policy).run()
+
+        no_data_alerts = list(
+            MonitorAlert.objects.filter(policy_id=no_data_policy.id).order_by("metric_instance_id")
+        )
+        first_events = MonitorEvent.objects.filter(policy_id=no_data_policy.id)
+        assert {alert.metric_instance_id for alert in no_data_alerts} == set(baselines)
+        assert {alert.monitor_instance_id for alert in no_data_alerts} == {pod_id}
+        assert {alert.monitor_instance_name for alert in no_data_alerts} == {"orders-7f9"}
+        assert {alert.content for alert in no_data_alerts} == {"生产集群/orders-7f9 Pod Ready 无数据"}
+        assert first_events.count() == 2
+        assert set(first_events.values_list("action", flat=True)) == {MonitorEvent.Action.TRIGGERED}
+        assert set(first_events.values_list("alert_id", flat=True)) == {alert.id for alert in no_data_alerts}
+
+        # api 恢复但 worker 仍无数据：只恢复 api 对应 Alert。
+        no_data_policy.last_run_time += timedelta(minutes=10)
+        no_data_policy.save(update_fields=["last_run_time"])
+        phase["result"] = [
+            {
+                "metric": {
+                    "instance_id": "cluster-a",
+                    "pod": "orders-7f9",
+                    "container": "api",
+                },
+                "values": [[1785559500, "1"]],
+            }
+        ]
+        MonitorPolicyScan(no_data_policy).run()
+
+        alerts_by_metric = {
+            alert.metric_instance_id: alert
+            for alert in MonitorAlert.objects.filter(policy_id=no_data_policy.id)
+        }
+        assert alerts_by_metric["('cluster-a', 'orders-7f9', 'api')"].status == "recovered"
+        assert alerts_by_metric["('cluster-a', 'orders-7f9', 'worker')"].status == "new"
+        assert MonitorEvent.objects.filter(
+            policy_id=no_data_policy.id, action=MonitorEvent.Action.RECOVERED
+        ).count() == 1
+
+        # 两个容器都恢复数据：worker 对应 Alert 也自动恢复。
+        no_data_policy.last_run_time += timedelta(minutes=10)
+        no_data_policy.save(update_fields=["last_run_time"])
+        phase["result"] = [
+            {
+                "metric": {
+                    "instance_id": "cluster-a",
+                    "pod": "orders-7f9",
+                    "container": container,
+                },
+                "values": [[1785560100, "1"]],
+            }
+            for container in ("api", "worker")
+        ]
+        MonitorPolicyScan(no_data_policy).run()
+
+        worker_alert = MonitorAlert.objects.get(
+            policy_id=no_data_policy.id,
+            metric_instance_id="('cluster-a', 'orders-7f9', 'worker')",
+        )
+        assert worker_alert.status == "recovered"
+        assert worker_alert.end_event_time == no_data_policy.last_run_time
+        recovered_events = MonitorEvent.objects.filter(
+            policy_id=no_data_policy.id, action=MonitorEvent.Action.RECOVERED
+        )
+        assert recovered_events.count() == 2
+
+
+class TestThresholdLifecycleEvents:
+    def test_still_firing_adds_info_snapshot_without_new_event(self, mocker):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h1',)", name="主机1", monitor_object=obj)
+        policy = _make_policy(
+            obj,
+            source={"type": "instance", "values": ["('h1',)"]},
+            threshold=[{"method": ">", "value": 80, "level": "critical"}],
+            recovery_condition=5,
+            period={"type": "min", "value": 5},
+        )
+        phase = {
+            "result": [
+                {
+                    "metric": {"instance_id": "h1"},
+                    "values": [[1767225600, "95"]],
+                }
+            ]
+        }
+
+        def mock_victoriametrics(*args, **kwargs):
+            return {"data": {"result": phase["result"]}}
+
+        mocker.patch.object(
+            metric_query_module,
+            "VictoriaMetricsAPI",
+        ).return_value.query_range.side_effect = lambda *args, **kwargs: {
+            "data": {"result": phase["result"]}
+        }
+        snapshot_store = {}
+
+        def upload_snapshot(self, instance, json_data, *args, **kwargs):
+            snapshot_store["data"] = json_data
+            return "2026/01/01/mock.json.gz"
+
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._upload_to_s3",
+            upload_snapshot,
+        )
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._load_from_s3",
+            lambda self, *args, **kwargs: snapshot_store.get("data", []),
+        )
+        mocker.patch("apps.monitor.tasks.services.policy_scan.alert_detector.AlertLifecycleNotifier.notify_alerts")
+        mocker.patch(
+            "apps.monitor.tasks.services.policy_scan.snapshot_recorder." "SnapshotRecorder._build_pre_alert_snapshot",
+            return_value=None,
+        )
+
+        MonitorPolicyScan(policy).run()
+        alert = MonitorAlert.objects.get(policy_id=policy.id)
+        events = list(MonitorEvent.objects.filter(alert_id=alert.id))
+        assert [event.action for event in events] == [MonitorEvent.Action.TRIGGERED]
+        first_snap = MonitorAlertMetricSnapshot.objects.get(alert_id=alert.id)
+        assert any(item["type"] == "event" for item in first_snap.snapshots)
+
+        policy.last_run_time += timedelta(minutes=5)
+        policy.save(update_fields=["last_run_time"])
+        MonitorPolicyScan(policy).run()
+
+        assert MonitorEvent.objects.filter(alert_id=alert.id).count() == 1
+        snap = MonitorAlertMetricSnapshot.objects.get(alert_id=alert.id)
+        assert any(item["type"] == "info" for item in snap.snapshots)
+        alert.refresh_from_db()
+        assert alert.status == "new"
+        assert alert.level == "critical"
+
+
+class TestStockPolicyScanRegression:
+    def test_policy_without_new_fields_still_creates_alert_and_event(self, mocker):
+        obj = _make_obj()
+        MonitorInstance.objects.create(id="('h1',)", name="主机1", monitor_object=obj)
+        policy = _make_policy(
+            obj,
+            source={"type": "instance", "values": ["('h1',)"]},
+            algorithm="max",
+            threshold=[{"method": ">", "value": 80, "level": "critical"}],
+            period={"type": "min", "value": 5},
+        )
+        mocker.patch.object(
+            metric_query_module,
+            "VictoriaMetricsAPI",
+        ).return_value.query_range.return_value = {
+            "data": {
+                "result": [
+                    {"metric": {"instance_id": "h1"}, "values": [[1767225600, "95"]]}
+                ]
+            }
+        }
+        snapshot_store = {}
+
+        def upload_snapshot(self, instance, json_data, *args, **kwargs):
+            snapshot_store["data"] = json_data
+            return "2026/01/01/mock.json.gz"
+
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._upload_to_s3",
+            upload_snapshot,
+        )
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._load_from_s3",
+            lambda self, *args, **kwargs: snapshot_store.get("data", []),
+        )
+        mocker.patch(
+            "apps.monitor.tasks.services.policy_scan.alert_detector.AlertLifecycleNotifier.notify_alerts"
+        )
+        mocker.patch(
+            "apps.monitor.tasks.services.policy_scan.snapshot_recorder.SnapshotRecorder._build_pre_alert_snapshot",
+            return_value=None,
+        )
+
+        MonitorPolicyScan(policy).run()
+
+        alert = MonitorAlert.objects.get(policy_id=policy.id)
+        events = list(MonitorEvent.objects.filter(policy_id=policy.id))
+        assert alert.status == "new"
+        assert alert.level == "critical"
+        assert len(events) == 1
+        assert events[0].action == MonitorEvent.Action.TRIGGERED
+        assert MonitorAlertMetricSnapshot.objects.filter(alert_id=alert.id).exists()

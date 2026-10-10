@@ -1,0 +1,1962 @@
+"""Secure Markdown import preflight and one-time execution."""
+
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import stat
+import unicodedata
+import uuid
+import zipfile
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
+from pathlib import PurePosixPath
+
+from django.db import transaction
+from django.utils import timezone
+
+from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.models import BuildRecord, CheckItem, KnowledgePage, PageVersion, WikiGeneration, WikiImportPreflight, WikiKnowledgeBase
+from apps.opspilot.services.wiki.build_generation_service import (
+    begin_build_generation,
+    fail_build_generation,
+    finalize_build_generation,
+    stage_ai_page,
+)
+from apps.opspilot.services.wiki.build_service import _invoke_llm
+from apps.opspilot.services.wiki.cascade_service import cascade
+from apps.opspilot.services.wiki.colloquial_alias_service import enrich_generation_colloquial_aliases_safely
+from apps.opspilot.services.wiki.directory_assignment_service import resolve_page_directory
+from apps.opspilot.services.wiki.generation_navigation_service import enhance_generation_overviews
+from apps.opspilot.services.wiki.markdown_import_service import parse_markdown_document
+from apps.opspilot.services.wiki.material_build_queue_service import kb_has_user_build_in_progress
+from apps.opspilot.services.wiki.okf_import_service import (
+    OkfParseError,
+    bound_okf_image_missing,
+    detect_bundle_root,
+    import_layer_name,
+    is_okf_import_format,
+    is_reserved_okf_path,
+    parse_okf_document,
+    plan_okf_images,
+    prepare_okf_documents,
+    read_okf_version,
+    strip_bundle_root,
+)
+from apps.opspilot.services.wiki.purpose_schema_service import (
+    MATERIALS_ROOT_KEY,
+    import_folder_display_name,
+    match_frozen_knowledge_root_name,
+    normalize_folder_name,
+)
+from apps.opspilot.services.wiki.parsed_media_service import (
+    collect_page_media_locators,
+    delete_media_locator,
+    save_import_archive_bytes,
+    save_page_media_bytes,
+)
+from apps.opspilot.services.wiki.structure_service import StructureServiceError, save_structure
+from apps.opspilot.services.wiki.title_service import InvalidWikiTitle, canonical_title, title_identity_key, validate_display_title
+from apps.opspilot.services.wiki.wiki_budget_service import new_alias_enrich_call_budget
+
+MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_ENTRIES = 5000
+MAX_UNCOMPRESSED_BYTES = 400 * 1024 * 1024
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 1000
+# 大包二次上传需要时间，但不能无限有效。
+TOKEN_TTL_MINUTES = 120
+_MARKDOWN_SUFFIXES = {".md", ".markdown"}
+_ERROR_DETAIL_TEXT_LIMIT = 160
+
+
+class MarkdownImportGovernanceError(Exception):
+    def __init__(self, code, message, *, status_code=422, retryable=False, details=None):
+        self.code = str(code)
+        self.status_code = int(status_code)
+        self.retryable = bool(retryable)
+        self.details = dict(details or {})
+        super().__init__(message)
+
+
+def _bounded_text_details(field, value):
+    text = "" if value is None else str(value)
+    bounded_text = "".join("\ufffd" if unicodedata.category(character) == "Cs" else character for character in text[:_ERROR_DETAIL_TEXT_LIMIT])
+    return {
+        field: bounded_text,
+        f"{field}_length": len(text),
+        f"{field}_sha256": hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest(),
+        f"{field}_truncated": len(text) > _ERROR_DETAIL_TEXT_LIMIT,
+    }
+
+
+@dataclass(frozen=True)
+class InspectedArchive:
+    archive_kind: str
+    documents: tuple[dict, ...]
+    manifest: dict
+    structure: dict
+    skipped_entries: int
+    archive_sha256: str
+    bundle_root: str = ""
+    import_layer_name: str = ""
+    okf_version: str = ""
+    skipped_details: tuple = ()
+    okf_stats: dict = field(default_factory=dict)
+    okf_image_uploads: tuple = ()
+
+
+def _safe_member_path(name):
+    if not isinstance(name, str) or not name or "\x00" in name or "\\" in name:
+        raise MarkdownImportGovernanceError("zip_entry_path_invalid", "压缩包包含非法路径")
+    if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+        raise MarkdownImportGovernanceError("zip_entry_path_invalid", "压缩包包含绝对路径")
+    path = PurePosixPath(name)
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise MarkdownImportGovernanceError("zip_entry_path_invalid", "压缩包包含路径穿越")
+    return path.as_posix()
+
+
+_ZIP_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+
+
+def decode_zip_member_name(info):
+    """Recover GBK filenames stored without the ZIP UTF-8 flag.
+
+    Windows Explorer often writes Chinese names as GBK with flag bit 11 unset.
+    Python then decodes those bytes as CP437, so markdown paths no longer match.
+    UTF-8 flagged names are left unchanged.
+    """
+    name = str(getattr(info, "filename", "") or "").replace("\\", "/")
+    flag_bits = int(getattr(info, "flag_bits", 0) or 0)
+    if flag_bits & 0x800:
+        return name
+    try:
+        recovered = name.encode("cp437").decode("gbk").replace("\\", "/")
+    except UnicodeError:
+        return name
+    if _ZIP_CJK_RE.search(recovered):
+        return recovered
+    return name
+
+
+def _decode_utf8(payload, path):
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise MarkdownImportGovernanceError(
+            "archive_text_not_utf8",
+            "导入文本必须使用 UTF-8 编码",
+            details={"path": path},
+        ) from error
+
+
+def _document(path, payload, *, metadata=None):
+    text = _decode_utf8(payload, path)
+    parsed = parse_markdown_document(path, text)
+    metadata = dict(metadata or {})
+    return {
+        "archive_path": path,
+        "title": parsed.title,
+        "page_type": parsed.page_type,
+        "tags": parsed.tags,
+        "body": parsed.body,
+        "original_id": parsed.original_id,
+        "directory_key": metadata.get("directory_key") or "",
+        "directory_assignment_mode": metadata.get("directory_assignment_mode") or "auto",
+        "content_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _okf_document(path, payload):
+    try:
+        text = _decode_utf8(payload, path)
+    except MarkdownImportGovernanceError as error:
+        if error.code != "archive_text_not_utf8":
+            raise
+        raise OkfParseError("not_utf8", "导入文本必须使用 UTF-8 编码") from error
+    parsed = parse_okf_document(path, text)
+    return {
+        "archive_path": path,
+        "title": parsed["title"],
+        "page_type": "concept",
+        "tags": parsed["tags"],
+        "body": parsed["body"],
+        "original_id": parsed["concept_id"],
+        "directory_key": "",
+        "directory_assignment_mode": "auto",
+        "content_sha256": hashlib.sha256(payload).hexdigest(),
+        "concept_id": parsed["concept_id"],
+        "okf_original_title": parsed["okf_original_title"],
+        "okf_type": parsed["okf_type"],
+        "description": parsed["description"],
+        "verified": parsed["verified"],
+        "okf_status": parsed["okf_status"],
+        "okf_frontmatter": parsed["okf_frontmatter"],
+    }
+
+
+def _okf_no_concepts_error(skipped_details):
+    skipped = [dict(item) for item in skipped_details or []]
+    counts = {}
+    for item in skipped:
+        reason = str(item.get("reason") or "").strip()
+        if not reason:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    yaml_invalid = counts.get("yaml_invalid", 0)
+    type_missing = counts.get("type_missing", 0)
+    if type_missing and not yaml_invalid:
+        message = "OKF 归档中没有可导入的知识页。" "YAML 已有，但缺少非空 type（例如 type: concept）。"
+    else:
+        message = "OKF 归档中没有可导入的知识页。" "请给主题 Markdown 补 YAML，并写上非空 type（例如 type: concept）。"
+    return MarkdownImportGovernanceError(
+        "okf_no_concepts",
+        message,
+        details={"skipped": skipped, "skip_reason_counts": counts},
+    )
+
+
+def _inspect_okf_archive(payloads, skipped, archive_sha256, member_paths):
+    bundle_root = detect_bundle_root(member_paths)
+    skipped_details = []
+    documents = []
+    okf_version = ""
+    extra_skipped = 0
+    for path, payload in sorted(payloads.items()):
+        relative = strip_bundle_root(path, bundle_root)
+        if not relative or PurePosixPath(relative).suffix.casefold() not in _MARKDOWN_SUFFIXES:
+            extra_skipped += 1
+            continue
+        if is_reserved_okf_path(relative):
+            if PurePosixPath(relative).as_posix() == "index.md":
+                try:
+                    okf_version = read_okf_version(_decode_utf8(payload, path)) or okf_version
+                except MarkdownImportGovernanceError as error:
+                    if error.code != "archive_text_not_utf8":
+                        raise
+                    skipped_details.append({"path": relative, "reason": "not_utf8"})
+                    extra_skipped += 1
+                    continue
+            skipped_details.append({"path": relative, "reason": "reserved"})
+            extra_skipped += 1
+            continue
+        try:
+            documents.append(_okf_document(relative, payload))
+        except OkfParseError as error:
+            skipped_details.append({"path": relative, "reason": error.reason})
+            extra_skipped += 1
+    if not documents:
+        raise _okf_no_concepts_error(skipped_details)
+    return InspectedArchive(
+        archive_kind="okf",
+        documents=tuple(documents),
+        manifest={},
+        structure={},
+        skipped_entries=skipped + extra_skipped,
+        archive_sha256=archive_sha256,
+        bundle_root=bundle_root,
+        import_layer_name=import_layer_name(bundle_root),
+        okf_version=okf_version,
+        skipped_details=tuple(skipped_details),
+    )
+
+
+def _ensure_okf_prepared(knowledge_base, inspected):
+    if inspected.archive_kind != "okf" or inspected.okf_stats:
+        return inspected
+    revision = knowledge_base.active_structure_revision
+    page_types = list((revision.structure_snapshot or {}).get("page_types") or []) if revision is not None else []
+    documents, stats = prepare_okf_documents(
+        inspected.documents,
+        page_types=page_types,
+        okf_version=inspected.okf_version,
+        canonical_title_fn=lambda title: canonical_title(knowledge_base, title),
+    )
+    stats = {
+        **stats,
+        "bundle_root": inspected.bundle_root,
+        "skipped": [dict(item) for item in inspected.skipped_details],
+    }
+    return replace(inspected, documents=tuple(documents), okf_stats=stats)
+
+
+def _okf_zip_member_index(content, bundle_root):
+    lookup = {}
+    archive = zipfile.ZipFile(io.BytesIO(content))
+    with archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name = _safe_member_path(decode_zip_member_name(info).rstrip("/"))
+            relative = strip_bundle_root(name, bundle_root)
+            if relative:
+                lookup[relative.casefold()] = info.filename
+    return lookup
+
+
+def _attach_okf_images(knowledge_base, inspected, content):
+    if inspected.archive_kind != "okf":
+        return inspected
+    member_index = _okf_zip_member_index(content, inspected.bundle_root)
+    archive = zipfile.ZipFile(io.BytesIO(content))
+
+    def read_member(relative):
+        zip_name = member_index.get(str(relative or "").replace("\\", "/").casefold())
+        if not zip_name:
+            return None
+        try:
+            payload = archive.read(zip_name)
+        except KeyError:
+            return None
+        return payload
+
+    with archive:
+        documents, image_stats, uploads, missing = plan_okf_images(
+            inspected.documents,
+            knowledge_base_id=knowledge_base.pk,
+            read_member=read_member,
+        )
+    if missing:
+        details = bound_okf_image_missing(missing)
+        raise MarkdownImportGovernanceError(
+            "okf_images_missing",
+            "OKF 归档中有正文引用了缺失或无效的本地图片",
+            details=details,
+        )
+    stats = dict(inspected.okf_stats or {})
+    stats["images"] = image_stats
+    return replace(
+        inspected,
+        documents=tuple(documents),
+        okf_stats=stats,
+        okf_image_uploads=tuple(uploads),
+    )
+
+
+def _upload_okf_page_images(knowledge_base, inspected, archive_content):
+    uploads = list(inspected.okf_image_uploads or ())
+    if not uploads:
+        return []
+    member_index = _okf_zip_member_index(archive_content or b"", inspected.bundle_root)
+    created = []
+    archive = zipfile.ZipFile(io.BytesIO(archive_content or b""))
+    try:
+        with archive:
+            for item in uploads:
+                relative = item["relative"]
+                zip_name = member_index.get(str(relative).replace("\\", "/").casefold())
+                if not zip_name:
+                    raise MarkdownImportGovernanceError(
+                        "okf_images_missing",
+                        "OKF 归档中有正文引用了缺失或无效的本地图片",
+                        details=bound_okf_image_missing([{"archive_path": "", "image_path": relative, "reason": "not_found"}]),
+                    )
+                payload = archive.read(zip_name)
+                _locator, was_new = save_page_media_bytes(knowledge_base.pk, payload, item["content_type"])
+                if was_new:
+                    created.append(_locator)
+        return created
+    except Exception:
+        for locator in created:
+            delete_media_locator(locator)
+        raise
+
+
+def _gc_okf_page_media(knowledge_base, released_locators):
+    candidates = {locator for locator in released_locators or () if locator.split("/")[3:4] == ["pages"]}
+    if not candidates:
+        return
+    referenced = set()
+    for page in KnowledgePage.objects.filter(knowledge_base=knowledge_base).select_related("current_version"):
+        referenced.update(collect_page_media_locators(getattr(page.current_version, "body", None) or ""))
+    for check in CheckItem.objects.filter(knowledge_base=knowledge_base, status="open").select_related("candidate_version"):
+        referenced.update(collect_page_media_locators(getattr(check.candidate_version, "body", None) or ""))
+    for locator in candidates:
+        if locator not in referenced:
+            delete_media_locator(locator)
+
+
+def inspect_markdown_archive(content, filename="", import_format=""):  # noqa: C901
+    if not is_okf_import_format(import_format):
+        raise MarkdownImportGovernanceError(
+            "import_format_unsupported",
+            "批量知识导入仅支持 OKF",
+            status_code=400,
+            details={"import_format": str(import_format or "")},
+        )
+    if not isinstance(content, (bytes, bytearray)):
+        raise MarkdownImportGovernanceError("archive_content_invalid", "导入内容必须为 bytes")
+    content = bytes(content)
+    if not content:
+        raise MarkdownImportGovernanceError(
+            "archive_empty",
+            "导入归档为空",
+            details={"max_bytes": MAX_ARCHIVE_BYTES, "actual_bytes": 0},
+        )
+    if len(content) > MAX_ARCHIVE_BYTES:
+        raise MarkdownImportGovernanceError(
+            "archive_size_exceeded",
+            f"ZIP 超过大小限制（上限 {MAX_ARCHIVE_BYTES // (1024 * 1024)}MB）",
+            details={"max_bytes": MAX_ARCHIVE_BYTES, "actual_bytes": len(content)},
+        )
+    archive_sha256 = hashlib.sha256(content).hexdigest()
+    suffix = PurePosixPath(filename or "").suffix.casefold()
+    if suffix != ".zip":
+        raise MarkdownImportGovernanceError("archive_type_unsupported", "OKF 导入仅支持 ZIP")
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as error:
+        raise MarkdownImportGovernanceError("zip_invalid", "ZIP 文件损坏") from error
+    with archive:
+        infos = archive.infolist()
+        if len(infos) > MAX_ENTRIES:
+            raise MarkdownImportGovernanceError(
+                "zip_entry_limit",
+                f"ZIP 条目数超过限制（上限 {MAX_ENTRIES} 个）",
+                details={"max_entries": MAX_ENTRIES, "actual_entries": len(infos)},
+            )
+        total_size = 0
+        names = set()
+        payloads = {}
+        skipped = 0
+        member_paths = []
+        for info in infos:
+            name = _safe_member_path(decode_zip_member_name(info).rstrip("/"))
+            identity = name.casefold()
+            if identity in names:
+                raise MarkdownImportGovernanceError("zip_duplicate_entry", "ZIP 存在大小写等价的重复路径", details={"path": name})
+            names.add(identity)
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == stat.S_IFLNK:
+                raise MarkdownImportGovernanceError("zip_symlink_forbidden", "ZIP 不允许符号链接", details={"path": name})
+            if info.flag_bits & 0x1:
+                raise MarkdownImportGovernanceError("zip_encrypted_forbidden", "ZIP 不允许加密条目", details={"path": name})
+            if info.is_dir():
+                continue
+            member_paths.append(name)
+            if info.file_size > MAX_FILE_BYTES:
+                raise MarkdownImportGovernanceError(
+                    "zip_file_size_limit",
+                    f"ZIP 单文件超过限制（上限 {MAX_FILE_BYTES // (1024 * 1024)}MB）",
+                    details={"path": name, "max_bytes": MAX_FILE_BYTES, "actual_bytes": info.file_size},
+                )
+            total_size += info.file_size
+            if total_size > MAX_UNCOMPRESSED_BYTES:
+                raise MarkdownImportGovernanceError(
+                    "zip_uncompressed_limit",
+                    f"ZIP 解压总大小超过限制（上限 {MAX_UNCOMPRESSED_BYTES // (1024 * 1024)}MB）",
+                    details={"max_bytes": MAX_UNCOMPRESSED_BYTES, "actual_bytes": total_size},
+                )
+            if info.file_size and info.compress_size == 0:
+                raise MarkdownImportGovernanceError("zip_compression_ratio", "ZIP 压缩比异常", details={"path": name})
+            if info.compress_size and info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
+                raise MarkdownImportGovernanceError("zip_compression_ratio", "ZIP 压缩比超过限制", details={"path": name})
+            if name in {"manifest.json", "structure.json"} or PurePosixPath(name).suffix.casefold() in _MARKDOWN_SUFFIXES:
+                payloads[name] = archive.read(info)
+            else:
+                skipped += 1
+
+    return _inspect_okf_archive(payloads, skipped, archive_sha256, member_paths)
+
+
+def _existing_pages(knowledge_base):
+    result = {}
+    for page in KnowledgePage.objects.filter(knowledge_base=knowledge_base).select_related("directory", "current_version").order_by("id"):
+        result.setdefault(title_identity_key(page.title), page)
+    return result
+
+
+def _folder_path(document):
+    parent = PurePosixPath(document["archive_path"]).parent.as_posix()
+    return "" if parent == "." else parent
+
+
+def _path_suggestion(knowledge_base, document, options):
+    explicit_id = options.get("target_directory_id")
+    if explicit_id:
+        directory = knowledge_base.directories.filter(pk=explicit_id).first()
+        return directory.key if directory is not None else None
+    mappings = options.get("path_mappings") or {}
+    folder = _folder_path(document)
+    value = mappings.get(folder)
+    if value is None:
+        return document.get("directory_key") or None
+    if type(value) is int:
+        directory = knowledge_base.directories.filter(pk=value).first()
+        return directory.key if directory is not None else None
+    return str(value or "").strip() or None
+
+
+def _restore_structure_requested(options):
+    return bool(options.get("restore_structure") or options.get("restore_native_structure"))
+
+
+def _reject_structure_restore(options):
+    if _restore_structure_requested(options):
+        raise MarkdownImportGovernanceError(
+            "native_structure_restore_unavailable",
+            "OKF 导入不支持恢复原生结构",
+            status_code=400,
+        )
+
+
+def _drop_retired_import_options(options):
+    cleaned = dict(options or {})
+    cleaned.pop("path_mappings", None)
+    return cleaned
+
+
+def _create_folders_requested(options):
+    if "create_directories_from_folders" not in options:
+        return True
+    return bool(options.get("create_directories_from_folders"))
+
+
+def _resolve_existing_directory(knowledge_base, value, *, field):
+    if value in (None, ""):
+        return None
+    query = knowledge_base.directories.filter(status="active", accepts_pages=True)
+    if type(value) is int:
+        directory = query.filter(pk=value).first()
+    else:
+        directory = query.filter(key=str(value).strip()).first()
+    if directory is None:
+        raise MarkdownImportGovernanceError(
+            "import_directory_invalid",
+            "导入目录映射不存在、已失活或不接收页面",
+            details={"field": field, "value": value},
+        )
+    return directory
+
+
+def _folder_client_ref(folder):
+    digest = hashlib.sha256(folder.encode("utf-8")).hexdigest()[:24]
+    return f"import-folder-{digest}"
+
+
+def _folder_parent_token(parent):
+    if parent is None:
+        return None
+    if "id" in parent:
+        return ("existing", parent["id"])
+    return ("new", parent.get("client_ref"))
+
+
+def _anchor_from_sibling(hit):
+    if "id" in hit:
+        return {"id": hit["id"], "key": hit["key"]}
+    return {"client_ref": hit["client_ref"]}
+
+
+def _binding_from_anchor(anchor):
+    if "id" in anchor:
+        return {"kind": "existing", "id": anchor["id"], "key": anchor["key"]}
+    return {"kind": "new", "client_ref": anchor["client_ref"]}
+
+
+def _walk_named_folder_children(names, start_parent, sibling_names):
+    parent = start_parent
+    matched = 0
+    for name in names:
+        hit = sibling_names.get((_folder_parent_token(parent), normalize_folder_name(name)))
+        if hit is None:
+            break
+        parent = _anchor_from_sibling(hit)
+        matched += 1
+    return matched, parent
+
+
+def _okf_has_loose_pages(inspected):
+    return any(len(PurePosixPath(document["archive_path"]).parts) == 1 for document in inspected.documents)
+
+
+def _okf_first_level_folders(inspected):
+    folders = []
+    seen = set()
+    for document in inspected.documents:
+        parts = PurePosixPath(document["archive_path"]).parts
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        identity = normalize_folder_name(name)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        folders.append(name)
+    return folders
+
+
+def _okf_alignment_mode(inspected):
+    if _okf_has_loose_pages(inspected):
+        return "new_root"
+    if any(match_frozen_knowledge_root_name(name) for name in _okf_first_level_folders(inspected)):
+        return "merge"
+    return "new_root"
+
+
+def _okf_layer_display_name(inspected, options):
+    name = str(getattr(inspected, "import_layer_name", "") or "").strip()
+    if name:
+        return name
+    filename = str((options or {}).get("filename") or "").strip()
+    stem = PurePosixPath(filename).stem
+    return stem or "imported"
+
+
+def _align_okf_folder_parts(parts, sibling_names, root_parent, *, mode):
+    if mode == "new_root":
+        if not parts:
+            return root_parent, ()
+        matched, parent = _walk_named_folder_children(parts, root_parent, sibling_names)
+        return parent, parts[matched:]
+    if not parts:
+        return None, ()
+    spec = match_frozen_knowledge_root_name(parts[0])
+    if spec is not None:
+        hit = sibling_names.get((None, normalize_folder_name(spec["name"])))
+        if hit is None:
+            return None, parts
+        start = _anchor_from_sibling(hit)
+        matched, parent = _walk_named_folder_children(parts[1:], start, sibling_names)
+        return parent, parts[1 + matched :]
+    matched, parent = _walk_named_folder_children(parts, None, sibling_names)
+    return parent, parts[matched:]
+
+
+def _folder_structure_plan(knowledge_base, inspected, options):
+    if inspected.archive_kind != "okf":
+        raise MarkdownImportGovernanceError(
+            "folder_structure_requires_okf",
+            "仅 OKF 归档可从文件夹创建人工目录",
+        )
+    revision = knowledge_base.active_structure_revision
+    generation = knowledge_base.active_generation
+    if revision is None or generation is None:
+        raise MarkdownImportGovernanceError(
+            "active_structure_missing",
+            "知识库缺少 active structure/generation",
+            status_code=409,
+        )
+
+    snapshot = deepcopy(revision.structure_snapshot or {})
+    existing_nodes = []
+    existing_by_id = {}
+    for raw in snapshot.get("directories") or []:
+        node = {"kind": "existing", **deepcopy(raw)}
+        existing_nodes.append(node)
+        existing_by_id[node["id"]] = node
+
+    target = _resolve_existing_directory(
+        knowledge_base,
+        options.get("target_directory_id"),
+        field="target_directory_id",
+    )
+    if target is not None:
+        root_parent = {"id": target.pk, "key": target.key}
+    else:
+        root_parent = None
+    path_mappings = {}
+    folders = set()
+    for document in inspected.documents:
+        folder = _folder_path(document)
+        if not folder:
+            continue
+        parts = PurePosixPath(folder).parts
+        for index in range(1, len(parts) + 1):
+            folders.add(PurePosixPath(*parts[:index]).as_posix())
+
+    def existing_depth(directory_id, visiting=None):
+        visiting = set(visiting or ())
+        if directory_id in visiting:
+            raise MarkdownImportGovernanceError(
+                "directory_cycle",
+                "现有目录父链存在循环",
+                details={"directory_id": directory_id},
+            )
+        visiting.add(directory_id)
+        node = existing_by_id.get(directory_id)
+        if node is None:
+            raise MarkdownImportGovernanceError(
+                "directory_parent_missing",
+                "现有目录父链不完整",
+                details={"directory_id": directory_id},
+            )
+        parent = node.get("parent")
+        return 1 if parent is None else existing_depth(parent["id"], visiting) + 1
+
+    anchors = {}
+    directory_bindings = {}
+    new_nodes = []
+    new_depths = {}
+    sibling_names = {}
+    for node in existing_nodes:
+        if node.get("status") != "active":
+            continue
+        if node.get("key") == MATERIALS_ROOT_KEY:
+            continue
+        parent = node.get("parent")
+        parent_token = ("existing", parent["id"]) if parent else None
+        sibling_names[(parent_token, normalize_folder_name(node["name"]))] = {
+            "id": node["id"],
+            "key": node["key"],
+        }
+
+    okf_align_structure = target is None
+    alignment_mode = _okf_alignment_mode(inspected) if okf_align_structure else ""
+    alignment_reports = []
+    created_reports = []
+
+    def ensure_child(parent, name, folder_path):
+        display_name = import_folder_display_name(name, parent_is_root=parent is None)
+        parent_token = _folder_parent_token(parent)
+        collision = sibling_names.get((parent_token, normalize_folder_name(display_name)))
+        if collision is not None:
+            return _anchor_from_sibling(collision)
+        client_ref = _folder_client_ref(folder_path)
+        if parent is None:
+            depth = 1
+        elif "id" in parent:
+            depth = existing_depth(parent["id"]) + 1
+        else:
+            depth = new_depths[parent["client_ref"]] + 1
+        if depth > 8:
+            raise MarkdownImportGovernanceError(
+                "directory_depth_exceeded",
+                "从文件夹创建目录后将超过最大深度 8",
+                details={"folder": folder_path, "depth": depth},
+            )
+        node = {
+            "kind": "new",
+            "client_ref": client_ref,
+            "name": display_name,
+            "description": f"由 OKF 归档文件夹 {folder_path} 创建",
+            "order": len(existing_nodes) + len(new_nodes),
+            "rules": {
+                "allowed_page_types": [],
+                "default_for_page_types": [],
+            },
+            "parent": deepcopy(parent),
+        }
+        new_nodes.append(node)
+        anchor = {"client_ref": client_ref}
+        new_depths[client_ref] = depth
+        sibling_names[(parent_token, normalize_folder_name(display_name))] = anchor
+        created_reports.append(
+            {
+                "folder_path": folder_path,
+                "client_ref": client_ref,
+                "name": display_name,
+            }
+        )
+        return anchor
+
+    if okf_align_structure:
+        folders = {_folder_path(document) for document in inspected.documents if _folder_path(document)}
+        if alignment_mode == "new_root":
+            layer_name = _okf_layer_display_name(inspected, options)
+            root_parent = ensure_child(None, layer_name, layer_name)
+            alignment_reports.append({"folder": "", "action": "new_root", "target": layer_name})
+            directory_bindings[""] = _binding_from_anchor(root_parent)
+        else:
+            for name in _okf_first_level_folders(inspected):
+                spec = match_frozen_knowledge_root_name(name)
+                if spec is not None:
+                    alignment_reports.append({"folder": name, "action": "merge", "target": spec["name"]})
+                else:
+                    alignment_reports.append(
+                        {
+                            "folder": name,
+                            "action": "create",
+                            "target": import_folder_display_name(name, parent_is_root=True),
+                        }
+                    )
+
+    for folder in sorted(
+        folders,
+        key=lambda value: (len(PurePosixPath(value).parts), value.casefold()),
+    ):
+        mapped = path_mappings.get(folder)
+        if mapped not in (None, ""):
+            directory = _resolve_existing_directory(
+                knowledge_base,
+                mapped,
+                field=f"path_mappings.{folder}",
+            )
+            anchor = {"id": directory.pk, "key": directory.key}
+            anchors[folder] = anchor
+            directory_bindings[folder] = {"kind": "existing", **anchor}
+            continue
+
+        if okf_align_structure:
+            parent, remainder = _align_okf_folder_parts(
+                PurePosixPath(folder).parts,
+                sibling_names,
+                root_parent,
+                mode=alignment_mode,
+            )
+            current = parent
+            created = list(PurePosixPath(folder).parts[: len(PurePosixPath(folder).parts) - len(remainder)])
+            for name in remainder:
+                created.append(name)
+                current = ensure_child(current, name, "/".join(created))
+            anchors[folder] = current
+            directory_bindings[folder] = _binding_from_anchor(current)
+            continue
+
+        parent_folder = PurePosixPath(folder).parent.as_posix()
+        parent = anchors.get(parent_folder) if parent_folder != "." else root_parent
+        name = PurePosixPath(folder).name
+        anchor = ensure_child(parent, name, folder)
+        anchors[folder] = anchor
+        directory_bindings[folder] = _binding_from_anchor(anchor)
+    return {
+        "payload": {
+            "structure_version": revision.revision_no,
+            "base_generation_id": generation.pk,
+            "structure": {
+                "format_version": 1,
+                "page_types": list(snapshot.get("page_types") or []),
+                "directories": [*existing_nodes, *new_nodes],
+            },
+        },
+        "directory_bindings": directory_bindings,
+        "new_directories": list(created_reports),
+        "alignment": alignment_reports,
+        "alignment_mode": alignment_mode,
+        "bundle_root": inspected.bundle_root,
+        "import_layer_name": getattr(inspected, "import_layer_name", "") or "",
+    }
+
+
+def build_import_preview(knowledge_base, inspected, options=None):
+    options = dict(options or {})
+    _reject_structure_restore(options)
+    inspected = _ensure_okf_prepared(knowledge_base, inspected)
+    existing = _existing_pages(knowledge_base)
+    titles = set()
+    rows = []
+    revision = knowledge_base.active_structure_revision
+    creating_folders = _create_folders_requested(options)
+    structure_preview = None
+    folder_plan = None
+    if creating_folders:
+        folder_plan = _folder_structure_plan(knowledge_base, inspected, options)
+        structure_preview = {
+            "create_directories_from_folders": True,
+            "create_directory_count": len(folder_plan["new_directories"]),
+            "directories": folder_plan["new_directories"],
+            "alignment": list(folder_plan.get("alignment") or []),
+            "alignment_mode": folder_plan.get("alignment_mode") or "",
+            "bundle_root": folder_plan.get("bundle_root") or "",
+            "import_layer_name": folder_plan.get("import_layer_name") or "",
+        }
+    for document in inspected.documents:
+        original_title = document["title"]
+        canonicalized_title = original_title
+        try:
+            canonicalized_title = canonical_title(knowledge_base, original_title)
+            title = validate_display_title(canonicalized_title)
+        except InvalidWikiTitle as error:
+            raise MarkdownImportGovernanceError(
+                "archive_title_invalid",
+                str(error),
+                status_code=422,
+                details={
+                    "archive_path": document["archive_path"],
+                    **_bounded_text_details("original_title", original_title),
+                    **_bounded_text_details("canonical_title", canonicalized_title),
+                },
+            ) from error
+        identity = title_identity_key(title)
+        if identity in titles:
+            raise MarkdownImportGovernanceError(
+                "archive_title_duplicate",
+                "归档中存在规范化后同名页面",
+                details={"title": title},
+            )
+        titles.add(identity)
+        page = existing.get(identity)
+        row = {
+            "archive_path": document["archive_path"],
+            "title": title,
+            "page_type": document["page_type"],
+            "content_sha256": document["content_sha256"],
+            "existing_page_id": page.pk if page is not None else None,
+            "action": "create" if page is None else ("candidate" if page.contribution != "ai" else "update"),
+        }
+        if document.get("renamed_from"):
+            row["renamed_from"] = document["renamed_from"]
+        if revision is None:
+            raise MarkdownImportGovernanceError("active_structure_missing", "知识库缺少 active structure")
+        if creating_folders and folder_plan["directory_bindings"].get(_folder_path(document)):
+            binding = folder_plan["directory_bindings"][_folder_path(document)]
+            folder = _folder_path(document)
+            if binding["kind"] == "new":
+                row["directory"] = {
+                    "directory_id": None,
+                    "directory_key": "",
+                    "pending_client_ref": binding["client_ref"],
+                    "assignment_mode": "auto",
+                    "source": "okf_folder_preview",
+                    "trace": [
+                        "okf_folder",
+                        folder,
+                        binding["client_ref"],
+                    ],
+                    "route_reason": "create_manual_directory_from_folder",
+                    "suggestion": {
+                        "key": None,
+                        "source": "okf_folder",
+                        "reason": folder,
+                        "confidence": 1,
+                        "schema_mismatch": False,
+                        "low_confidence": False,
+                    },
+                    "redirect_chain": [],
+                    "structure_revision": {
+                        "id": revision.pk,
+                        "revision_no": revision.revision_no,
+                        "fingerprint": revision.fingerprint,
+                    },
+                }
+            else:
+                row["directory"] = {
+                    "directory_id": binding["id"],
+                    "directory_key": binding["key"],
+                    "assignment_mode": "auto",
+                    "source": "okf_folder_existing_directory",
+                    "trace": ["okf_folder", folder, binding["key"]],
+                    "route_reason": "okf_folder_existing_directory",
+                    "suggestion": {
+                        "key": binding["key"],
+                        "source": "okf_folder",
+                        "reason": folder,
+                        "confidence": 1,
+                        "schema_mismatch": False,
+                        "low_confidence": False,
+                    },
+                    "redirect_chain": [],
+                    "structure_revision": {
+                        "id": revision.pk,
+                        "revision_no": revision.revision_no,
+                        "fingerprint": revision.fingerprint,
+                    },
+                }
+        else:
+            assignment = resolve_page_directory(
+                knowledge_base=knowledge_base,
+                structure_revision=revision,
+                page_type=document["page_type"],
+                assignment_mode=page.directory_assignment_mode if page is not None else "auto",
+                current_directory=page.directory if page is not None else None,
+                suggested_key=_path_suggestion(knowledge_base, document, options),
+                suggestion_source="native_import",
+                classification_root_id=options.get("classification_root_id"),
+                suggestion_reason="okf folder alignment",
+            )
+            row["directory"] = assignment.as_build_trace()
+        rows.append(row)
+    preview = {
+        "archive_kind": inspected.archive_kind,
+        "archive_sha256": inspected.archive_sha256,
+        "skipped_entries": inspected.skipped_entries,
+        "pages": rows,
+        "counts": {
+            "total": len(rows),
+            "create": sum(row["action"] == "create" for row in rows),
+            "update": sum(row["action"] == "update" for row in rows),
+            "candidate": sum(row["action"] == "candidate" for row in rows),
+        },
+        "create_directories_from_folders_requested": creating_folders,
+        "structure_preview": structure_preview,
+    }
+    if inspected.archive_kind == "okf":
+        stats = inspected.okf_stats or {}
+        preview["okf"] = {
+            "okf_version": inspected.okf_version,
+            "bundle_root": inspected.bundle_root,
+            "import_layer_name": getattr(inspected, "import_layer_name", "") or "",
+            "alignment": list((structure_preview or {}).get("alignment") or []),
+            "alignment_mode": (structure_preview or {}).get("alignment_mode") or "",
+            "type_mapping": list(stats.get("type_mapping") or []),
+            "skipped": list(stats.get("skipped") or [dict(item) for item in inspected.skipped_details]),
+            "links": dict(stats.get("links") or {"rewritten": 0, "unresolved": 0}),
+            "renamed_count": int(stats.get("renamed_count") or 0),
+            "images": dict(stats.get("images") or {"count": 0, "bytes": 0, "pages": 0, "html_unchecked": 0}),
+        }
+    return preview
+
+
+def _fingerprint(value):
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@transaction.atomic
+def preflight_markdown_import(knowledge_base, content, *, filename="", actor="", options=None):
+    options = _drop_retired_import_options(options)
+    if filename and not options.get("filename"):
+        options["filename"] = filename
+    inspected = inspect_markdown_archive(content, filename, import_format=options.get("import_format"))
+    knowledge_base = WikiKnowledgeBase.objects.select_for_update().get(pk=knowledge_base.pk)
+    inspected = _ensure_okf_prepared(knowledge_base, inspected)
+    inspected = _attach_okf_images(knowledge_base, inspected, content)
+    preview = build_import_preview(knowledge_base, inspected, options=options)
+    token = secrets.token_urlsafe(32)
+    WikiImportPreflight.objects.create(
+        knowledge_base=knowledge_base,
+        token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        actor=str(actor or "")[:150],
+        archive_sha256=inspected.archive_sha256,
+        filename=PurePosixPath(filename or "import").name[:255],
+        archive_kind=inspected.archive_kind,
+        base_generation=knowledge_base.active_generation,
+        structure_revision=knowledge_base.active_structure_revision,
+        structure_version=getattr(knowledge_base.active_structure_revision, "revision_no", None),
+        classification_root_id=options.get("classification_root_id") or None,
+        options=options,
+        preview=preview,
+        preview_fingerprint=_fingerprint(preview),
+        expires_at=timezone.now() + timedelta(minutes=TOKEN_TTL_MINUTES),
+        created_by=str(actor or "")[:32],
+        updated_by=str(actor or "")[:32],
+    )
+    return {
+        "token": token,
+        "expires_in_seconds": TOKEN_TTL_MINUTES * 60,
+        "preview": preview,
+        "base_generation_id": knowledge_base.active_generation_id,
+        "structure_revision_id": knowledge_base.active_structure_revision_id,
+        "structure_version": getattr(knowledge_base.active_structure_revision, "revision_no", None),
+    }
+
+
+def _import_meta_snapshot(document, inspected):
+    snapshot = {
+        "source": "okf_import",
+        "archive_path": document["archive_path"],
+        "archive_sha256": inspected.archive_sha256,
+    }
+    if inspected.archive_kind == "okf":
+        snapshot["okf"] = dict(document.get("okf_meta") or {})
+    return snapshot
+
+
+def _create_import_body_candidate(page, document, build, generation, operator, inspected):
+    version = PageVersion.objects.create(
+        page=page,
+        no=(page.page_versions.order_by("-no").values_list("no", flat=True).first() or 0) + 1,
+        body=document["body"],
+        meta_snapshot=_import_meta_snapshot(document, inspected),
+        change_type="candidate",
+        build_record=build,
+        created_in_generation=generation,
+        is_current=False,
+        created_by=operator or "",
+    )
+    check = CheckItem.objects.create(
+        knowledge_base=page.knowledge_base,
+        check_type="conflict",
+        status="open",
+        related={"pages": [page.pk], "source": "markdown_import", "archive_path": document["archive_path"]},
+        candidate_version=version,
+        suggested_actions=["use_current", "use_candidate"],
+        decision_context={"decision_type": "knowledge_conflict", "source": "markdown_import"},
+        created_by=operator or "",
+        updated_by=operator or "",
+    )
+    return check
+
+
+_EXECUTION_PREVIEW_KEY = "_execution"
+_TERMINAL_BUILD_STATUSES = frozenset(("success", "partial", "failed"))
+_MARKDOWN_IMPORT_FENCED_CODES = frozenset(("markdown_import_fenced", "markdown_import_build_terminal"))
+
+
+def _preflight_execution_result(record):
+    execution = (record.preview or {}).get(_EXECUTION_PREVIEW_KEY)
+    if not isinstance(execution, dict) or execution.get("status") != "success":
+        return None
+    result = execution.get("result")
+    return dict(result) if isinstance(result, dict) else None
+
+
+def _store_preflight_execution_result(record_id, result):
+    if not record_id:
+        return
+    record = WikiImportPreflight.objects.select_for_update().get(pk=record_id)
+    record.preview = {
+        **(record.preview or {}),
+        _EXECUTION_PREVIEW_KEY: {
+            "status": "success",
+            "result": dict(result),
+            "completed_at": timezone.now().isoformat(),
+        },
+    }
+    record.status = "consumed"
+    record.consumed_at = record.consumed_at or timezone.now()
+    record.save(update_fields=["preview", "status", "consumed_at", "updated_at"])
+
+
+def _release_preflight_after_failure(record_id):
+    if not record_id:
+        return
+    with transaction.atomic():
+        record = WikiImportPreflight.objects.select_for_update().get(pk=record_id)
+        if _preflight_execution_result(record) is not None:
+            return
+        preview = dict(record.preview or {})
+        preview.pop(_EXECUTION_PREVIEW_KEY, None)
+        record.preview = preview
+        record.status = "active"
+        record.consumed_at = None
+        record.save(update_fields=["preview", "status", "consumed_at", "updated_at"])
+
+
+def _complete_import_build(record, *, counts, affected_page_ids, generation_id, relation_result, import_build_id):
+    if record.status in _TERMINAL_BUILD_STATUSES:
+        return
+    record.counts = dict(counts)
+    record.affected_pages = list(affected_page_ids)
+    record.maintenance = {
+        **(record.maintenance or {}),
+        "generation_relations": relation_result,
+        "generation_import": {
+            "build_record_id": import_build_id,
+            "generation_id": generation_id,
+        },
+    }
+    record.stage = "done"
+    record.status = "success"
+    record.progress = 100
+    record.save(
+        update_fields=[
+            "counts",
+            "affected_pages",
+            "maintenance",
+            "stage",
+            "status",
+            "progress",
+            "updated_at",
+        ]
+    )
+
+
+def _bind_import_build(knowledge_base, inspected, *, operator="", existing_build_record_id=None):
+    inputs = {
+        "archive_sha256": inspected.archive_sha256,
+        "archive_kind": inspected.archive_kind,
+    }
+    if not existing_build_record_id:
+        return BuildRecord.objects.create(
+            knowledge_base=knowledge_base,
+            trigger="markdown_import",
+            operator=operator or "",
+            inputs=inputs,
+            stage="generating",
+            status="running",
+        )
+    with transaction.atomic():
+        build = (
+            BuildRecord.objects.select_for_update()
+            .filter(
+                pk=existing_build_record_id,
+                knowledge_base_id=knowledge_base.pk,
+                trigger="markdown_import",
+            )
+            .first()
+        )
+        if build is None:
+            raise MarkdownImportGovernanceError(
+                "markdown_import_build_missing",
+                "导入任务记录不存在",
+                status_code=409,
+            )
+        if build.status in _TERMINAL_BUILD_STATUSES:
+            raise MarkdownImportGovernanceError(
+                "markdown_import_build_terminal",
+                "导入任务已结束",
+                status_code=409,
+            )
+        build.operator = operator or build.operator
+        build.inputs = {**(build.inputs or {}), **inputs}
+        build.stage = "generating"
+        build.status = "running"
+        build.save(update_fields=["operator", "inputs", "stage", "status", "updated_at"])
+        return build
+
+
+def _execute_generation_import(
+    knowledge_base,
+    inspected,
+    preview,
+    *,
+    operator="",
+    preflight_record_id=None,
+    completion_build_record_id=None,
+    existing_build_record_id=None,
+    archive_content=None,
+):
+    build = _bind_import_build(
+        knowledge_base,
+        inspected,
+        operator=operator,
+        existing_build_record_id=existing_build_record_id,
+    )
+    expected_token = str((build.inputs or {}).get(_CELERY_TASK_ID_KEY) or "")
+    _touch_markdown_import_build(build)
+    context = begin_build_generation(
+        knowledge_base,
+        build,
+        source_fingerprints=[{"archive_sha256": inspected.archive_sha256}],
+        pipeline_version="wiki-markdown-import-v1",
+        operator=operator,
+    )
+    page_actions = []
+    directory_trace = []
+    result_pages = []
+    counts = {"created": 0, "updated": 0, "candidate": 0}
+    result_payload = {}
+    created_locators = []
+    try:
+        generation = WikiGeneration.objects.get(pk=context.candidate_generation_id)
+        preview_by_path = {row["archive_path"]: row for row in preview["pages"]}
+        existing = _existing_pages(knowledge_base)
+        released_locators = set()
+        for document in inspected.documents:
+            row = preview_by_path[document["archive_path"]]
+            page = existing.get(title_identity_key(row["title"]))
+            if page is not None and page.contribution == "ai":
+                old_body = getattr(page.current_version, "body", None) or ""
+                released_locators.update(collect_page_media_locators(old_body) - collect_page_media_locators(document.get("body") or ""))
+        created_locators = _upload_okf_page_images(knowledge_base, inspected, archive_content)
+        _touch_markdown_import_build(build)
+        for document in inspected.documents:
+            _assert_markdown_import_owns(build, expected_token)
+            _touch_markdown_import_build(build)
+            row = preview_by_path[document["archive_path"]]
+            page = existing.get(title_identity_key(row["title"]))
+            directory = row.get("directory") or {}
+            if page is not None and page.contribution != "ai":
+                check = _create_import_body_candidate(page, document, build, generation, operator, inspected)
+                counts["candidate"] += 1
+                action = {
+                    "page_id": page.pk,
+                    "title": page.title,
+                    "action": "candidate",
+                    "check_id": check.pk,
+                    "archive_path": document["archive_path"],
+                }
+                page_actions.append(action)
+                result_pages.append(action)
+                continue
+            staged = stage_ai_page(
+                context,
+                title=row["title"],
+                page_type=document["page_type"],
+                tags=document["tags"],
+                body=document["body"],
+                directory_id=directory["directory_id"],
+                assignment_mode=directory["assignment_mode"],
+                build_record=build,
+                operator=operator,
+                update_method="markdown_import",
+                change_type="markdown_import",
+                body_strategy="replace",
+            )
+            version = PageVersion.objects.get(pk=staged.page_version_id)
+            version.meta_snapshot = {
+                **(version.meta_snapshot or {}),
+                **_import_meta_snapshot(document, inspected),
+            }
+            version.save(update_fields=["meta_snapshot", "updated_at"])
+            count_key = "created" if staged.action == "create" else "updated"
+            counts[count_key] += 1
+            action = {
+                "page_id": staged.page_id,
+                "page_version_id": staged.page_version_id,
+                "title": staged.title,
+                "action": staged.action,
+                "archive_path": document["archive_path"],
+                "directory_id": staged.directory_id,
+            }
+            page_actions.append(action)
+            directory_trace.append({**directory, "page_id": staged.page_id, "archive_path": document["archive_path"]})
+            result_pages.append(action)
+            existing[title_identity_key(staged.title)] = KnowledgePage.objects.get(pk=staged.page_id)
+
+        affected_page_ids = [row["page_id"] for row in result_pages]
+
+        def pre_activation_hook(_candidate):
+            _assert_markdown_import_owns(build, expected_token)
+
+        def activation_hook(candidate, _locked_knowledge_base, relation_result):
+            payload = {
+                "build_record_id": build.pk,
+                "generation_id": candidate.pk,
+                "counts": dict(counts),
+                "pages": list(result_pages),
+                "relations": relation_result,
+            }
+            locked_build = _assert_markdown_import_owns(build, expected_token)
+            _complete_import_build(
+                locked_build,
+                counts=counts,
+                affected_page_ids=affected_page_ids,
+                generation_id=candidate.pk,
+                relation_result=relation_result,
+                import_build_id=build.pk,
+            )
+            if completion_build_record_id and completion_build_record_id != build.pk:
+                completion = (
+                    BuildRecord.objects.select_for_update()
+                    .filter(
+                        pk=completion_build_record_id,
+                        knowledge_base_id=knowledge_base.pk,
+                    )
+                    .first()
+                )
+                if completion is not None:
+                    _complete_import_build(
+                        completion,
+                        counts=counts,
+                        affected_page_ids=affected_page_ids,
+                        generation_id=candidate.pk,
+                        relation_result=relation_result,
+                        import_build_id=build.pk,
+                    )
+            _store_preflight_execution_result(preflight_record_id, payload)
+            result_payload.update(payload)
+            _gc_okf_page_media(knowledge_base, released_locators)
+
+        _assert_markdown_import_owns(build, expected_token)
+        finalize_build_generation(
+            context,
+            build_record=build,
+            page_actions=page_actions,
+            directory_trace=directory_trace,
+            pre_activation_hook=pre_activation_hook,
+            activation_hook=activation_hook,
+            run_embedding_index=False,
+        )
+        return dict(result_payload)
+    except Exception as error:
+        for locator in created_locators:
+            delete_media_locator(locator)
+        fenced = getattr(error, "code", "") in _MARKDOWN_IMPORT_FENCED_CODES
+        fail_build_generation(context, build_record=None if fenced else build, error=error)
+        if not fenced:
+            BuildRecord.objects.filter(pk=build.pk).exclude(status__in=_TERMINAL_BUILD_STATUSES).update(
+                status="failed", stage="failed", errors=[str(error)]
+            )
+            _release_preflight_after_failure(preflight_record_id)
+        raise
+
+
+def _import_search_page_ids(result):
+    return [int(row["page_id"]) for row in (result or {}).get("pages") or [] if row.get("page_id")]
+
+
+def run_markdown_import_search_enrichment(knowledge_base_id, generation_id, page_ids):
+    """Fill colloquial aliases and embeddings after imported pages are already visible."""
+
+    page_ids = [int(page_id) for page_id in page_ids or [] if page_id]
+    knowledge_base = WikiKnowledgeBase.objects.filter(pk=knowledge_base_id).first()
+    if knowledge_base is None or not generation_id or not page_ids:
+        logger.debug(
+            "wiki markdown import search enrich skipped knowledge_base=%s generation_id=%s",
+            knowledge_base_id,
+            generation_id,
+        )
+        return {"status": "skipped", "updated": 0, "llm_called": False}
+    aliases = enrich_generation_colloquial_aliases_safely(
+        generation_id,
+        page_ids,
+        llm_model_id=knowledge_base.llm_model_id,
+        invoke_llm=_invoke_llm,
+        budget=new_alias_enrich_call_budget(),
+        llm_when="always",
+        inplace=True,
+    )
+    try:
+        enhance_generation_overviews(
+            generation_id,
+            llm_model_id=knowledge_base.llm_model_id,
+            budget=new_alias_enrich_call_budget(),
+            invoke_llm=_invoke_llm,
+        )
+    except Exception:
+        logger.exception(
+            "wiki okf import overview enhance failed generation_id=%s",
+            generation_id,
+        )
+    try:
+        cascade(
+            knowledge_base,
+            page_ids,
+            "build",
+            stages=["page_embedding", "chunk_embedding"],
+        )
+    except Exception:
+        logger.exception(
+            "wiki embedding index after generation activate failed generation_id=%s",
+            generation_id,
+        )
+    return aliases
+
+
+def _maybe_run_markdown_import_search_enrichment(knowledge_base, result, *, deferred):
+    if deferred or not result:
+        return result
+    generation_id = result.get("generation_id")
+    page_ids = _import_search_page_ids(result)
+    if generation_id and page_ids:
+        run_markdown_import_search_enrichment(knowledge_base.pk, generation_id, page_ids)
+    return result
+
+
+def _claim_preflight(knowledge_base, token, inspected, actor, preview, *, preflight_id=None):
+    """Consume a one-shot preflight. Consumed is fail-and-rerequest, not same-id resume."""
+    token_hash = hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+    with transaction.atomic():
+        current = WikiKnowledgeBase.objects.select_for_update().get(pk=knowledge_base.pk)
+        if preflight_id:
+            record = WikiImportPreflight.objects.select_for_update().filter(pk=preflight_id, knowledge_base=current).first()
+        else:
+            record = WikiImportPreflight.objects.select_for_update().filter(token_hash=token_hash).first()
+        if record is None or record.knowledge_base_id != knowledge_base.pk:
+            raise MarkdownImportGovernanceError("preflight_token_invalid", "导入预检 token 无效", status_code=409)
+        if record.status != "active":
+            raise MarkdownImportGovernanceError("preflight_token_consumed", "导入预检 token 已使用", status_code=409)
+        if record.expires_at <= timezone.now():
+            raise MarkdownImportGovernanceError("preflight_token_expired", "导入预检 token 已过期", status_code=409)
+        if record.actor != str(actor or "")[:150] or record.archive_sha256 != inspected.archive_sha256:
+            raise MarkdownImportGovernanceError("preflight_binding_mismatch", "导入归档或操作者与预检不一致", status_code=409)
+        if (
+            current.active_generation_id != record.base_generation_id
+            or current.active_structure_revision_id != record.structure_revision_id
+            or getattr(current.active_structure_revision, "revision_no", None) != record.structure_version
+        ):
+            raise MarkdownImportGovernanceError(
+                "preflight_cas_conflict",
+                "知识库 generation 或结构已变化，请重新预检",
+                status_code=409,
+                retryable=True,
+                details={
+                    "active_generation_id": current.active_generation_id,
+                    "structure_revision_id": current.active_structure_revision_id,
+                },
+            )
+        if record.preview_fingerprint != _fingerprint(preview):
+            raise MarkdownImportGovernanceError("preflight_preview_changed", "导入预览已变化，请重新预检", status_code=409)
+        record.status = "consumed"
+        record.consumed_at = timezone.now()
+        record.preview = {
+            **(record.preview or {}),
+            _EXECUTION_PREVIEW_KEY: {
+                "status": "running",
+                "claimed_at": record.consumed_at.isoformat(),
+            },
+        }
+        record.save(update_fields=["preview", "status", "consumed_at", "updated_at"])
+        return record, current
+
+
+_CELERY_TASK_ID_KEY = "celery_task_id"
+_MARKDOWN_IMPORT_STALE_SECONDS = int(os.environ.get("WIKI_MARKDOWN_IMPORT_STALE_SECONDS", str(2 * 3600)))
+
+
+def _touch_markdown_import_build(build) -> None:
+    """Heartbeat updated_at so TTL reclaim does not kill a live importer."""
+    if build is None:
+        return
+    BuildRecord.objects.filter(pk=build.pk, trigger="markdown_import", status="running").update(updated_at=timezone.now())
+
+
+def _assert_markdown_import_owns(build, expected_token):
+    """Lock the build and abort if fencing token rotated or status left running."""
+    expected = str(expected_token or "").strip()
+    with transaction.atomic():
+        current = BuildRecord.objects.select_for_update().filter(pk=build.pk, trigger="markdown_import").first()
+        if current is None:
+            raise MarkdownImportGovernanceError(
+                "markdown_import_fenced",
+                "导入任务记录不存在",
+                status_code=409,
+                retryable=True,
+            )
+        stored = str((current.inputs or {}).get(_CELERY_TASK_ID_KEY) or "").strip()
+        if current.status != "running" or (expected and stored != expected):
+            raise MarkdownImportGovernanceError(
+                "markdown_import_fenced",
+                "导入任务已被回收或取代",
+                status_code=409,
+                retryable=True,
+            )
+        return current
+
+
+def markdown_import_celery_task_is_live(task_id) -> bool:
+    """Fail-closed liveness: a recorded Celery task id is always treated live.
+
+    Empty id means apply_async never succeeded (or was never persisted). Inspect
+    is not consulted: broker-queued but unreserved tasks are invisible to it, and
+    inspect timeout/None must not look dead. Workers fence on the persisted id.
+    Age-stale recorded ids are reclaimed separately by markdown_import_build_is_stale.
+    """
+    return bool(str(task_id or "").strip())
+
+
+def _markdown_import_stale_cutoff():
+    return timezone.now() - timedelta(seconds=max(_MARKDOWN_IMPORT_STALE_SECONDS, 60))
+
+
+def markdown_import_build_is_stale(build) -> bool:
+    """Empty id is immediately reclaimable; recorded id only after the wall-clock TTL."""
+    if not markdown_import_celery_task_is_live((build.inputs or {}).get(_CELERY_TASK_ID_KEY)):
+        return True
+    stamp = getattr(build, "updated_at", None) or getattr(build, "created_at", None)
+    if stamp is None:
+        return True
+    return stamp < _markdown_import_stale_cutoff()
+
+
+def _new_markdown_import_celery_task_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _markdown_import_dispatch(build, *, celery_task_id=None):
+    inputs = build.inputs or {}
+    return {
+        "build_record_id": build.pk,
+        "archive_locator": inputs.get("archive_locator") or "",
+        "filename": inputs.get("filename") or "",
+        "celery_task_id": str(celery_task_id or inputs.get(_CELERY_TASK_ID_KEY) or _new_markdown_import_celery_task_id()),
+        "preflight_id": inputs.get("preflight_id"),
+    }
+
+
+def _rotate_markdown_import_celery_task_id(build):
+    inputs = dict(build.inputs or {})
+    inputs[_CELERY_TASK_ID_KEY] = _new_markdown_import_celery_task_id()
+    build.inputs = inputs
+    build.save(update_fields=["inputs", "updated_at"])
+    return build
+
+
+def persist_markdown_import_celery_task_id(build_record_id, celery_task_id) -> bool:
+    """Record the broker task id after apply_async. Never overwrite an existing id."""
+    task_id = str(celery_task_id or "").strip()
+    if not build_record_id or not task_id:
+        return False
+    with transaction.atomic():
+        build = BuildRecord.objects.select_for_update().filter(pk=build_record_id, trigger="markdown_import").first()
+        if build is None or build.status != "running":
+            return False
+        stored = str((build.inputs or {}).get(_CELERY_TASK_ID_KEY) or "").strip()
+        if stored:
+            return stored == task_id
+        inputs = dict(build.inputs or {})
+        inputs[_CELERY_TASK_ID_KEY] = task_id
+        build.inputs = inputs
+        build.save(update_fields=["inputs", "updated_at"])
+        return True
+
+
+def claim_markdown_import_execution(kb_id, build_record_id, current_task_id):
+    """Re-read fencing under KB+build row locks. Stale or terminal workers skip."""
+    current_task_id = str(current_task_id or "").strip()
+    with transaction.atomic():
+        knowledge_base = WikiKnowledgeBase.objects.select_for_update().filter(pk=kb_id).first()
+        build = (
+            BuildRecord.objects.select_for_update()
+            .filter(
+                pk=build_record_id,
+                knowledge_base_id=kb_id,
+                trigger="markdown_import",
+            )
+            .first()
+        )
+        if build is None:
+            return None, {
+                "status": "failed",
+                "code": "markdown_import_build_not_found",
+                "retryable": False,
+            }
+        stored_task_id = str((build.inputs or {}).get(_CELERY_TASK_ID_KEY) or "").strip()
+        if build.status in {"success", "partial"}:
+            return None, {"status": "success", "build_record_id": build.pk}
+        if stored_task_id and stored_task_id != current_task_id:
+            logger.info(
+                "wiki markdown import skipped stale celery task knowledge_base=%s build_record=%s",
+                kb_id,
+                build_record_id,
+            )
+            return None, {"status": "skipped", "code": "stale_celery_task"}
+        if build.status == "failed":
+            return None, {"status": "skipped", "code": "markdown_import_build_terminal"}
+        if knowledge_base is None:
+            from apps.opspilot.tasks.wiki import _fail_wiki_task_build
+
+            _fail_wiki_task_build(build, "knowledge_base_not_found", "知识库不存在")
+            return None, {
+                "status": "failed",
+                "code": "knowledge_base_not_found",
+                "retryable": False,
+            }
+        update_fields = []
+        if not stored_task_id and current_task_id:
+            inputs = dict(build.inputs or {})
+            inputs[_CELERY_TASK_ID_KEY] = current_task_id
+            build.inputs = inputs
+            update_fields.append("inputs")
+        if build.stage == "queued":
+            build.stage = "generating"
+            update_fields.append("stage")
+        if update_fields:
+            update_fields.append("updated_at")
+            build.save(update_fields=update_fields)
+        return build, None
+
+
+def reclaim_stale_markdown_import_builds(kb_id) -> int:
+    """Fail running markdown_import records that never started or exceeded the TTL.
+
+    Caller must already hold the knowledge-base row lock. Empty celery_task_id is
+    reclaimable immediately. A recorded id is still live until updated_at passes
+    WIKI_MARKDOWN_IMPORT_STALE_SECONDS; inspect is never consulted. Rotate a
+    fencing token so an in-flight worker must skip. Lazy-imports the wiki task
+    helper so this module does not import tasks.wiki at load time.
+    """
+    from apps.opspilot.tasks.wiki import _fail_wiki_task_build
+
+    closed = 0
+    running = (
+        BuildRecord.objects.select_for_update()
+        .filter(
+            knowledge_base_id=kb_id,
+            trigger="markdown_import",
+            status="running",
+        )
+        .order_by("id")
+    )
+    for build in running:
+        if not markdown_import_build_is_stale(build):
+            continue
+        _rotate_markdown_import_celery_task_id(build)
+        _fail_wiki_task_build(
+            build,
+            "markdown_import_stale",
+            "导入任务已丢失，已释放",
+            retryable=True,
+        )
+        _release_preflight_after_failure((build.inputs or {}).get("preflight_id"))
+        closed += 1
+    return closed
+
+
+def _accepted_import_payload(build):
+    return {
+        "async": True,
+        "accepted": True,
+        "queued": True,
+        "status": build.status,
+        "stage": build.stage,
+        "build_record_id": build.pk,
+    }
+
+
+def _token_hash(token):
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _validate_preflight_for_enqueue(record, knowledge_base, *, actor, archive_sha256):
+    if record is None or record.knowledge_base_id != knowledge_base.pk:
+        raise MarkdownImportGovernanceError("preflight_token_invalid", "导入预检 token 无效", status_code=409)
+    if record.actor != str(actor or "")[:150] or record.archive_sha256 != archive_sha256:
+        raise MarkdownImportGovernanceError("preflight_binding_mismatch", "导入归档或操作者与预检不一致", status_code=409)
+
+
+def enqueue_markdown_import(
+    knowledge_base,
+    token,
+    content,
+    *,
+    filename="",
+    actor="",
+):
+    if not isinstance(content, (bytes, bytearray)):
+        raise MarkdownImportGovernanceError("archive_content_invalid", "导入内容必须为 bytes")
+    content = bytes(content)
+    if not content:
+        raise MarkdownImportGovernanceError(
+            "archive_empty",
+            "导入归档为空",
+            details={"max_bytes": MAX_ARCHIVE_BYTES, "actual_bytes": 0},
+        )
+    if len(content) > MAX_ARCHIVE_BYTES:
+        raise MarkdownImportGovernanceError(
+            "archive_size_exceeded",
+            f"ZIP 超过大小限制（上限 {MAX_ARCHIVE_BYTES // (1024 * 1024)}MB）",
+            details={"max_bytes": MAX_ARCHIVE_BYTES, "actual_bytes": len(content)},
+        )
+    token_hash = _token_hash(token)
+    archive_sha256 = hashlib.sha256(content).hexdigest()
+    probe = WikiImportPreflight.objects.filter(token_hash=token_hash, knowledge_base=knowledge_base).first()
+    _validate_preflight_for_enqueue(probe, knowledge_base, actor=actor, archive_sha256=archive_sha256)
+    replay = _preflight_execution_result(probe)
+    if replay is not None:
+        return dict(replay), None
+
+    locator = save_import_archive_bytes(knowledge_base.pk, archive_sha256, content)
+    with transaction.atomic():
+        current = WikiKnowledgeBase.objects.select_for_update().get(pk=knowledge_base.pk)
+        record = WikiImportPreflight.objects.select_for_update().filter(token_hash=token_hash).first()
+        _validate_preflight_for_enqueue(record, current, actor=actor, archive_sha256=archive_sha256)
+        replay = _preflight_execution_result(record)
+        if replay is not None:
+            return dict(replay), None
+        if record.status != "active":
+            raise MarkdownImportGovernanceError("preflight_token_consumed", "导入预检 token 已使用", status_code=409)
+
+        execution = (record.preview or {}).get(_EXECUTION_PREVIEW_KEY)
+        if isinstance(execution, dict) and execution.get("status") == "running":
+            existing = (
+                BuildRecord.objects.select_for_update()
+                .filter(
+                    pk=execution.get("build_record_id"),
+                    knowledge_base_id=current.pk,
+                    trigger="markdown_import",
+                )
+                .first()
+            )
+            if existing is not None and existing.status == "running":
+                if not markdown_import_build_is_stale(existing):
+                    return _accepted_import_payload(existing), None
+                if not markdown_import_celery_task_is_live((existing.inputs or {}).get(_CELERY_TASK_ID_KEY)):
+                    return _accepted_import_payload(existing), _markdown_import_dispatch(existing)
+
+        if record.expires_at <= timezone.now():
+            raise MarkdownImportGovernanceError("preflight_token_expired", "导入预检 token 已过期", status_code=409)
+
+        reclaim_stale_markdown_import_builds(current.pk)
+        if kb_has_user_build_in_progress(current.pk):
+            raise MarkdownImportGovernanceError(
+                "knowledge_base_build_in_progress",
+                "知识库存在运行中的构建任务,请等待完成后再操作",
+                status_code=400,
+                retryable=True,
+            )
+
+        build = BuildRecord.objects.create(
+            knowledge_base=current,
+            trigger="markdown_import",
+            operator=actor or "",
+            inputs={
+                "archive_sha256": archive_sha256,
+                "archive_locator": locator,
+                "filename": str(filename or "")[:255],
+                "preflight_id": record.pk,
+            },
+            stage="queued",
+            status="running",
+        )
+        record.preview = {
+            **(record.preview or {}),
+            _EXECUTION_PREVIEW_KEY: {
+                "status": "running",
+                "build_record_id": build.pk,
+                "archive_locator": locator,
+                "filename": str(filename or "")[:255],
+                "queued_at": timezone.now().isoformat(),
+            },
+        }
+        record.save(update_fields=["preview", "updated_at"])
+        logger.info(
+            "wiki markdown import accepted knowledge_base=%s build_record=%s archive_bytes=%s",
+            current.pk,
+            build.pk,
+            len(content),
+        )
+        return _accepted_import_payload(build), _markdown_import_dispatch(build)
+
+
+def execute_markdown_import(
+    knowledge_base,
+    token,
+    content,
+    *,
+    filename="",
+    actor="",
+    completion_build_record_id=None,
+    existing_build_record_id=None,
+    defer_search_enrichment=False,
+    preflight_id=None,
+):
+    if preflight_id:
+        probe = WikiImportPreflight.objects.filter(pk=preflight_id, knowledge_base=knowledge_base).first()
+    else:
+        probe = WikiImportPreflight.objects.filter(
+            token_hash=hashlib.sha256(str(token or "").encode("utf-8")).hexdigest(),
+            knowledge_base=knowledge_base,
+        ).first()
+    if probe is None:
+        raise MarkdownImportGovernanceError("preflight_token_invalid", "导入预检 token 无效", status_code=409)
+    inspected = inspect_markdown_archive(
+        content,
+        filename,
+        import_format=(probe.options or {}).get("import_format"),
+    )
+    if probe.actor != str(actor or "")[:150] or probe.archive_sha256 != inspected.archive_sha256:
+        raise MarkdownImportGovernanceError("preflight_binding_mismatch", "导入归档或操作者与预检不一致", status_code=409)
+    replay = _preflight_execution_result(probe)
+    if replay is not None:
+        return replay
+    current = WikiKnowledgeBase.objects.select_related("active_structure_revision", "active_generation").get(pk=knowledge_base.pk)
+    inspected = _ensure_okf_prepared(current, inspected)
+    inspected = _attach_okf_images(current, inspected, content)
+    preview = build_import_preview(current, inspected, options=probe.options)
+    if _create_folders_requested(probe.options):
+        with transaction.atomic():
+            record, current = _claim_preflight(
+                current,
+                token,
+                inspected,
+                actor,
+                preview,
+                preflight_id=probe.pk,
+            )
+            folder_plan = _folder_structure_plan(
+                current,
+                inspected,
+                record.options,
+            )
+            structure_result = None
+            if folder_plan["new_directories"]:
+                try:
+                    structure_result = save_structure(
+                        current,
+                        folder_plan["payload"],
+                        operator=actor,
+                    )
+                except StructureServiceError as error:
+                    raise MarkdownImportGovernanceError(
+                        error.code,
+                        str(error),
+                        status_code=error.status_code,
+                        retryable=error.retryable,
+                        details=error.details,
+                    ) from error
+
+            current = WikiKnowledgeBase.objects.select_related(
+                "active_structure_revision",
+                "active_generation",
+            ).get(pk=current.pk)
+            routed_options = dict(record.options or {})
+            routed_options["create_directories_from_folders"] = False
+
+            folder_report = []
+            created_by_ref = {
+                item["client_ref"]: item for item in (structure_result.get("client_ref_map", []) if structure_result is not None else [])
+            }
+            path_mappings = dict(routed_options.get("path_mappings") or {})
+            for folder, binding in folder_plan["directory_bindings"].items():
+                if binding["kind"] == "existing":
+                    directory_id = binding["id"]
+                    directory_key = binding["key"]
+                else:
+                    created = created_by_ref.get(binding["client_ref"])
+                    if created is None:
+                        raise MarkdownImportGovernanceError(
+                            "folder_directory_mapping_missing",
+                            "结构发布后缺少文件夹目录映射",
+                            details={
+                                "folder": folder,
+                                "client_ref": binding["client_ref"],
+                            },
+                        )
+                    directory_id = created["id"]
+                    directory_key = created["key"]
+                path_mappings[folder] = directory_id
+                folder_report.append(
+                    {
+                        "folder_path": folder,
+                        "directory_id": directory_id,
+                        "directory_key": directory_key,
+                        "created": binding["kind"] == "new",
+                    }
+                )
+            routed_options["path_mappings"] = path_mappings
+
+            routed_preview = build_import_preview(
+                current,
+                inspected,
+                options=routed_options,
+            )
+            result = _execute_generation_import(
+                current,
+                inspected,
+                routed_preview,
+                operator=actor,
+                preflight_record_id=record.pk,
+                completion_build_record_id=completion_build_record_id,
+                existing_build_record_id=existing_build_record_id,
+                archive_content=content,
+            )
+            result["folder_structure"] = {
+                "created_directory_count": sum(item["created"] for item in folder_report),
+                "directories": folder_report,
+                "structure_revision": (structure_result["structure_revision"] if structure_result is not None else None),
+                "governance_generation": (structure_result["active_generation"] if structure_result is not None else None),
+            }
+            _store_preflight_execution_result(record.pk, result)
+        return _maybe_run_markdown_import_search_enrichment(
+            current,
+            result,
+            deferred=defer_search_enrichment,
+        )
+
+    _record, current = _claim_preflight(
+        current,
+        token,
+        inspected,
+        actor,
+        preview,
+        preflight_id=probe.pk,
+    )
+    result = _execute_generation_import(
+        current,
+        inspected,
+        preview,
+        operator=actor,
+        preflight_record_id=_record.pk,
+        completion_build_record_id=completion_build_record_id,
+        existing_build_record_id=existing_build_record_id,
+        archive_content=content,
+    )
+    return _maybe_run_markdown_import_search_enrichment(
+        current,
+        result,
+        deferred=defer_search_enrichment,
+    )
+
+
+__all__ = [
+    "MarkdownImportGovernanceError",
+    "build_import_preview",
+    "enqueue_markdown_import",
+    "execute_markdown_import",
+    "inspect_markdown_archive",
+    "claim_markdown_import_execution",
+    "markdown_import_build_is_stale",
+    "markdown_import_celery_task_is_live",
+    "persist_markdown_import_celery_task_id",
+    "preflight_markdown_import",
+    "reclaim_stale_markdown_import_builds",
+    "run_markdown_import_search_enrichment",
+]

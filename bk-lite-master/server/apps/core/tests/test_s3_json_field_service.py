@@ -1,0 +1,460 @@
+"""apps.core.fields.s3_json_field.S3JSONField 单元测试。
+
+S3JSONField 是 JSONField 的透明替代：DB 存路径，实际数据存 MinIO。
+仅 mock 真实外部边界（MinioBackend storage 的 save/open/exists/delete）。
+断言真实行为：序列化+gzip 压缩内容正确、上传路径生成、从 S3 读回 round-trip、
+descriptor 读写拦截、pre_save/get_prep_value 类型分支、deconstruct 迁移序列化。
+"""
+
+import gzip
+import io
+import json
+import logging
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
+from apps.core.fields import s3_json_field as mod
+from apps.core.fields.s3_json_field import (
+    S3JSONField,
+    S3JSONFieldDescriptor,
+    s3_json_upload_path,
+)
+
+
+@contextmanager
+def _capture_real_logger():
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    mod.logger.addHandler(handler)
+    try:
+        yield output
+    finally:
+        mod.logger.removeHandler(handler)
+
+pytestmark = pytest.mark.unit
+
+
+class _FakeStorage:
+    """模拟 MinioBackend 的最小存储后端。"""
+
+    def __init__(self):
+        self.objects = {}
+        self.deleted = []
+        self.calls = []
+
+    def save(self, filename, content):
+        # 模拟 storage 真实行为：读取 ContentFile 字节并以路径为键存储
+        content.seek(0)
+        self.objects[filename] = content.read()
+        return filename
+
+    def exists(self, path):
+        self.calls.append(("exists", path))
+        return path in self.objects
+
+    def open(self, path, mode="rb"):
+        self.calls.append(("open", path, mode))
+        return io.BytesIO(self.objects[path])
+
+    def delete(self, path):
+        self.deleted.append(path)
+        self.objects.pop(path, None)
+
+
+class _Instance:
+    """模拟带 pk 与 _state.db 的模型实例。"""
+
+    class _State:
+        db = "default"
+
+    def __init__(self, pk=1):
+        self.pk = pk
+        self._state = self._State()
+        self.__dict__["__name_marker__"] = True
+
+
+def _make_field(compressed=True, bucket="b1"):
+    field = S3JSONField(bucket_name=bucket, compressed=compressed)
+    field.set_attributes_from_name("data")
+    # 注入假 storage，绕过真实 MinioBackend 初始化
+    field._minio_storage = _FakeStorage()
+    return field
+
+
+class TestUploadPath:
+    def test_path_format_contains_model_and_uuid(self):
+        inst = _Instance(pk=42)
+        inst.__class__.__name__  # noqa
+        path = s3_json_upload_path(inst, "data.json.gz")
+        # 形如 YYYY/MM/DD/instance_42_xxxx.json.gz
+        parts = path.split("/")
+        assert len(parts) == 4
+        assert parts[-1].endswith(".json.gz")
+        assert "_42_" in parts[-1]
+
+    def test_new_instance_uses_new_marker(self):
+        inst = _Instance(pk=None)
+        path = s3_json_upload_path(inst, "x")
+        assert "_new_" in path
+
+
+class TestUploadAndLoadRoundTrip:
+    def test_upload_compressed_then_load(self):
+        field = _make_field(compressed=True)
+        inst = _Instance()
+        data = [{"log": "hello"}, {"n": 1}]
+        path = field._upload_to_s3(inst, data)
+        # 实际存储的是 gzip 字节
+        raw = field.storage.objects[path]
+        assert gzip.decompress(raw) == json.dumps(data, ensure_ascii=False).encode("utf-8")
+        # 从 S3 读回还原
+        assert field._load_from_s3(path) == data
+
+    def test_upload_uncompressed(self):
+        field = _make_field(compressed=False)
+        inst = _Instance()
+        data = {"a": "中文"}
+        path = field._upload_to_s3(inst, data)
+        raw = field.storage.objects[path]
+        # 未压缩：直接是 json 字节
+        assert json.loads(raw.decode("utf-8")) == data
+        assert field._load_from_s3(path) == data
+
+    def test_load_non_gzip_raw_json_has_debug_summary_without_info(self, mocker):
+        field = _make_field(compressed=True)
+        field.storage.objects["p.json"] = b'{"plain": true}'
+        info = mocker.patch.object(mod.logger, "info")
+        debug = mocker.patch.object(mod.logger, "debug")
+
+        assert field.to_python("p.json") == {"plain": True}
+        info.assert_not_called()
+        debug.assert_called_once_with(
+            "event=s3_json_load_succeeded path=%s compressed=%s "
+            "stored_bytes=%s decoded_bytes=%s value_type=%s item_count=%s",
+            "p.json",
+            False,
+            15,
+            15,
+            "dict",
+            1,
+        )
+
+    def test_load_debug_path_is_bounded_and_single_line(self, mocker):
+        field = _make_field(compressed=True)
+        path = "folder\r\n" + "x" * 600
+        field.storage.objects[path] = b"[]"
+        debug = mocker.patch.object(mod.logger, "debug")
+
+        assert field.to_python(path) == []
+
+        logged_path = debug.call_args.args[1]
+        assert len(logged_path) == 500
+        assert "\r" not in logged_path
+        assert "\n" not in logged_path
+
+
+class TestLoadFromS3EdgeCases:
+    def test_load_opens_object_without_exists_request(self):
+        field = _make_field()
+        field.storage.objects["one-request.json"] = b'{"ok": true}'
+
+        assert field._load_from_s3("one-request.json") == {"ok": True}
+        assert field.storage.calls == [("open", "one-request.json", "rb")]
+
+    def test_empty_path_returns_none(self):
+        field = _make_field()
+        assert field._load_from_s3("") is None
+
+    def test_missing_file_returns_none(self):
+        field = _make_field()
+        assert field._load_from_s3("nope.json") is None
+
+    def test_empty_content_returns_none(self):
+        field = _make_field()
+        field.storage.objects["empty"] = b""
+        assert field._load_from_s3("empty") is None
+
+    def test_invalid_json_returns_none_without_logging_raw_path_or_content(self):
+        field = _make_field()
+        path = "bad\r\n" + "x" * 600
+        payload = b"{s3-json-secret-must-not-enter-logs"
+        field.storage.objects[path] = payload
+        with _capture_real_logger() as output:
+            assert field._load_from_s3(path) is None
+
+        rendered = output.getvalue().rstrip("\n")
+        message = rendered.splitlines()[0]
+        assert "s3-json-secret-must-not-enter-logs" not in rendered
+        assert "\r" not in message
+        assert "\n" not in message
+        assert "bad\\r\\n" in message
+        assert "x" * 501 not in message
+        assert "failed_stage=json_decode" in rendered
+        assert "call_chain=" in rendered
+        assert "Traceback" in rendered
+        assert "_load_from_s3" in rendered
+
+    def test_storage_error_returns_none_without_logging_exception_body(self, mocker):
+        field = _make_field()
+        secret = "storage-response-secret-must-not-enter-logs"
+        error = RuntimeError(secret)
+        mocker.patch.object(field.storage, "open", side_effect=error)
+
+        with _capture_real_logger() as output:
+            assert field._load_from_s3("x") is None
+
+        rendered = output.getvalue().rstrip("\n")
+        safe_type, safe_error, safe_traceback = mod.safe_exception_info(error)
+        assert safe_traceback is error.__traceback__
+        assert safe_error is not error
+        assert safe_type.__name__ == "SafeLogException"
+        assert isinstance(safe_error, RuntimeError)
+        assert str(safe_error) == "RuntimeError"
+        assert str(error) == secret
+        assert secret not in rendered
+        assert "failed_stage=storage_or_decode" in rendered
+        assert "error_type=RuntimeError" in rendered
+        assert "call_chain=" in rendered
+        assert "Traceback" in rendered
+        assert "_load_from_s3" in rendered
+
+
+class TestToPythonAndPrep:
+    def test_to_python_none_and_empty(self):
+        field = _make_field()
+        assert field.to_python(None) is None
+        assert field.to_python("") is None
+
+    def test_to_python_passthrough_objects(self):
+        field = _make_field()
+        assert field.to_python([1, 2]) == [1, 2]
+        assert field.to_python({"k": "v"}) == {"k": "v"}
+
+    def test_to_python_string_loads_from_s3(self):
+        field = _make_field()
+        field.storage.objects["p"] = gzip.compress(b'{"x": 1}')
+        assert field.to_python("p") == {"x": 1}
+
+    def test_from_db_value_returns_path_or_none(self):
+        field = _make_field()
+        assert field.from_db_value(None, None, None) is None
+        assert field.from_db_value("", None, None) is None
+        assert field.from_db_value("some/path.json.gz", None, None) == "some/path.json.gz"
+
+    def test_get_prep_value_branches(self):
+        field = _make_field()
+        assert field.get_prep_value(None) is None
+        assert field.get_prep_value("path/x") == "path/x"
+        # list/dict -> None（上传在 pre_save 完成）
+        assert field.get_prep_value([1]) is None
+        assert field.get_prep_value({"a": 1}) is None
+
+    def test_get_internal_type(self):
+        assert _make_field().get_internal_type() == "CharField"
+
+
+def test_post_save_cleanup_failure_keeps_original_delete_path_without_leaking_log(mocker):
+    old_path = "old\r\n" + "x" * 600
+    new_path = "new.json"
+    secret = "delete-response-secret-must-not-enter-logs"
+    storage = mocker.Mock()
+    error = RuntimeError(secret)
+    storage.delete.side_effect = error
+    instance = SimpleNamespace(pk=42)
+    setattr(
+        instance,
+        S3JSONField.CLEANUP_TASKS_ATTR,
+        [{"old_path": old_path, "new_path": new_path, "storage": storage, "using": "default"}],
+    )
+    sender = SimpleNamespace(_meta=SimpleNamespace(label="app.Model"))
+    mocker.patch.object(mod.transaction, "on_commit", side_effect=lambda callback, using: callback())
+
+    with _capture_real_logger() as output:
+        mod._handle_s3jsonfield_post_save_cleanup(sender, instance)
+
+    storage.delete.assert_called_once_with(old_path)
+    assert getattr(instance, S3JSONField.CLEANUP_TASKS_ATTR) == []
+    rendered = output.getvalue().rstrip("\n")
+    message = rendered.splitlines()[0]
+    safe_type, safe_error, safe_traceback = mod.safe_exception_info(error)
+    assert safe_traceback is error.__traceback__
+    assert safe_error is not error
+    assert safe_type.__name__ == "SafeLogException"
+    assert isinstance(safe_error, RuntimeError)
+    assert str(safe_error) == "RuntimeError"
+    assert str(error) == secret
+    assert "event=s3_json_previous_object_delete_failed" in rendered
+    assert rendered.startswith("ERROR ")
+    assert "failed_stage=cleanup" in rendered
+    assert "error_type=RuntimeError" in rendered
+    assert "call_chain=" in rendered
+    assert "Traceback" in rendered
+    assert "_cleanup_old_object" in rendered
+    assert secret not in rendered
+    assert "\r" not in message
+    assert "\n" not in message
+    assert "old\\r\\n" in message
+
+
+class TestPreSave:
+    def test_pre_save_string_returns_as_is(self):
+        field = _make_field()
+        inst = _Instance()
+        inst.__dict__["data"] = "already/uploaded.json.gz"
+        assert field.pre_save(inst, add=False) == "already/uploaded.json.gz"
+
+    def test_pre_save_none_returns_empty(self):
+        field = _make_field()
+        inst = _Instance()
+        inst.__dict__["data"] = None
+        assert field.pre_save(inst, add=True) == ""
+
+    def test_pre_save_object_uploads_without_info_noise(self, mocker):
+        field = _make_field()
+        inst = _Instance()
+        inst.__dict__["data"] = [{"k": 1}]
+        info = mocker.patch.object(mod.logger, "info")
+        debug = mocker.patch.object(mod.logger, "debug")
+
+        path = field.pre_save(inst, add=True)
+
+        assert path in field.storage.objects
+        # 实例字段被改写为路径
+        assert inst.__dict__["data"] == path
+        info.assert_not_called()
+        debug.assert_called_once_with(
+            "event=s3_json_upload_succeeded path=%s compressed=%s "
+            "original_bytes=%s stored_bytes=%s",
+            path,
+            True,
+            10,
+            30,
+        )
+
+    def test_pre_save_promotes_pending_value(self):
+        field = _make_field()
+        inst = _Instance()
+        inst.__dict__[field._pending_value_attr_name] = {"pending": True}
+        path = field.pre_save(inst, add=True)
+        assert path in field.storage.objects
+        assert field._load_from_s3(path) == {"pending": True}
+
+    def test_pre_save_upload_error_propagates(self, mocker):
+        field = _make_field()
+        inst = _Instance()
+        inst.__dict__["data"] = [{"k": 1}]
+        secret = "upload-response-secret-must-not-enter-logs"
+        error = RuntimeError(secret)
+        mocker.patch.object(field.storage, "save", side_effect=error)
+        with _capture_real_logger() as output, pytest.raises(RuntimeError) as caught:
+            field.pre_save(inst, add=True)
+
+        assert caught.value is error
+        safe_type, safe_error, safe_traceback = mod.safe_exception_info(error)
+        assert safe_traceback is error.__traceback__
+        assert safe_error is not error
+        assert safe_type.__name__ == "SafeLogException"
+        assert isinstance(safe_error, RuntimeError)
+        assert str(safe_error) == "RuntimeError"
+        assert str(error) == secret
+        rendered = output.getvalue()
+        assert "event=s3_json_upload_failed failed_stage=storage_write error_type=RuntimeError" in rendered
+        assert "call_chain=" in rendered
+        assert "Traceback" in rendered
+        assert "pre_save" in rendered
+        assert secret not in rendered
+
+    def test_previous_path_is_loaded_through_model_manager(self, mocker):
+        field = S3JSONField(bucket_name="b1", delete_previous_on_update=True)
+        field.set_attributes_from_name("data")
+        manager = mocker.MagicMock()
+        manager.using.return_value.filter.return_value.values_list.return_value.first.return_value = "old/path.json.gz"
+        mocker.patch.object(_Instance, "_base_manager", manager, create=True)
+        inst = _Instance(pk=42)
+        inst._state.db = "replica"
+
+        assert field._get_raw_db_value(inst) == "old/path.json.gz"
+        manager.using.assert_called_once_with("replica")
+        manager.using.return_value.filter.assert_called_once_with(pk=42)
+        manager.using.return_value.filter.return_value.values_list.assert_called_once_with("data", flat=True)
+
+
+class TestDescriptor:
+    def test_get_on_class_returns_descriptor(self):
+        field = _make_field()
+        desc = S3JSONFieldDescriptor(field)
+        assert desc.__get__(None, object) is desc
+
+    def test_get_loads_string_path_and_caches(self):
+        field = _make_field()
+        field.storage.objects["p"] = gzip.compress(b"[1,2,3]")
+        desc = S3JSONFieldDescriptor(field)
+        inst = _Instance()
+        inst.__dict__["data"] = "p"
+        loaded = desc.__get__(inst, _Instance)
+        assert loaded == [1, 2, 3]
+        # 已缓存为对象
+        assert inst.__dict__["data"] == [1, 2, 3]
+
+    def test_get_load_failure_preserves_path_returns_none(self):
+        field = _make_field()
+        desc = S3JSONFieldDescriptor(field)
+        inst = _Instance()
+        inst.__dict__["data"] = "missing"
+        assert desc.__get__(inst, _Instance) is None
+
+    def test_set_object_stores_pending(self):
+        field = _make_field()
+        desc = S3JSONFieldDescriptor(field)
+        inst = _Instance()
+        desc.__set__(inst, {"x": 1})
+        assert inst.__dict__[field._pending_value_attr_name] == {"x": 1}
+        assert inst.__dict__["data"] == {"x": 1}
+
+    def test_set_object_when_current_is_path_keeps_path(self):
+        field = _make_field()
+        desc = S3JSONFieldDescriptor(field)
+        inst = _Instance()
+        inst.__dict__["data"] = "existing/path.json.gz"
+        desc.__set__(inst, [9])
+        # current 是字符串路径时，不覆盖 attname
+        assert inst.__dict__["data"] == "existing/path.json.gz"
+        assert inst.__dict__[field._pending_value_attr_name] == [9]
+
+    def test_set_string_directly_assigns(self):
+        field = _make_field()
+        desc = S3JSONFieldDescriptor(field)
+        inst = _Instance()
+        desc.__set__(inst, "raw/path")
+        assert inst.__dict__["data"] == "raw/path"
+
+
+class TestDeconstructAndSerialization:
+    def test_deconstruct_includes_custom_kwargs(self):
+        field = S3JSONField(bucket_name="mybucket", compressed=False)
+        field.set_attributes_from_name("data")
+        name, path, args, kwargs = field.deconstruct()
+        assert kwargs["bucket_name"] == "mybucket"
+        assert kwargs["compressed"] is False
+        assert kwargs["delete_previous_on_update"] is False
+        assert "storage" not in kwargs
+
+    def test_value_to_string(self, mocker):
+        field = _make_field()
+        obj = _Instance()
+        mocker.patch.object(field, "value_from_object", return_value="some/path")
+        assert field.value_to_string(obj) == "some/path"
+        mocker.patch.object(field, "value_from_object", return_value=None)
+        assert field.value_to_string(obj) == ""
+
+    def test_storage_lazy_init(self, mocker):
+        field = S3JSONField(bucket_name="lazy")
+        field.set_attributes_from_name("data")
+        fake = object()
+        mb = mocker.patch.object(mod, "MinioBackend", return_value=fake)
+        assert field.storage is fake
+        # 再次访问走缓存，不重复构造
+        assert field.storage is fake
+        mb.assert_called_once_with(bucket_name="lazy")

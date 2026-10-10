@@ -1,0 +1,386 @@
+{
+  "object_name": "Host",
+  "instance_type": "os",
+  "collect_type": "http",
+  "config_type": [
+    "host"
+  ],
+  "collector": "Telegraf",
+  "instance_id": "{{cloud_region}}_{{instance_type}}_{{host}}",
+  "form_fields": [
+    {
+      "name": "host",
+      "label": "目标主机IP",
+      "type": "input",
+      "required": true,
+      "visible_in": "edit",
+      "editable": false,
+      "description": "目标主机的IP地址",
+      "widget_props": {
+        "placeholder": "10.0.0.1"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.host"
+      },
+      "label_en": "Target Host IP"
+    },
+    {
+      "name": "os_type",
+      "label": "操作系统",
+      "type": "select",
+      "required": true,
+      "default_value": "linux",
+      "description": "目标主机操作系统类型",
+      "widget_props": {
+        "options": [
+          {
+            "label": "Linux",
+            "value": "linux",
+            "label_en": "Linux"
+          },
+          {
+            "label": "Windows",
+            "value": "windows",
+            "label_en": "Windows"
+          }
+        ]
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.os_type"
+      },
+      "label_en": "Operating System"
+    },
+    {
+      "name": "metrics_modules",
+      "type": "hidden",
+      "required": true,
+      "default_value": [
+        "cpu",
+        "mem",
+        "disk",
+        "diskio",
+        "net",
+        "processes",
+        "system"
+      ],
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.metrics_modules",
+        "to_form": {
+          "array": true
+        }
+      }
+    },
+    {
+      "name": "disk_include_fstypes",
+      "label": "仅采集的文件系统类型",
+      "type": "input",
+      "required": false,
+      "default_value": "",
+      "description": "逗号分隔；留空表示不限制类型，例如 ext4,xfs 或 NTFS,ReFS。",
+      "tooltip": "推荐仅采集 Linux 的 ext4、xfs、btrfs，或 Windows 的 NTFS、ReFS；留空表示不按类型限制。",
+      "guide_short": "推荐仅采集 Linux 的 ext4、xfs、btrfs，或 Windows 的 NTFS、ReFS；留空表示不按类型限制。",
+      "widget_props": {
+        "placeholder": "ext4,xfs"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.disk_include_fstypes"
+      },
+      "label_en": "Included Filesystem Types"
+    },
+    {
+      "name": "disk_exclude_fstypes",
+      "label": "排除的文件系统类型",
+      "type": "input",
+      "required": false,
+      "default_value": "tmpfs,devtmpfs,devfs,iso9660,overlay,aufs,squashfs,vfat,exfat,fat,fat32,cdfs",
+      "description": "逗号分隔；黑名单优先于仅采集列表，例如 vfat,exfat,ntfs。",
+      "tooltip": "临时盘/容器盘：tmpfs、devtmpfs、overlay、aufs、squashfs；光盘：iso9660、cdfs；常见 U 盘：vfat、exfat、fat、fat32。黑名单优先于仅采集列表；不默认排除 ntfs。",
+      "guide_short": "临时盘/容器盘：tmpfs、devtmpfs、overlay、aufs、squashfs；光盘：iso9660、cdfs；常见 U 盘：vfat、exfat、fat、fat32。黑名单优先于仅采集列表；不默认排除 ntfs。",
+      "widget_props": {
+        "placeholder": "vfat,exfat,ntfs"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.disk_exclude_fstypes"
+      },
+      "label_en": "Excluded Filesystem Types"
+    },
+    {
+      "name": "username",
+      "label": "用户名",
+      "type": "input",
+      "required": true,
+      "editable": false,
+      "description": "SSH/WinRM 登录用户名",
+      "widget_props": {
+        "placeholder": "root / Administrator"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.username"
+      },
+      "label_en": "Username"
+    },
+    {
+      "name": "auth_type",
+      "label": "Linux认证方式",
+      "type": "select",
+      "required": false,
+      "default_value": "password",
+      "description": "Linux SSH 认证方式。Windows 始终使用 WinRM 密码认证。",
+      "widget_props": {
+        "options": [
+          {
+            "label": "密码",
+            "value": "password",
+            "label_en": "Password"
+          },
+          {
+            "label": "SSH密钥",
+            "value": "private_key",
+            "label_en": "SSH Key"
+          }
+        ]
+      },
+      "dependency": {
+        "field": "os_type",
+        "value": "linux"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.auth_type"
+      },
+      "label_en": "Linux Authentication"
+    },
+    {
+      "name": "ENV_PASSWORD",
+      "label": "密码",
+      "type": "password",
+      "required": true,
+      "editable": false,
+      "encrypted": true,
+      "description": "SSH/WinRM 登录密码",
+      "widget_props": {
+        "placeholder": "密码",
+        "placeholder_en": "Password"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.env_config.PASSWORD__{{config_id}}"
+      },
+      "label_en": "Password"
+    },
+    {
+      "name": "private_key_content",
+      "label": "SSH私钥",
+      "type": "password",
+      "required": false,
+      "editable": false,
+      "encrypted": true,
+      "description": "Linux SSH 私钥内容，仅认证方式为 SSH密钥 时使用",
+      "widget_props": {
+        "placeholder": "-----BEGIN OPENSSH PRIVATE KEY-----"
+      },
+      "dependency": {
+        "field": "auth_type",
+        "value": "private_key"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.env_config.PRIVATE_KEY_CONTENT__{{config_id}}"
+      },
+      "label_en": "SSH Private Key"
+    },
+    {
+      "name": "private_key_passphrase",
+      "label": "SSH私钥口令",
+      "type": "password",
+      "required": false,
+      "editable": false,
+      "encrypted": true,
+      "description": "Linux SSH 私钥口令，可为空",
+      "widget_props": {
+        "placeholder": "私钥口令"
+      },
+      "dependency": {
+        "field": "auth_type",
+        "value": "private_key"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.env_config.PRIVATE_KEY_PASSPHRASE__{{config_id}}"
+      },
+      "label_en": "SSH Private Key Passphrase"
+    },
+    {
+      "name": "port",
+      "label": "端口",
+      "type": "input",
+      "required": false,
+      "default_value": "",
+      "description": "连接端口。Linux SSH 默认 22，Windows WinRM 默认 5986。",
+      "widget_props": {
+        "placeholder": "Linux: 22 / Windows: 5986"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.port"
+      },
+      "label_en": "Port"
+    },
+    {
+      "name": "winrm_scheme",
+      "label": "WinRM协议",
+      "type": "select",
+      "required": false,
+      "default_value": "https",
+      "description": "Windows WinRM 协议",
+      "widget_props": {
+        "options": [
+          {
+            "label": "HTTPS",
+            "value": "https",
+            "label_en": "HTTPS"
+          },
+          {
+            "label": "HTTP",
+            "value": "http",
+            "label_en": "HTTP"
+          }
+        ]
+      },
+      "dependency": {
+        "field": "os_type",
+        "value": "windows"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.winrm_scheme"
+      },
+      "label_en": "WinRM Protocol"
+    },
+    {
+      "name": "winrm_transport",
+      "label": "WinRM认证方式",
+      "type": "select",
+      "required": false,
+      "default_value": "ntlm",
+      "description": "推荐 NTLM。Basic 需要目标 Windows 开启 Basic 认证，默认通常未开启。",
+      "widget_props": {
+        "options": [
+          {
+            "label": "NTLM",
+            "value": "ntlm",
+            "label_en": "NTLM"
+          },
+          {
+            "label": "Basic",
+            "value": "basic",
+            "label_en": "Basic"
+          },
+          {
+            "label": "CredSSP",
+            "value": "credssp",
+            "label_en": "CredSSP"
+          }
+        ]
+      },
+      "dependency": {
+        "field": "os_type",
+        "value": "windows"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.winrm_transport"
+      },
+      "label_en": "WinRM Authentication"
+    },
+    {
+      "name": "winrm_cert_validation",
+      "label": "校验WinRM证书",
+      "type": "switch",
+      "required": false,
+      "default_value": false,
+      "description": "HTTPS WinRM 是否校验证书。自签证书场景建议关闭。",
+      "dependency": {
+        "field": "os_type",
+        "value": "windows"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.http_headers.winrm_cert_validation"
+      },
+      "label_en": "Verify WinRM Certificate"
+    },
+    {
+      "name": "interval",
+      "label": "采集间隔",
+      "type": "inputNumber",
+      "required": true,
+      "default_value": 60,
+      "description": "监控数据的采集时间间隔（单位：秒）",
+      "widget_props": {
+        "min": 10,
+        "precision": 0,
+        "placeholder": "60",
+        "addonAfter": "s"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.interval",
+        "to_form": {
+          "regex": "^(\\d+)s$"
+        },
+        "to_api": {
+          "suffix": "s"
+        }
+      },
+      "label_en": "Collection Interval",
+      "description_en": "Collection time interval (unit: seconds)"
+    }
+  ],
+  "table_columns": [
+    {
+      "name": "node_ids",
+      "label": "节点",
+      "type": "select",
+      "required": true,
+      "widget_props": {
+        "placeholder": "请选择节点",
+        "placeholder_en": "Please select node"
+      },
+      "enable_row_filter": false,
+      "label_en": "Node"
+    },
+    {
+      "name": "host",
+      "label": "目标主机IP",
+      "type": "input",
+      "required": true,
+      "widget_props": {
+        "placeholder": "10.0.0.1"
+      },
+      "change_handler": {
+        "type": "simple",
+        "source_fields": [
+          "host"
+        ],
+        "target_field": "instance_name"
+      },
+      "label_en": "Target Host IP"
+    },
+    {
+      "name": "instance_name",
+      "label": "实例名称",
+      "type": "input",
+      "required": true,
+      "widget_props": {
+        "placeholder": "实例名称",
+        "disabled": false,
+        "placeholder_en": "Instance Name"
+      },
+      "label_en": "Instance Name"
+    },
+    {
+      "name": "group_ids",
+      "label": "组",
+      "type": "group_select",
+      "required": false,
+      "widget_props": {
+        "placeholder": "请选择组",
+        "placeholder_en": "Please select group"
+      },
+      "label_en": "Group"
+    }
+  ],
+  "extra_edit_fields": {}
+}

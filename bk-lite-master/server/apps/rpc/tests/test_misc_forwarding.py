@@ -1,0 +1,792 @@
+"""rpc 各业务封装的转发契约测试。
+
+覆盖 cmdb / log / mlops / opspilot / job_mgmt / console_mgmt /
+operation_analysis / alerts / stargazer 客户端的方法名 + 参数转发契约。
+统一把 self.client 替换为记录器，断言转发的方法名与入参，不触达真实 NATS。
+"""
+import pydantic.root_model  # noqa
+import pytest
+
+pytestmark = pytest.mark.unit
+
+
+class _Recorder:
+    def __init__(self, ret=None):
+        self.calls = []
+        self.ret = ret if ret is not None else {"result": True}
+
+    def run(self, method_name, *args, **kwargs):
+        self.calls.append(("run", method_name, args, kwargs))
+        return self.ret
+
+    def request(self, method_name, *args, **kwargs):
+        self.calls.append(("request", method_name, args, kwargs))
+        return self.ret
+
+
+def _last(rec):
+    return rec.calls[-1]
+
+
+# --------------------------- CMDB ---------------------------
+
+
+@pytest.fixture
+def cmdb(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.cmdb import CMDB
+
+    c = CMDB(is_local_client=False)
+    c.client = _Recorder()
+    return c
+
+
+def test_cmdb_get_module_data(cmdb):
+    out = cmdb.get_module_data(module="host", page=2)
+    assert out == {"result": True}
+    assert _last(cmdb.client) == ("run", "get_cmdb_module_data", (), {"module": "host", "page": 2})
+
+
+def test_cmdb_get_module_list(cmdb):
+    cmdb.get_module_list(module="host")
+    assert _last(cmdb.client) == ("run", "get_cmdb_module_list", (), {"module": "host"})
+
+
+def test_cmdb_search_instances(cmdb):
+    cmdb.search_instances(ip="1.1.1.1")
+    assert _last(cmdb.client) == ("run", "search_instances", (), {"params": {"ip": "1.1.1.1"}})
+
+
+def test_cmdb_search_instances_batch(cmdb):
+    cmdb.search_instances_batch(items=[1, 2])
+    assert _last(cmdb.client) == ("run", "search_instances_batch", (), {"params": {"items": [1, 2]}})
+
+
+def test_cmdb_search_instances_batch_preserves_prebuilt_params_envelope(cmdb):
+    params = {"protocol_version": "2", "model_id": "host", "inst_uuids": ["u1"], "organization_ids": [1]}
+    cmdb.search_instances_batch(params=params)
+    assert _last(cmdb.client) == ("run", "search_instances_batch", (), {"params": params})
+
+
+def test_cmdb_list_instances(cmdb):
+    cmdb.list_instances(model_id="host", page=1)
+    assert _last(cmdb.client) == ("run", "list_instances", (), {"params": {"model_id": "host", "page": 1}})
+
+
+def test_cmdb_search_model_attrs(cmdb):
+    cmdb.search_model_attrs(model_id="host")
+    assert _last(cmdb.client) == ("run", "search_model_attrs", (), {"params": {"model_id": "host"}})
+
+
+def test_cmdb_search_models(cmdb):
+    cmdb.search_models(classification_id="biz")
+    assert _last(cmdb.client) == ("run", "search_models", (), {"params": {"classification_id": "biz"}})
+
+
+def test_cmdb_search_models_for_llm(cmdb):
+    cmdb.search_models_for_llm(classification_id="biz")
+    assert _last(cmdb.client) == ("run", "search_models_for_llm", (), {"params": {"classification_id": "biz"}})
+
+
+def test_cmdb_list_instances_for_llm(cmdb):
+    cmdb.list_instances_for_llm(model_id="host", page=1)
+    assert _last(cmdb.client) == ("run", "list_instances_for_llm", (), {"params": {"model_id": "host", "page": 1}})
+
+
+def test_cmdb_search_classifications(cmdb):
+    cmdb.search_classifications(include_hidden=False)
+    assert _last(cmdb.client) == ("run", "search_classifications", (), {"params": {"include_hidden": False}})
+
+
+def test_cmdb_search_model_associations(cmdb):
+    cmdb.search_model_associations(model_id="host")
+    assert _last(cmdb.client) == ("run", "search_model_associations", (), {"params": {"model_id": "host"}})
+
+
+def test_cmdb_search_instance_associations(cmdb):
+    cmdb.search_instance_associations(model_id="host", inst_id=1)
+    assert _last(cmdb.client) == ("run", "search_instance_associations", (), {"params": {"model_id": "host", "inst_id": 1}})
+
+
+def test_cmdb_create_instance_association(cmdb):
+    cmdb.create_instance_association(src_inst_id=1, dst_inst_id=2)
+    assert _last(cmdb.client) == (
+        "run",
+        "create_instance_association",
+        (),
+        {"params": {"src_inst_id": 1, "dst_inst_id": 2}},
+    )
+
+
+def test_cmdb_create_instance_association_for_llm(cmdb):
+    cmdb.create_instance_association_for_llm(src_inst_uuid="s1", dst_inst_uuid="d1", model_asst_id="a1")
+    assert _last(cmdb.client) == (
+        "run",
+        "create_instance_association_for_llm",
+        (),
+        {"params": {"src_inst_uuid": "s1", "dst_inst_uuid": "d1", "model_asst_id": "a1"}},
+    )
+
+
+def test_cmdb_delete_instance_association(cmdb):
+    cmdb.delete_instance_association(asso_id=9)
+    assert _last(cmdb.client) == ("run", "delete_instance_association", (), {"params": {"asso_id": 9}})
+
+
+def test_cmdb_delete_instance_association_for_llm(cmdb):
+    cmdb.delete_instance_association_for_llm(src_inst_uuid="s1", dst_inst_uuid="d1", model_asst_id="a1")
+    assert _last(cmdb.client) == (
+        "run",
+        "delete_instance_association_for_llm",
+        (),
+        {"params": {"src_inst_uuid": "s1", "dst_inst_uuid": "d1", "model_asst_id": "a1"}},
+    )
+
+
+def test_cmdb_create_instance(cmdb):
+    cmdb.create_instance(model_id="host", instance_info={"inst_name": "box"})
+    assert _last(cmdb.client) == (
+        "run",
+        "create_instance",
+        (),
+        {"params": {"model_id": "host", "instance_info": {"inst_name": "box"}}},
+    )
+
+
+def test_cmdb_create_instance_for_llm(cmdb):
+    cmdb.create_instance_for_llm(model_id="host", instance_info={"inst_name": "box"})
+    assert _last(cmdb.client) == (
+        "run",
+        "create_instance_for_llm",
+        (),
+        {"params": {"model_id": "host", "instance_info": {"inst_name": "box"}}},
+    )
+
+
+def test_cmdb_update_instance_for_llm(cmdb):
+    cmdb.update_instance_for_llm(inst_uuid="u1", update_attr={"k": "v"})
+    assert _last(cmdb.client) == (
+        "run",
+        "update_instance_for_llm",
+        (),
+        {"params": {"inst_uuid": "u1", "update_attr": {"k": "v"}}},
+    )
+
+
+def test_cmdb_delete_instance_for_llm(cmdb):
+    cmdb.delete_instance_for_llm(inst_uuid="u1")
+    assert _last(cmdb.client) == ("run", "delete_instance_for_llm", (), {"params": {"inst_uuid": "u1"}})
+
+
+def test_cmdb_sync_display_fields(cmdb):
+    cmdb.sync_display_fields(organizations=[{"id": 1}])
+    assert _last(cmdb.client) == ("run", "sync_display_fields", (), {"organizations": [{"id": 1}]})
+
+
+def test_cmdb_model_inst_count(cmdb):
+    cmdb.model_inst_count(model_id="host")
+    assert _last(cmdb.client) == ("run", "model_inst_count", (), {"model_id": "host"})
+
+
+def test_cmdb_license_instance_count(cmdb):
+    cmdb.license_instance_count()
+    assert _last(cmdb.client) == ("run", "license_cmdb_instance_count", (), {})
+
+
+def test_cmdb_get_monitor_ids_by_inst_uuids(cmdb):
+    payload = {"inst_uuids": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"], "user_info": {"team": 1}}
+    cmdb.get_monitor_ids_by_inst_uuids(**payload)
+    assert _last(cmdb.client) == ("run", "get_monitor_ids_by_inst_uuids", (), payload)
+
+
+def test_cmdb_list_monitored_hosts(cmdb):
+    cmdb.list_monitored_hosts(user_info={"team": 1})
+    assert _last(cmdb.client) == ("run", "list_monitored_hosts", (), {"user_info": {"team": 1}})
+
+
+def test_cmdb_list_application_systems(cmdb):
+    cmdb.list_application_systems(user_info={"team": 1})
+    assert _last(cmdb.client) == ("run", "list_application_systems", (), {"user_info": {"team": 1}})
+
+
+def test_cmdb_list_host_uuids_for_systems(cmdb):
+    payload = {"system_uuids": ["s1"], "user_info": {"team": 1}}
+    cmdb.list_host_uuids_for_systems(**payload)
+    assert _last(cmdb.client) == ("run", "list_host_uuids_for_systems", (), payload)
+
+
+def test_cmdb_list_monitored_hosts_for_systems(cmdb):
+    payload = {"system_uuids": ["s1"], "user_info": {"team": 1}}
+    cmdb.list_monitored_hosts_for_systems(**payload)
+    assert _last(cmdb.client) == ("run", "list_monitored_hosts_for_systems", (), payload)
+
+
+def test_cmdb_network_topology_among_uuids(cmdb):
+    payload = {"inst_uuids": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"], "user_info": {"team": 1}}
+    cmdb.network_topology_among_uuids(**payload)
+    assert _last(cmdb.client) == ("run", "network_topology_among_uuids", (), payload)
+
+
+def test_cmdb_network_topology_by_uuid(cmdb):
+    payload = {
+        "inst_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "depth": 1,
+        "user_info": {"team": 1},
+    }
+    cmdb.network_topology_by_uuid(**payload)
+    assert _last(cmdb.client) == ("run", "network_topology_by_uuid", (), payload)
+
+
+def test_cmdb_topo_search_lite_by_uuid(cmdb):
+    payload = {"inst_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "user_info": {"team": 1}}
+    cmdb.topo_search_lite_by_uuid(**payload)
+    assert _last(cmdb.client) == ("run", "topo_search_lite_by_uuid", (), payload)
+
+
+def test_cmdb_ingest_from_source_wraps_flat_kwargs_as_params(cmdb):
+    """NATS handler 是 ingest_from_source(params)；RPC 必须整包，不能摊成顶层 kwargs。"""
+    cmdb.ingest_from_source(
+        source_module="node_mgmt",
+        source_id="n1",
+        event_type="upsert",
+        allowed_org_ids=[1],
+        operator="admin",
+    )
+    assert _last(cmdb.client) == (
+        "run",
+        "ingest_from_source",
+        (),
+        {
+            "params": {
+                "source_module": "node_mgmt",
+                "source_id": "n1",
+                "event_type": "upsert",
+                "allowed_org_ids": [1],
+                "operator": "admin",
+            }
+        },
+    )
+
+
+def test_cmdb_create_manual_config_files(cmdb):
+    params = {"protocol_version": "2", "allowed_org_ids": [1], "items": [{"instance_uuid": "u1"}]}
+    cmdb.create_manual_config_files(params=params)
+    assert _last(cmdb.client) == ("run", "create_manual_config_files", (), {"params": params})
+
+
+def test_cmdb_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.cmdb import CMDB
+
+    c = CMDB(is_local_client=True)
+    assert c.client.path == "apps.cmdb.nats.nats"
+
+
+def test_cmdb_remote_client_is_rpcclient(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.base import RpcClient
+    from apps.rpc.cmdb import CMDB
+
+    c = CMDB(is_local_client=False)
+    assert isinstance(c.client, RpcClient)
+
+
+def test_cmdb_env_forces_local(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "1")
+    from apps.rpc.base import AppClient
+    from apps.rpc.cmdb import CMDB
+
+    c = CMDB(is_local_client=False)
+    assert isinstance(c.client, AppClient)
+    assert c.client.path == "apps.cmdb.nats.nats"
+
+
+# --------------------------- Log ---------------------------
+
+
+@pytest.fixture
+def log(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.log import Log
+
+    obj = Log(is_local_client=False)
+    obj.client = _Recorder()
+    return obj
+
+
+def test_log_get_module_data(log):
+    log.get_module_data(module="syslog", page=1)
+    assert _last(log.client) == ("run", "get_log_module_data", (), {"module": "syslog", "page": 1})
+
+
+def test_log_get_module_list(log):
+    log.get_module_list(module="syslog")
+    assert _last(log.client) == ("run", "get_log_module_list", (), {"module": "syslog"})
+
+
+def test_log_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.log import Log
+
+    obj = Log(is_local_client=True)
+    assert obj.client.path == "apps.log.nats.permission"
+
+
+def test_log_env_forces_local(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "1")
+    from apps.rpc.base import AppClient
+    from apps.rpc.log import Log
+
+    obj = Log(is_local_client=False)
+    assert isinstance(obj.client, AppClient)
+
+
+@pytest.fixture
+def log_ana():
+    from apps.rpc.log import LogOperationAnaRpc
+
+    rpc = LogOperationAnaRpc()
+    rpc.client = _Recorder()
+    return rpc
+
+
+def test_log_ana_get_vmlogs_disk_usage(log_ana):
+    log_ana.get_vmlogs_disk_usage(foo="bar")
+    assert _last(log_ana.client) == ("run", "get_vmlogs_disk_usage", (), {"foo": "bar"})
+
+
+def test_log_ana_search_defaults(log_ana):
+    log_ana.search("q", "1h")
+    assert _last(log_ana.client) == (
+        "run",
+        "log_search",
+        (),
+        {"query": "q", "time_range": "1h", "limit": 10},
+    )
+
+
+def test_log_ana_search_custom_limit(log_ana):
+    log_ana.search("q", "1h", limit=50, extra="x")
+    assert _last(log_ana.client) == (
+        "run",
+        "log_search",
+        (),
+        {"query": "q", "time_range": "1h", "limit": 50, "extra": "x"},
+    )
+
+
+def test_log_ana_list_log_groups(log_ana):
+    log_ana.list_log_groups(user_info={"team": 1})
+    assert _last(log_ana.client) == ("run", "list_log_groups", (), {"user_info": {"team": 1}})
+
+
+def test_log_ana_search_structured(log_ana):
+    log_ana.search_structured({"keyword": "err"}, user_info={"team": 1})
+    assert _last(log_ana.client) == (
+        "run",
+        "log_search_structured",
+        (),
+        {"query_data": {"keyword": "err"}, "user_info": {"team": 1}},
+    )
+
+
+def test_log_ana_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "1")
+    from apps.rpc.log import LogOperationAnaRpc
+
+    rpc = LogOperationAnaRpc()
+    assert rpc.client.path == "apps.log.nats.log"
+
+
+def test_log_ana_hits_defaults(log_ana):
+    log_ana.hits("q", "1h", "host")
+    assert _last(log_ana.client) == (
+        "run",
+        "log_hits",
+        (),
+        {"query": "q", "time_range": "1h", "field": "host", "fields_limit": 5, "step": "5m"},
+    )
+
+
+def test_log_ana_hits_custom(log_ana):
+    log_ana.hits("q", "1h", "host", fields_limit=3, step="10m")
+    assert _last(log_ana.client) == (
+        "run",
+        "log_hits",
+        (),
+        {"query": "q", "time_range": "1h", "field": "host", "fields_limit": 3, "step": "10m"},
+    )
+
+
+def test_log_ana_query_alert_segments(log_ana):
+    qd = {"collect_type_id": "c1", "page": 1}
+    log_ana.query_log_alert_segments(qd, user_info={"team": 1})
+    assert _last(log_ana.client) == (
+        "run",
+        "query_log_alert_segments",
+        (),
+        {"query_data": qd, "user_info": {"team": 1}},
+    )
+
+
+def test_log_ana_count_successful_logins_by_host(log_ana):
+    log_ana.count_successful_logins_by_host(hosts=[], time_range="7d")
+    assert _last(log_ana.client) == (
+        "run",
+        "count_successful_logins_by_host",
+        (),
+        {"hosts": [], "time_range": "7d"},
+    )
+
+
+# --------------------------- MLOps ---------------------------
+
+
+@pytest.fixture
+def mlops(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.mlops import MLOps
+
+    obj = MLOps(is_local_client=False)
+    obj.client = _Recorder()
+    return obj
+
+
+def test_mlops_get_module_data(mlops):
+    mlops.get_module_data(module="m")
+    assert _last(mlops.client) == ("run", "get_mlops_module_data", (), {"module": "m"})
+
+
+def test_mlops_get_module_list(mlops):
+    mlops.get_module_list()
+    assert _last(mlops.client) == ("run", "get_mlops_module_list", (), {})
+
+
+def test_mlops_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.mlops import MLOps
+
+    obj = MLOps(is_local_client=True)
+    assert obj.client.path == "apps.mlops.nats_api"
+
+
+# --------------------------- OpsPilot ---------------------------
+
+
+@pytest.fixture
+def opspilot(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.opspilot import OpsPilot
+
+    obj = OpsPilot(is_local_client=False)
+    obj.client = _Recorder()
+    return obj
+
+
+def test_opspilot_get_module_data(opspilot):
+    opspilot.get_module_data(module="bot")
+    assert _last(opspilot.client) == ("run", "get_opspilot_module_data", (), {"module": "bot"})
+
+
+def test_opspilot_get_module_list(opspilot):
+    opspilot.get_module_list()
+    assert _last(opspilot.client) == ("run", "get_opspilot_module_list", (), {})
+
+
+def test_opspilot_get_guest_provider(opspilot):
+    opspilot.get_guest_provider(group_id=7)
+    assert _last(opspilot.client) == ("run", "get_guest_provider", (), {"group_id": 7})
+
+
+def test_opspilot_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.opspilot import OpsPilot
+
+    obj = OpsPilot(is_local_client=True)
+    assert obj.client.path == "apps.opspilot.nats_api"
+
+
+# --------------------------- JobMgmt ---------------------------
+
+
+@pytest.fixture
+def job(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.job_mgmt import JobMgmt
+
+    obj = JobMgmt(is_local_client=False)
+    obj.client = _Recorder()
+    return obj
+
+
+def test_job_get_module_data(job):
+    job.get_module_data(module="j", page=1)
+    assert _last(job.client) == ("run", "get_job_mgmt_module_data", (), {"module": "j", "page": 1})
+
+
+def test_job_get_module_list(job):
+    job.get_module_list()
+    assert _last(job.client) == ("run", "get_job_mgmt_module_list", (), {})
+
+
+def test_job_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.job_mgmt import JobMgmt
+
+    obj = JobMgmt(is_local_client=True)
+    assert obj.client.path == "apps.job_mgmt.nats_api"
+
+
+def test_job_env_forces_local(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "1")
+    from apps.rpc.base import AppClient
+    from apps.rpc.job_mgmt import JobMgmt
+
+    obj = JobMgmt(is_local_client=False)
+    assert isinstance(obj.client, AppClient)
+
+
+# --------------------------- ConsoleMgmt ---------------------------
+
+
+@pytest.fixture
+def console(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.console_mgmt import ConsoleMgmt
+
+    obj = ConsoleMgmt(is_local_client=False)
+    obj.client = _Recorder()
+    return obj
+
+
+def test_console_create_notification(console):
+    console.create_notification("monitor", "hello")
+    assert _last(console.client) == ("run", "create_notification", (), {"app": "monitor", "message": "hello"})
+
+
+def test_console_local_client_appclient_path():
+    from apps.rpc.console_mgmt import ConsoleMgmt
+
+    obj = ConsoleMgmt(is_local_client=True)
+    assert obj.client.path == "apps.console_mgmt.nats_api"
+
+
+def test_console_remote_client_is_rpcclient():
+    from apps.rpc.base import RpcClient
+    from apps.rpc.console_mgmt import ConsoleMgmt
+
+    obj = ConsoleMgmt(is_local_client=False)
+    assert isinstance(obj.client, RpcClient)
+
+
+# --------------------------- OperationAnalysisRPC ---------------------------
+
+
+@pytest.fixture
+def op_ana():
+    from apps.rpc.operation_analysis import OperationAnalysisRPC
+
+    obj = OperationAnalysisRPC()
+    obj.client = _Recorder()
+    return obj
+
+
+def test_op_ana_get_module_data(op_ana):
+    from apps.operation_analysis.nats.auth import verify_module_data_request
+
+    params = {"module": "directory", "child_module": "dashboard", "page": 1, "page_size": 100, "group_id": 7}
+
+    op_ana.get_module_data(**params, _internal_auth="caller-controlled")
+
+    call_type, method_name, args, kwargs = _last(op_ana.client)
+    token = kwargs.pop("_internal_auth")
+    assert (call_type, method_name, args, kwargs) == ("run", "get_operation_analysis_module_data_v2", (), params)
+    verify_module_data_request(token, **params)
+
+
+def test_op_ana_get_module_list(op_ana):
+    op_ana.get_module_list(module="x")
+    assert _last(op_ana.client) == ("run", "get_operation_analysis_module_list", (), {"module": "x"})
+
+
+def test_op_ana_construct_uses_rpcclient():
+    from apps.rpc.base import RpcClient
+    from apps.rpc.operation_analysis import OperationAnalysisRPC
+
+    obj = OperationAnalysisRPC()
+    assert isinstance(obj.client, RpcClient)
+
+
+# --------------------------- AlertOperationAnaRpc ---------------------------
+
+
+@pytest.fixture
+def alert_ana():
+    from apps.rpc.alerts import AlertOperationAnaRpc
+
+    obj = AlertOperationAnaRpc()
+    obj.client = _Recorder()
+    return obj
+
+
+def test_alert_get_trend_data_kwargs(alert_ana):
+    alert_ana.get_alert_trend_data(group_by="level", filters={"a": 1})
+    assert _last(alert_ana.client) == ("run", "get_alert_trend_data", (), {"group_by": "level", "filters": {"a": 1}})
+
+
+def test_alert_get_trend_data_positional(alert_ana):
+    alert_ana.get_alert_trend_data("level", {"a": 1})
+    assert _last(alert_ana.client) == ("run", "get_alert_trend_data", ("level", {"a": 1}), {})
+
+
+def test_alert_ana_list_alerts(alert_ana):
+    alert_ana.list_alerts({"status": "unassigned"}, user_info={"team": 1})
+    assert _last(alert_ana.client) == (
+        "run",
+        "list_alerts",
+        (),
+        {"query_data": {"status": "unassigned"}, "user_info": {"team": 1}},
+    )
+
+
+def test_alert_ana_get_alert_detail(alert_ana):
+    alert_ana.get_alert_detail("ALERT-1", user_info={"team": 1})
+    assert _last(alert_ana.client) == (
+        "run",
+        "get_alert_detail",
+        (),
+        {"alert_id": "ALERT-1", "user_info": {"team": 1}},
+    )
+
+
+def test_alert_ana_list_alert_events(alert_ana):
+    alert_ana.list_alert_events("ALERT-1", {"page": 1}, user_info={"team": 1})
+    assert _last(alert_ana.client) == (
+        "run",
+        "list_alert_events",
+        (),
+        {"alert_id": "ALERT-1", "query_data": {"page": 1}, "user_info": {"team": 1}},
+    )
+
+
+def test_alert_ana_uses_operation_analysis_rpc(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "0")
+    from apps.rpc.alerts import AlertOperationAnaRpc
+    from apps.rpc.base import OperationAnalysisRpc
+
+    obj = AlertOperationAnaRpc()
+    assert isinstance(obj.client, OperationAnalysisRpc)
+
+
+def test_alert_ana_local_client_appclient_path(monkeypatch):
+    monkeypatch.setenv("IS_LOCAL_RPC", "1")
+    from apps.rpc.alerts import AlertOperationAnaRpc
+
+    obj = AlertOperationAnaRpc()
+    assert obj.client.path == "apps.alerts.nats.nats"
+
+
+# --------------------------- Stargazer ---------------------------
+
+
+@pytest.fixture
+def stargazer():
+    from apps.rpc.stargazer import Stargazer
+
+    obj = Stargazer()
+    obj.client = _Recorder()
+    obj.health_check_client = _Recorder()
+    return obj
+
+
+def test_stargazer_default_instance_id():
+    from apps.rpc.stargazer import Stargazer
+
+    obj = Stargazer()
+    assert obj.instance_id == "stargazer"
+    assert obj.client.namespace == "stargazer"
+    assert obj.health_check_client.namespace == "stargazer"
+
+
+def test_stargazer_custom_instance_id():
+    from apps.rpc.stargazer import Stargazer
+
+    obj = Stargazer(instance_id="sg-2")
+    assert obj.instance_id == "sg-2"
+    assert obj.client.namespace == "sg-2"
+
+
+def test_stargazer_list_regions(stargazer):
+    stargazer.list_regions({"region": "cn"})
+    assert _last(stargazer.client) == ("request", "list_regions", (), {"region": "cn"})
+
+
+def test_stargazer_health_check_default_timeout(stargazer):
+    stargazer.health_check()
+    assert _last(stargazer.health_check_client) == (
+        "run",
+        "health_check",
+        ({"execute_timeout": 5},),
+        {"_timeout": 5},
+    )
+
+
+def test_stargazer_health_check_custom_timeout(stargazer):
+    stargazer.health_check(timeout=20)
+    assert _last(stargazer.health_check_client) == (
+        "run",
+        "health_check",
+        ({"execute_timeout": 20},),
+        {"_timeout": 20},
+    )
+
+
+def test_stargazer_round_metadata_query_forwards_payload_and_timeout(stargazer):
+    payload = {
+        "schema_version": 1,
+        "collection_task_id": "321",
+        "instance_id": "cmdb_321",
+        "lookups": [
+            {
+                "collection_target": "10.0.0.8",
+                "publish_timestamp_ms": 1780000000123,
+            }
+        ],
+    }
+
+    stargazer.get_collection_round_metadata(payload, timeout=3)
+
+    assert _last(stargazer.client) == (
+        "request",
+        "get_collection_round_metadata",
+        (),
+        {"_timeout": 3, **payload},
+    )
+
+
+def test_stargazer_collection_tool_debug_default_protocol(stargazer):
+    stargazer.collection_tool_debug({"host": "h"}, timeout=10)
+    # protocol 默认 snmp -> handler debug_snmp, nats_timeout = 10 + 5
+    assert _last(stargazer.client) == (
+        "request",
+        "debug_snmp",
+        (),
+        {"_timeout": 15, "host": "h"},
+    )
+
+
+def test_stargazer_collection_tool_debug_ipmi(stargazer):
+    stargazer.collection_tool_debug({"protocol": "ipmi", "host": "h"}, timeout=3)
+    assert _last(stargazer.client) == (
+        "request",
+        "debug_ipmi",
+        (),
+        {"_timeout": 8, "protocol": "ipmi", "host": "h"},
+    )
+
+
+def test_stargazer_rpc_client_subclass_namespace():
+    from apps.rpc.stargazer import StargazerRpcClient
+
+    c = StargazerRpcClient("ns-x")
+    assert c.namespace == "ns-x"

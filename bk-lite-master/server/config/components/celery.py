@@ -1,0 +1,60 @@
+import importlib
+import logging
+import os
+
+from config.components.locale import TIME_ZONE
+
+logger = logging.getLogger("celery_config")
+
+
+def _load_beat_schedule(installed_apps, importer=importlib.import_module):
+    beat_schedule = {}
+    complete = True
+    for app_label in installed_apps:
+        config_module = f"{app_label}.config"
+        try:
+            mod = importer(config_module)
+            app_schedule = getattr(mod, "CELERY_BEAT_SCHEDULE", None)
+            if app_schedule:
+                beat_schedule.update(app_schedule)
+        except ModuleNotFoundError as exc:
+            if exc.name == config_module:
+                continue
+            complete = False
+            logger.exception("Failed to load CELERY_BEAT_SCHEDULE from %s", config_module)
+        except Exception:
+            complete = False
+            logger.exception("Failed to load CELERY_BEAT_SCHEDULE from %s", config_module)
+    return beat_schedule, complete
+
+
+IS_USE_CELERY = os.getenv("ENABLE_CELERY", "False").lower() == "true"
+# celery
+CELERY_IMPORTS = ()
+CELERY_TIMEZONE = TIME_ZONE  # celery 时区问题
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "amqp://admin:password@rabbitmq.lite/")
+
+if IS_USE_CELERY:
+    INSTALLED_APPS = locals().get("INSTALLED_APPS", [])
+    INSTALLED_APPS += (
+        "django_celery_beat",
+        "django_celery_results",
+    )
+    CELERY_ENABLE_UTC = True
+    CELERY_WORKER_POOL = "prefork"
+    CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_CONCURRENCY", "2"))
+    # worker_max_tasks_per_child / worker_max_memory_per_child 只对 prefork 生效。
+    # 旧名 CELERY_MAX_TASKS_PER_CHILD 不会映射到 Celery 配置，threads 下也无效。
+    CELERY_WORKER_MAX_TASKS_PER_CHILD = int(os.getenv("CELERY_MAX_TASKS_PER_CHILD", "200"))
+    CELERY_WORKER_MAX_MEMORY_PER_CHILD = int(os.getenv("CELERY_MAX_MEMORY_PER_CHILD", "512000"))
+    CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers.DatabaseScheduler"
+    CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+    CELERY_ACCEPT_CONTENT = ["application/json"]
+    CELERY_TASK_SERIALIZER = "json"
+    CELERY_RESULT_SERIALIZER = "json"
+    CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
+    DJANGO_CELERY_BEAT_TZ_AWARE = True
+
+    CELERY_BEAT_SCHEDULE, CELERY_BEAT_SCHEDULE_COMPLETE = _load_beat_schedule(INSTALLED_APPS)
+    CELERY_BEAT_SCHEDULE_RECONCILE_MODE = os.getenv("CELERY_BEAT_SCHEDULE_RECONCILE_MODE", "shadow")
+    CELERY_BEAT_SCHEDULE_LEGACY_MANAGED_NAMES = os.getenv("CELERY_BEAT_SCHEDULE_LEGACY_MANAGED_NAMES", "")

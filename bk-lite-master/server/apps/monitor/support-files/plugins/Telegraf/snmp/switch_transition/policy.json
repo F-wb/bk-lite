@@ -1,0 +1,56 @@
+{
+  "object": "Switch",
+  "plugin": "Switch Transition Networks SNMP",
+  "templates": [
+    {
+      "name": "Transition交换机CPU温度过高",
+      "alert_name": "交换机${resource_name} CPU 温度过高",
+      "description": "监控 Transition Networks 交换机 CPU 温度（tnDevSysHwInforCPUtmp），当持续高于阈值时触发告警，提示散热不良或环境过热，避免热保护或器件损坏。",
+      "metric_name": "cpu_temperature_celsius",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 70,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 60,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 50,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "Transition交换机板卡温度过高",
+      "alert_name": "交换机${resource_name} 板卡温度过高",
+      "description": "监控 Transition Networks 交换机可选板卡温度（tnDevSysHwInforBoardtmp）。部分机型不返回该对象；有读数且持续高于阈值时触发告警，提示机柜散热不良或环境过热。",
+      "metric_name": "device_temperature_celsius",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 70,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 60,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 50,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    }
+  ]
+}

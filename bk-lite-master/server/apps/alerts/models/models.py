@@ -1,0 +1,339 @@
+# -- coding: utf-8 --
+# @File: models.py
+# @Time: 2025/5/14 16:14
+# @Author: windyzhao
+import hashlib
+import json
+from zoneinfo import ZoneInfo
+
+from django.db import models
+from django.db.models import JSONField
+from django.utils import timezone as django_timezone
+
+from apps.alerts.constants.constants import (
+    AlertOperate,
+    AlertStatus,
+    EventAction,
+    EventStatus,
+    EventType,
+    IncidentOperate,
+    IncidentStatus,
+    IncidentUpdateType,
+    LevelType,
+    SessionStatus,
+)
+from apps.alerts.models.alert_source import AlertSource
+from apps.core.models.maintainer_info import MaintainerInfo
+
+
+class Event(models.Model):
+    """原始事件"""
+
+    source = models.ForeignKey(AlertSource, on_delete=models.CASCADE, db_index=True, help_text="通道")
+    push_source_id = models.CharField(max_length=100, default="default", help_text="事件推送来源")
+    raw_data = JSONField(help_text="原始数据")
+    received_at = models.DateTimeField(auto_now_add=True, db_index=True, help_text="接收时间")
+
+    # 标准化字段
+    title = models.CharField(max_length=200, help_text="事件标题")
+    description = models.TextField(help_text="事件描述", null=True, blank=True)
+    level = models.CharField(max_length=32, db_index=True, help_text="级别")
+    # 新版本
+    service = models.CharField(max_length=200, help_text="所属服务", null=True, blank=True)
+    event_type = models.SmallIntegerField(default=EventType.ALERT, choices=EventType.CHOICES, help_text="发生类型")
+    tags = JSONField(default=dict, help_text="事件标签")
+    location = models.CharField(max_length=200, help_text="事件发生位置", null=True, blank=True)
+    external_id = models.CharField(max_length=128, null=True, blank=True, help_text="外部事件ID")  # 指纹，用于恢复
+    # 常规
+    start_time = models.DateTimeField(db_index=True, help_text="事件开始时间")
+    end_time = models.DateTimeField(null=True, blank=True, db_index=True, help_text="事件结束时间")
+    labels = JSONField(default=dict, help_text="事件元数据")
+    enrichment = JSONField(default=dict, help_text="丰富数据，按来源命名空间分区")
+    enrichment_meta = JSONField(default=dict, help_text="丰富执行诊断（有界状态摘要）")
+    action = models.CharField(
+        max_length=32,
+        choices=EventAction.CHOICES,
+        default=EventAction.CREATED,
+        help_text="事件动作",
+    )
+    ingest_key = models.CharField(max_length=64, null=True, blank=True, db_index=True, help_text="接入幂等键")
+    rule_id = models.CharField(max_length=100, null=True, blank=True, help_text="触发该事件的规则ID")
+    # f"EVENT-{uuid.uuid4().hex}"
+    event_id = models.CharField(max_length=100, unique=True, db_index=True, help_text="事件唯一ID")
+    item = models.CharField(max_length=128, null=True, blank=True, db_index=True, help_text="事件指标")
+    monitor_id = models.CharField(max_length=100, null=True, blank=True, help_text="监控实例ID快照")
+    cmdb_id = models.CharField(max_length=100, null=True, blank=True, help_text="CMDB实例ID快照")
+    node_id = models.CharField(max_length=100, null=True, blank=True, help_text="节点ID快照")
+    resource_id = models.CharField(max_length=100, null=True, blank=True, db_index=True, help_text="资源唯一ID")
+    resource_type = models.CharField(max_length=100, null=True, blank=True, help_text="资源类型")
+    resource_name = models.CharField(max_length=128, null=True, blank=True, help_text="资源名称")
+    status = models.CharField(
+        max_length=32,
+        choices=EventStatus.CHOICES,
+        default=EventStatus.RECEIVED,
+        help_text="事件状态",
+    )
+    assignee = JSONField(default=list, blank=True, help_text="事件责任人")
+    # note = models.TextField(null=True, blank=True, help_text="事件备注")
+    value = models.FloatField(blank=True, null=True, verbose_name="事件值")
+    team = JSONField(default=list, help_text="归属组织")
+
+    class Meta:
+        db_table = "alerts_event"
+        indexes = [
+            models.Index(fields=["source", "received_at"]),
+            # 注意: JSONField 索引在部分数据库（如达梦）上不支持，通过 migrate_patch 处理
+            models.Index(fields=["labels"], name="event_labels_gin"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source", "push_source_id", "ingest_key"],
+                name="event_source_push_ingest_key_uniq",
+            ),
+        ]
+        ordering = ["-received_at"]
+
+    def __str__(self):
+        return f"{self.title} ({self.level}) at {self.received_at}"
+
+    @staticmethod
+    def _normalize_ingest_component(value):
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @classmethod
+    def build_ingest_key(cls, source_id, push_source_id, external_id, action, start_time):
+        if not source_id or not external_id or not action or not start_time:
+            return None
+
+        fingerprint = {
+            "source_id": source_id,
+            "push_source_id": cls._normalize_ingest_component(push_source_id),
+            "external_id": cls._normalize_ingest_component(external_id),
+            "action": cls._normalize_ingest_component(action),
+            "start_time": start_time.isoformat() if hasattr(start_time, "isoformat") else str(start_time),
+        }
+        return hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def calculate_ingest_key(self):
+        return self.build_ingest_key(
+            getattr(self, "source_id", None),
+            getattr(self, "push_source_id", None),
+            getattr(self, "external_id", None),
+            getattr(self, "action", None),
+            getattr(self, "start_time", None),
+        )
+
+    def save(self, *args, **kwargs):
+        if not self.ingest_key:
+            self.ingest_key = self.calculate_ingest_key()
+        super().save(*args, **kwargs)
+
+
+class Alert(models.Model):
+    """聚合后的告警"""
+
+    alert_id = models.CharField(max_length=100, unique=True, db_index=True, help_text="告警ID")  # f"ALERT-{uuid.uuid4().hex.upper()}"
+    status = models.CharField(
+        max_length=32,
+        choices=AlertStatus.CHOICES,
+        default=AlertStatus.UNASSIGNED,
+        help_text="告警状态",
+        db_index=True,
+    )
+    level = models.CharField(max_length=32, db_index=True, help_text="级别")
+    events = models.ManyToManyField(Event)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, help_text="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, db_index=True, help_text="更新时间")
+
+    # 从事件继承的字段
+    title = models.CharField(max_length=200, help_text="标题")
+    content = models.TextField(help_text="内容")
+    labels = JSONField(default=dict, help_text="标签")
+    enrichment = JSONField(default=dict, help_text="丰富数据，按来源命名空间分区")
+    enrichment_meta = JSONField(default=dict, help_text="成员事件丰富执行聚合摘要")
+    first_event_time = models.DateTimeField(null=True, blank=True, help_text="首次事件时间")
+    last_event_time = models.DateTimeField(null=True, blank=True, help_text="最近事件时间")
+    closed_at = models.DateTimeField(
+        "关闭时间",
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text="自动关闭、手动关闭、自动恢复或接口关闭的时间",
+    )
+    item = models.CharField(max_length=128, null=True, blank=True, db_index=True, help_text="事件指标")
+    resource_id = models.CharField(max_length=128, null=True, blank=True, db_index=True, help_text="资源唯一ID")
+    resource_name = models.CharField(max_length=128, null=True, blank=True, help_text="资源名称")
+    resource_type = models.CharField(max_length=100, null=True, blank=True, help_text="资源类型")
+    monitor_objects = JSONField(default=list, blank=True, help_text="关联监控对象身份快照")
+    operate = models.CharField(
+        max_length=64,
+        choices=AlertOperate.CHOICES,
+        null=True,
+        blank=True,
+        help_text="告警操作",
+    )
+    operator = JSONField(default=list, blank=True, help_text="告警处理人")
+    source_name = models.CharField(max_length=100, null=True, blank=True, help_text="告警源名称")
+    push_source_ids = JSONField(default=list, blank=True, editable=False, help_text="监控源，关联事件推送来源去重集合")
+    # 核心指纹字段（用于聚合）
+    fingerprint = models.CharField(max_length=32, db_index=True, help_text="告警指纹")  # group_by_field:group_by_value
+    group_by_field = models.CharField(max_length=200, null=True, blank=True, help_text="聚合字段")
+    dimensions = JSONField(default=dict, help_text="聚合维度键值对")
+    rule_id = models.CharField(max_length=256, null=True, blank=True, help_text="触发该事件的规则ID")
+
+    # 会话窗口字段（用于自愈检查）
+    is_session_alert = models.BooleanField(default=False, db_index=True, help_text="是否为会话窗口Alert")
+    session_status = models.CharField(
+        max_length=32,
+        choices=SessionStatus.CHOICES,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="会话Alert状态",
+    )
+    session_end_time = models.DateTimeField(null=True, blank=True, help_text="会话结束时间")
+    team = JSONField(default=list, help_text="关联组织")  # 告警组织
+
+    # 告警通知单独存储
+
+    class Meta:
+        db_table = "alerts_alert"
+        indexes = [
+            # 状态和严重程度组合索引
+            models.Index(fields=["status", "level"], name="alert_status_level_idx"),
+            # 注意: created_at 已有 db_index=True，无需重复定义
+            # 注意: JSONField 索引在部分数据库（如达梦）上不支持，通过 migrate_patch 处理
+            models.Index(fields=["operator"], name="alert_operator_gin"),
+        ]
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"{self.alert_id} - {self.title} ({self.status})"
+
+    @staticmethod
+    def stamp_closed_at(alert, closed_at=None):
+        """首次关闭或自动恢复时写入关闭时间，之后不再覆盖。"""
+        if getattr(alert, "closed_at", None) is None:
+            alert.closed_at = closed_at or django_timezone.now()
+        return alert.closed_at
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.status not in AlertStatus.ACTIVATE_STATUS:
+            from apps.alerts.models.active_fingerprint import ActiveAlertFingerprint
+
+            ActiveAlertFingerprint.objects.filter(alert_id=self.pk).delete()
+
+    def format_created_at(self, target_timezone=None):
+        """格式化创建时间"""
+        if not self.created_at:
+            return ""
+
+        if isinstance(target_timezone, str) and target_timezone:
+            target_timezone = ZoneInfo(target_timezone)
+
+        if target_timezone is None:
+            target_timezone = django_timezone.get_current_timezone()
+
+        return django_timezone.localtime(self.created_at, target_timezone).strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def model_fields(cls):
+        model_fields = [field.name for field in Alert._meta.get_fields() if not field.is_relation]
+        return model_fields
+
+
+class Incident(MaintainerInfo):
+    """聚合后的告警（事件）"""
+
+    incident_id = models.CharField(max_length=100, unique=True, db_index=True, help_text="事故ID")
+    status = models.CharField(
+        max_length=32,
+        choices=IncidentStatus.CHOICES,
+        default=IncidentStatus.PENDING,
+        help_text="事件状态",
+        db_index=True,
+    )
+    level = models.CharField(max_length=32, db_index=True, help_text="级别")
+    alert = models.ManyToManyField(Alert)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, help_text="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, db_index=True, help_text="更新时间")
+    title = models.CharField(max_length=256, help_text="标题")
+    content = models.TextField(null=True, blank=True, help_text="内容")
+    note = models.TextField(null=True, blank=True, help_text="事件备注")
+    labels = JSONField(default=dict, help_text="标签")
+    operate = models.CharField(
+        max_length=64,
+        choices=IncidentOperate.CHOICES,
+        null=True,
+        blank=True,
+        help_text="操作",
+    )
+    operator = JSONField(default=list, blank=True, help_text="处理人")
+    collaborators = JSONField(default=list, blank=True, help_text="协作者")
+    # 核心指纹字段（用于聚合）
+    fingerprint = models.CharField(max_length=32, null=True, blank=True, db_index=True, help_text="事件指纹")
+    team = JSONField(default=list, help_text="管理组织")
+
+    class Meta:
+        db_table = "alerts_incident"
+        indexes = [
+            # 注意: created_at 已有 db_index=True，无需重复定义
+            # 注意: JSONField 索引在部分数据库（如达梦）上不支持，通过 migrate_patch 处理
+            models.Index(fields=["operator"], name="incident_operator_gin"),
+        ]
+
+    def __str__(self):
+        return f"{self.incident_id} - {self.title} ({self.status})"
+
+    @property
+    def format_created_at(self):
+        """格式化创建时间"""
+        if not self.created_at:
+            return ""
+        return django_timezone.localtime(self.created_at).strftime("%Y-%m-%d %H:%M:%S")
+
+
+class Level(models.Model):
+    """事件级别配置"""
+
+    level_id = models.SmallIntegerField(help_text="级别ID")
+    level_name = models.CharField(max_length=32, help_text="级别名称")
+    level_display_name = models.CharField(max_length=32, help_text="级别中文名称")
+    color = models.CharField(max_length=16, null=True, blank=True, help_text="颜色代码")
+    icon = models.TextField(null=True, blank=True, help_text="图标base64")
+    description = models.CharField(max_length=300, null=True, blank=True, help_text="级别描述")
+    level_type = models.CharField(max_length=32, choices=LevelType.CHOICES, help_text="级别类型")
+    built_in = models.BooleanField(default=False, help_text="是否为内置级别")
+
+    class Meta:
+        db_table = "alerts_level"
+        constraints = [
+            models.UniqueConstraint(fields=["level_id", "level_type"], name="unique_level_id_level_type"),
+        ]
+
+    def __str__(self):
+        return f"{self.level_name}({self.level_id})"
+
+
+class IncidentUpdate(models.Model):
+    """事故协作更新"""
+
+    incident = models.ForeignKey(Incident, on_delete=models.CASCADE, related_name="updates", help_text="关联事故")
+    parent = models.ForeignKey("self", on_delete=models.CASCADE, null=True, blank=True, related_name="replies", help_text="回复的父更新")
+    author = models.CharField(max_length=64, help_text="发布者")
+    update_type = models.CharField(max_length=32, choices=IncidentUpdateType.CHOICES, help_text="更新类型")
+    content = models.TextField(max_length=1000, help_text="更新内容")
+    attachments = JSONField(default=list, blank=True, help_text="附件列表")
+    is_key_info = models.BooleanField(default=False, help_text="是否标记为关键信息")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, help_text="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, help_text="更新时间")
+
+    class Meta:
+        db_table = "alerts_incident_update"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.author} - {self.get_update_type_display()} ({self.created_at})"

@@ -1,0 +1,186 @@
+import { afterEach, describe, expect, it } from 'vitest';
+
+import {
+  buildDashboardCaption,
+  buildDashboardCurrentTime,
+  getContext,
+  getTextContext,
+  isDashboardMetricsMode,
+  isDecorativeDashboardChart,
+  labelFromDashboardCard,
+  readDashboardKpiReadings,
+  readDashboardPageDataStamp,
+  readDashboardRankPanels,
+} from '../dashboard.pilot';
+import type { PageContextToolkit } from '@/components/ai-page-context/types';
+
+describe('dashboard.pilot chart labeling', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('skips KPI mini sparklines and reads the ring card title', () => {
+    document.body.innerHTML = `
+      <section>
+        <div class="statCard">
+          <div class="statLabel"><span class="titleWithGuide"><span>CPU 使用率</span></span></div>
+          <div class="miniTrend"><div _echarts_instance_="kpi" style="height:40px"></div></div>
+        </div>
+        <div class="panel">
+          <h3 class="panelTitle"><span class="titleWithGuide"><span>CPU 时间分布</span></span></h3>
+          <div class="metricRow">
+            <span class="metricName">用户态</span>
+            <span class="metricPercent">76.4%</span>
+            <span class="metricCount">(21.8%)</span>
+          </div>
+          <div class="metricRow">
+            <span class="metricName">内核态</span>
+            <span class="metricPercent">0.0%</span>
+            <span class="metricCount">(--)</span>
+          </div>
+          <div _echarts_instance_="ring"></div>
+        </div>
+      </section>
+    `;
+    const kpi = document.querySelector<HTMLElement>('[_echarts_instance_="kpi"]');
+    const ring = document.querySelector<HTMLElement>('[_echarts_instance_="ring"]');
+    expect(kpi && isDecorativeDashboardChart(kpi)).toBe(true);
+    expect(ring && isDecorativeDashboardChart(ring)).toBe(false);
+    expect(ring && labelFromDashboardCard(ring)).toEqual({
+      title: 'CPU 时间分布',
+      legends: ['用户态 76.4% (21.8%)', '内核态 0.0% (--)'],
+      readings: ['用户态 76.4% (21.8%)', '内核态 0.0% (--)'],
+    });
+  });
+
+  it('uses visible ring readings instead of raw echarts precision', () => {
+    const caption = buildDashboardCaption(
+      { caption: '图表；序列: 用户态, 内核态；最新值: 21.759, 3.165', dataUrl: 'data:x' },
+      {
+        title: 'CPU 时间分布',
+        legends: ['用户态 76.4% (21.8%)', '内核态 0.0% (--)'],
+        readings: ['用户态 76.4% (21.8%)', '内核态 0.0% (--)'],
+      },
+    );
+    expect(caption).toBe('CPU 时间分布；序列: 用户态 76.4% (21.8%), 内核态 0.0% (--)');
+    expect(caption).not.toContain('21.759');
+  });
+
+  it('reads horizontal bar rank rows as series readings', () => {
+    document.body.innerHTML = `
+      <div class="panel">
+        <h3 class="panelTitle"><span class="titleWithGuide"><span>磁盘使用率 Top</span></span></h3>
+        <div class="barRow">
+          <div class="barLabel"><span>1</span><div>/</div></div>
+          <div class="barValue">82.9%</div>
+        </div>
+        <div class="barRow">
+          <div class="barLabel"><div>/var</div></div>
+          <div class="barValue">80.1%</div>
+        </div>
+        <div class="barRow">
+          <div class="barLabel"><div>/boot</div></div>
+          <div class="barValue">16.8%</div>
+        </div>
+      </div>
+    `;
+    expect(readDashboardRankPanels()).toEqual([{
+      title: '磁盘使用率 Top',
+      legends: ['/ 82.9%', '/var 80.1%', '/boot 16.8%'],
+      readings: ['/ 82.9%', '/var 80.1%', '/boot 16.8%'],
+    }]);
+    const text = getTextContext().sections?.map((section) => section.content).join('\n') || '';
+    expect(text).toContain('磁盘使用率 Top；序列: / 82.9%, /var 80.1%, /boot 16.8%');
+    expect(readDashboardPageDataStamp().rankFingerprint).toBe('磁盘使用率 Top:/ 82.9%|/var 80.1%|/boot 16.8%');
+  });
+});
+
+describe('dashboard.pilot page data stamp', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('builds currentTime from time filter and KPI fingerprint', () => {
+    document.body.innerHTML = `
+      <div class="toolbarTimeSelector">
+        <div class="ant-select-selection-item">最近6小时</div>
+      </div>
+      <div class="statCard"><div class="statValue">86.2%</div></div>
+      <div class="statCard"><div class="statValue">79.1%</div></div>
+      <div class="collectionStatusValue">正常</div>
+      <div class="uptimeStatusMain">运行正常</div>
+    `;
+    const stamp = readDashboardPageDataStamp();
+    expect(stamp.timeRangeLabel).toBe('最近6小时');
+    expect(stamp.kpiFingerprint).toBe('86.2%|79.1%');
+    expect(stamp.kpiReadings).toEqual([]);
+    expect(buildDashboardCurrentTime(stamp)).toBe('dashboard::最近6小时::86.2%|79.1%::正常::运行正常');
+  });
+
+  it('reads labeled KPI values from stat cards', () => {
+    document.body.innerHTML = `
+      <div class="statCard">
+        <div class="statLabel"><span class="titleWithGuide"><span>磁盘使用率</span></span></div>
+        <div class="statValue">82.9%</div>
+      </div>
+      <div class="statCard">
+        <div class="statLabel"><span class="titleWithGuide"><span>CPU 使用率</span></span></div>
+        <div class="statValue">86.0%</div>
+      </div>
+    `;
+    expect(readDashboardKpiReadings()).toEqual(['磁盘使用率: 82.9%', 'CPU 使用率: 86.0%']);
+    expect(getTextContext().sections?.some((section) => section.content.includes('磁盘使用率: 82.9%'))).toBe(true);
+  });
+
+  it('changes currentTime when time filter label changes', () => {
+    document.body.innerHTML = `
+      <div class="toolbarTimeSelector">
+        <div class="ant-select-selection-item">最近15分钟</div>
+      </div>
+      <div class="statCard"><div class="statValue">22.4%</div></div>
+    `;
+    const stamp15 = readDashboardPageDataStamp();
+    document.querySelector('.ant-select-selection-item')!.textContent = '最近6小时';
+    document.querySelector('.statValue')!.textContent = '86.0%';
+    const stamp6h = readDashboardPageDataStamp();
+    expect(buildDashboardCurrentTime(stamp15)).not.toBe(buildDashboardCurrentTime(stamp6h));
+  });
+});
+
+describe('dashboard.pilot display mode', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  const toolkit: PageContextToolkit = {
+    captureEchartsFromDoms: async () => [{ dataUrl: 'data:image/jpeg,x', caption: '不该出现' }],
+    captureEchartsFromDom: async () => [],
+    captionFromOption: () => '图表',
+    captureRechartsFromDoms: async () => [{ dataUrl: 'data:image/jpeg,y', caption: '也不该出现' }],
+  };
+
+  it('skips professional dashboard screenshots in metrics mode', async () => {
+    document.body.innerHTML = `
+      <div class="modeSegmented">
+        <div class="ant-segmented-item ant-segmented-item-selected">全量指标</div>
+      </div>
+      <div _echarts_instance_="panel" style="height:200px"></div>
+    `;
+    expect(isDashboardMetricsMode()).toBe(true);
+    const text = (getTextContext().sections || []).map((section) => section.content).join('\n');
+    expect(text).toContain('展示模式: 全量指标');
+    const full = await getContext(toolkit);
+    expect(full.images || []).toEqual([]);
+  });
+
+  it('keeps dashboard mode capture path when 监控仪表盘 is selected', async () => {
+    document.body.innerHTML = `
+      <div class="modeSegmented">
+        <div class="ant-segmented-item ant-segmented-item-selected">监控仪表盘</div>
+      </div>
+    `;
+    expect(isDashboardMetricsMode()).toBe(false);
+    const text = (getTextContext().sections || []).map((section) => section.content).join('\n');
+    expect(text).toContain('展示模式: 监控仪表盘');
+  });
+});

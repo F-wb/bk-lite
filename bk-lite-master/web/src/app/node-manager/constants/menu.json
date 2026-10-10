@@ -1,0 +1,120 @@
+{
+  "zh": [
+    {
+      "title": "云区域",
+      "icon": "cloud-full",
+      "url": "/node-manager/cloudregion",
+      "name": "cloud_region_list",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "节点",
+          "url": "/node-manager/cloudregion/node",
+          "icon": "jiedianguanli",
+          "name": "cloud_region_node"
+        },
+        {
+          "title": "环境",
+          "url": "/node-manager/cloudregion/environment",
+          "icon": "windows",
+          "name": "cloud_region_environment"
+        },
+        {
+          "title": "变量",
+          "url": "/node-manager/cloudregion/variable",
+          "icon": "bianliang",
+          "name": "cloud_region_variable"
+        }
+      ]
+    },
+    {
+      "title": "组件库",
+      "icon": "caijiqi",
+      "url": "/node-manager/collector",
+      "name": "collector_list",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "包管理",
+          "url": "/node-manager/collector/detail",
+          "icon": "baoguanli-full",
+          "name": "collector_packet"
+        }
+      ]
+    },
+    {
+      "title": "控制器",
+      "icon": "nenglifabuguanli",
+      "url": "/node-manager/controller",
+      "name": "controller_list",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "包管理",
+          "url": "/node-manager/controller/detail",
+          "icon": "baoguanli-full",
+          "name": "controller_packet"
+        }
+      ]
+    }
+  ],
+  "en": [
+    {
+      "title": "Cloud Region",
+      "icon": "yunchang-yunquyu",
+      "url": "/node-manager/cloudregion",
+      "name": "cloud_region_list",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "Node",
+          "url": "/node-manager/cloudregion/node",
+          "icon": "jiedianguanli",
+          "name": "cloud_region_node"
+        },
+        {
+          "title": "Environment",
+          "url": "/node-manager/cloudregion/environment",
+          "icon": "windows",
+          "name": "cloud_region_environment"
+        },
+        {
+          "title": "Variable",
+          "url": "/node-manager/cloudregion/variable",
+          "icon": "bianliang",
+          "name": "cloud_region_variable"
+        }
+      ]
+    },
+    {
+      "title": "Component Library",
+      "icon": "xiaocaijiqi",
+      "url": "/node-manager/collector",
+      "name": "collector_list",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "Package Management",
+          "url": "/node-manager/collector/detail",
+          "icon": "baoguanli-full",
+          "name": "collector_packet"
+        }
+      ]
+    },
+    {
+      "title": "Controller",
+      "icon": "nenglifabuguanli",
+      "url": "/node-manager/controller",
+      "name": "controller_list",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "Package Management",
+          "url": "/node-manager/controller/detail",
+          "icon": "baoguanli-full",
+          "name": "controller_packet"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,324 @@
+import json
+import shlex
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from django.utils import timezone
+
+from apps.core.logger import job_logger as logger
+from apps.job_mgmt.constants import ExecutionStatus, ScriptType, TargetSource
+from apps.job_mgmt.models import JobExecution
+from apps.job_mgmt.services.dangerous_checker import DangerousChecker
+from apps.job_mgmt.services.execution_base_service import ExecutionTaskBaseService
+from apps.job_mgmt.services.execution_stream_service import (
+    JOB_LOG_MAX_AGE_SECONDS,
+    JOB_LOG_MAX_BYTES,
+    JOB_LOG_STREAM_NAME,
+    JOB_LOG_SUBJECTS,
+    build_stream_topic,
+    publish_done_sentinel,
+)
+from apps.job_mgmt.services.execution_timeout_service import ExecutionTimeoutService
+from apps.job_mgmt.services.shell_utils import build_heredoc_command, parse_shebang
+from apps.job_mgmt.utils.i18n import job_message
+from apps.rpc.executor import Executor
+from nats_client.clients import ensure_stream_sync
+
+
+class ScriptExecutionRunner(ExecutionTaskBaseService):
+    def __init__(self, execution_id: int):
+        super().__init__(execution_id, "execute_script_task")
+
+    def run(self):
+        logger.info(f"[{self.task_name}] 开始执行脚本任务: execution_id={self.execution_id}")
+        execution, target_list = self.prepare_execution()
+        if not execution:
+            return
+
+        # 尽早声明 JetStream 流，保证后续所有路径（ansible 提交前、sidecar 首行前）发的流事件可被回放
+        try:
+            ensure_stream_sync(JOB_LOG_STREAM_NAME, JOB_LOG_SUBJECTS, JOB_LOG_MAX_AGE_SECONDS, JOB_LOG_MAX_BYTES)
+        except Exception as e:
+            logger.warning(f"[{self.task_name}] JetStream 流声明失败(不阻断执行): {e}")
+
+        if self._handle_dangerous_command(execution, target_list):
+            return
+
+        script_content = self.merge_script_with_params(execution.script_content, execution.params, execution.script_type)
+        if self._run_via_ansible_if_needed(execution, target_list, script_content):
+            return
+
+        results = self._run_via_sidecar(execution, target_list, script_content)
+        self.finalize_execution(execution, self.task_name, results)
+
+    def _handle_dangerous_command(self, execution, target_list: list) -> bool:
+        check_result = DangerousChecker.check_command(execution.script_content, execution.team)
+        if check_result.can_execute:
+            return False
+
+        forbidden_rules = [r["rule_name"] for r in check_result.forbidden]
+        error_msg = job_message(
+            None,
+            "error.dangerous_command_forbidden",
+            "Script contains high-risk commands and cannot be executed: {rules}",
+            rules=", ".join(forbidden_rules),
+        )
+        logger.warning(f"[{self.task_name}] {error_msg}")
+        self.update_execution_status(execution, ExecutionStatus.FAILED, finished_at=timezone.now())
+        execution.execution_results = [self.build_target_failed_result(t, error_msg) for t in target_list]
+        execution.save(update_fields=["execution_results", "updated_at"])
+        self._publish_done_for_targets(execution.id, target_list, ExecutionStatus.FAILED)
+        return True
+
+    @staticmethod
+    def _publish_done_for_targets(execution_id, target_list: list, status: str) -> None:
+        """为所有目标各发一条 done 哨兵（用于同步早退/拦截路径，避免 SSE 空等到 idle 超时）。"""
+        for t in target_list:
+            tk = t.get("node_id") or str(t.get("target_id", ""))
+            publish_done_sentinel(execution_id, tk, status)
+
+    def _run_via_ansible_if_needed(self, execution, target_list: list, script_content: str) -> bool:
+        if execution.target_source == TargetSource.MANUAL and self._contains_windows_manual_target(target_list):
+            if not self._should_use_ansible(execution.target_source, target_list):
+                error_msg = job_message(
+                    None,
+                    "error.windows_manual_ansible_only",
+                    "Windows manual targets only support Ansible/WinRM execution; switch the driver to Ansible",
+                )
+                logger.warning(f"[{self.task_name}] {error_msg}")
+                self.update_execution_status(execution, ExecutionStatus.FAILED, finished_at=timezone.now())
+                execution.execution_results = [self.build_target_failed_result(t, error_msg) for t in target_list]
+                execution.save(update_fields=["execution_results", "updated_at"])
+                self._publish_done_for_targets(execution.id, target_list, ExecutionStatus.FAILED)
+                return True
+        if not self._should_use_ansible(execution.target_source, target_list):
+            return False
+        try:
+            self._execute_script_via_ansible(execution, target_list, script_content, execution.script_type)
+            logger.info(f"[{self.task_name}] Ansible 任务已提交，等待回调: execution_id={self.execution_id}")
+            return True
+        except Exception as e:
+            error_msg = job_message(
+                None,
+                "error.ansible_execute_failed",
+                "Ansible execution failed: {detail}",
+                detail=str(e),
+            )
+            logger.exception(f"[{self.task_name}] {error_msg}")
+            self.update_execution_status(execution, ExecutionStatus.FAILED, finished_at=timezone.now())
+            execution.execution_results = [self.build_target_failed_result(t, error_msg) for t in target_list]
+            execution.save(update_fields=["execution_results", "updated_at"])
+            self._publish_done_for_targets(execution.id, target_list, ExecutionStatus.FAILED)
+            return True
+
+    def _run_via_sidecar(self, execution, target_list: list, script_content: str) -> list:
+        """分批提交目标到线程池执行：每批不超过 MAX_WORKERS。
+
+        取消后不再向线程池提交后续批次（不依赖 future.cancel 竞速），保证"取消即止"。
+        """
+        results = []
+        cancelled = False
+        sentineled = set()
+        workers = min(self.MAX_WORKERS, len(target_list)) or 1
+        for batch_start in range(0, len(target_list), workers):
+            if isinstance(execution, JobExecution) and ExecutionTimeoutService.renew_running(execution.id) is None:
+                break
+            batch = target_list[batch_start : batch_start + workers]
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                futures = {
+                    pool.submit(
+                        self.execute_script_on_target,
+                        t,
+                        execution.target_source,
+                        script_content,
+                        execution.script_type,
+                        execution.timeout,
+                        execution.id,
+                        execution,
+                    ): t
+                    for t in batch
+                }
+                for future in as_completed(futures):
+                    target_info = futures[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        logger.info(f"[{self.task_name}] 目标 {target_info.get('name')} 执行完成: status={result['status']}")
+                        tk = result.get("target_key", "")
+                        publish_done_sentinel(execution.id, tk, result.get("status", ExecutionStatus.FAILED))
+                        sentineled.add(tk)
+                    except Exception as e:
+                        logger.exception(f"[{self.task_name}] 目标 {target_info.get('name')} 执行异常: {e}")
+                        failed_result = self.build_target_failed_result(target_info, str(e))
+                        results.append(failed_result)
+                        tk = failed_result.get("target_key", "")
+                        publish_done_sentinel(execution.id, tk, ExecutionStatus.FAILED)
+                        sentineled.add(tk)
+
+            # 本批完成后检查是否已取消，取消则不再提交后续批次
+            if self.is_cancelled(execution.id):
+                cancelled = True
+                logger.info(f"[{self.task_name}] 检测到取消，停止提交剩余目标: execution_id={execution.id}")
+                break
+
+        # 被取消而未提交执行的目标不会产出结果、也就不会发哨兵；收尾补发 CANCELLED，
+        # 避免前端 SSE 面板空等到 idle 超时（spec §8）。
+        if cancelled:
+            self._publish_cancelled_sentinels(execution.id, target_list, sentineled)
+        return results
+
+    @staticmethod
+    def _publish_cancelled_sentinels(execution_id, target_list: list, sentineled: set) -> None:
+        """为尚未发过 done 哨兵的目标补发一条 CANCELLED 哨兵。"""
+        for t in target_list:
+            tk = t.get("node_id") or str(t.get("target_id", ""))
+            if tk not in sentineled:
+                publish_done_sentinel(execution_id, tk, ExecutionStatus.CANCELLED)
+                sentineled.add(tk)
+
+    def merge_script_with_params(self, script_content: str, params: str, script_type: str) -> str:
+        """将位置参数注入脚本，使脚本内可按顺序获取参数。
+
+        params 为 ScriptParamsService.params_to_string 生成的逐值 shell 引用字符串，
+        先 shlex.split 还原出有序 token（含空字符串占位），再按脚本类型注入：
+        - shell：set -- 设置位置参数（$1 $2 ...）
+        - python：注入 sys.argv（sys.argv[1] sys.argv[2] ...）
+        - powershell：注入 $args（$args[0] $args[1] ...）
+        - bat：当前执行机制下无法在脚本内重设 %1/%2，暂不支持，忽略参数
+        """
+        if not params:
+            return script_content
+
+        try:
+            tokens = shlex.split(params)
+        except ValueError:
+            tokens = params.split()
+        if not tokens:
+            return script_content
+
+        if script_type == ScriptType.SHELL:
+            escaped_params = " ".join(shlex.quote(token) for token in tokens)
+            return f"set -- {escaped_params}\n{script_content}"
+
+        if script_type == ScriptType.PYTHON:
+            # json 数组同时是合法的 Python 列表字面量，可安全注入空值/特殊字符
+            argv_literal = json.dumps(["script", *tokens], ensure_ascii=False)
+            return f"import sys as _sys\n_sys.argv = {argv_literal}\n{script_content}"
+
+        if script_type == ScriptType.POWERSHELL:
+            # PowerShell 单引号字符串，内部单引号转义为两个单引号
+            ps_args = ", ".join("'" + token.replace("'", "''") + "'" for token in tokens)
+            return f"$args = @({ps_args})\n{script_content}"
+
+        # bat 等其它类型：本次不支持参数注入，原样返回脚本内容
+        return script_content
+
+    def execute_script_on_target(
+        self,
+        target_info: dict,
+        target_source: str,
+        script_content: str,
+        script_type: str,
+        timeout: int,
+        execution_id: int,
+        execution: JobExecution | None = None,
+    ) -> dict:
+        target_key = target_info.get("node_id") or str(target_info.get("target_id", ""))
+        target_name = target_info.get("name", "")
+        target_ip = target_info.get("ip", "")
+
+        result = {
+            "target_key": target_key,
+            "name": target_name,
+            "ip": target_ip,
+            "status": ExecutionStatus.PENDING,
+            "stdout": "",
+            "stderr": "",
+            "exit_code": None,
+            "error_message": "",
+            "started_at": timezone.now().isoformat(),
+            "finished_at": "",
+        }
+
+        # 执行前检查是否已取消
+        if self.is_cancelled(execution_id):
+            result["status"] = ExecutionStatus.CANCELLED
+            result["error_message"] = job_message(None, "error.cancelled_skip_execute", "Task cancelled; execution skipped")
+            result["finished_at"] = timezone.now().isoformat()
+            return result
+
+        # 规范化换行符（类 Unix 脚本 CRLF/CR -> LF），在 parse_shebang 之前处理。
+        # 与 Ansible 路径共用 ExecutionTaskBaseService.normalize_script_line_endings（#3404）。
+        script_content = self.normalize_script_line_endings(script_content, script_type)
+
+        logger.info(
+            "[%s] 目标 %s(%s) 开始流式执行: source=%s topic=%s",
+            self.task_name,
+            target_name,
+            target_ip,
+            target_source,
+            build_stream_topic(execution_id, target_key),
+        )
+        try:
+            shell = parse_shebang(script_content) or ScriptType.SHELL_MAPPING.get(script_type, "bash")
+            if target_source in (TargetSource.NODE_MGMT, TargetSource.SYNC):
+                node_id = target_info.get("node_id")
+                executor = Executor(node_id)
+                exec_result = executor.execute_local_stream(
+                    script_content,
+                    timeout=timeout,
+                    shell=shell,
+                    execution_id=str(execution_id),
+                    stream_log_topic=build_stream_topic(execution_id, target_key),
+                )
+            else:
+                target_id = target_info.get("target_id")
+                ssh_creds = self.get_ssh_credentials(target_id, execution=execution)
+                if not ssh_creds:
+                    raise ValueError(f"无法获取目标凭据: target_id={target_id}")
+
+                executor = Executor(ssh_creds["node_id"])
+                ssh_command = build_heredoc_command(shell, script_content)
+                exec_result = executor.execute_ssh_stream(
+                    command=ssh_command,
+                    host=ssh_creds["host"],
+                    username=ssh_creds["username"],
+                    password=ssh_creds["password"],
+                    private_key=ssh_creds["private_key"],
+                    timeout=timeout,
+                    port=ssh_creds["port"],
+                    execution_id=str(execution_id),
+                    stream_log_topic=build_stream_topic(execution_id, target_key),
+                    fast_fail=True,
+                )
+
+            if isinstance(exec_result, str):
+                result["stdout"] = exec_result
+                result["stderr"] = ""
+                result["exit_code"] = 0
+                result["status"] = ExecutionStatus.SUCCESS
+            elif isinstance(exec_result, dict):
+                result["stdout"] = exec_result.get("stdout", exec_result.get("result", ""))
+                result["stderr"] = self.normalize_executor_error(exec_result, exec_result.get("stderr", ""))
+                result["exit_code"] = exec_result.get("exit_code", exec_result.get("code", 0))
+                # 检测超时：executor 返回 code="timeout" 或 category="remote_timeout"
+                is_timeout = str(exec_result.get("code", "")) == "timeout" or exec_result.get("category") == "remote_timeout"
+                if is_timeout:
+                    result["status"] = ExecutionStatus.TIMEOUT
+                elif result["exit_code"] == 0:
+                    result["status"] = ExecutionStatus.SUCCESS
+                else:
+                    result["status"] = ExecutionStatus.FAILED
+            else:
+                result["stdout"] = str(exec_result)
+                result["stderr"] = ""
+                result["exit_code"] = 0
+                result["status"] = ExecutionStatus.SUCCESS
+
+        except Exception as e:
+            result["error_message"] = self.format_error_message(e)
+            result["stderr"] = result["error_message"]
+            result["status"] = ExecutionStatus.FAILED
+            logger.exception(f"目标 {target_name}({target_ip}) 脚本执行失败")
+
+        result["finished_at"] = timezone.now().isoformat()
+        return result

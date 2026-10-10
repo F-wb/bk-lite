@@ -1,0 +1,342 @@
+{
+  "object_name": "Mysql",
+  "instance_type": "mysql",
+  "collect_type": "database",
+  "config_type": [
+    "mysql"
+  ],
+  "collector": "Telegraf",
+  "instance_id": "{{cloud_region}}_{{host}}_{{port}}",
+  "form_fields": [
+    {
+      "name": "username",
+      "label": "用户名",
+      "type": "input",
+      "required": true,
+      "editable": false,
+      "description": "用于连接 MySQL 数据库的用户名",
+      "guide_short": "建议使用专用只读监控账号。默认采集至少需要 PROCESS，以及对 performance_schema / information_schema 的 SELECT；开启 Binary Log 或主从/副本状态时还需 REPLICATION CLIENT。",
+      "guide_short_en": "Use a dedicated read-only account. Default collection needs PROCESS plus SELECT on required performance_schema / information_schema objects; enable REPLICATION CLIENT when gathering binary logs or replica status.",
+      "widget_props": {
+        "placeholder": "用户名",
+        "placeholder_en": "Username"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.servers[0]",
+        "to_form": {
+          "regex": "^([^:]+):"
+        }
+      },
+      "label_en": "Username"
+    },
+    {
+      "name": "ENV_PASSWORD",
+      "label": "密码",
+      "type": "password",
+      "required": true,
+      "editable": false,
+      "description": "用于连接 MySQL 数据库的密码",
+      "guide_short": "填写与用户名对应的登录密码，注意不要带入首尾空格或换行；MySQL 8.0 默认 caching_sha2_password，请确认采集端驱动兼容。",
+      "guide_short_en": "Enter the password for the username without leading or trailing spaces or line breaks. For MySQL 8.0 caching_sha2_password, confirm collector-driver compatibility.",
+      "widget_props": {
+        "placeholder": "密码",
+        "placeholder_en": "Password"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.env_config.PASSWORD__{{config_id}}"
+      },
+      "label_en": "Password"
+    },
+    {
+      "name": "host",
+      "label": "主机",
+      "type": "input",
+      "required": true,
+      "visible_in": "edit",
+      "editable": false,
+      "description": "与设备进行通信的主机",
+      "guide_short": "填写 MySQL 实例的 IP 或域名，例如 10.0.0.10；保存前可在采集节点用 mysql -h <host> -u <user> -p 验证连通。",
+      "guide_short_en": "Enter the MySQL instance IP address or hostname, such as 10.0.0.10, and verify connectivity from the collector node with an interactive mysql login.",
+      "widget_props": {
+        "placeholder": "主机地址"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.servers[0]",
+        "to_form": {
+          "regex": "@tcp\\(([^:]+):"
+        }
+      },
+      "label_en": "Host"
+    },
+    {
+      "name": "port",
+      "label": "端口",
+      "type": "inputNumber",
+      "required": true,
+      "visible_in": "edit",
+      "editable": false,
+      "description": "与设备进行通信的端口",
+      "guide_short": "MySQL 服务监听端口，默认 3306；若修改过 my.cnf 的 port，请填写实际端口；本端口与任何 exporter 端口无关。",
+      "guide_short_en": "Enter the actual MySQL listener port, commonly 3306. If my.cnf changes the port, use that value; it is unrelated to any exporter port.",
+      "widget_props": {
+        "min": 1,
+        "precision": 0,
+        "placeholder": "端口",
+        "placeholder_en": "Port"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.servers[0]",
+        "to_form": {
+          "regex": "@tcp\\([^:]+:(\\d+)\\)"
+        }
+      },
+      "label_en": "Port"
+    },
+    {
+      "name": "interval",
+      "label": "间隔",
+      "type": "inputNumber",
+      "required": true,
+      "default_value": 60,
+      "description": "监控数据的采集时间间隔（单位：秒）",
+      "guide_short": "默认 60 秒；过低会增加 MySQL 实例压力，过高会延误告警；建议不少于 30 秒。",
+      "guide_short_en": "The default is 60 seconds. Short intervals increase MySQL load, while long intervals delay alerts; use at least 30 seconds.",
+      "widget_props": {
+        "min": 1,
+        "precision": 0,
+        "placeholder": "间隔",
+        "addonAfter": "s",
+        "placeholder_en": "Interval"
+      },
+      "transform_on_edit": {
+        "origin_path": "child.content.config.interval",
+        "to_form": {
+          "regex": "^(\\d+)s$"
+        },
+        "to_api": {
+          "suffix": "s"
+        }
+      },
+      "label_en": "Interval",
+      "description_en": "Collection time interval (unit: seconds)"
+    },
+    {
+      "name": "gather_process_list",
+      "advanced": true,
+      "label": "进程列表",
+      "type": "switch",
+      "required": false,
+      "default_value": true,
+      "description": "采集线程空闲、执行中、等锁等进程状态。",
+      "guide_short": "默认开启。对应 SHOW PROCESSLIST 汇总，仪表盘「线程分布」依赖此项，需 PROCESS 权限。开启后可采 mysql_process_list_*（如 threads_idle / executing / sending_data / waiting_for_lock）。关闭后上述指标为空，连接数、QPS 等 STATUS 指标仍可采。",
+      "guide_short_en": "On by default. SHOW PROCESSLIST aggregates for dashboard thread distribution; needs PROCESS. Metrics: mysql_process_list_* (idle/executing/sending/waiting). Turning off clears those only; STATUS metrics like connections/QPS still collect.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_process_list"
+      },
+      "label_en": "Process List",
+      "description_en": "Collect process-list thread states such as idle, executing, and waiting for lock."
+    },
+    {
+      "name": "gather_innodb_metrics",
+      "advanced": true,
+      "label": "InnoDB 指标",
+      "type": "switch",
+      "required": false,
+      "default_value": true,
+      "description": "采集缓冲池与 InnoDB 读写、行锁等性能指标。",
+      "guide_short": "默认开启。仪表盘 InnoDB/缓冲池相关图依赖此项。开启后可采 mysql_innodb_*、mysql_buffer_pool_*（命中率、脏页、行锁等待、读写与 fsync 等）。关闭后上述指标为空，连接与 QPS 等仍可采。",
+      "guide_short_en": "On by default. Dashboard InnoDB/buffer pool panels depend on it. Metrics: mysql_innodb_*, mysql_buffer_pool_* (hit/dirty ratio, row-lock waits, IO/fsync). STATUS metrics still collect when off.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_innodb_metrics"
+      },
+      "label_en": "InnoDB Metrics",
+      "description_en": "Collect buffer pool and InnoDB IO/row-lock performance metrics."
+    },
+    {
+      "name": "gather_global_variables",
+      "advanced": true,
+      "label": "全局变量",
+      "type": "switch",
+      "required": false,
+      "default_value": true,
+      "description": "采集连接上限、缓存容量、读写角色等配置类指标。",
+      "guide_short": "默认开启。连接使用率、打开文件使用率、表缓存使用率等「当前值/上限」类图依赖此项。开启后可采 mysql_variables_*（如 max_connections、table_open_cache、open_files_limit、tmp/innodb 缓冲池大小、read_only、log_bin）。关闭后配置类指标为空，纯 STATUS 计数仍可采。",
+      "guide_short_en": "On by default. Utilization charts that divide by limits need it. Metrics: mysql_variables_* (max_connections, caches, open_files_limit, buffer sizes, read_only, log_bin). Raw STATUS counters still collect when off.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_global_variables"
+      },
+      "label_en": "Global Variables",
+      "description_en": "Collect config metrics such as connection limits, cache sizes, and read-only role."
+    },
+    {
+      "name": "gather_binary_logs",
+      "advanced": true,
+      "label": "Binary Log",
+      "type": "switch",
+      "required": false,
+      "default_value": false,
+      "description": "采集 binlog 文件数量与总大小。",
+      "guide_short": "默认关闭。执行 SHOW BINARY LOGS，可采 mysql_binary_files_count、mysql_binary_size_bytes。仅实例已开 binlog 且账号有 REPLICATION CLIENT 时再开，否则连通测试/采集会失败。是否已开 binlog 可看全局变量 log_bin（需开启「全局变量」）。",
+      "guide_short_en": "Off by default. Metrics: mysql_binary_files_count, mysql_binary_size_bytes via SHOW BINARY LOGS. Enable only with binary logging on and REPLICATION CLIENT; otherwise detect/collection fails. Check log_bin via Global Variables.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_binary_logs"
+      },
+      "label_en": "Binary Logs",
+      "description_en": "Collect binary log file count and total size."
+    },
+    {
+      "name": "gather_slave_status",
+      "advanced": true,
+      "label": "Slave 状态",
+      "type": "switch",
+      "required": false,
+      "default_value": false,
+      "description": "采集传统主从复制延迟与 IO/SQL 线程状态。",
+      "guide_short": "默认关闭。传统 SHOW SLAVE STATUS（MySQL 5.7 / 部分 MariaDB）。开启后可采 mysql_slave_seconds_behind_master、mysql_slave_io_running、mysql_slave_sql_running。仅从库需要复制监控时开启，需 REPLICATION CLIENT；非复制实例开启可能导致采集失败。MySQL 8+ 也可改用「Replica 状态」。",
+      "guide_short_en": "Off by default. Classic SHOW SLAVE STATUS. Metrics: mysql_slave_seconds_behind_master, mysql_slave_io_running, mysql_slave_sql_running. For replicas only; needs REPLICATION CLIENT. Non-replicas may fail. On MySQL 8+ you may use Replica Status instead.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_slave_status"
+      },
+      "label_en": "Slave Status",
+      "description_en": "Collect classic replication lag and IO/SQL thread status."
+    },
+    {
+      "name": "gather_replica_status",
+      "advanced": true,
+      "label": "Replica 状态",
+      "type": "switch",
+      "required": false,
+      "default_value": false,
+      "description": "采集 MySQL 8+ 复制延迟与线程状态。",
+      "guide_short": "默认关闭。面向 MySQL 8+ SHOW REPLICA STATUS，指标与 Slave 状态同类（复制延迟、IO/SQL 线程）。需 REPLICATION CLIENT；与「Slave 状态」按目标版本择一即可，一般不必两个都开。非复制实例开启可能导致采集失败。",
+      "guide_short_en": "Off by default. MySQL 8+ SHOW REPLICA STATUS for lag/thread state (same class as slave metrics). Needs REPLICATION CLIENT. Prefer one of Slave or Replica by version; non-replicas may fail.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_replica_status"
+      },
+      "label_en": "Replica Status",
+      "description_en": "Collect MySQL 8+ replication lag and thread status."
+    },
+    {
+      "name": "gather_table_io_waits",
+      "advanced": true,
+      "label": "表 IO Wait",
+      "type": "switch",
+      "required": false,
+      "default_value": false,
+      "description": "采集各表读写删除等 IO 等待情况。",
+      "guide_short": "默认关闭。依赖 performance_schema 表 IO 汇总。开启后可采 mysql_table_io_waits_*（fetch/insert/update/delete 次数与耗时汇总）。未启用或不具备 SELECT 权限时可能导致采集失败；按表产生序列，适合排查热点表，日常默认不必开。",
+      "guide_short_en": "Off by default. Metrics: mysql_table_io_waits_* (fetch/insert/update/delete counts and time) from PERFORMANCE_SCHEMA. Needs performance_schema and SELECT; may fail otherwise. Per-table series—use for hot-table diagnosis, keep off for routine monitoring.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_table_io_waits"
+      },
+      "label_en": "Table IO Waits",
+      "description_en": "Collect per-table IO wait for read/write/delete operations."
+    },
+    {
+      "name": "gather_table_lock_waits",
+      "advanced": true,
+      "label": "表锁 Wait",
+      "type": "switch",
+      "required": false,
+      "default_value": false,
+      "description": "采集各表 SQL 锁等待的读写情况。",
+      "guide_short": "默认关闭。依赖 performance_schema.table_lock_waits_summary_by_table。开启后可采 mysql_table_lock_waits_*（读/写等待次数与耗时汇总）。未启用可能失败；与「表 IO Wait」类似有表级基数，仅排查锁竞争时开启。",
+      "guide_short_en": "Off by default. Metrics: mysql_table_lock_waits_* (read/write wait rates and time) from PERFORMANCE_SCHEMA. May fail if disabled. Per-table cardinality—enable only when diagnosing lock contention.",
+      "widget_props": {},
+      "transform_on_edit": {
+        "origin_path": "child.content.config.gather_table_lock_waits"
+      },
+      "label_en": "Table Lock Waits",
+      "description_en": "Collect per-table SQL lock wait for read and write."
+    }
+  ],
+  "advanced_panel": {
+    "title": "高级采集选项",
+    "hint": "默认即可覆盖连接、QPS、慢查询等 STATUS 指标。展开后按需开关；详细说明见各开关旁「？」指引。"
+  },
+  "table_columns": [
+    {
+      "name": "node_ids",
+      "label": "节点",
+      "type": "select",
+      "required": true,
+      "widget_props": {
+        "placeholder": "请选择节点",
+        "placeholder_en": "Please select node"
+      },
+      "enable_row_filter": false,
+      "label_en": "Node"
+    },
+    {
+      "name": "host",
+      "label": "主机",
+      "type": "input",
+      "required": true,
+      "widget_props": {
+        "placeholder": "主机地址"
+      },
+      "change_handler": {
+        "type": "combine",
+        "source_fields": [
+          "host",
+          "port"
+        ],
+        "target_field": "instance_name",
+        "separator": ":"
+      },
+      "label_en": "Host"
+    },
+    {
+      "name": "port",
+      "label": "端口",
+      "type": "inputNumber",
+      "required": true,
+      "widget_props": {
+        "min": 1,
+        "precision": 0,
+        "placeholder": "端口",
+        "placeholder_en": "Port"
+      },
+      "change_handler": {
+        "type": "combine",
+        "source_fields": [
+          "host",
+          "port"
+        ],
+        "target_field": "instance_name",
+        "separator": ":"
+      },
+      "label_en": "Port"
+    },
+    {
+      "name": "instance_name",
+      "label": "实例名称",
+      "type": "input",
+      "required": true,
+      "widget_props": {
+        "placeholder": "实例名称",
+        "disabled": false,
+        "placeholder_en": "Instance Name"
+      },
+      "label_en": "Instance Name"
+    },
+    {
+      "name": "group_ids",
+      "label": "组",
+      "type": "group_select",
+      "required": false,
+      "widget_props": {
+        "placeholder": "请选择组",
+        "placeholder_en": "Please select group"
+      },
+      "label_en": "Group"
+    }
+  ]
+}

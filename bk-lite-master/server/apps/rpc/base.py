@@ -1,0 +1,97 @@
+import asyncio
+import os
+
+from django.conf import settings
+
+import nats_client
+from apps.core.logger import logger
+from apps.rpc.exceptions import RpcMethodNotFoundError, RpcTimeoutError
+
+DEFAULT_REQUEST_TIMEOUT = 60
+
+
+class RpcClient(object):
+    def __init__(self, namespace=None):
+        if namespace is None:
+            # Default namespace is set to 'bk_lite' if not provided
+            # This can be overridden by the environment variable NATS_NAMESPACE
+            namespace = os.getenv("NATS_NAMESPACE", "bklite")
+        self.namespace = namespace
+
+    def run(self, method_name, *args, **kwargs):
+        timeout = kwargs.get("_timeout")
+        effective_timeout = timeout if timeout is not None else getattr(settings, "NATS_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
+        return self._request_with_timeout(nats_client.request, method_name, effective_timeout, *args, **kwargs)
+
+    def request(self, method_name, **kwargs):
+        timeout = kwargs.get("_timeout")
+        effective_timeout = timeout if timeout is not None else getattr(settings, "NATS_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
+        return self._request_with_timeout(nats_client.nat_request, method_name, effective_timeout, **kwargs)
+
+    def _request_with_timeout(self, request_func, method_name, effective_timeout, *args, **kwargs):
+        try:
+            request_coro = request_func(self.namespace, method_name, *args, **kwargs)
+            if effective_timeout and effective_timeout > 0:
+                request_coro = asyncio.wait_for(request_coro, timeout=effective_timeout)
+            return asyncio.run(request_coro)
+        except TimeoutError as exc:
+            logger.warning(
+                "RPC request timeout: namespace=%s, method=%s, timeout=%ss",
+                self.namespace,
+                method_name,
+                effective_timeout,
+            )
+            raise RpcTimeoutError(self.namespace, method_name, effective_timeout) from exc
+
+
+class AppClient(object):
+    def __init__(self, path):
+        self.path = path
+
+    def run(self, method_name, *args, **kwargs):
+        m = __import__(self.path, globals(), locals(), ["*"])
+        method = getattr(m, method_name, None)
+        if not method:
+            logger.warning("RPC method not found: path=%s, method=%s", self.path, method_name)
+            raise RpcMethodNotFoundError(self.path, method_name)
+        return method(*args, **kwargs)
+
+
+class OperationAnalysisRpc(RpcClient):
+    """
+    操作分析专用RPC客户端
+    支持自定义服务器地址，独立于框架基础RpcClient实现
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.namespace = kwargs.pop("namespace", None)
+        super().__init__(namespace=self.namespace)
+        self.server = kwargs.pop("server", "")
+
+    def run(self, method_name, *args, **kwargs):
+        nats_user = kwargs.pop("_nats_user", None)
+        nats_password = kwargs.pop("_nats_password", None)
+        return_data = asyncio.run(
+            nats_client.request_v2(
+                self.namespace,
+                method_name,
+                server=self.server,
+                _nats_user=nats_user,
+                _nats_password=nats_password,
+                *args,
+                **kwargs,
+            )
+        )
+        return return_data
+
+
+class BaseOperationAnaRpc(object):
+    def __init__(self, *args, **kwargs):
+        params = {}
+        server = kwargs.get("server", None)
+        namespace = kwargs.get("namespace", None)
+        if server:
+            params["server"] = server
+        if namespace:
+            params["namespace"] = namespace
+        self.client = OperationAnalysisRpc(**params)

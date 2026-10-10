@@ -1,0 +1,197 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_sonicwall",
+  "plugin": "Firewall SonicWall SNMP",
+  "plugin_desc": "SNMP monitoring template for SonicWall firewall. It reports uptime, CPU utilization, memory utilization, temperature, fan, sessions/connections, max sessions, interface traffic, and NAT translations (enterprise PEN 8741).",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='firewall', collect_type='snmp_sonicwall'}) by (instance_id)",
+  "name": "Firewall",
+  "icon": "mm-firewall_防火墙",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='firewall'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "device_cpu_usage",
+    "device_memory_usage",
+    "firewall_active_sessions",
+    "device_total_incoming_traffic",
+    "device_total_outgoing_traffic"
+  ],
+  "display_fields": [],
+  "metrics": [
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='firewall', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the SonicWall firewall since the last restart, derived from sysUpTime. Monitoring uptime helps administrators understand device stability and identify unexpected reboots."
+    },
+    {
+      "metric_group": "Firewall",
+      "name": "device_cpu_usage",
+      "query": "snmp_device_cpu_usage{instance_type='firewall', __$labels__}",
+      "display_name": "CPU Usage",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Overall CPU utilization of the SonicWall firewall (SONICWALL-FIREWALL-IP-STATISTICS-MIB sonicCurrentCPUUtil) as a 0-100 percentage. Sustained high CPU usage can indicate inspection overload or attack traffic."
+    },
+    {
+      "metric_group": "Firewall",
+      "name": "device_cpu_usage_management",
+      "query": "snmp_device_cpu_usage_management{instance_type='firewall', __$labels__}",
+      "display_name": "Management CPU Usage",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Management-plane CPU utilization of the SonicWall firewall (SONICWALL-FIREWALL-IP-STATISTICS-MIB sonicCurrentManagementCPUUtil) as a 0-100 percentage."
+    },
+    {
+      "metric_group": "Firewall",
+      "name": "device_cpu_usage_fwd_inspect",
+      "query": "snmp_device_cpu_usage_fwd_inspect{instance_type='firewall', __$labels__}",
+      "display_name": "Forward and Inspect CPU Usage",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Forwarding and inspection CPU utilization of the SonicWall firewall (SONICWALL-FIREWALL-IP-STATISTICS-MIB sonicCurrentFwdAndInspectCPUUtil) as a 0-100 percentage."
+    },
+    {
+      "metric_group": "Firewall",
+      "name": "device_memory_usage",
+      "query": "snmp_device_memory_usage{instance_type='firewall', __$labels__}",
+      "display_name": "Memory Usage",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "RAM utilization of the SonicWall firewall (SONICWALL-FIREWALL-IP-STATISTICS-MIB sonicCurrentRAMUtil) reported directly as a 0-100 percentage. High memory pressure can degrade connection handling."
+    },
+    {
+      "metric_group": "Firewall",
+      "name": "firewall_active_sessions",
+      "query": "snmp_firewall_active_sessions{instance_type='firewall', __$labels__}",
+      "display_name": "Active Sessions",
+      "data_type": "Number",
+      "unit": "short",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Number of current connection-cache entries on the SonicWall firewall (SONICWALL-FIREWALL-IP-STATISTICS-MIB sonicCurrentConnCacheEntries). A rapid rise can indicate a connection flood or connection-cache exhaustion risk."
+    },
+    {
+      "metric_group": "Firewall",
+      "name": "firewall_max_connections",
+      "query": "snmp_firewall_max_connections{instance_type='firewall', __$labels__}",
+      "display_name": "Max Connections",
+      "data_type": "Number",
+      "unit": "short",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Maximum number of connection-cache entries supported by the SonicWall firewall (SONICWALL-FIREWALL-IP-STATISTICS-MIB sonicMaxConnCacheEntries). Combined with active sessions it gauges remaining connection-table headroom."
+    },
+    {
+      "metric_group": "Firewall",
+      "name": "firewall_nat_translations",
+      "query": "snmp_firewall_nat_translations{instance_type='firewall', __$labels__}",
+      "display_name": "NAT Translations",
+      "data_type": "Number",
+      "unit": "short",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Current number of NAT translation entries on the SonicWall firewall (SONICWALL-FIREWALL-IP-STATISTICS-MIB sonicNatTranslationCount)."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_sensor_value",
+      "query": "device_sensor_value{instance_type='firewall', __$labels__}",
+      "display_name": "Hardware Sensor Value",
+      "data_type": "Number",
+      "unit": "short",
+      "dimensions": [
+        {
+          "name": "device",
+          "description": "sensor device name"
+        },
+        {
+          "name": "unit",
+          "description": "sensor unit"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Raw hardware sensor reading from sonicwallSensorsTable (Device/Value/Unit). Temperature, fan, and power rows are identified by Name/Unit rather than invented status enumerations."
+    },
+    {
+      "metric_group": "Temperature",
+      "name": "device_temperature_celsius",
+      "query": "device_sensor_value{instance_type='firewall', __$labels__, unit=~\"(?i)^(C|°C|Celsius|degC)$\"} or device_sensor_value{instance_type='firewall', __$labels__, device=~\"(?i).*temp.*\"}",
+      "display_name": "Device Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [
+        {
+          "name": "device",
+          "description": "sensor device name"
+        },
+        {
+          "name": "unit",
+          "description": "sensor unit"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Hardware temperature rows from sonicwallSensorsTable, selected by Unit (C/Celsius) or Device name containing temp."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_fan_speed",
+      "query": "device_sensor_value{instance_type='firewall', __$labels__, unit=~\"(?i)^RPM$\"} or device_sensor_value{instance_type='firewall', __$labels__, device=~\"(?i).*fan.*\"}",
+      "display_name": "Fan Speed",
+      "data_type": "Number",
+      "unit": "short",
+      "dimensions": [
+        {
+          "name": "device",
+          "description": "sensor device name"
+        },
+        {
+          "name": "unit",
+          "description": "sensor unit"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Fan sensor rows from sonicwallSensorsTable, selected by Unit (RPM) or Device name containing fan. Values are the vendor-reported reading, not a normalized health enum."
+    }
+  ]
+}

@@ -1,0 +1,382 @@
+'use client';
+
+import React, { useEffect, useRef, useState } from 'react';
+import BaseTaskForm, { BaseTaskRef } from './baseTask';
+import { useCollectApi } from '@/app/cmdb/api';
+import { useTranslation } from '@/utils/i18n';
+import { useCollectionFormLayout } from '../hooks/useCollectionFormLayout';
+import { useTaskForm } from '../hooks/useTaskForm';
+import { getCleanupFormValues } from '../hooks/useTaskForm';
+import { TreeNode, ModelItem } from '@/app/cmdb/types/autoDiscovery';
+import { Form, Spin, message } from 'antd';
+import {
+  getCloudFormInitialValues,
+  PASSWORD_PLACEHOLDER,
+} from '@/app/cmdb/constants/professCollection';
+import { formatTaskValues, normalizeCredentialPool, trimFormString, withTaskCredentialSource } from '../hooks/formatTaskValues';
+import useAssetManageStore from '@/app/cmdb/store/useAssetManage';
+import CredentialPoolEditor from './credentialPoolEditor';
+import {
+  buildCloudCredential,
+  buildCloudRegionQueryParams,
+  getCloudCredentialConfig,
+  restoreCloudCredential,
+  validateCloudCredential,
+} from './cloudCredentialConfig';
+import { buildCloudCredentialHelp } from './credentialHelp';
+
+interface RegionItem {
+  cloud_type: string;
+  resource_id: string;
+  resource_name: string;
+  desc: string;
+  tag: any[];
+  extra: {
+    RegionEndpoint: string;
+  };
+  status: string;
+}
+
+interface cloudTaskFormProps {
+  onClose: () => void;
+  onSuccess?: () => void;
+  selectedNode: TreeNode;
+  modelItem: ModelItem;
+  editId?: number | null;
+}
+
+const CloudTask: React.FC<cloudTaskFormProps> = ({
+  onClose,
+  onSuccess,
+  selectedNode,
+  modelItem,
+  editId,
+}) => {
+  const { t } = useTranslation();
+  const collectionFormLayout = useCollectionFormLayout();
+  const baseRef = useRef<BaseTaskRef>(null as any);
+  const { model_id: modelId } = modelItem;
+  const cloudCredentialConfig = getCloudCredentialConfig(modelId);
+  const cloudFormInitialValues = getCloudFormInitialValues(modelItem.default_timeout);
+  const [regions, setRegions] = useState<RegionItem[]>([]);
+  const [loadingRegions, setLoadingRegions] = useState(false);
+  const collectApi = useCollectApi();
+  const { copyTaskData, setCopyTaskData, editingId } = useAssetManageStore();
+  const taskId = editId ?? editingId;
+
+  const {
+    form,
+    loading,
+    submitLoading,
+    fetchTaskDetail,
+    formatCycleValue,
+    onFinish,
+  } = useTaskForm({
+    modelId,
+    editId,
+    initialValues: cloudFormInitialValues,
+    onSuccess,
+    onClose,
+    formatValues: (values) => {
+      const credentialValue = normalizeCredentialPool(values.credentialPool)[0] || {};
+      const accessKey = trimFormString(credentialValue.accessKey);
+      const accessSecret = trimFormString(credentialValue.accessSecret);
+      const regionItem = regions.find(
+        (item: any) => item.resource_id === credentialValue.regionId
+      );
+
+      const baseData = formatTaskValues({
+        values,
+        baseRef,
+        selectedNode,
+        modelItem,
+        modelId,
+        formatCycleValue,
+      });
+
+      const instance = baseRef.current?.instOptions?.find(
+        (item) => item.value === values.instUuid
+      );
+
+      const credential = withTaskCredentialSource(credentialValue, buildCloudCredential(
+        modelId,
+        {
+          ...credentialValue,
+          accessKey,
+          accessSecret,
+        },
+        regionItem,
+      ));
+
+      return {
+        ...baseData,
+        instances: instance?.origin && [instance.origin],
+        credential: [credential],
+      };
+    },
+  });
+
+  // 构建表单值，用于复制任务和编辑任务中回填表单数据（true:复制任务，false:编辑任务）
+  const buildFormValues = (values: any, isCopy: boolean) => {
+    return {
+      ...getCleanupFormValues(values),
+      ...values,
+      taskName: isCopy ? '' : values.name,
+      credentialPool: [
+        withTaskCredentialSource(
+          normalizeCredentialPool(values.credential)[0] || {},
+          restoreCloudCredential(modelId, values.credential || {}, isCopy),
+        ),
+      ],
+      organization: values.team || [],
+      timeout: values.timeout,
+      instUuid: values.instances?.[0]?.inst_uuid,
+      accessPointId: values.access_point?.[0]?.id,
+    };
+  };
+
+  const fetchRegions = async (
+    accessKey: string,
+    accessSecret: string,
+    cloudRegionId: string,
+    refreshFlag = true,
+    host?: string,
+    projectId?: string,
+    savedTaskId: number | null = taskId,
+    vaultCredentialId?: string,
+  ) => {
+    const canUseSavedTask = Boolean(savedTaskId);
+    if ((!accessKey || !accessSecret) && !canUseSavedTask && !vaultCredentialId) return;
+    if (!cloudRegionId) return;
+    setLoadingRegions(true);
+    try {
+      const params = buildCloudRegionQueryParams({
+        modelId,
+        cloudRegionId,
+        accessKey,
+        accessSecret,
+        editId: savedTaskId,
+        vaultCredentialId,
+        host,
+        projectId,
+      });
+
+      const data = await collectApi.getCollectRegions(params);
+      setRegions(data || []);
+      if (refreshFlag) {
+        message.success(t('common.updateSuccess'));
+      }
+    } catch (error) {
+      console.error('获取regions失败:', error);
+    } finally {
+      setLoadingRegions(false);
+    }
+  };
+
+  const handleRefreshRegions = async (refreshFlag = false) => {
+    const rawValues = form.getFieldsValue(['credentialPool', 'accessPointId']);
+    const credentialValue = normalizeCredentialPool(rawValues.credentialPool)[0] || {};
+    const values = {
+      ...rawValues,
+      accessKey: trimFormString(credentialValue.accessKey),
+      accessSecret: trimFormString(credentialValue.accessSecret),
+      projectId: trimFormString(credentialValue.projectId),
+    };
+    const vaultCredentialId = credentialValue.credential_source === 'vault'
+      ? trimFormString(credentialValue.vault_credential_id)
+      : undefined;
+
+    form.setFieldValue('credentialPool', [{
+      ...credentialValue,
+      accessKey: values.accessKey,
+      accessSecret: values.accessSecret,
+    }]);
+
+    const isAbsentSecret = (value?: string) => {
+      const normalized = trimFormString(value);
+      return !normalized || normalized === PASSWORD_PLACEHOLDER;
+    };
+    const isCredentialUnchanged =
+      Boolean(taskId)
+      && isAbsentSecret(values.accessKey)
+      && isAbsentSecret(values.accessSecret);
+    const hasMixedCredentialState =
+      Boolean(taskId)
+      && isAbsentSecret(values.accessKey) !== isAbsentSecret(values.accessSecret);
+
+    if (!vaultCredentialId && hasMixedCredentialState) {
+      message.error(
+        `${t('common.inputMsg')}${t('Collection.cloudTask.accessKey')} / ${t('Collection.cloudTask.accessSecret')}`
+      );
+      return;
+    }
+
+    if (!vaultCredentialId && (!values.accessKey || !values.accessSecret) && !isCredentialUnchanged) {
+      const msg = !values.accessKey
+        ? t('Collection.cloudTask.accessKey')
+        : t('Collection.cloudTask.accessSecret');
+      message.error(t('common.inputMsg') + msg);
+      return;
+    }
+    if (
+      cloudCredentialConfig.requiresProjectId
+      && !trimFormString(values.projectId)
+    ) {
+      message.error(
+        t('common.inputMsg') + t('Collection.cloudTask.projectId'),
+      );
+      return;
+    }
+    if (!values.accessPointId) {
+      message.error(t('common.selectTip') + t('Collection.accessPoint'));
+      return;
+    }
+
+    const selectedAccessPoint = baseRef.current?.accessPoints?.find(
+      (item: any) => item.value === values.accessPointId,
+    );
+    const cloudRegion = selectedAccessPoint?.origin?.cloud_region || '';
+
+    const instUuid = form.getFieldValue('instUuid');
+    const instOption = baseRef.current?.instOptions?.find((item) => item.value === instUuid);
+    const endpoint = instOption?.origin?.endpoint;
+    const host = typeof endpoint === 'string' ? endpoint : undefined;
+
+    await fetchRegions(
+      values.accessKey,
+      values.accessSecret,
+      cloudRegion,
+      refreshFlag,
+      host,
+      values.projectId,
+      taskId,
+      vaultCredentialId,
+    );
+  };
+
+  const handleCredentialChange = () => {
+    setRegions([]);
+  };
+
+  useEffect(() => {
+    const initForm = async () => {
+      if (copyTaskData) {
+        const values = copyTaskData;
+        const regionItem = normalizeCredentialPool(values.credential)[0]?.regions;
+
+        // 复制任务中回填表单数据（此时任务名称和密码为空，需要用户手动输入）
+        form.setFieldsValue(buildFormValues(values, true));
+        setRegions(regionItem ? [regionItem] : []);
+      } else if (editId) {
+        const values = await fetchTaskDetail(editId);
+        const credentialItem = normalizeCredentialPool(values.credential)[0];
+        const regionItem = credentialItem?.regions;
+
+        // 编辑任务中回填表单数据
+        form.setFieldsValue(buildFormValues(values, false));
+        setRegions(regionItem ? [regionItem] : []);
+
+        const cloudRegion = values.access_point?.[0]?.cloud_region || '';
+        if (cloudRegion) {
+          fetchRegions(
+            PASSWORD_PLACEHOLDER,
+            PASSWORD_PLACEHOLDER,
+            cloudRegion,
+            false,
+            values.instances?.[0]?.endpoint || undefined,
+            undefined,
+            editId,
+          );
+        }
+      } else {
+        form.setFieldsValue({
+          ...cloudFormInitialValues,
+          credentialPool: [{ accessKey: '', accessSecret: '', regionId: '' }],
+        });
+      }
+    };
+    initForm();
+  }, [modelId, copyTaskData, setCopyTaskData, editId]);
+
+  const validateCredentialPool = (_: any, value?: any[]) => {
+    const credentialValue = normalizeCredentialPool(value)[0] || {};
+    if (credentialValue.credential_source === 'vault' && !credentialValue.vault_credential_id) {
+      return Promise.reject(new Error('请选择已有凭据'));
+    }
+    const invalidField = validateCloudCredential(modelId, credentialValue);
+    if (invalidField) {
+      const label = invalidField === 'accessKey'
+        ? t(cloudCredentialConfig.accessKeyLabelKey)
+        : invalidField === 'accessSecret'
+          ? t(cloudCredentialConfig.accessSecretLabelKey)
+          : invalidField === 'projectId'
+            ? t('Collection.cloudTask.projectId')
+            : t('Collection.cloudTask.region');
+      const prefix = invalidField === 'regionId'
+        ? t('common.selectTip')
+        : t('common.inputMsg');
+      return Promise.reject(new Error(prefix + label));
+    }
+    return Promise.resolve();
+  };
+
+  return (
+    <Spin spinning={loading}>
+      <Form
+        {...collectionFormLayout}
+        form={form}
+        onFinish={onFinish}
+        initialValues={cloudFormInitialValues}
+      >
+        <BaseTaskForm
+          ref={baseRef}
+          nodeId={selectedNode.id}
+          modelItem={modelItem}
+          onClose={onClose}
+          submitLoading={submitLoading}
+          instPlaceholder={`${t('Collection.cloudTask.cloudAccount')}`}
+          timeoutProps={{
+            min: 1,
+            max: 86400,
+            addonAfter: t('Collection.k8sTask.second'),
+          }}
+        >
+          <Form.Item
+            name="credentialPool"
+            rules={[{ validator: validateCredentialPool }]}
+            validateTrigger={[]}
+          >
+            <CredentialPoolEditor
+              collectModelId={modelId}
+              vaultCategory={modelItem.credential_category}
+              vaultTypeKeys={modelItem.credential_type_keys}
+              credentialShape="cloud"
+              editMode={Boolean(editId)}
+              maxCount={1}
+              allowAdd={false}
+              allowRemove={false}
+              showCount={false}
+              cloudRegionLoading={loadingRegions}
+              cloudRegionOptions={regions.map((item) => ({
+                label: item.resource_name,
+                value: item.resource_id,
+              }))}
+              onCloudRegionRefresh={() => handleRefreshRegions()}
+              onCredentialFieldChange={handleCredentialChange}
+              cloudCredentialLabels={{
+                accessKey: t(cloudCredentialConfig.accessKeyLabelKey),
+                accessSecret: t(cloudCredentialConfig.accessSecretLabelKey),
+                ...(cloudCredentialConfig.requiresProjectId
+                  ? { projectId: t('Collection.cloudTask.projectId') }
+                  : {}),
+              }}
+              credentialHelp={buildCloudCredentialHelp(modelId, t)}
+            />
+          </Form.Item>
+        </BaseTaskForm>
+      </Form>
+    </Spin>
+  );
+};
+
+export default CloudTask;

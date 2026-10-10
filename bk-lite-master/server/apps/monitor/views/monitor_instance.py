@@ -1,0 +1,642 @@
+import json
+
+from rest_framework import viewsets
+from rest_framework.decorators import action
+
+from apps.core.exceptions.base_app_exception import BaseAppException, UnauthorizedException
+from apps.core.utils.current_team_scope import (
+    assert_unassigned_catalog_access,
+    is_persisted_superuser,
+    missing_organization_q,
+    resolve_current_team_data_scope,
+    scope_permission_queryset,
+    validate_assignable_organizations,
+)
+from apps.core.utils.permission_utils import get_permission_rules
+from apps.core.utils.user_group import normalize_user_group_ids
+from apps.core.utils.web_utils import WebUtils
+from apps.monitor.constants.permission import PermissionConstants
+from apps.monitor.models import MonitorInstance, MonitorInstanceOrganization, MonitorObject
+from apps.monitor.services.effective_plugins import MonitorEffectivePluginService
+from apps.monitor.services.metrics import Metrics as MetricsService
+from apps.monitor.services.module_push import MonitorToCmdbPushService, build_monitor_push_actor_scope
+from apps.monitor.services.monitor_instance import InstanceSearch
+from apps.monitor.services.monitor_instance_removal import MonitorInstanceRemovalService
+from apps.monitor.services.monitor_object import MonitorObjectService
+from apps.monitor.services.node_mgmt import InstanceConfigService
+from apps.monitor.utils.dimension import normalize_instance_identity, parse_instance_id
+from apps.monitor.utils.pagination import parse_page_params
+
+# 已选资产回填等批量精确查询的单次上限，避免超长 URL / 过大 IN 子句。
+_MAX_INSTANCE_ID_IN = 200
+
+
+def _normalize_storage_instance_keys(raw_ids):
+    """将原始 instance_id 列表归一为去重后的存储键；非法项跳过。"""
+    normalized = []
+    seen = set()
+    for raw in raw_ids:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        try:
+            key = normalize_instance_identity(text)["storage_instance_key"]
+        except ValueError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return normalized
+
+
+def _parse_instance_id_filters(query_params):
+    """解析 list 的精确实例过滤。
+
+    返回 (instance_id, instance_ids, empty_response)：
+    - empty_response=True：调用方应直接返回空列表（非法单值等）
+    - instance_ids 非空时优先批量过滤
+    - 否则回落单值 instance_id
+    """
+    raw_in = (query_params.get("instance_id_in") or "").strip()
+    if raw_in:
+        try:
+            parsed = json.loads(raw_in)
+        except json.JSONDecodeError:
+            return None, None, True
+        if not isinstance(parsed, list):
+            return None, None, True
+        if len(parsed) > _MAX_INSTANCE_ID_IN:
+            parsed = parsed[:_MAX_INSTANCE_ID_IN]
+        keys = _normalize_storage_instance_keys(parsed)
+        if not keys:
+            return None, None, True
+        return None, keys, False
+
+    raw_instance_id = (query_params.get("instance_id") or "").strip()
+    if not raw_instance_id:
+        return None, None, False
+    try:
+        return normalize_instance_identity(raw_instance_id)["storage_instance_key"], None, False
+    except ValueError:
+        return None, None, True
+
+
+def _candidate_instance_ids(raw_instance_id):
+    """Lookup 候选主键：存储键优先，其次原始输入（兼容未补齐 tuple 的遗留 PK）。"""
+    text = str(raw_instance_id or "").strip()
+    if not text:
+        return []
+    try:
+        storage_key = normalize_instance_identity(text)["storage_instance_key"]
+    except ValueError:
+        return []
+    keys = []
+    seen = set()
+    for key in (storage_key, text):
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return keys
+
+
+def _build_actor_context(request):
+    scope = resolve_current_team_data_scope(request)
+
+    return {
+        "username": scope.username,
+        "domain": scope.domain,
+        "current_team": scope.current_team,
+        "include_children": scope.include_children,
+        "is_superuser": scope.is_superuser,
+        "group_list": normalize_user_group_ids(getattr(request.user, "group_list", [])),
+        "data_scope": scope,
+        "request": request,
+    }
+
+
+def _normalize_id_list(values):
+    normalized_ids = []
+    seen_ids = set()
+    for value in values:
+        if value in (None, ""):
+            continue
+        normalized_id = str(value)
+        if normalized_id in seen_ids:
+            continue
+        seen_ids.add(normalized_id)
+        normalized_ids.append(normalized_id)
+    return normalized_ids
+
+
+def _extract_vm_params(request):
+    """从 POST body 或 GET 查询串提取 vm_params（兼容 axios 的 vm_params[key] 形式）。"""
+    data = getattr(request, "data", None)
+    if isinstance(data, dict):
+        body_params = data.get("vm_params")
+        if isinstance(body_params, dict):
+            return body_params
+
+    params = {}
+    for key, value in request.GET.items():
+        if key.startswith("vm_params[") and key.endswith("]"):
+            params[key[len("vm_params[") : -1]] = value
+        elif key.startswith("vm_params."):
+            params[key[len("vm_params.") :]] = value
+    return params
+
+
+def _get_authorized_scope_groups(actor_context):
+    groups = set(InstanceConfigService._get_actor_scope_groups(actor_context) or [])
+    if not groups:
+        raise UnauthorizedException("当前组织无可用权限范围")
+    return groups
+
+
+def _ensure_target_organizations(organizations, actor_context, request=None):
+    request = request or actor_context.get("request")
+    if request is None:
+        raise BaseAppException("缺少组织分配请求上下文")
+    validate_assignable_organizations(request, organizations)
+
+
+def _ensure_instance_scope(instance_ids, actor_context):
+    normalized_ids = _normalize_id_list(instance_ids)
+    if not normalized_ids:
+        return normalized_ids
+
+    allowed_groups = _get_authorized_scope_groups(actor_context)
+    instance_org_map = {}
+    for instance_id, organization in MonitorInstanceOrganization.objects.filter(monitor_instance_id__in=normalized_ids).values_list(
+        "monitor_instance_id", "organization"
+    ):
+        instance_org_map.setdefault(str(instance_id), set()).add(organization)
+
+    unauthorized_ids = [instance_id for instance_id in normalized_ids if not instance_org_map.get(instance_id, set()).intersection(allowed_groups)]
+    if unauthorized_ids:
+        if actor_context.get("is_superuser"):
+            unauthorized_ids = [instance_id for instance_id in unauthorized_ids if instance_org_map.get(instance_id)]
+        if unauthorized_ids:
+            raise UnauthorizedException("无权限操作跨组织监控实例")
+
+    return normalized_ids
+
+
+def _ensure_operate_instances(request, instance_ids, actor_context=None, allow_missing=False):
+    normalized_ids = _normalize_id_list(instance_ids)
+    if not normalized_ids:
+        return []
+
+    actor_context = actor_context or _build_actor_context(request)
+    instances = list(
+        MonitorInstance.objects.filter(id__in=normalized_ids).values(
+            "id",
+            "monitor_object_id",
+        )
+    )
+    found_ids = {str(instance["id"]) for instance in instances}
+    # allow_missing: derived / auto-discovered instances (e.g. K8s Pod and Node)
+    # report metrics under an instance_id that has no MonitorInstance row. Read-only
+    # endpoints (e.g. effective_plugins) must tolerate their absence instead of 500-ing;
+    # only the instances that DO have a row are authorization-scoped below. Mutating
+    # callers keep allow_missing=False so a bogus instance_id still fails fast.
+    if found_ids != set(normalized_ids) and not allow_missing:
+        raise BaseAppException("监控实例不存在")
+
+    instances_by_object = {}
+    for instance in instances:
+        instances_by_object.setdefault(instance["monitor_object_id"], set()).add(str(instance["id"]))
+
+    for monitor_object_id, requested_ids in instances_by_object.items():
+        allowed_ids = {
+            str(instance_id)
+            for instance_id in InstanceConfigService._get_authorized_monitor_instances(
+                actor_context,
+                monitor_object_id,
+                require_operate=True,
+            )
+            .filter(id__in=requested_ids)
+            .values_list("id", flat=True)
+        }
+        unauthorized_ids = requested_ids - allowed_ids
+        if unauthorized_ids:
+            if not actor_context.get("is_superuser"):
+                raise UnauthorizedException("无权限操作指定监控实例")
+            assigned_ids = {
+                str(instance_id)
+                for instance_id in MonitorInstanceOrganization.objects.filter(monitor_instance_id__in=unauthorized_ids).values_list(
+                    "monitor_instance_id",
+                    flat=True,
+                )
+            }
+            if unauthorized_ids & assigned_ids:
+                raise UnauthorizedException("无权限操作指定监控实例")
+
+    if found_ids:
+        _ensure_instance_scope(found_ids, actor_context)
+    return normalized_ids
+
+
+def _monitor_catalog_queryset(request, permission, scope):
+    if assert_unassigned_catalog_access(request):
+        return MonitorInstance.objects.filter(missing_organization_q(MonitorInstanceOrganization, fk_name="monitor_instance_id"))
+    return scope_permission_queryset(
+        MonitorInstance,
+        permission,
+        scope,
+        team_key="monitorinstanceorganization__organization__in",
+        id_key="id__in",
+    )
+
+
+class MonitorInstanceViewSet(viewsets.ViewSet):
+    @action(methods=["get"], detail=False, url_path="query_params_enum/(?P<name>[^/.]+)")
+    def get_query_params_enum(self, request, name):
+        data = InstanceSearch.get_query_params_enum(name, request.GET.get("monitor_object_id"))
+        return WebUtils.response_success(data)
+
+    @action(methods=["get"], detail=False, url_path="lookup")
+    def lookup_monitor_instance(self, request):
+        """按 instance_id 一次定位所属监控对象，避免公开组件按对象类型逐个试探 list。"""
+        raw_instance_id = (request.GET.get("instance_id") or "").strip()
+        if not raw_instance_id:
+            raise BaseAppException("instance_id is required")
+
+        candidate_ids = _candidate_instance_ids(raw_instance_id)
+        if not candidate_ids:
+            return WebUtils.response_success(None)
+
+        scope = resolve_current_team_data_scope(request)
+        org_matches = list(
+            MonitorInstance.objects.filter(
+                id__in=candidate_ids,
+                is_deleted=False,
+                is_active=True,
+                monitorinstanceorganization__organization__in=list(scope.data_team_ids),
+            )
+            .select_related("monitor_object")
+            .distinct()
+        )
+        by_id = {instance.id: instance for instance in org_matches}
+        instance = next((by_id[key] for key in candidate_ids if key in by_id), None)
+        if instance is None and is_persisted_superuser(request.user):
+            org_matches = list(
+                MonitorInstance.objects.filter(
+                    id__in=candidate_ids,
+                    is_deleted=False,
+                    is_active=True,
+                )
+                .filter(missing_organization_q(MonitorInstanceOrganization, fk_name="monitor_instance_id"))
+                .select_related("monitor_object")
+            )
+            by_id = {row.id: row for row in org_matches}
+            instance = next((by_id[key] for key in candidate_ids if key in by_id), None)
+        if instance is None:
+            return WebUtils.response_success(None)
+
+        monitor_object_id = instance.monitor_object_id
+        permission = (
+            {"team": list(scope.data_team_ids), "instance": []}
+            if request.user.is_superuser
+            else get_permission_rules(
+                request.user,
+                scope.current_team,
+                "monitor",
+                f"{PermissionConstants.INSTANCE_MODULE}.{monitor_object_id}",
+                include_children=scope.include_children,
+            )
+        )
+        unassigned = is_persisted_superuser(request.user) and not MonitorInstanceOrganization.objects.filter(
+            monitor_instance_id=instance.pk
+        ).exists()
+        if not unassigned:
+            qs = scope_permission_queryset(
+                MonitorInstance,
+                permission,
+                scope,
+                team_key="monitorinstanceorganization__organization__in",
+                id_key="id__in",
+            )
+            if not qs.filter(pk=instance.pk).exists():
+                return WebUtils.response_success(None)
+
+        monitor_object = instance.monitor_object
+        instance_id_keys = list(monitor_object.instance_id_keys) if monitor_object.instance_id_keys else ["instance_id"]
+        operating_system = ""
+        if instance.node_id:
+            from apps.node_mgmt.models import Node
+
+            os_value = Node.objects.filter(id=instance.node_id).values_list("operating_system", flat=True).first()
+            text = str(os_value or "").strip().lower()
+            if text in {"linux", "windows"}:
+                operating_system = text
+        return WebUtils.response_success(
+            {
+                "monitor_object": {
+                    "id": monitor_object.id,
+                    "name": monitor_object.name,
+                    "display_name": monitor_object.display_name,
+                    "instance_id_keys": instance_id_keys,
+                },
+                "instance": {
+                    "instance_id": instance.id,
+                    "instance_name": instance.name or instance.id,
+                    "instance_id_values": list(parse_instance_id(instance.id)),
+                    "instance_id_keys": instance_id_keys,
+                    "cmdb_id": instance.cmdb_id or "",
+                    "node_id": instance.node_id or "",
+                    "operating_system": operating_system,
+                },
+            }
+        )
+
+    @action(methods=["get"], detail=False, url_path="(?P<monitor_object_id>[^/.]+)/list")
+    def monitor_instance_list(self, request, monitor_object_id):
+        """非特殊对象的通用列表接口"""
+        scope = resolve_current_team_data_scope(request)
+        permission = (
+            {"team": list(scope.data_team_ids), "instance": []}
+            if request.user.is_superuser
+            else get_permission_rules(
+                request.user,
+                scope.current_team,
+                "monitor",
+                f"{PermissionConstants.INSTANCE_MODULE}.{monitor_object_id}",
+                include_children=scope.include_children,
+            )
+        )
+
+        qs = _monitor_catalog_queryset(request, permission, scope)
+        page, page_size = parse_page_params(
+            request.GET,
+            default_page=1,
+            default_page_size=10,
+            allow_page_size_all=True,
+        )
+        add_metrics = str(request.GET.get("add_metrics", "")).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # 可选精确实例 ID（单值 instance_id 或批量 JSON instance_id_in）：
+        # 与 name 模糊搜索并存；非法值按无匹配返回，避免 500。
+        instance_id, instance_ids, empty_response = _parse_instance_id_filters(request.GET)
+        if empty_response:
+            return WebUtils.response_success({"count": 0, "results": []})
+        data = MonitorObjectService.get_monitor_instance(
+            int(monitor_object_id),
+            page,
+            page_size,
+            request.GET.get("name"),
+            qs,
+            add_metrics,
+            request.GET.get("monitor_plugin_id"),
+            visible_organization_ids=scope.data_team_ids,
+            vm_params=_extract_vm_params(request),
+            instance_id=instance_id,
+            instance_ids=instance_ids,
+            ordering=request.GET.get("ordering"),
+            order=request.GET.get("order", "asc"),
+        )
+        # 如果有权限规则，则添加到数据中
+        inst_permission_map = {i["id"]: i["permission"] for i in permission.get("instance", [])}
+        for instance_info in data["results"]:
+            if instance_info["instance_id"] in inst_permission_map:
+                instance_info["permission"] = inst_permission_map[instance_info["instance_id"]]
+            else:
+                instance_info["permission"] = PermissionConstants.DEFAULT_PERMISSION
+
+        if add_metrics:
+            MetricsService.convert_instance_list_metrics(int(monitor_object_id), data["results"])
+
+        return WebUtils.response_success(data)
+
+    @action(methods=["post"], detail=False, url_path="(?P<monitor_object_id>[^/.]+)/search")
+    def monitor_instance_search(self, request, monitor_object_id):
+        """特殊搜索接口，特殊对象不通用的查询条件"""
+
+        monitor_obj = MonitorObject.objects.filter(id=monitor_object_id).first()
+        if not monitor_obj:
+            raise BaseAppException("Monitor object does not exist")
+
+        scope = resolve_current_team_data_scope(request)
+        permission = (
+            {"team": list(scope.data_team_ids), "instance": []}
+            if request.user.is_superuser
+            else get_permission_rules(
+                request.user,
+                scope.current_team,
+                "monitor",
+                f"{PermissionConstants.INSTANCE_MODULE}.{monitor_object_id}",
+                include_children=scope.include_children,
+            )
+        )
+        qs = _monitor_catalog_queryset(request, permission, scope)
+
+        search_obj = InstanceSearch(
+            monitor_obj,
+            dict(**request.data),
+            qs=qs,
+            locale=request.user.locale,
+            visible_organization_ids=scope.data_team_ids,
+        )
+        data = search_obj.search()
+        # 如果有权限规则，则添加到数据中
+        inst_permission_map = {i["id"]: i["permission"] for i in permission.get("instance", [])}
+        for instance_info in data["results"]:
+            if instance_info["instance_id"] in inst_permission_map:
+                instance_info["permission"] = inst_permission_map[instance_info["instance_id"]]
+            else:
+                instance_info["permission"] = PermissionConstants.DEFAULT_PERMISSION
+
+        if request.data.get("add_metrics"):
+            MetricsService.convert_instance_list_metrics(int(monitor_object_id), data["results"])
+
+        return WebUtils.response_success(data)
+
+    @action(methods=["get"], detail=False, url_path="(?P<monitor_object_id>[^/.]+)/effective_plugins")
+    def effective_plugins(self, request, monitor_object_id):
+        instance_id = request.GET.get("instance_id")
+        if not instance_id:
+            raise BaseAppException("instance_id is required")
+
+        # 前端下传的可能是干净标量(如 "mssql_1433"),也可能是完整 tuple 串
+        # (如 VMware ESXi 的 "('vcenter-a', 'host-3171')")。统一归一为存储键形态：
+        # - 单维实例补齐为 "('mssql_1433',)"
+        # - 多维实例保持完整 tuple
+        # 这样既匹配存在性校验,也保证 get_effective_plugins 内部按存储键比对上报数据,
+        # 避免误报"监控实例不存在"。
+        instance_id = normalize_instance_identity(instance_id)["storage_instance_key"]
+
+        actor_context = _build_actor_context(request)
+        # Derived instances (K8s Pod/Node) have no MonitorInstance row; tolerate their
+        # absence so the detail view resolves plugins from reported metrics instead of 500-ing.
+        _ensure_operate_instances(request, [instance_id], actor_context, allow_missing=True)
+        data = MonitorEffectivePluginService.get_effective_plugins(
+            int(monitor_object_id),
+            instance_id,
+            getattr(request.user, "locale", "zh-Hans"),
+        )
+        return WebUtils.response_success(data)
+
+    @action(
+        methods=["post"],
+        detail=False,
+        url_path="(?P<monitor_object_id>[^/.]+)/list_by_primary_object",
+    )
+    def list_by_primary_object(self, request, monitor_object_id):
+        monitor_obj = MonitorObject.objects.filter(id=monitor_object_id).first()
+        if not monitor_obj:
+            raise BaseAppException("Monitor object does not exist")
+        if monitor_obj.parent_id:
+            raise BaseAppException("Only primary monitor objects support instance search")
+
+        scope = resolve_current_team_data_scope(request)
+        permission = (
+            {"team": list(scope.data_team_ids), "instance": []}
+            if request.user.is_superuser
+            else get_permission_rules(
+                request.user,
+                scope.current_team,
+                "monitor",
+                f"{PermissionConstants.INSTANCE_MODULE}.{monitor_object_id}",
+                include_children=scope.include_children,
+            )
+        )
+        qs = _monitor_catalog_queryset(request, permission, scope)
+
+        search_obj = InstanceSearch(
+            monitor_obj,
+            dict(**request.data),
+            qs=qs,
+            locale=request.user.locale,
+            visible_organization_ids=scope.data_team_ids,
+        )
+        data = search_obj.search_by_primary_object()
+        # 如果有权限规则，则添加到数据中
+        inst_permission_map = {i["id"]: i["permission"] for i in permission.get("instance", [])}
+        for instance_info in data["results"]:
+            if instance_info["instance_id"] in inst_permission_map:
+                instance_info["permission"] = inst_permission_map[instance_info["instance_id"]]
+            else:
+                instance_info["permission"] = PermissionConstants.DEFAULT_PERMISSION
+        return WebUtils.response_success(data)
+
+    @action(
+        methods=["post"],
+        detail=False,
+        url_path="(?P<monitor_object_id>[^/.]+)/generate_instance_id",
+    )
+    def generate_monitor_instance_id(self, request, monitor_object_id):
+        result = MonitorObjectService.generate_monitor_instance_id(
+            int(monitor_object_id),
+            request.data["monitor_instance_name"],
+            request.data["interval"],
+            actor_context=_build_actor_context(request),
+        )
+        return WebUtils.response_success(result)
+
+    @action(
+        methods=["post"],
+        detail=False,
+        url_path="(?P<monitor_object_id>[^/.]+)/check_monitor_instance",
+    )
+    def check_monitor_instance(self, request, monitor_object_id):
+        MonitorObjectService.check_monitor_instance(int(monitor_object_id), request.data)
+        return WebUtils.response_success()
+
+    @action(methods=["get"], detail=False, url_path="autodiscover_monitor_instance")
+    def autodiscover_monitor_instance(self, request):
+        MonitorObjectService.autodiscover_monitor_instance()
+        return WebUtils.response_success()
+
+    @action(methods=["post"], detail=False, url_path="remove_monitor_instance")
+    def remove_monitor_instance(self, request):
+        actor_context = _build_actor_context(request)
+        instance_ids = _ensure_operate_instances(
+            request,
+            request.data.get("instance_ids", []),
+            actor_context,
+            allow_missing=True,
+        )
+        MonitorInstanceRemovalService.remove(
+            instance_ids,
+            operator=actor_context.get("username") or getattr(request.user, "username", "system"),
+            reason="manual_instance_deleted",
+        )
+
+        return WebUtils.response_success()
+
+    @action(methods=["post"], detail=False, url_path="update_monitor_instance")
+    def update_monitor_instance(self, request):
+        actor_context = _build_actor_context(request)
+        _ensure_operate_instances(
+            request,
+            [request.data.get("instance_id")],
+            actor_context,
+        )
+        organizations = request.data.get("organizations")
+        if "organizations" in request.data:
+            _ensure_target_organizations(organizations, actor_context, request)
+        MonitorObjectService.update_instance(
+            request.data.get("instance_id"),
+            request.data.get("name"),
+            organizations,
+            actor_context=actor_context,
+        )
+        return WebUtils.response_success()
+
+    @action(methods=["post"], detail=False, url_path="push_to_cmdb")
+    def push_to_cmdb(self, request):
+        """显式推送到 CMDB：无级联，带 causation。"""
+        actor_context = _build_actor_context(request)
+        instance_id = request.data.get("instance_id")
+        _ensure_operate_instances(request, [instance_id], actor_context)
+        actor_scope = build_monitor_push_actor_scope(request)
+        try:
+            result = MonitorToCmdbPushService.push_instance(str(instance_id), actor_scope=actor_scope)
+        except ValueError as exc:
+            raise BaseAppException(str(exc)) from exc
+        return WebUtils.response_success(result)
+
+    @action(methods=["post"], detail=False, url_path="instances_remove_organizations")
+    def instances_remove_organizations(self, request):
+        """删除监控对象实例组织"""
+        actor_context = _build_actor_context(request)
+        instance_ids = _ensure_operate_instances(
+            request,
+            request.data.get("instance_ids", []),
+            actor_context,
+        )
+        organizations = request.data.get("organizations", [])
+        _ensure_target_organizations(organizations, actor_context, request)
+        MonitorObjectService.remove_instances_organizations(instance_ids, organizations)
+        return WebUtils.response_success()
+
+    @action(methods=["post"], detail=False, url_path="instances_add_organizations")
+    def instances_add_organizations(self, request):
+        """添加监控对象实例组织"""
+        actor_context = _build_actor_context(request)
+        instance_ids = _ensure_operate_instances(
+            request,
+            request.data.get("instance_ids", []),
+            actor_context,
+        )
+        organizations = request.data.get("organizations", [])
+        _ensure_target_organizations(organizations, actor_context, request)
+        MonitorObjectService.add_instances_organizations(instance_ids, organizations)
+        return WebUtils.response_success()
+
+    @action(methods=["post"], detail=False, url_path="set_instances_organizations")
+    def set_instances_organizations(self, request):
+        """设置监控对象实例组织"""
+        actor_context = _build_actor_context(request)
+        instance_ids = _ensure_operate_instances(
+            request,
+            request.data.get("instance_ids", []),
+            actor_context,
+        )
+        organizations = request.data.get("organizations", [])
+        _ensure_target_organizations(organizations, actor_context, request)
+        MonitorObjectService.set_instances_organizations(instance_ids, organizations)
+        return WebUtils.response_success()

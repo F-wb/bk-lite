@@ -1,0 +1,276 @@
+import useApiClient from '@/utils/request';
+import type {
+  InvocationLogParams,
+  InvocationLogResponse,
+  SkillListParams,
+  SkillListResponse,
+  SkillDetail,
+  RuleParams,
+  RuleResponse,
+  RulePayload,
+  LlmModel,
+  SkillDetailPayload,
+  SkillTool,
+  SkillTemplate,
+  CreateSkillPayload,
+  Skill,
+  SkillPackage,
+  SkillPackageListResponse,
+} from '@/app/opspilot/types/skill';
+import type { RedisInstanceFormValue } from '@/app/opspilot/components/skill/redisToolEditor';
+import type { MysqlInstanceFormValue } from '@/app/opspilot/components/skill/mysqlToolEditor';
+import type { OracleInstanceFormValue } from '@/app/opspilot/components/skill/oracleToolEditor';
+import type { MssqlInstanceFormValue } from '@/app/opspilot/components/skill/mssqlToolEditor';
+import type { PostgresInstanceFormValue } from '@/app/opspilot/components/skill/postgresToolEditor';
+import type { ElasticsearchInstanceFormValue } from '@/app/opspilot/components/skill/elasticsearchToolEditor';
+import type { JenkinsInstanceFormValue } from '@/app/opspilot/components/skill/jenkinsToolEditor';
+import type { KubernetesInstanceFormValue } from '@/app/opspilot/components/skill/kubernetesToolEditor';
+import type { ActiveDirectoryInstanceFormValue } from '@/app/opspilot/components/skill/activeDirectoryToolEditor';
+
+export const useSkillApi = () => {
+  const { get, post, patch, del, put } = useApiClient();
+
+  const fetchInvocationLogs = async (params: InvocationLogParams): Promise<InvocationLogResponse> => {
+    return get('/opspilot/model_provider_mgmt/skill_log/', { params });
+  };
+
+  const fetchSkill = async (params: SkillListParams): Promise<SkillListResponse> => {
+    return get('/opspilot/model_provider_mgmt/llm/', { params });
+  };
+
+  const fetchSkillDetail = async (id: string | null): Promise<SkillDetail> => {
+    return get(`/opspilot/model_provider_mgmt/llm/${id}/`);
+  };
+
+  const updateRule = async (key: string | number, postData: Partial<RulePayload>): Promise<void> => {
+    await patch(`/opspilot/model_provider_mgmt/rule/${key}/`, postData);
+  };
+
+  const createRule = async (postData: RulePayload): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/rule/', postData);
+  };
+
+  const fetchRules = async (params: RuleParams): Promise<RuleResponse> => {
+    return get('/opspilot/model_provider_mgmt/rule/', { params });
+  };
+
+  const deleteRule = async (id: number): Promise<void> => {
+    await del(`/opspilot/model_provider_mgmt/rule/${id}/`);
+  };
+
+  const fetchLlmModels = async (): Promise<LlmModel[]> => {
+    return get('/opspilot/model_provider_mgmt/llm_model/', { params: { enabled: 1 } });
+  };
+
+  const saveSkillDetail = async (id: string | null, payload: SkillDetailPayload): Promise<void> => {
+    await put(`/opspilot/model_provider_mgmt/llm/${id}/`, payload);
+  };
+
+  const fetchSkillTools = async (): Promise<SkillTool[]> => {
+    return get('/opspilot/model_provider_mgmt/skill_tools/');
+  };
+
+  const testRedisConnection = async (instance: Omit<RedisInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_redis_connection/', instance);
+  };
+
+  const testMysqlConnection = async (instance: Omit<MysqlInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_mysql_connection/', instance);
+  };
+
+  const testOracleConnection = async (instance: Omit<OracleInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_oracle_connection/', instance);
+  };
+
+  const testMssqlConnection = async (instance: Omit<MssqlInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_mssql_connection/', instance);
+  };
+
+  const testPostgresConnection = async (instance: Omit<PostgresInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_postgres_connection/', instance);
+  };
+
+  const testEsConnection = async (instance: Omit<ElasticsearchInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_es_connection/', instance);
+  };
+
+  const testJenkinsConnection = async (instance: Omit<JenkinsInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_jenkins_connection/', instance);
+  };
+
+  const testKubernetesConnection = async (instance: Omit<KubernetesInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_kubernetes_connection/', instance);
+  };
+
+  const testAdConnection = async (instance: Omit<ActiveDirectoryInstanceFormValue, 'testStatus'>): Promise<void> => {
+    await post('/opspilot/model_provider_mgmt/skill_tools/test_ad_connection/', instance);
+  };
+
+  const fetchSkillTemplates = async (): Promise<SkillTemplate[]> => {
+    return get('/opspilot/model_provider_mgmt/llm/get_template_list/');
+  };
+
+  const createSkill = async (payload: CreateSkillPayload): Promise<Skill> => {
+    return post('/opspilot/model_provider_mgmt/llm/', payload);
+  };
+
+  const togglePin = async (id: string | number): Promise<void> => {
+    return post(`/opspilot/model_provider_mgmt/llm/${id}/toggle_pin/`);
+  };
+
+  const fetchSkillPackages = async (params?: { search?: string; is_enabled?: boolean | number }): Promise<SkillPackageListResponse> => {
+    const response = await get('/opspilot/model_provider_mgmt/skill_packages/', { params });
+    if (Array.isArray(response)) {
+      return { items: response, count: response.length };
+    }
+    return {
+      items: response?.items || response?.results || [],
+      count: response?.count ?? response?.items?.length ?? response?.results?.length ?? 0,
+    };
+  };
+
+  const importSkillPackageZip = async (file: File): Promise<SkillPackage> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return post('/opspilot/model_provider_mgmt/skill_packages/import_zip/', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+  };
+
+  const updateSkillPackage = async (id: number, payload: Partial<SkillPackage>): Promise<SkillPackage> => {
+    return patch(`/opspilot/model_provider_mgmt/skill_packages/${id}/`, payload);
+  };
+
+  const deleteSkillPackage = async (id: number): Promise<void> => {
+    await del(`/opspilot/model_provider_mgmt/skill_packages/${id}/`);
+  };
+
+  const fetchSkillChannels = async (skillId: string | number) => {
+    const res = await get('/opspilot/model_provider_mgmt/skill_channel/', {
+      params: { skill_id: skillId },
+    });
+    return (res?.data ?? res) as any[];
+  };
+
+  const createSkillChannel = async (payload: Record<string, any>) => {
+    const res = await post('/opspilot/model_provider_mgmt/skill_channel/', payload);
+    return res?.data ?? res;
+  };
+
+  const updateSkillChannel = async (id: number | string, payload: Record<string, any>) => {
+    const res = await put(`/opspilot/model_provider_mgmt/skill_channel/${id}/`, payload);
+    return res?.data ?? res;
+  };
+
+  const setSkillChannelEnabled = async (id: number | string, enabled: boolean) => {
+    const res = await post(`/opspilot/model_provider_mgmt/skill_channel/${id}/set_enabled/`, { enabled });
+    return res?.data ?? res;
+  };
+
+  const deleteSkillChannel = async (id: number | string): Promise<void> => {
+    await del(`/opspilot/model_provider_mgmt/skill_channel/${id}/`);
+  };
+
+  const fetchWebChatSkillChannels = async () => {
+    const res = await get('/opspilot/skill_channel/web_chat/');
+    return (res?.data ?? res) as any[];
+  };
+
+  const fetchPublishedWebSkills = async () => {
+    const res = await get('/opspilot/skill_channel/web_skills/');
+    return (res?.data ?? res) as any[];
+  };
+
+  const getPublishedWebSkillChatUrl = (skillId: number | string) =>
+    `/api/proxy/opspilot/skill_channel/skill/${skillId}/chat/`;
+
+  const fetchSkillConversations = async (channelId: number | string) => {
+    const res = await get('/opspilot/skill_channel/conversations/', {
+      params: { channel_id: channelId },
+    });
+    return (res?.data ?? res) as any[];
+  };
+
+  const fetchSkillSessionMessages = async (sessionId: string) => {
+    const res = await get('/opspilot/skill_channel/conversations/messages/', {
+      params: { session_id: sessionId },
+    });
+    if (Array.isArray(res)) {
+      return { messages: res, llm_context_usage: null };
+    }
+    return {
+      messages: Array.isArray(res?.messages) ? res.messages : [],
+      llm_context_usage: res?.llm_context_usage ?? null,
+    };
+  };
+
+  const deleteSkillSession = async (sessionId: string): Promise<void> => {
+    await post('/opspilot/skill_channel/conversations/delete/', { session_id: sessionId });
+  };
+
+  const fetchAdminSkillConversations = async (params: Record<string, string | number | undefined>) => {
+    const res = await get('/opspilot/model_provider_mgmt/skill_channel/admin_conversations/', {
+      params,
+    });
+    const payload = res?.data ?? res;
+    return {
+      items: Array.isArray(payload?.items) ? payload.items : [],
+      count: Number(payload?.count || 0),
+    };
+  };
+
+  const fetchAdminSkillSessionMessages = async (sessionId: string) => {
+    const res = await get('/opspilot/model_provider_mgmt/skill_channel/admin_conversation_messages/', {
+      params: { session_id: sessionId },
+    });
+    const payload = res?.data ?? res;
+    if (Array.isArray(payload)) {
+      return payload;
+    }
+    return Array.isArray(payload?.messages) ? payload.messages : [];
+  };
+
+  return {
+    fetchInvocationLogs,
+    fetchSkill,
+    fetchSkillDetail,
+    updateRule,
+    createRule,
+    fetchRules,
+    deleteRule,
+    fetchLlmModels,
+    saveSkillDetail,
+    fetchSkillTools,
+    testRedisConnection,
+    testMysqlConnection,
+    testOracleConnection,
+    testMssqlConnection,
+    testPostgresConnection,
+    testEsConnection,
+    testJenkinsConnection,
+    testKubernetesConnection,
+    testAdConnection,
+    fetchSkillTemplates,
+    createSkill,
+    togglePin,
+    fetchSkillPackages,
+    importSkillPackageZip,
+    updateSkillPackage,
+    deleteSkillPackage,
+    fetchSkillChannels,
+    createSkillChannel,
+    updateSkillChannel,
+    setSkillChannelEnabled,
+    deleteSkillChannel,
+    fetchWebChatSkillChannels,
+    fetchPublishedWebSkills,
+    getPublishedWebSkillChatUrl,
+    fetchSkillConversations,
+    fetchSkillSessionMessages,
+    deleteSkillSession,
+    fetchAdminSkillConversations,
+    fetchAdminSkillSessionMessages,
+  };
+};

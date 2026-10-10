@@ -1,0 +1,72 @@
+.conditionItem :global(.ant-btn-default) {
+    min-width: 32px;
+}
+
+.conditionItem {
+    .itemLabel {
+        font-weight: 600;
+        font-size: 13px;
+        margin-bottom: 10px;
+    }
+
+    .itemOption {
+        display: flex;
+    }
+
+    .source {
+        .sourceObjectType {
+        }
+
+        .sourceObject {
+        }
+    }
+
+    .conditions {
+        display: flex;
+        flex-wrap: wrap;
+        margin-bottom: -10px;
+
+        .conditionTitle {
+            height: 32px;
+            line-height: 32px;
+            margin-right: 10px;
+        }
+
+        .filter {
+            margin-bottom: 10px;
+        }
+    }
+}
+
+.conditionItem .source .sourceObjectType :global(.ant-select-selector) {
+    border-radius: 6px 0 0 6px;
+}
+
+.conditionItem .source .sourceObject :global(.ant-select-selector) {
+    border-radius: 0 6px 6px 0;
+}
+
+.conditionItem .conditions .filter :global(.ant-btn:nth-of-type(1)) {
+    border-radius: 0 6px 6px 0;
+    margin-right: 10px;
+}
+
+.conditionItem .conditions .filter :global(.ant-btn:nth-of-type(2)) {
+    margin-right: 10px;
+}
+
+.conditionItem .conditions .filter :global(.ant-btn) {
+    background: var(--color-fill-2);
+}
+
+.conditionItem .conditions .filter :global(.ant-btn-icon) {
+    transform: scale(0.8);
+}
+
+.conditionItem .conditions .filter :global(.ant-select-selector) {
+    border-radius: 0;
+}
+
+.conditionItem .conditions .filter :global(.ant-input) {
+    border-radius: 0;
+}

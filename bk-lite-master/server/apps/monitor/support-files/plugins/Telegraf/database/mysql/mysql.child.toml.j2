@@ -1,0 +1,131 @@
+[[inputs.mysql]]
+    startup_error_behavior = "retry"
+    servers = ["{{ username }}:${PASSWORD__{{ config_id }}}@tcp({{ host }}:{{ port }})/?tls=false"]
+    metric_version = 2
+    interval = "{{ interval }}s"
+
+    # 扩展采集项：核心开关由表单控制。
+    # 默认 true 的开关用 | default(true)（勿加 boolean=true，否则显式 false 会被当成缺失盖掉）。
+    # 默认 false 的开关可用 | default(false, true)，falsey 与未传均落 false。
+    gather_process_list = {{ gather_process_list | default(true) | lower }}
+    gather_user_statistics = false
+    gather_innodb_metrics = {{ gather_innodb_metrics | default(true) | lower }}
+    gather_slave_status = {{ gather_slave_status | default(false, true) | lower }}
+    gather_replica_status = {{ gather_replica_status | default(false, true) | lower }}
+    gather_binary_logs = {{ gather_binary_logs | default(false, true) | lower }}
+    gather_global_variables = {{ gather_global_variables | default(true) | lower }}
+    gather_table_schema = false
+    gather_table_io_waits = {{ gather_table_io_waits | default(false, true) | lower }}
+    gather_table_lock_waits = {{ gather_table_lock_waits | default(false, true) | lower }}
+
+    # 慢速 SQL 相关采集间隔
+    interval_slow = "10s"
+    table_schema_databases = []
+
+    fieldinclude = [
+      # 连接状态
+      "uptime",
+      "threads_connected",
+      "threads_running",
+      "threads_cached",
+      "threads_idle",
+      "threads_executing",
+      "threads_sending_data",
+      "threads_waiting_for_lock",
+      "max_used_connections",
+      "aborted_connects",
+      "aborted_clients",
+      "connection_errors_internal",
+      "connection_errors_max_connections",
+      "connection_errors_peer_address",
+      "connection_errors_select",
+      "connection_errors_tcpwrap",
+
+      # 查询性能
+      "slow_queries",
+      "queries",
+      "questions",
+      "com_select",
+      "com_insert",
+      "com_update",
+      "com_delete",
+
+      # InnoDB 性能
+      "innodb_row_lock_time_avg",
+      "innodb_row_lock_waits",
+      "innodb_data_reads",
+      "innodb_data_writes",
+      "innodb_data_fsyncs",
+      "innodb_os_log_fsyncs",
+      "innodb_buffer_pool_read_requests",
+      "innodb_buffer_pool_reads",
+      "innodb_buffer_pool_pages_free",
+      "innodb_buffer_pool_pages_dirty",
+      "innodb_buffer_pool_pages_total",
+
+      # 网络流量
+      "bytes_received",
+      "bytes_sent",
+
+      # 表缓存
+      "open_tables",
+      "opened_tables",
+      "open_files",
+      "table_open_cache_hits",
+      "table_open_cache_misses",
+
+      # MyISAM/键缓存
+      "key_reads",
+      "key_read_requests",
+
+      # 临时表
+      "created_tmp_disk_tables",
+      "created_tmp_tables",
+
+      # 全局变量
+      "max_connections",
+      "table_open_cache",
+      "open_files_limit",
+      "tmp_table_size",
+      "max_heap_table_size",
+      "innodb_buffer_pool_size",
+
+      # 主从/角色状态
+      "read_only",
+      "super_read_only",
+      "log_bin",
+      "log_slave_updates",
+      "slave_seconds_behind_master",
+      "slave_slave_io_running",
+      "slave_slave_sql_running",
+
+      # Binary Log（需 gather_binary_logs）
+      "binary_files_count",
+      "binary_size_bytes",
+
+      # 表 IO wait（需 gather_table_io_waits，measurement=mysql_perf_schema）
+      "table_io_waits_total_fetch",
+      "table_io_waits_total_insert",
+      "table_io_waits_total_update",
+      "table_io_waits_total_delete",
+      "table_io_waits_seconds_total_fetch",
+      "table_io_waits_seconds_total_insert",
+      "table_io_waits_seconds_total_update",
+      "table_io_waits_seconds_total_delete",
+
+      # 表锁 wait（需 gather_table_lock_waits；不含过于泛化的 read/write 字段名）
+      "read_normal",
+      "read_with_shared_locks",
+      "read_high_priority",
+      "read_no_insert",
+      "write_normal",
+      "write_allow_write",
+      "write_concurrent_insert",
+      "write_low_priority"
+    ]
+
+    [inputs.mysql.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "database"
+        config_type = "mysql"

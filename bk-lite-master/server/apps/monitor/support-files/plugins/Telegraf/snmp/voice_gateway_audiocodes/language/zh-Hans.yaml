@@ -1,0 +1,52 @@
+VoiceGateway AudioCodes SNMP:
+  name: AudioCodes (Telegraf)
+  desc: 面向 AudioCodes 语音网关的 SNMP 监控模板，可采集运行时长、接口流量、语音面与数据面 CPU / 内存使用率、板卡温度（企业号 PEN 5003）。
+monitor_object:
+  VoiceGateway: 语音网关
+monitor_object_type:
+  Network Device: 网络设备
+monitor_object_metric:
+  VoiceGateway:
+    snmp_uptime:
+      name: 系统运行时间
+      desc: 该指标表示设备自上次启动以来的运行时间（来自 sysUpTime）。通过监测设备运行时间，网络管理员可以了解设备的稳定性与可靠性，识别潜在的重启或故障问题。
+    interface_ifHCInOctets:
+      name: 接口接收流量速率
+      desc: 此指标表示过去5分钟内接收到的字节数的平均速率（来自 64 位 IF-MIB ifHCInOctets 计数器，ifXTable），单位为字节每秒。64
+        位计数器可避免 32 位 ifInOctets 在高速口上快速回绕，使流量速率更准确。
+    interface_ifHCOutOctets:
+      name: 接口发送流量速率
+      desc: 该指标计算过去5分钟内发送的字节数的平均速率（来自 64 位 IF-MIB ifHCOutOctets 计数器，ifXTable），单位为字节每秒。64
+        位计数器可避免 32 位 ifOutOctets 在高速口上快速回绕，使流量速率更准确。
+    device_total_incoming_traffic:
+      name: 设备接收总流量速率
+      desc: 此指标表示整个设备在过去5分钟内接收到的总字节流量的平均速率（按所有接口的 64 位 ifHCInOctets 汇总），单位为字节每秒。帮助管理员获取整个设备的接收流量情况，支持总体流量监控与容量规划。
+    device_total_outgoing_traffic:
+      name: 设备发送总流量速率
+      desc: 此指标表示整个设备在过去5分钟内发送的总字节流量的平均速率（按所有接口的 64 位 ifHCOutOctets 汇总），单位为字节每秒。帮助管理员评估整个系统的发送性能，进行更有效的流量管理与优化。
+    device_cpu_usage:
+      name: 语音面 CPU 使用率
+      desc: AudioCodes 语音网关语音（VoIP）处理器 CPU 使用率（AC-SYSTEM-MIB acSysStateVoIpCpuUtilization），单位百分比。
+    device_data_cpu_usage:
+      name: 数据面 CPU 使用率
+      desc: AudioCodes 语音网关数据面处理器 CPU 使用率（acSysStateDataCpuUtilization），单位百分比；无数据面的机型不上报。
+    device_memory_usage:
+      name: 语音面内存使用率
+      desc: AudioCodes 语音网关语音（VoIP）内存使用率（acSysStateVoIpMemoryUtilization），单位百分比。
+    device_data_memory_usage:
+      name: 数据面内存使用率
+      desc: AudioCodes 语音网关数据面内存使用率（acSysStateDataMemoryUtilization），单位百分比；无数据面的机型不上报。
+    device_temperature_celsius:
+      name: 板卡温度
+      desc: AudioCodes 语音网关板卡温度（acSysStateTemperature），单位摄氏度，厂商建议不超过 60℃。用于识别散热异常或过热风险。
+    device_psu_state:
+      name: 电源状态
+      desc: 语音网关电源状态，归一后 1 表示正常，2 表示异常。
+monitor_object_metric_group:
+  VoiceGateway:
+    Base: 基础
+    Traffic: 流量
+    CPU: CPU
+    Memory: 内存
+    Temperature: 温度
+    Hardware Status: 硬件状态

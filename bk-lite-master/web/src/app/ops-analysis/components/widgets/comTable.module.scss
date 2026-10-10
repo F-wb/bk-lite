@@ -1,0 +1,147 @@
+.screenDarkRoot {
+  color: var(--ops-screen-table-text);
+}
+
+.screenDarkTableWrap {
+  height: 100%;
+  min-height: 0;
+
+  > :global([class*="customTable"]) {
+    display: flex;
+    flex-direction: column;
+    height: 100% !important;
+    min-height: 0;
+  }
+
+  > :global([class*="customTable"]) > :global(.ant-table-wrapper) {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  > :global([class*="customTable"]) > :global(.absolute.right-0.bottom-0) {
+    position: static !important;
+    flex: 0 0 auto;
+    width: 100%;
+    justify-content: flex-end;
+    padding-top: var(--ops-screen-table-pagination-gap, 6px);
+  }
+
+  :global(.ant-pagination) {
+    color: var(--ops-screen-table-muted);
+    font-size: var(--ops-screen-table-pagination-font-size, 12px);
+  }
+
+  :global(.ant-pagination-total-text) {
+    color: var(--ops-screen-table-muted);
+    font-size: var(--ops-screen-table-pagination-font-size, 12px);
+  }
+
+  :global(.ant-pagination-item),
+  :global(.ant-pagination-prev .ant-pagination-item-link),
+  :global(.ant-pagination-next .ant-pagination-item-link) {
+    background: var(--ops-screen-table-control-bg);
+    border-color: var(--ops-screen-table-border);
+  }
+
+  :global(.ant-pagination-item a),
+  :global(.ant-pagination-prev button),
+  :global(.ant-pagination-next button) {
+    color: var(--ops-screen-table-text);
+  }
+
+  :global(.ant-pagination-item-active) {
+    background: var(--ops-screen-table-row-hover-bg);
+    border-color: var(--ops-screen-table-accent);
+  }
+
+  :global(.ant-pagination-item-active a) {
+    color: var(--ops-screen-table-heading);
+  }
+
+  :global(.ant-pagination-options .ant-select-selector) {
+    color: var(--ops-screen-table-text) !important;
+    background: var(--ops-screen-table-control-bg) !important;
+    border-color: var(--ops-screen-table-border) !important;
+  }
+}
+
+.screenDarkTable {
+  :global(.ant-table) {
+    color: var(--ops-screen-table-text);
+    background: transparent;
+  }
+
+  :global(.ant-table-container) {
+    border-color: var(--ops-screen-table-border);
+  }
+
+  :global(.ant-table-thead > tr > th) {
+    padding: var(--ops-screen-table-cell-padding-y, 8px) var(--ops-screen-table-cell-padding-x, 10px);
+    color: var(--ops-screen-table-heading);
+    font-size: var(--ops-screen-table-header-font-size, 12px);
+    font-weight: 600;
+    line-height: var(--ops-screen-table-line-height, 18px);
+    background: var(--ops-screen-table-subtle-bg) !important;
+    border-bottom: 1px solid var(--ops-screen-table-border);
+  }
+
+  :global(.ant-table-thead > tr > th::before) {
+    background: var(--ops-screen-table-border) !important;
+  }
+
+  :global(.ant-table-tbody > tr > td) {
+    padding: var(--ops-screen-table-cell-padding-y, 8px) var(--ops-screen-table-cell-padding-x, 10px);
+    color: var(--ops-screen-table-text);
+    font-size: var(--ops-screen-table-body-font-size, 12px);
+    line-height: var(--ops-screen-table-line-height, 18px);
+    background: var(--ops-screen-table-row-bg);
+    border-bottom: 1px solid var(--ops-screen-table-border);
+  }
+
+  :global(.ant-table-tbody > tr:nth-child(even) > td) {
+    background: var(--ops-screen-table-row-alt-bg);
+  }
+
+  :global(.ant-table-tbody > tr.ant-table-row:hover > td),
+  :global(.ant-table-tbody > tr > td.ant-table-cell-row-hover) {
+    background: var(--ops-screen-table-row-hover-bg) !important;
+  }
+
+  :global(.ant-table-placeholder),
+  :global(.ant-table-placeholder:hover > td) {
+    background: transparent !important;
+  }
+
+  :global(.ant-empty-description) {
+    color: var(--ops-screen-table-muted);
+  }
+
+  :global(.ant-table-cell-scrollbar) {
+    box-shadow: none;
+  }
+
+  :global(.ant-table-body),
+  :global(.ant-table-content) {
+    scrollbar-color:
+      var(--screen-table-scrollbar-thumb, var(--ops-screen-table-scrollbar-thumb))
+      var(--screen-table-scrollbar-track, var(--ops-screen-table-scrollbar-track));
+  }
+
+  :global(.ant-table-body::-webkit-scrollbar),
+  :global(.ant-table-content::-webkit-scrollbar) {
+    width: var(--ops-screen-table-scrollbar-size, 8px);
+    height: var(--ops-screen-table-scrollbar-size, 8px);
+  }
+
+  :global(.ant-table-body::-webkit-scrollbar-thumb),
+  :global(.ant-table-content::-webkit-scrollbar-thumb) {
+    background: var(--screen-table-scrollbar-thumb, var(--ops-screen-table-scrollbar-thumb));
+    border-radius: 999px;
+  }
+
+  :global(.ant-table-body::-webkit-scrollbar-track),
+  :global(.ant-table-content::-webkit-scrollbar-track) {
+    background: var(--screen-table-scrollbar-track, var(--ops-screen-table-scrollbar-track));
+  }
+}

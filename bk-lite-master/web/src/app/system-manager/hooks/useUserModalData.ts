@@ -1,0 +1,439 @@
+'use client';
+
+import { useState, useCallback, useRef } from 'react';
+import type { FormInstance } from 'antd';
+import { message } from 'antd';
+import type { DataNode as TreeDataNode } from 'antd/lib/tree';
+import { useTranslation } from '@/utils/i18n';
+import { useUserApi } from '@/app/system-manager/api/user/index';
+import { useGroupApi } from '@/app/system-manager/api/group/index';
+import { useClientData } from '@/context/client';
+import {
+  type GroupRules,
+  type TreeSelectNode,
+  type UserDetailResponse,
+  processRoleTreeData,
+  extractGroupIds,
+  extractPersonalRoleIds,
+  buildGroupRulesFromUserDetail,
+  buildFormValuesFromUserDetail,
+  buildUserPayload,
+  hasNormalGroupSelection,
+  mergeRoles,
+} from '@/app/system-manager/utils/userFormUtils';
+import { useSensitiveFieldEditBehavior as useCESensitiveFieldEditBehavior } from '@/app/system-manager/hooks/useSensitiveFieldEditBehavior';
+
+const loadSensitiveHook = () => {
+  try {
+    // EE 增强判断：优先加载 enterprise hook，缺失时回退到 CE 默认实现。
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('@/app/system-manager/(enterprise)/hooks/useSensitiveFieldEditBehavior');
+    return mod.useSensitiveFieldEditBehavior || useCESensitiveFieldEditBehavior;
+  } catch {
+    return useCESensitiveFieldEditBehavior;
+  }
+};
+const useSensitiveFieldEditBehavior = loadSensitiveHook();
+
+interface ModalConfig {
+  type: 'add' | 'edit';
+  userId?: string;
+  groupKeys?: React.Key[];
+  groupTreeData?: TreeSelectNode[];
+}
+
+interface UseUserModalDataReturn {
+  formRef: React.RefObject<FormInstance | null>;
+  visible: boolean;
+  loading: boolean;
+  roleLoading: boolean;
+  isSubmitting: boolean;
+  type: 'add' | 'edit';
+  roleTreeData: TreeDataNode[];
+  selectedGroups: React.Key[];
+  selectedRoles: number[];
+  personalRoleIds: number[];
+  groupRules: GroupRules;
+  organizationRoleIds: number[];
+  organizationRoleSourceMap: Record<string, string>;
+  isSuperuser: boolean;
+  isSyncedUser: boolean;
+  currentUserId: string;
+  setSelectedGroups: (groups: React.Key[]) => void;
+  setSelectedRoles: (roles: number[]) => void;
+  handleRoleChange: (newRoleIds: React.Key[]) => void;
+  handleSuperuserChange: (value: boolean) => void;
+  setGroupRules: (rules: GroupRules) => void;
+  setIsSuperuser: (value: boolean) => void;
+  showModal: (config: ModalConfig) => void;
+  handleCancel: () => void;
+  handleConfirm: (onSuccess: () => void) => Promise<void>;
+  handleGroupChange: (newGroupIds: React.Key[]) => Promise<void>;
+  handleChangeRule: (newKey: number, newRules: { [app: string]: number }) => void;
+  sensitiveBehavior: ReturnType<typeof useSensitiveFieldEditBehavior>;
+}
+
+export function useUserModalData(): UseUserModalDataReturn {
+  const { t } = useTranslation();
+  const formRef = useRef<FormInstance>(null);
+  const { clientData } = useClientData();
+
+  const [currentUserId, setCurrentUserId] = useState('');
+  const [visible, setVisible] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [roleLoading, setRoleLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [type, setType] = useState<'add' | 'edit'>('add');
+  const [roleTreeData, setRoleTreeData] = useState<TreeDataNode[]>([]);
+  const [selectedGroups, setSelectedGroups] = useState<React.Key[]>([]);
+  const [selectedRoles, setSelectedRoles] = useState<number[]>([]);
+  const [personalRoleIds, setPersonalRoleIds] = useState<number[]>([]);
+  const [groupRules, setGroupRules] = useState<GroupRules>({});
+  const [organizationRoleIds, setOrganizationRoleIds] = useState<number[]>([]);
+  const [organizationRoleSourceMap, setOrganizationRoleSourceMap] = useState<Record<string, string>>({});
+  const [isSuperuser, setIsSuperuser] = useState<boolean>(false);
+  const [isSyncedUser, setIsSyncedUser] = useState(false);
+  const [groupTreeData, setGroupTreeData] = useState<TreeSelectNode[]>([]);
+  // 普通→超级管理员切换时缓存个人角色；切回普通时恢复，避免来回切换清空
+  const cachedPersonalRoleIds = useRef<number[]>([]);
+
+  const { addUser, editUser, getUserDetail, getRoleList } = useUserApi();
+  const { batchGetGroupDetailWithRoles } = useGroupApi();
+
+  const sensitiveBehavior = useSensitiveFieldEditBehavior(formRef);
+  const { initField, isAnyFieldEditing, cleanPayload } = sensitiveBehavior;
+
+  const fetchRoleInfoWithOrgRoles = useCallback(
+    async () => {
+      try {
+        setRoleLoading(true);
+        const roleData = await getRoleList({ client_list: clientData });
+        const processedRoleData = processRoleTreeData(roleData, t('common.externalApp'));
+        setRoleTreeData(processedRoleData);
+      } catch {
+        message.error(t('common.fetchFailed'));
+      } finally {
+        setRoleLoading(false);
+      }
+    },
+    [getRoleList, clientData, t]
+  );
+
+  const fetchOrganizationRoleIds = useCallback(
+    async (groupIds: React.Key[]): Promise<number[]> => {
+      if (groupIds.length === 0) {
+        setOrganizationRoleIds([]);
+        setOrganizationRoleSourceMap({});
+        return [];
+      }
+
+      try {
+        const groupDetails = await batchGetGroupDetailWithRoles({
+          group_ids: groupIds.map((id) => String(id)),
+        });
+
+        const orgRoleSourceMap = groupDetails.reduce<Record<string, string>>((acc, detail) => {
+          [...(detail.own_role_ids || []), ...(detail.inherited_role_ids || [])].forEach((roleId) => {
+            const roleKey = String(roleId);
+            const existingGroupNames = acc[roleKey] ? acc[roleKey].split(', ') : [];
+
+            if (!existingGroupNames.includes(detail.group_name)) {
+              acc[roleKey] = [...existingGroupNames, detail.group_name].filter(Boolean).join(', ');
+            }
+          });
+
+          return acc;
+        }, {});
+
+        const orgRoleIds = [...new Set(
+          groupDetails.flatMap((detail) => [
+            ...(detail.own_role_ids || []),
+            ...(detail.inherited_role_ids || []),
+          ])
+        )];
+
+        setOrganizationRoleIds(orgRoleIds);
+        setOrganizationRoleSourceMap(orgRoleSourceMap);
+        await fetchRoleInfoWithOrgRoles();
+        return orgRoleIds;
+      } catch (error) {
+        console.error('Failed to fetch group roles:', error);
+        setOrganizationRoleIds([]);
+        setOrganizationRoleSourceMap({});
+        return [];
+      }
+    },
+    [batchGetGroupDetailWithRoles, fetchRoleInfoWithOrgRoles]
+  );
+
+  const fetchUserDetail = useCallback(
+    async (userId: string) => {
+      setLoading(true);
+      try {
+        const id = clientData.map((client) => client.id);
+        const userDetail: UserDetailResponse = await getUserDetail({ user_id: userId, id });
+        if (userDetail) {
+          setCurrentUserId(userId);
+          const userGroupIds = extractGroupIds(userDetail);
+          setSelectedGroups(userGroupIds);
+
+          const personalRoles = extractPersonalRoleIds(userDetail);
+          const orgRoleIds = await fetchOrganizationRoleIds(userGroupIds);
+          const allRoles = mergeRoles(personalRoles, orgRoleIds);
+
+          setPersonalRoleIds(personalRoles);
+          setSelectedRoles(allRoles);
+          setIsSuperuser(userDetail?.is_superuser || false);
+          setIsSyncedUser(userDetail.sync_source != null);
+
+          const formValues = buildFormValuesFromUserDetail(userDetail, allRoles, userGroupIds);
+          formRef.current?.setFieldsValue(formValues);
+          setGroupRules(buildGroupRulesFromUserDetail(userDetail));
+
+          // EE 增强判断：将 email / phone 初始化为敏感字段状态，供 enterprise hook 决定 plain / overwrite 行为。
+          initField('email', formValues.email);
+          initField('phone', formValues.phone);
+        }
+      } catch {
+        message.error(t('common.fetchFailed'));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [clientData, getUserDetail, fetchOrganizationRoleIds, initField, t]
+  );
+
+  const showModal = useCallback(
+    ({ type: modalType, userId, groupKeys = [], groupTreeData: nextGroupTreeData = [] }: ModalConfig) => {
+      setVisible(true);
+      setType(modalType);
+      setGroupTreeData(nextGroupTreeData);
+      formRef.current?.resetFields();
+      setIsSuperuser(false);
+      setIsSyncedUser(false);
+
+      if (modalType === 'edit' && userId) {
+        setOrganizationRoleIds([]);
+        setOrganizationRoleSourceMap({});
+        fetchUserDetail(userId);
+      } else if (modalType === 'add') {
+        setOrganizationRoleIds([]);
+        setOrganizationRoleSourceMap({});
+        setSelectedGroups(groupKeys);
+        setPersonalRoleIds([]);
+        setSelectedRoles([]);
+        setGroupRules({});
+
+        if (groupKeys.length > 0) {
+          void fetchOrganizationRoleIds(groupKeys).then((orgRoleIds) => {
+            const mergedRoleIds = mergeRoles([], orgRoleIds);
+            setSelectedRoles(mergedRoleIds);
+            formRef.current?.setFieldsValue({ roles: mergedRoleIds });
+          });
+        } else {
+          fetchRoleInfoWithOrgRoles();
+        }
+
+        setTimeout(() => {
+          formRef.current?.setFieldsValue({
+            groups: groupKeys,
+            zoneinfo: 'Asia/Shanghai',
+            locale: 'zh-Hans',
+            is_superuser: false,
+          });
+        }, 0);
+      }
+    },
+    [fetchUserDetail, fetchOrganizationRoleIds, fetchRoleInfoWithOrgRoles]
+  );
+
+  const handleCancel = useCallback(() => {
+    setVisible(false);
+  }, []);
+
+  const handleConfirm = useCallback(
+    async (onSuccess: () => void) => {
+      try {
+        if (isAnyFieldEditing()) {
+          message.error(t('system.user.form.pendingSensitiveEdit'));
+          return;
+        }
+
+        setIsSubmitting(true);
+        const formData = await formRef.current?.validateFields();
+
+        if (!isSuperuser && selectedGroups.length === 0) {
+          message.error(t('system.user.form.groupSelectionRequired'));
+          return;
+        }
+
+        if (!isSuperuser && !hasNormalGroupSelection(selectedGroups, groupTreeData)) {
+          message.error(t('system.user.form.normalGroupRequired'));
+          return;
+        }
+
+        if (type === 'edit' && !isSuperuser && selectedRoles.length === 0) {
+          message.error(t('common.inputRequired'));
+          return;
+        }
+
+        let payload = buildUserPayload(
+          {
+            ...formData,
+            groups: selectedGroups,
+            roles: selectedRoles,
+            is_superuser: isSuperuser,
+          },
+          personalRoleIds,
+          groupRules,
+          isSuperuser
+        );
+
+        if (type === 'edit') {
+          // EE 增强判断：编辑态对敏感字段做 payload 裁剪，避免 overwrite 模式下未确认的新值误覆盖原值。
+          payload = cleanPayload(payload, ['email', 'phone']);
+        }
+
+        if (type === 'add') {
+          // addUser 成功时若返回 data.email_sent / data.email_error,表示初始密码通知链路有附加状态。
+          // 注意:request 工具已解包 result 字段,addResult 直接是 data 子对象。
+          const addResult: any = await addUser(payload);
+          if (addResult?.email_sent === true) {
+            message.success(`${t('common.addSuccess')}\n${t('system.user.form.initialPasswordEmailSent')}`, 6);
+          } else if (addResult?.email_sent === false) {
+            message.warning(
+              `${t('common.addSuccess')}\n${t('system.user.form.initialPasswordEmailFailed')}：${addResult.email_error || t('common.saveFailed')}`,
+              8
+            );
+          } else {
+            message.success(t('common.addSuccess'));
+          }
+        } else {
+          await editUser({ user_id: currentUserId, ...payload });
+          message.success(t('common.updateSuccess'));
+        }
+        onSuccess();
+        setVisible(false);
+      } catch (error: unknown) {
+        const err = error as { errorFields?: Array<{ errors: string[] }> };
+        if (err.errorFields && err.errorFields.length) {
+          const firstFieldErrorMessage = err.errorFields[0].errors[0];
+          message.error(firstFieldErrorMessage || t('common.valFailed'));
+        } else {
+          message.error(t('common.saveFailed'));
+        }
+      } finally {
+        setIsSubmitting(false);
+      }
+    },
+    [
+      addUser,
+      cleanPayload,
+      currentUserId,
+      editUser,
+      groupRules,
+      isAnyFieldEditing,
+      isSuperuser,
+      personalRoleIds,
+      selectedGroups,
+      selectedRoles,
+      t,
+      type,
+    ]
+  );
+
+  const handleRoleChange = useCallback(
+    (newRoleIds: React.Key[]) => {
+      const nextPersonalRoleIds = newRoleIds.map((roleId) => Number(roleId));
+      setPersonalRoleIds(nextPersonalRoleIds);
+
+      const mergedRoleIds = mergeRoles(nextPersonalRoleIds, organizationRoleIds);
+      setSelectedRoles(mergedRoleIds);
+      formRef.current?.setFieldsValue({ roles: mergedRoleIds });
+    },
+    [organizationRoleIds]
+  );
+
+  const handleSuperuserChange = useCallback(
+    (value: boolean) => {
+      setIsSuperuser(value);
+
+      let nextSelectedRoles: number[];
+      if (value) {
+        // 普通→超级管理员：备份个人角色后清空
+        cachedPersonalRoleIds.current = personalRoleIds;
+        setPersonalRoleIds([]);
+        nextSelectedRoles = [];
+      } else {
+        // 超级管理员→普通：恢复之前备份的个人角色，并合并到 selectedRoles
+        const restoredPersonalRoleIds = cachedPersonalRoleIds.current;
+        setPersonalRoleIds(restoredPersonalRoleIds);
+        nextSelectedRoles = mergeRoles(restoredPersonalRoleIds, organizationRoleIds);
+      }
+
+      setSelectedRoles(nextSelectedRoles);
+
+      formRef.current?.setFieldsValue({
+        is_superuser: value,
+        roles: nextSelectedRoles,
+      });
+    },
+    [personalRoleIds, organizationRoleIds]
+  );
+
+  const handleGroupChange = useCallback(
+    async (newGroupIds: React.Key[]) => {
+      setSelectedGroups(newGroupIds);
+      formRef.current?.setFieldsValue({ groups: newGroupIds });
+
+      const newOrgRoleIds = await fetchOrganizationRoleIds(newGroupIds);
+
+      const updatedRoles = mergeRoles(personalRoleIds, newOrgRoleIds);
+
+      setSelectedRoles(updatedRoles);
+      formRef.current?.setFieldsValue({ roles: updatedRoles });
+    },
+    [fetchOrganizationRoleIds, personalRoleIds]
+  );
+
+  const handleChangeRule = useCallback(
+    (newKey: number, newRules: { [app: string]: number }) => {
+      setGroupRules({
+        ...groupRules,
+        [newKey]: newRules,
+      });
+    },
+    [groupRules]
+  );
+
+  return {
+    formRef,
+    visible,
+    loading,
+    roleLoading,
+    isSubmitting,
+    type,
+    roleTreeData,
+    selectedGroups,
+    selectedRoles,
+    personalRoleIds,
+    groupRules,
+    organizationRoleIds,
+    organizationRoleSourceMap,
+    isSuperuser,
+    isSyncedUser,
+    currentUserId,
+    setSelectedGroups,
+    setSelectedRoles,
+    handleRoleChange,
+    handleSuperuserChange,
+    setGroupRules,
+    setIsSuperuser,
+    showModal,
+    handleCancel,
+    handleConfirm,
+    handleGroupChange,
+    handleChangeRule,
+    sensitiveBehavior,
+  };
+}

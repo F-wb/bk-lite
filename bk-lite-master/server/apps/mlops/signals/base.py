@@ -1,0 +1,344 @@
+"""
+MLOps 信号处理器基础模块
+
+提供通用的信号处理器工厂函数，用于统一注册各 ML 任务类型的资源清理信号
+"""
+
+from typing import Type
+
+from django.db import models, transaction
+from django.db.models.signals import post_delete
+from django_minio_backend import MinioBackend
+
+from apps.core.logger import mlops_logger as logger
+from apps.mlops.services.external_resource_cleanup import (
+    create_container_cleanup_intent,
+    create_mlflow_cleanup_intent,
+    create_minio_cleanup_intent,
+)
+from apps.mlops.utils import mlflow_service
+
+
+class MetadataDeleteStrategy:
+    """元数据删除策略枚举"""
+
+    NONE = "none"  # 没有 metadata 字段
+    HASATTR = "hasattr"  # 使用 hasattr(instance.metadata, "delete")
+    MINIO_BACKEND = "minio_backend"  # 使用 MinioBackend.delete()
+
+
+def _file_storage_target(file_field) -> tuple[str, str] | None:
+    if not file_field or not getattr(file_field, "name", None):
+        return None
+    storage = file_field.storage
+    bucket = getattr(storage, "bucket_name", None) or getattr(storage, "bucket", None)
+    if not bucket:
+        return None
+    return str(bucket), str(file_field.name)
+
+
+def _enqueue_cleanup_intent_on_commit(intent, using: str, *, log_context: str) -> None:
+    def dispatch_cleanup():
+        from apps.mlops.tasks.external_resource_cleanup import enqueue_external_resource_cleanup_intent
+
+        scheduled = enqueue_external_resource_cleanup_intent(intent.pk, using=using)
+        if not scheduled:
+            logger.warning(
+                "外部资源清理任务未立即投递，将由周期扫描补偿: intent_id=%s, %s",
+                intent.pk,
+                log_context,
+            )
+
+    transaction.on_commit(dispatch_cleanup, using=using)
+
+
+def register_cleanup_signals(
+    *,
+    prefix: str,
+    dispatch_uid_prefix: str,
+    dataset_release_model: Type[models.Model],
+    train_data_model: Type[models.Model],
+    train_job_model: Type[models.Model],
+    serving_model: Type[models.Model],
+    metadata_strategy: str = MetadataDeleteStrategy.NONE,
+    minio_bucket: str = "munchkin-public",
+) -> None:
+    """
+    为 MLOps 模型注册资源清理信号处理器
+
+    Args:
+        prefix: 模型前缀，用于日志和资源命名 (如 "AnomalyDetection", "Classification")
+        dispatch_uid_prefix: dispatch_uid 前缀 (如 "ad", "clf")
+        dataset_release_model: 数据集发布模型类
+        train_data_model: 训练数据模型类
+        train_job_model: 训练任务模型类
+        serving_model: 推理服务模型类
+        metadata_strategy: 元数据删除策略 (MetadataDeleteStrategy)
+        minio_bucket: MinIO bucket 名称 (仅 MINIO_BACKEND 策略需要)
+    """
+    # 1. 数据集发布文件清理
+    _register_dataset_release_cleanup(
+        prefix=prefix,
+        dispatch_uid_prefix=dispatch_uid_prefix,
+        model=dataset_release_model,
+    )
+
+    # 2. 训练数据文件清理
+    _register_train_data_cleanup(
+        prefix=prefix,
+        dispatch_uid_prefix=dispatch_uid_prefix,
+        model=train_data_model,
+        metadata_strategy=metadata_strategy,
+        minio_bucket=minio_bucket,
+    )
+
+    # 3. 训练任务配置文件清理
+    _register_train_job_cleanup(
+        prefix=prefix,
+        dispatch_uid_prefix=dispatch_uid_prefix,
+        model=train_job_model,
+    )
+
+    # 4. MLflow 资源清理
+    _register_mlflow_cleanup(
+        prefix=prefix,
+        dispatch_uid_prefix=dispatch_uid_prefix,
+        model=train_job_model,
+    )
+
+    # 5. Serving 运行时清理
+    _register_docker_cleanup(
+        prefix=prefix,
+        dispatch_uid_prefix=dispatch_uid_prefix,
+        model=serving_model,
+    )
+
+
+def _register_dataset_release_cleanup(
+    *,
+    prefix: str,
+    dispatch_uid_prefix: str,
+    model: Type[models.Model],
+) -> None:
+    """注册数据集发布文件清理信号"""
+
+    def cleanup_dataset_release_files(sender, instance, **kwargs):
+        using = kwargs.get("using", "default")
+        logger.info(
+            f"[Signal] post_delete 触发: {prefix}DatasetRelease, "
+            f"dataset_release_id={instance.id}, version={instance.version}, "
+            f"has_dataset_file={bool(instance.dataset_file)}"
+        )
+        target = _file_storage_target(instance.dataset_file)
+        if target is None:
+            logger.debug(f"数据集发布版本没有文件, " f"dataset_release_id={instance.id}, version={instance.version}")
+            return
+        bucket, path = target
+        intent = create_minio_cleanup_intent(bucket, path, using=using)
+        _enqueue_cleanup_intent_on_commit(
+            intent,
+            using,
+            log_context=f"dataset_release_id={instance.id}, path={path}",
+        )
+
+    post_delete.connect(
+        cleanup_dataset_release_files,
+        sender=model,
+        dispatch_uid=f"cleanup_{dispatch_uid_prefix}_dataset_release",
+        weak=False,
+    )
+
+
+def _register_train_data_cleanup(
+    *,
+    prefix: str,
+    dispatch_uid_prefix: str,
+    model: Type[models.Model],
+    metadata_strategy: str,
+    minio_bucket: str,
+) -> None:
+    """注册训练数据文件清理信号"""
+
+    def cleanup_train_data_files(sender, instance, **kwargs):
+        instance_pk = instance.pk
+        using = kwargs.get("using", "default")
+        train_data_path = instance.train_data.name if instance.train_data else None
+        has_metadata = hasattr(instance, "metadata") and bool(instance.metadata)
+        logger.info(
+            f"[Signal] post_delete 触发: {prefix}TrainData, "
+            f"train_data_id={instance.id}, name={instance.name}, "
+            f"has_train_data={bool(instance.train_data)}"
+            + (f", has_metadata={has_metadata}" if metadata_strategy != MetadataDeleteStrategy.NONE else "")
+        )
+
+        def delete_files():
+            try:
+                # 删除训练数据文件
+                if train_data_path:
+                    from apps.mlops.services.train_data_file_cleanup import delete_train_data_file_with_retry
+
+                    result = delete_train_data_file_with_retry(
+                        model_label=sender._meta.label,
+                        instance_pk=instance_pk,
+                        file_field_name="train_data",
+                        old_path=train_data_path,
+                        using=using,
+                    )
+                    logger.info(
+                        "训练数据文件清理结果: %s, path=%s, train_data_id=%s, name=%s",
+                        result,
+                        train_data_path,
+                        instance_pk,
+                        instance.name,
+                    )
+
+                # 根据策略删除元数据
+                if metadata_strategy == MetadataDeleteStrategy.HASATTR:
+                    if instance.metadata:
+                        try:
+                            if hasattr(instance.metadata, "delete"):
+                                instance.metadata.delete(save=False)
+                                logger.info(f"成功删除元数据文件, " f"train_data_id={instance.id}, name={instance.name}")
+                        except Exception as metadata_error:
+                            logger.warning(f"删除元数据文件时出现警告: {str(metadata_error)}, " f"train_data_id={instance.id}")
+                elif metadata_strategy == MetadataDeleteStrategy.MINIO_BACKEND:
+                    if instance.metadata:
+                        storage = MinioBackend(bucket_name=minio_bucket)
+                        storage.delete(instance.metadata)
+                        logger.info(f"成功删除元数据文件: {instance.metadata}, " f"train_data_id={instance.id}, name={instance.name}")
+
+                # 无文件时的日志
+                if not instance.train_data and (
+                    metadata_strategy == MetadataDeleteStrategy.NONE or not (hasattr(instance, "metadata") and instance.metadata)
+                ):
+                    logger.debug(f"训练数据没有关联文件, " f"train_data_id={instance.id}, name={instance.name}")
+            except Exception as e:
+                logger.error(f"删除训练数据文件失败: {str(e)}, " f"train_data_id={instance.id}, name={instance.name}")
+
+        transaction.on_commit(delete_files, using=using)
+
+    post_delete.connect(
+        cleanup_train_data_files,
+        sender=model,
+        dispatch_uid=f"cleanup_{dispatch_uid_prefix}_train_data",
+        weak=False,
+    )
+
+
+def _register_train_job_cleanup(
+    *,
+    prefix: str,
+    dispatch_uid_prefix: str,
+    model: Type[models.Model],
+) -> None:
+    """注册训练任务配置文件清理信号"""
+
+    def cleanup_train_job_config_file(sender, instance, **kwargs):
+        using = kwargs.get("using", "default")
+        logger.info(
+            f"[Signal] post_delete 触发: {prefix}TrainJob, "
+            f"train_job_id={instance.id}, name={instance.name}, "
+            f"has_config_url={bool(instance.config_url)}"
+        )
+        target = _file_storage_target(instance.config_url)
+        if target is None:
+            logger.debug(f"训练任务没有配置文件, " f"train_job_id={instance.id}, name={instance.name}")
+            return
+        bucket, path = target
+        intent = create_minio_cleanup_intent(bucket, path, using=using)
+        _enqueue_cleanup_intent_on_commit(
+            intent,
+            using,
+            log_context=f"train_job_id={instance.id}, path={path}",
+        )
+
+    post_delete.connect(
+        cleanup_train_job_config_file,
+        sender=model,
+        dispatch_uid=f"cleanup_{dispatch_uid_prefix}_train_job",
+        weak=False,
+    )
+
+
+def _register_mlflow_cleanup(
+    *,
+    prefix: str,
+    dispatch_uid_prefix: str,
+    model: Type[models.Model],
+) -> None:
+    """注册 MLflow 资源清理信号"""
+
+    def cleanup_mlflow_experiment(sender, instance, **kwargs):
+        using = kwargs.get("using", "default")
+        train_job_id = instance.id
+        logger.info(f"[Signal] post_delete 触发: {prefix}TrainJob (MLflow清理), " f"train_job_id={train_job_id}, algorithm={instance.algorithm}")
+
+        experiment_name = mlflow_service.build_experiment_name(
+            prefix=prefix,
+            algorithm=instance.algorithm,
+            train_job_id=train_job_id,
+        )
+        model_name = mlflow_service.build_model_name(
+            prefix=prefix,
+            algorithm=instance.algorithm,
+            train_job_id=train_job_id,
+        )
+        intent = create_mlflow_cleanup_intent(
+            experiment_name,
+            model_name,
+            using=using,
+        )
+        _enqueue_cleanup_intent_on_commit(
+            intent,
+            using,
+            log_context=f"train_job_id={train_job_id}",
+        )
+
+    post_delete.connect(
+        cleanup_mlflow_experiment,
+        sender=model,
+        dispatch_uid=f"cleanup_{dispatch_uid_prefix}_mlflow_experiment",
+        weak=False,
+    )
+
+
+def _register_docker_cleanup(
+    *,
+    prefix: str,
+    dispatch_uid_prefix: str,
+    model: Type[models.Model],
+) -> None:
+    """注册 Docker 容器清理信号"""
+
+    def cleanup_docker_container(sender, instance, origin=None, **kwargs):
+        using = kwargs.get("using", "default")
+        if origin is instance:
+            logger.info(f"[Signal] 跳过 direct delete 的 {prefix}Serving 容器清理, " f"serving_id={instance.id}")
+            return
+
+        origin_class_name = getattr(getattr(origin, "__class__", None), "__name__", "")
+        if (
+            getattr(instance, "train_job_id", None) is not None
+            and getattr(origin, "pk", None) == instance.train_job_id
+            and origin_class_name.endswith("TrainJob")
+        ):
+            logger.info(
+                f"[Signal] 跳过 train job cascade delete 的 {prefix}Serving 容器清理, " f"serving_id={instance.id}, train_job_id={instance.train_job_id}"
+            )
+            return
+
+        logger.info(f"[Signal] post_delete 触发: {prefix}Serving (容器清理), " f"serving_id={instance.id}, port={instance.port}")
+        container_id = f"{prefix}_Serving_{instance.id}"
+        intent = create_container_cleanup_intent(container_id, using=using)
+        _enqueue_cleanup_intent_on_commit(
+            intent,
+            using,
+            log_context=f"serving_id={instance.id}, container_id={container_id}",
+        )
+
+    post_delete.connect(
+        cleanup_docker_container,
+        sender=model,
+        dispatch_uid=f"cleanup_{dispatch_uid_prefix}_docker_container",
+        weak=False,
+    )

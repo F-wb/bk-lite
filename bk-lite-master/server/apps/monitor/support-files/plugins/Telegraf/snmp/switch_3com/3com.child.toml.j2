@@ -1,0 +1,148 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_3com"
+        config_type = "3com"
+        brand = "3com"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB) + 64-bit HC ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- 3Com CPU (A3COM-HUAWEI-LswDEVM-MIB hwCpuCostRatePer1Min, 近1分钟占用率%, 每板卡表, PEN 43；3com.snmprec 实测 34/99, avg by instance) ----
+    # 不设置私有表根 OID：collector 未安装厂商 MIB 时，Telegraf 无法将其识别为 table；直接 walk 数值列 OID。
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.43.45.1.6.1.1.1.3"
+        name = "usage"
+    # ---- 3Com 内存 (hwMemSize 总量 + hwMemFree 空闲, 字节, 每板卡表；usage = (total-free)/total) ----
+    # 待现网核验：hwMemSize .43.45.1.6.1.2.1.1.2(总量) / hwMemFree .43.45.1.6.1.2.1.1.3(空闲)；snmprec total=36212352 free=21029498。
+    [[inputs.snmp.table]]
+        name = "device_memory"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.43.45.1.6.1.2.1.1.2"
+        name = "total"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.43.45.1.6.1.2.1.1.3"
+        name = "free"
+    # ---- 风扇状态：hwdevMFanStatusEntry，表列禁止 .0；INDEX hwDevMFanNum ----
+    [[inputs.snmp.table]]
+        name = "device_fan"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.43.45.1.2.23.1.9.1.1.1.2"
+        name = "state"
+    # ---- 电源状态：hwdevMPowerStatusEntry，表列禁止 .0；INDEX hwDevMPowerNum ----
+    [[inputs.snmp.table]]
+        name = "device_psu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.43.45.1.2.23.1.9.1.2.1.2"
+        name = "state"
+    # ---- 槽位环境温度：hwdevMSlotEnvironmentEntry，表列禁止 .0；INDEX {frame,slot,type}，starlark 只保留 type=temperature(1) ----
+    [[inputs.snmp.table]]
+        name = "device_temperature"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.43.45.1.2.23.1.9.1.3.1.3"
+        name = "celsius"
+# ---- 风扇/电源：active(1)/not-install(3)→1，deactive(2)/unsupport(4)→2；未定义取值丢弃。温度仅保留 index 末段为 1 的行，范围 -40..125。----
+[[processors.starlark]]
+    namepass = ["device_fan", "device_psu", "device_temperature"]
+    source = '''
+def map_hw_status(value):
+    if value == None:
+        return None
+    code = int(value)
+    if code == 1 or code == 3:
+        return 1
+    if code == 2 or code == 4:
+        return 2
+    return None
+
+def apply(metric):
+    f = metric.fields
+    name = metric.name
+    if name == "device_fan" or name == "device_psu":
+        mapped = map_hw_status(f.get("state"))
+        if mapped == None:
+            return None
+        f["state"] = mapped
+        return metric
+    if name == "device_temperature":
+        idx = metric.tags.get("index")
+        if idx == None:
+            return None
+        parts = idx.split(".")
+        if len(parts) != 3:
+            return None
+        if parts[2] != "1":
+            return None
+        metric.tags["frame"] = parts[0]
+        metric.tags["slot"] = parts[1]
+        metric.tags.pop("index")
+        raw = f.get("celsius")
+        if raw == None:
+            return None
+        raw = int(raw)
+        if raw < -40 or raw > 125:
+            return None
+        f["celsius"] = raw
+        return metric
+    if len(f.keys()) == 0:
+        return None
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["3com"]
+

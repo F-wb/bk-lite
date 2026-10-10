@@ -1,0 +1,264 @@
+"use client";
+import React, { useState, useEffect } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+import { Input, message, Button, Spin, Popconfirm, Tooltip } from "antd";
+import { ArrowLeftOutlined } from "@ant-design/icons";
+import { ColumnsType } from "antd/es/table";
+import { useTranslation } from "@/utils/i18n";
+import CustomTable from "@/components/custom-table";
+import ChannelModal from "@/app/system-manager/components/channel/channelModal";
+import { ChannelType } from "@/app/system-manager/types/channel";
+import { useChannelApi } from "@/app/system-manager/api/channel";
+import PermissionWrapper from "@/components/permission";
+
+const WEBHOOK_SUB_TYPES: ChannelType[] = ['enterprise_wechat_bot', 'feishu_bot', 'dingtalk_bot', 'custom_webhook'];
+
+const SUB_TYPE_LABEL_KEYS: Record<string, string> = {
+  enterprise_wechat_bot: 'system.channel.settings.subTypeEnterpriseWechat',
+  feishu_bot: 'system.channel.settings.subTypeFeishu',
+  dingtalk_bot: 'system.channel.settings.subTypeDingtalk',
+  custom_webhook: 'system.channel.settings.subTypeCustom',
+};
+
+const { Search } = Input;
+
+interface ChannelRow {
+  key: string;
+  name: string;
+  description: string;
+  channel_type?: string;
+  config?: Record<string, any>;
+}
+
+// 平台流程自动托管的 NATS 通道：生命周期由来源流程管理，这里只读展示。
+const managedSource = (record: ChannelRow): 'opspilot' | 'workflow_orchestration' | undefined => {
+  const source = record.config?.source;
+  return source === 'opspilot' || source === 'workflow_orchestration' ? source : undefined;
+};
+
+const ChannelSettingsPage: React.FC = () => {
+  const { t } = useTranslation();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  const channelType: ChannelType = (searchParams?.get("id") || "email") as ChannelType;
+
+  const [allTableData, setAllTableData] = useState<ChannelRow[]>([]);
+  const [tableData, setTableData] = useState<ChannelRow[]>([]);
+  const [searchValue, setSearchValue] = useState<string>("");
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [pageSize, setPageSize] = useState<number>(10);
+  const [loading, setLoading] = useState<boolean>(true);
+
+  const [isModalVisible, setIsModalVisible] = useState<boolean>(false);
+  const [modalType, setModalType] = useState<"add" | "edit">("add");
+  const [channelId, setChannelId] = useState<string | null>(null);
+
+  const { getChannelData, deleteChannel } = useChannelApi();
+
+  const isWebhookChannel = channelType === 'enterprise_wechat_bot';
+
+  const columns: ColumnsType<ChannelRow> = [
+    {
+      title: t("system.channel.table.name"),
+      dataIndex: "name",
+      width: 200,
+    },
+    ...(isWebhookChannel ? [{
+      title: t("system.channel.table.type"),
+      dataIndex: "channel_type",
+      width: 120,
+      render: (val: string) => t(SUB_TYPE_LABEL_KEYS[val] || val),
+    }] : []),
+    {
+      title: t("system.channel.table.description"),
+      dataIndex: "description",
+      width: 300,
+    },
+    {
+      title: t("common.actions"),
+      dataIndex: "key",
+      width: 160,
+      fixed: "right",
+      render: (key: string, record: ChannelRow) => {
+        const source = managedSource(record);
+        if (source) {
+          const workflowManaged = source === 'workflow_orchestration';
+          return (
+            <Tooltip title={t(workflowManaged
+              ? "system.channel.settings.workflowManagedTip"
+              : "system.channel.settings.opspilotManagedTip")}>
+              <span className="text-[var(--color-text-secondary)] text-xs">
+                {t(workflowManaged
+                  ? "system.channel.settings.workflowManaged"
+                  : "system.channel.settings.opspilotManaged")}
+              </span>
+            </Tooltip>
+          );
+        }
+        return (
+          <>
+            <PermissionWrapper requiredPermissions={['Edit']}>
+              <Button type="link" className="mr-[8px]" onClick={() => openChannelModal("edit", key)}>
+                {t("common.edit")}
+              </Button>
+            </PermissionWrapper>
+            <PermissionWrapper requiredPermissions={['Delete']}>
+              <Popconfirm
+                title={t("common.delConfirm")}
+                okText={t("common.confirm")}
+                cancelText={t("common.cancel")}
+                onConfirm={() => handleDeleteChannel(key)}
+              >
+                <Button type="link">
+                  {t("common.delete")}
+                </Button>
+              </Popconfirm>
+            </PermissionWrapper>
+          </>
+        );
+      },
+    },
+  ];
+
+  const fetchChannels = async () => {
+    setLoading(true);
+    try {
+      const typesToQuery = channelType === 'enterprise_wechat_bot'
+        ? WEBHOOK_SUB_TYPES
+        : [channelType];
+      const results = await Promise.all(
+        typesToQuery.map((ct) => getChannelData({ channel_type: ct }))
+      );
+      const merged = results.flat();
+      const channels: ChannelRow[] = merged.map((item: { id: string; name: string; description: string; channel_type?: string; config?: Record<string, any> }) => ({
+        key: item.id,
+        name: item.name,
+        description: item.description,
+        config: item.config,
+        ...(isWebhookChannel ? { channel_type: item.channel_type } : {}),
+      }));
+      setAllTableData(channels);
+      setTableData(getPaginatedData(filterData(channels)));
+    } catch {
+      message.error(t("common.fetchFailed"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const filterData = (data: ChannelRow[]) => {
+    const lowerCaseSearch = searchValue.toLowerCase();
+    return data.filter(
+      (item) =>
+        item.name.toLowerCase().includes(lowerCaseSearch) ||
+        item.description.toLowerCase().includes(lowerCaseSearch)
+    );
+  };
+
+  const getPaginatedData = (data: ChannelRow[]) => {
+    const startIndex = (currentPage - 1) * pageSize;
+    return data.slice(startIndex, startIndex + pageSize);
+  };
+
+  useEffect(() => {
+    fetchChannels();
+  }, [channelType]);
+
+  useEffect(() => {
+    const filteredData = filterData(allTableData);
+    setTableData(getPaginatedData(filteredData));
+  }, [searchValue, currentPage, pageSize, allTableData]);
+
+  const handleDeleteChannel = async (key: string) => {
+    try {
+      await deleteChannel({ id: key });
+      const updatedData = allTableData.filter((item) => item.key !== key);
+      setAllTableData(updatedData);
+      setTableData(getPaginatedData(filterData(updatedData)));
+      message.success(t("common.delSuccess"));
+    } catch {
+      message.error(t("common.delFailed"));
+    }
+  };
+
+  const openChannelModal = (type: "add" | "edit", id: string | null = null) => {
+    setIsModalVisible(true);
+    setModalType(type);
+    if (type === "edit" && id) {
+      setChannelId(id);
+    } else {
+      setChannelId(null);
+    }
+  };
+
+  const onSuccessChannelModal = () => {
+    fetchChannels();
+  };
+
+  const handleSearchChange = (value: string) => {
+    setSearchValue(value);
+    setCurrentPage(1);
+  };
+
+  const handlePaginationChange = (page: number, pageSize: number) => {
+    setCurrentPage(page);
+    setPageSize(pageSize);
+  };
+
+  const handleBack = () => {
+    router.push("/system-manager/channel");
+  };
+
+  return (
+    <div>
+      <div className="w-full mb-4 flex justify-between items-center">
+        <div className="flex items-center">
+          <Button 
+            color="default" variant="link"
+            icon={<ArrowLeftOutlined />} 
+            onClick={handleBack}
+          >
+          </Button>
+        </div>
+        <div className="flex">
+          <Search
+            allowClear
+            enterButton
+            className="w-60 mr-2"
+            placeholder={`${t("common.search")}...`}
+            onSearch={handleSearchChange}
+          />
+          <PermissionWrapper requiredPermissions={['Add']}>
+            <Button type="primary" className="mr-2" onClick={() => openChannelModal("add")}>
+              + {t("common.add")}
+            </Button>
+          </PermissionWrapper>
+        </div>
+        <ChannelModal
+          visible={isModalVisible}
+          onClose={() => setIsModalVisible(false)}
+          type={modalType}
+          channelId={channelId}
+          onSuccess={onSuccessChannelModal}
+        />
+      </div>
+      <Spin spinning={loading}>
+        <CustomTable
+          scroll={{ y: "calc(100vh - 405px)" }}
+          pagination={{
+            pageSize,
+            current: currentPage,
+            total: filterData(allTableData).length,
+            showSizeChanger: true,
+            onChange: handlePaginationChange,
+          }}
+          columns={columns}
+          dataSource={tableData}
+        />
+      </Spin>
+    </div>
+  );
+};
+
+export default ChannelSettingsPage;

@@ -1,0 +1,308 @@
+{
+  "zh": [
+    {
+      "title": "用户管理",
+      "icon": "yonghu1",
+      "name": "structure",
+      "url": "/system-manager/user",
+      "children": [
+        {
+          "title": "组织架构",
+          "icon": "yonghu1",
+          "name": "user_group",
+          "url": "/system-manager/user/structure"
+        },
+        {
+          "title": "登录认证",
+          "icon": "renzhengyuanguanli",
+          "name": "login_auth",
+          "url": "/system-manager/user/login-auth"
+        },
+        {
+          "title": "用户同步",
+          "icon": "tongbuyonghu",
+          "name": "user_sync",
+          "url": "/system-manager/user/user-sync"
+        },
+        {
+          "title": "安全策略",
+          "icon": "shezhi",
+          "name": "security_settings",
+          "url": "/system-manager/user/security-settings"
+        },
+        {
+          "title": "超级管理员",
+          "icon": "chaojiguanliyuan",
+          "name": "super_admin",
+          "url": "/system-manager/user/adminstrator"
+        }
+      ]
+    },
+    {
+      "title": "应用管理",
+      "icon": "guanli",
+      "name": "application_list",
+      "url": "/system-manager/application",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "角色",
+          "icon": "guanliyuan_jiaoseguanli",
+          "name": "application_role",
+          "url": "/system-manager/application/manage/role"
+        },
+        {
+          "title": "数据权限",
+          "icon": "line-DataPermissions",
+          "name": "data_permission",
+          "url": "/system-manager/application/manage/data"
+        },
+        {
+          "title": "自定义菜单",
+          "icon": "zidingyi",
+          "name": "custom_menu",
+          "url": "/system-manager/application/manage/menu",
+          "children": [
+            {
+              "title": "菜单配置",
+              "url": "/system-manager/application/manage/menu/config",
+              "isNotMenuItem": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "通知渠道",
+      "icon": "Channel",
+      "name": "channel_list",
+      "url": "/system-manager/channel",
+      "children": [
+        {
+          "title": "设置",
+          "icon": "shezhi",
+          "name": "channel_setting",
+          "url": "/system-manager/channel/detail/settings",
+          "isNotMenuItem": true
+        },
+        {
+          "title": "IM应用通知",
+          "icon": "qiwei2",
+          "name": "im_notification",
+          "url": "/system-manager/channel/im-notification",
+          "isNotMenuItem": true
+        }
+      ]
+    },
+    {
+      "title": "集成中心",
+      "icon": "waibuxitongguanli",
+      "name": "integration_center",
+      "url": "/system-manager/integration-center",
+      "children": [
+        {
+          "title": "集成详情",
+          "url": "/system-manager/integration-center/detail",
+          "isNotMenuItem": true
+        }
+      ]
+    },
+    {
+      "title": "凭据管理",
+      "icon": "key",
+      "name": "credential",
+      "url": "/system-manager/credential"
+    },
+    {
+      "title": "平台管理",
+      "icon": "settings-fill",
+      "url": "/system-manager/settings",
+      "name": "Setting",
+      "children": [
+        {
+          "title": "审计日志",
+          "url": "/system-manager/settings/audit-log",
+          "icon": "talk-line",
+          "name": "audit_log"
+        },
+        {
+          "title": "错误日志",
+          "url": "/system-manager/settings/error-logs",
+          "icon": "wannengbiaodan",
+          "name": "error_logs"
+        },
+        {
+          "title": "网络白名单",
+          "url": "/system-manager/settings/network-whitelist",
+          "icon": "whitelist",
+          "name": "network_white_list"
+        },
+        {
+          "title": "API 文档",
+          "url": "/system-manager/settings/openapi-docs",
+          "icon": "wendang1",
+          "name": "openapi_docs"
+        },
+        {
+          "title": "API 令牌",
+          "url": "/system-manager/settings/key",
+          "icon": "key",
+          "name": "api_secret_key"
+        }
+      ]
+    }
+  ],
+  "en": [
+    {
+      "title": "User Management",
+      "icon": "yonghu1",
+      "name": "organization",
+      "url": "/system-manager/user",
+      "children": [
+        {
+          "title": "Organization Structure",
+          "icon": "yonghu1",
+          "name": "user_group",
+          "url": "/system-manager/user/structure"
+        },
+        {
+          "title": "Login Auth",
+          "icon": "renzhengyuanguanli",
+          "name": "login_auth",
+          "url": "/system-manager/user/login-auth"
+        },
+        {
+          "title": "User Sync",
+          "icon": "tongbuyonghu",
+          "name": "user_sync",
+          "url": "/system-manager/user/user-sync"
+        },
+        {
+          "title": "Security Settings",
+          "icon": "shezhi",
+          "name": "security_settings",
+          "url": "/system-manager/user/security-settings"
+        },
+        {
+          "title": "Super Administrator",
+          "icon": "chaojiguanliyuan",
+          "name": "super_admin",
+          "url": "/system-manager/user/adminstrator"
+        }
+      ]
+    },
+    {
+      "title": "Application Management",
+      "icon": "guanli",
+      "name": "application_list",
+      "url": "/system-manager/application",
+      "hasDetail": true,
+      "children": [
+        {
+          "title": "Role",
+          "icon": "guanliyuan_jiaoseguanli",
+          "name": "application_role",
+          "url": "/system-manager/application/manage/role"
+        },
+        {
+          "title": "Data Permission",
+          "icon": "line-DataPermissions",
+          "name": "data_permission",
+          "url": "/system-manager/application/manage/data"
+        },
+        {
+          "title": "Custom Menu",
+          "icon": "zidingyi",
+          "name": "custom_menu",
+          "url": "/system-manager/application/manage/menu",
+          "children": [
+            {
+              "title": "Menu Config",
+              "url": "/system-manager/application/manage/menu/config",
+              "isNotMenuItem": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Channel",
+      "icon": "Channel",
+      "name": "channel_list",
+      "url": "/system-manager/channel",
+      "children": [
+        {
+          "title": "Settings",
+          "icon": "shezhi",
+          "name": "channel_setting",
+          "url": "/system-manager/channel/detail/settings",
+          "isNotMenuItem": true
+        },
+        {
+          "title": "IM Notification",
+          "icon": "qiwei2",
+          "name": "im_notification",
+          "url": "/system-manager/channel/im-notification",
+          "isNotMenuItem": true
+        }
+      ]
+    },
+    {
+      "title": "Integration Center",
+      "icon": "waibuxitongguanli",
+      "name": "integration_center",
+      "url": "/system-manager/integration-center",
+      "children": [
+        {
+          "title": "Integration Detail",
+          "url": "/system-manager/integration-center/detail",
+          "isNotMenuItem": true
+        }
+      ]
+    },
+    {
+      "title": "Credential Management",
+      "icon": "key",
+      "name": "credential",
+      "url": "/system-manager/credential"
+    },
+    {
+      "title": "Platform Management",
+      "icon": "settings-fill",
+      "url": "/system-manager/settings",
+      "name": "Setting",
+      "children": [
+        {
+          "title": "Audit Logs",
+          "url": "/system-manager/settings/audit-log",
+          "icon": "talk-line",
+          "name": "audit_log"
+        },
+        {
+          "title": "Error Logs",
+          "url": "/system-manager/settings/error-logs",
+          "icon": "wannengbiaodan",
+          "name": "error_logs"
+        },
+        {
+          "title": "Network Whitelist",
+          "url": "/system-manager/settings/network-whitelist",
+          "icon": "whitelist",
+          "name": "network_white_list"
+        },
+        {
+          "title": "API Documentation",
+          "url": "/system-manager/settings/openapi-docs",
+          "icon": "wendang1",
+          "name": "openapi_docs"
+        },
+        {
+          "title": "API Token",
+          "url": "/system-manager/settings/key",
+          "icon": "key",
+          "name": "api_secret_key"
+        }
+      ]
+    }
+  ]
+}

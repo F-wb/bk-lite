@@ -1,0 +1,75 @@
+import asyncio
+from typing import Dict, Any
+from sanic.log import logger
+from .base_collector import BaseCollector
+
+
+class OceanStorCollector(BaseCollector):
+    async def collect(self) -> str:
+        return await asyncio.to_thread(self._collect_sync)
+
+    def _collect_sync(self) -> str:
+        from common.monitor_plugins.oceanstor.api import OceanStorApiMonitor
+        from utils.convert import convert_to_prometheus
+
+        username = self.params["username"]
+        password = self.params["password"]
+        host = self.params.get("host") or self.params.get("base_url", "")
+        instance_id = self.params.get("instance_id", host)
+        task_id = self.params.get("collection_task_id") or self.params.get("task_id") or ""
+
+        base_url = f"https://{host}" if host and not host.startswith("http") else host
+
+        monitor_input = {
+            "config": {
+                "base_url": base_url,
+                "username": username,
+                "password": password,
+            },
+            "resource": {
+                "bk_inst_id": instance_id,
+                "metrics": [],
+            },
+            "interval": 300,
+            "timeout": 60,
+        }
+
+        monitor = OceanStorApiMonitor(monitor_input)
+
+        try:
+            monitor.execute()
+        except Exception as err:
+            logger.exception(
+                "event=oceanstor_collect_failed host=%s task_id=%s failed_stage=%s error_type=%s",
+                host,
+                task_id,
+                "execute",
+                type(err).__name__,
+            )
+            raise
+
+        if not monitor.data:
+            logger.warning(
+                "event=oceanstor_collect_empty host=%s task_id=%s failed_stage=%s",
+                host,
+                task_id,
+                "execute",
+            )
+            return ""
+
+        metric_dict = {}
+        for resource_id, metrics in monitor.data.items():
+            metric_dict[(resource_id, "oceanstor")] = metrics
+
+        metric_list = convert_to_prometheus(metric_dict)
+        result = "\n".join(metric_list) + "\n"
+
+        logger.info(
+            "event=oceanstor_collect_summary host=%s task_id=%s object_types=1 object_type_failed=0 resources=%s bytes=%s",
+            host,
+            task_id,
+            len(metric_dict),
+            len(result),
+        )
+
+        return result

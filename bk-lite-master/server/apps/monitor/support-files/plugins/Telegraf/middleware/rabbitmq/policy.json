@@ -1,0 +1,101 @@
+{
+  "object": "RabbitMQ",
+  "plugin": "RabbitMQ",
+  "templates": [
+    {
+      "name": "节点存活状态",
+      "alert_name": "RabbitMQ节点 ${resource_name} 服务中断",
+      "description": "监测节点持续运行时间（秒）。Management API 的 uptime 为毫秒，策略已换算为秒；异常重启会导致连接中断。",
+      "metric_name": "rabbitmq_node_uptime",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 60,
+          "method": "<="
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "磁盘告警",
+      "alert_name": "RabbitMQ节点 ${resource_name} 磁盘告警",
+      "description": "使用节点 disk_free_alarm。RabbitMQ 在剩余磁盘低于自身限制时置位，写满会导致消息持久化失败。",
+      "metric_name": "rabbitmq_node_disk_free_alarm",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    },
+    {
+      "name": "就绪消息堆积",
+      "alert_name": "RabbitMQ集群 ${resource_name} 消费延迟",
+      "description": "检测待消费消息数，持续积压表明消费者处理能力不足。",
+      "metric_name": "rabbitmq_overview_messages_ready",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 100000,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 50000,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 10000,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "发布速率突增",
+      "alert_name": "RabbitMQ交换器 ${resource_name} 写入过载",
+      "description": "检测消息发布速率，异常增长可能导致积压。需评估生产者流量。",
+      "metric_name": "rabbitmq_overview_messages_published_rate",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1000,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 500,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 200,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    },
+    {
+      "name": "内存告警",
+      "alert_name": "RabbitMQ节点 ${resource_name} 内存告警",
+      "description": "使用节点 mem_alarm。接近内存限制时 RabbitMQ 会触发流控并阻塞生产者。",
+      "metric_name": "rabbitmq_node_mem_alarm",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    }
+  ]
+}

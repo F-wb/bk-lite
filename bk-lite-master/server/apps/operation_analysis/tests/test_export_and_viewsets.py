@@ -1,0 +1,703 @@
+"""ExportService 与 view_sets 归一/改写工具的覆盖测试。
+
+对照 specs/capabilities/legacy-prd-运营分析-运营分析.md：导出按业务键收敛依赖、敏感字段脱敏、稳定排序。
+"""
+
+import pytest
+import yaml
+
+from apps.operation_analysis.constants.import_export import ObjectType, ScopeType
+from apps.operation_analysis.models.datasource_models import DataSourceAPIModel, DataSourceTag, NameSpace
+from apps.operation_analysis.models.models import Dashboard, Directory, NetworkTopology
+from apps.operation_analysis.serializers.import_export_serializers import ExportRequestSerializer
+from apps.operation_analysis.services.import_export import view_sets as vs
+from apps.operation_analysis.services.import_export.export_service import ExportService
+
+# --------------------------------------------------------------------------
+# view_sets 归一化
+# --------------------------------------------------------------------------
+
+
+def test_normalize_dashboard_returns_list():
+    assert vs.normalize_canvas_view_sets_for_storage([{"a": 1}], ObjectType.DASHBOARD) == [{"a": 1}]
+    assert vs.normalize_canvas_view_sets_for_storage("bad", ObjectType.DASHBOARD) == []
+
+
+def test_scene_widget_surface_contract_rejects_illegal_imports():
+    application3d = [{"valueConfig": {"chartType": "application3D", "sceneWidgetType": "application3D"}}]
+    with pytest.raises(ValueError, match="application3D is not supported on dashboard"):
+        vs.normalize_canvas_view_sets_for_storage(application3d, ObjectType.DASHBOARD)
+    with pytest.raises(ValueError, match="application3D is not supported on report"):
+        vs.normalize_canvas_view_sets_for_storage(
+            {"schema_version": 1, "filters": [], "sections": application3d},
+            ObjectType.REPORT,
+        )
+    screen = {"viewport": {"width": 1920, "height": 1080}, "items": application3d, "decorations": {}}
+    assert vs.normalize_canvas_view_sets_for_storage(screen, ObjectType.SCREEN)["items"] == application3d
+
+
+def test_room3d_scene_widget_is_screen_only():
+    room3d = [{"valueConfig": {"chartType": "room3D", "sceneWidgetType": "room3D"}}]
+    with pytest.raises(ValueError, match="room3D is not supported on dashboard"):
+        vs.normalize_canvas_view_sets_for_storage(room3d, ObjectType.DASHBOARD)
+    with pytest.raises(ValueError, match="room3D is not supported on report"):
+        vs.normalize_canvas_view_sets_for_storage(
+            {"schema_version": 1, "filters": [], "sections": room3d},
+            ObjectType.REPORT,
+        )
+    screen = {"viewport": {"width": 1920, "height": 1080}, "items": room3d, "decorations": {}}
+    assert vs.normalize_canvas_view_sets_for_storage(screen, ObjectType.SCREEN)["items"] == room3d
+
+
+def test_network_status_topology_remains_dashboard_and_screen_only():
+    nst = [{"valueConfig": {"chartType": "networkStatusTopology", "sceneWidgetType": "networkStatusTopology"}}]
+    assert vs.normalize_canvas_view_sets_for_storage(nst, ObjectType.DASHBOARD) == nst
+    screen = {"viewport": {"width": 1920, "height": 1080}, "items": nst, "decorations": {}}
+    assert vs.normalize_canvas_view_sets_for_storage(screen, ObjectType.SCREEN)["items"] == nst
+    with pytest.raises(ValueError, match="networkStatusTopology is not supported on report"):
+        vs.normalize_canvas_view_sets_for_storage(
+            {"schema_version": 1, "filters": [], "sections": nst},
+            ObjectType.REPORT,
+        )
+
+
+def test_normalize_topology_fills_keys():
+    out = vs.normalize_canvas_view_sets_for_storage({}, ObjectType.TOPOLOGY)
+    assert out == {"nodes": [], "edges": [], "filters": []}
+    out2 = vs.normalize_canvas_view_sets_for_storage("bad", ObjectType.TOPOLOGY)
+    assert out2 == {"nodes": [], "edges": [], "filters": []}
+
+
+def test_normalize_topology_drops_presentation_fields():
+    view_sets = {
+        "nodes": [{"id": "n1"}],
+        "edges": [],
+        "filters": [],
+        "viewport": {"width": 1920, "height": 1080, "letterboxColor": "#000000"},
+        "presentation": {
+            "templateKey": "custom-screen",
+            "templateVersion": 1,
+            "theme": "tech-blue",
+            "background": {"type": "preset", "key": "circuit-blue"},
+            "chrome": {"title": "基础资源态势大屏", "showClock": True},
+        },
+    }
+
+    out = vs.normalize_canvas_view_sets_for_storage(view_sets, ObjectType.TOPOLOGY)
+
+    assert out == {"nodes": [{"id": "n1"}], "edges": [], "filters": []}
+
+
+def test_normalize_screen_requires_complete_contract():
+    with pytest.raises(ValueError, match="view_sets.viewport"):
+        vs.normalize_canvas_view_sets_for_storage({}, ObjectType.SCREEN)
+
+
+def test_normalize_screen_keeps_valid_view_sets_without_ui_defaults():
+    out = vs.normalize_canvas_view_sets_for_storage(
+        {
+            "viewport": {"width": 1920, "height": 1080},
+            "items": [],
+            "decorations": {},
+        },
+        ObjectType.SCREEN,
+    )
+
+    assert out == {
+        "viewport": {"width": 1920, "height": 1080},
+        "items": [],
+        "decorations": {},
+    }
+
+
+def test_normalize_screen_keeps_adapter_background_and_chrome_items():
+    items = [
+        {
+            "id": "title-1",
+            "kind": "titleFrame",
+            "preset": "hero-1",
+            "content": "值班总览",
+            "x": 80,
+            "y": 16,
+            "w": 700,
+            "h": 56,
+            "zIndex": 2,
+        },
+        {
+            "id": "clock-1",
+            "kind": "clock",
+            "format": "YYYY-MM-DD HH:mm:ss",
+            "x": 1600,
+            "y": 20,
+            "w": 280,
+            "h": 48,
+            "zIndex": 3,
+        },
+    ]
+    out = vs.normalize_canvas_view_sets_for_storage(
+        {
+            "viewport": {
+                "width": 1920,
+                "height": 1080,
+                "adapter": "fitWidth",
+                "background": {"type": "color", "color": "#112233"},
+                "theme": "screen-dark",
+            },
+            "items": items,
+            "decorations": {"showTitle": False, "showClock": False},
+        },
+        ObjectType.SCREEN,
+    )
+
+    assert out["viewport"]["adapter"] == "fitWidth"
+
+    legacy = vs.normalize_canvas_view_sets_for_storage(
+        {
+            "viewport": {"width": 1920, "height": 1080, "adapter": "contain"},
+            "items": [],
+            "decorations": {},
+        },
+        ObjectType.SCREEN,
+    )
+    assert legacy["viewport"]["adapter"] == "fill"
+    assert out["viewport"]["background"] == {"type": "color", "color": "#112233"}
+    assert out["items"] == items
+
+
+def test_normalize_screen_keeps_custom_image_background_through_yaml_rewrite():
+    src = "data:image/png;base64,iVBORw0KGgo="
+    payload = {
+        "viewport": {
+            "width": 1920,
+            "height": 1080,
+            "background": {"type": "image", "src": src},
+        },
+        "items": [],
+        "decorations": {},
+    }
+    stored = vs.normalize_canvas_view_sets_for_storage(payload, ObjectType.SCREEN)
+    assert stored["viewport"]["background"] == {"type": "image", "src": src}
+
+    exported = vs.rewrite_canvas_view_sets_refs_for_yaml(stored, ObjectType.SCREEN, {})
+    assert exported["viewport"]["background"] == {"type": "image", "src": src}
+
+    imported = vs.rewrite_canvas_view_sets_refs_for_storage(exported, ObjectType.SCREEN, {})
+    assert imported["viewport"]["background"] == {"type": "image", "src": src}
+
+
+def test_validate_screen_allows_chrome_items_without_chart_type():
+    from apps.operation_analysis.services.canvas_draft.validation import validate_projectable
+
+    validate_projectable(
+        ObjectType.SCREEN,
+        {
+            "viewport": {"width": 1920, "height": 1080, "adapter": "contain"},
+            "items": [
+                {
+                    "id": "text-1",
+                    "kind": "text",
+                    "content": "说明",
+                    "x": 0,
+                    "y": 0,
+                    "w": 120,
+                    "h": 40,
+                    "zIndex": 1,
+                },
+                {
+                    "id": "shape-1",
+                    "kind": "shape",
+                    "shape": "rect",
+                    "shapeStyle": {"backgroundColor": "rgba(4, 165, 180, 0.10)"},
+                    "x": 40,
+                    "y": 40,
+                    "w": 320,
+                    "h": 180,
+                    "zIndex": 2,
+                },
+            ],
+            "decorations": {},
+        },
+    )
+
+
+def test_normalize_screen_keeps_unified_filters():
+    out = vs.normalize_canvas_view_sets_for_storage(
+        {
+            "viewport": {"width": 1920, "height": 1080},
+            "items": [],
+            "decorations": {},
+            "filters": [{"id": "time", "name": "时间范围"}],
+        },
+        ObjectType.SCREEN,
+    )
+
+    assert out["filters"] == [{"id": "time", "name": "时间范围"}]
+
+
+def test_normalize_report_fills_sections():
+    out = vs.normalize_canvas_view_sets_for_storage({}, ObjectType.REPORT)
+
+    assert out == {"schema_version": 1, "filters": [], "sections": []}
+
+
+def test_normalize_report_rejects_unregistered_component_type():
+    with pytest.raises(ValueError, match="sections\\[0\\].valueConfig.chartType"):
+        vs.normalize_canvas_view_sets_for_storage(
+            {
+                "schema_version": 1,
+                "filters": [],
+                "sections": [
+                    {
+                        "id": "chart-1",
+                        "valueConfig": {"chartType": "line", "dataSource": 1},
+                    }
+                ],
+            },
+            ObjectType.REPORT,
+        )
+
+
+def test_normalize_architecture_fills_keys():
+    out = vs.normalize_canvas_view_sets_for_storage({"items": [1]}, ObjectType.ARCHITECTURE)
+    assert out == {"items": [1], "views": []}
+    out2 = vs.normalize_canvas_view_sets_for_storage("bad", ObjectType.ARCHITECTURE)
+    assert out2 == {"items": [], "views": []}
+
+
+def test_normalize_for_yaml_dashboard_and_other():
+    assert vs.normalize_canvas_view_sets_for_yaml([1], ObjectType.DASHBOARD) == [1]
+    assert vs.normalize_canvas_view_sets_for_yaml({}, ObjectType.TOPOLOGY) == {
+        "nodes": [],
+        "edges": [],
+        "filters": [],
+    }
+
+
+def test_rewrite_datasource_refs_in_dashboard():
+    view_sets = [{"valueConfig": {"dataSource": 7, "chartType": "single"}}]
+    out = vs.rewrite_canvas_view_sets_refs_for_storage(view_sets, ObjectType.DASHBOARD, {7: "ds::api"})
+    assert out[0]["valueConfig"]["dataSource"] == "ds::api"
+
+
+def test_rewrite_datasource_refs_in_topology():
+    view_sets = {
+        "nodes": [{"valueConfig": {"dataSource": 3}}],
+        "edges": [],
+        "filters": [{"x": 1}],
+        "viewport": {"width": 1920, "height": 1080, "letterboxColor": "#000000"},
+    }
+    out = vs.rewrite_canvas_view_sets_refs_for_storage(view_sets, ObjectType.TOPOLOGY, {3: "ds::k"})
+    assert out["nodes"][0]["valueConfig"]["dataSource"] == "ds::k"
+    assert out["filters"] == [{"x": 1}]
+    assert "viewport" not in out
+
+
+def test_rewrite_topology_refs_drops_presentation():
+    view_sets = {
+        "nodes": [{"valueConfig": {"dataSource": 3}}],
+        "edges": [],
+        "filters": [],
+        "viewport": {"width": 1600, "height": 900, "letterboxColor": "#050b18"},
+        "presentation": {
+            "templateKey": "custom-screen",
+            "templateVersion": 1,
+            "theme": "tech-blue",
+            "viewportPreset": "1600x900",
+        },
+    }
+
+    out = vs.rewrite_canvas_view_sets_refs_for_storage(
+        view_sets,
+        ObjectType.TOPOLOGY,
+        {3: "监控中心总览统计::monitor/get_monitor_statistics"},
+    )
+
+    assert out["nodes"][0]["valueConfig"]["dataSource"] == "监控中心总览统计::monitor/get_monitor_statistics"
+    assert "presentation" not in out
+
+
+def test_rewrite_datasource_refs_in_screen_items():
+    view_sets = {
+        "viewport": {"width": 1920, "height": 1080, "theme": "screen-dark"},
+        "items": [{"valueConfig": {"dataSource": 8, "chartType": "line"}}],
+        "decorations": {"title": "大屏"},
+    }
+    out = vs.rewrite_canvas_view_sets_refs_for_storage(view_sets, ObjectType.SCREEN, {8: "ds::screen"})
+
+    assert out["items"][0]["valueConfig"]["dataSource"] == "ds::screen"
+
+
+def test_rewrite_datasource_refs_in_report_sections():
+    view_sets = {
+        "schema_version": 1,
+        "filters": [
+            {
+                "id": "billing_period__dateRange",
+                "key": "billing_period",
+                "name": "账期",
+                "type": "dateRange",
+                "order": 0,
+                "enabled": True,
+            }
+        ],
+        "sections": [
+            {
+                "id": "report-table",
+                "valueConfig": {"dataSource": "ds::report", "chartType": "table"},
+            }
+        ],
+    }
+    out = vs.rewrite_canvas_view_sets_refs_for_storage(view_sets, ObjectType.REPORT, {"ds::report": 6})
+
+    assert out["schema_version"] == 1
+    assert out["filters"][0]["key"] == "billing_period"
+    assert out["sections"][0]["valueConfig"]["dataSource"] == 6
+
+
+def test_rewrite_datasource_refs_for_yaml_architecture():
+    view_sets = {"items": [{"valueConfig": {"dataSource": 9}}], "views": []}
+    out = vs.rewrite_canvas_view_sets_refs_for_yaml(view_sets, ObjectType.ARCHITECTURE, {9: "ds::z"})
+    assert out["items"][0]["valueConfig"]["dataSource"] == "ds::z"
+
+
+# --------------------------------------------------------------------------
+# ExportService 纯函数
+# --------------------------------------------------------------------------
+
+
+def test_generate_business_key_variants():
+    from types import SimpleNamespace
+
+    ns = SimpleNamespace(name="ns-a")
+    ds = SimpleNamespace(name="ds-a", rest_api="monitor/q")
+    db = SimpleNamespace(name="db-a")
+    assert ExportService.generate_business_key(ns, ObjectType.NAMESPACE) == "ns-a"
+    assert ExportService.generate_business_key(ds, ObjectType.DATASOURCE) == "ds-a::monitor/q"
+    assert ExportService.generate_business_key(db, ObjectType.DASHBOARD) == "dashboard::db-a"
+
+
+def test_mask_sensitive_fields_nested():
+    data = {
+        "password": "p",
+        "nested": {"token": "t", "ok": 1, "X-API-Key": "header-secret"},
+        "list": [{"secret": "s"}, 2, [[{"api_key": "deep-secret"}]]],
+    }
+    out = ExportService.mask_sensitive_fields(data)
+    assert out["password"] == "******"
+    assert out["nested"]["token"] == "******"
+    assert out["nested"]["X-API-Key"] == "******"
+    assert out["nested"]["ok"] == 1
+    assert out["list"][0]["secret"] == "******"
+    assert out["list"][1] == 2
+    assert out["list"][2][0][0]["api_key"] == "******"
+
+
+def test_extract_canvas_dependencies_collects_datasource_ids():
+    view_sets = [
+        {"valueConfig": {"dataSource": 1}},
+        {"valueConfig": {"dataSource": 2}},
+        {"valueConfig": {"dataSource": "non-int"}},
+    ]
+    ds_ids, ns_ids = ExportService.extract_canvas_dependencies(view_sets, ObjectType.DASHBOARD)
+    assert ds_ids == {1, 2}
+    assert ns_ids == set()
+
+
+def test_extract_screen_dependencies_uses_value_config_contract():
+    view_sets = {
+        "viewport": {"width": 1920, "height": 1080},
+        "items": [
+            {
+                "id": "alert-kpi",
+                "type": "widget",
+                "valueConfig": {"dataSource": 8, "chartType": "single"},
+            }
+        ],
+        "decorations": {},
+    }
+
+    ds_ids, ns_ids = ExportService.extract_canvas_dependencies(view_sets, ObjectType.SCREEN)
+
+    assert ds_ids == {8}
+    assert ns_ids == set()
+
+
+def test_extract_canvas_dependencies_empty():
+    assert ExportService.extract_canvas_dependencies([], ObjectType.DASHBOARD) == (set(), set())
+
+
+@pytest.mark.django_db
+def test_extract_canvas_dependencies_includes_filter_option_datasource():
+    option = DataSourceAPIModel.objects.create(
+        name="监控主机列表",
+        rest_api="monitor/get_host_instance_list",
+        is_build_in=True,
+        created_by="s",
+        updated_by="s",
+    )
+    filters = [
+        {
+            "id": "instance_ids__string",
+            "inputConfig": {
+                "control": "select",
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "monitor/get_host_instance_list"},
+                    "valueField": "instance_id",
+                    "labelField": "display_name",
+                },
+            },
+        }
+    ]
+    ds_ids, ns_ids = ExportService.extract_canvas_dependencies(
+        [{"valueConfig": {"dataSource": 8}}],
+        ObjectType.DASHBOARD,
+        filters=filters,
+    )
+    assert ds_ids == {8, option.id}
+    assert ns_ids == set()
+
+
+@pytest.mark.django_db
+def test_extract_canvas_dependencies_includes_topology_overlay_without_datasource():
+    from apps.operation_analysis.services.network_status_topology_overlay import NETWORK_STATUS_TOPOLOGY_OVERLAY_REST_APIS
+
+    cmdb_api, monitor_api = NETWORK_STATUS_TOPOLOGY_OVERLAY_REST_APIS[:2]
+    cmdb = DataSourceAPIModel.objects.create(
+        name="export-overlay-cmdb",
+        rest_api=cmdb_api,
+        is_build_in=True,
+        created_by="s",
+        updated_by="s",
+    )
+    monitor = DataSourceAPIModel.objects.create(
+        name="export-overlay-monitor",
+        rest_api=monitor_api,
+        is_build_in=True,
+        created_by="s",
+        updated_by="s",
+    )
+    view_sets = [
+        {"valueConfig": {"chartType": "networkStatusTopology"}},
+        {"valueConfig": {"chartType": "line", "dataSource": 1}},
+    ]
+    ds_ids, ns_ids = ExportService.extract_canvas_dependencies(view_sets, ObjectType.DASHBOARD)
+    assert ds_ids == {1, cmdb.id, monitor.id}
+    assert ns_ids == set()
+
+
+# --------------------------------------------------------------------------
+# ExportService.export_objects 端到端
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_export_config_namespace():
+    ns = NameSpace.objects.create(name="ns-a", domain="d", account="a", password=NameSpace.encrypt_password("p"))
+    result = ExportService.export_objects(ScopeType.CONFIG.value, ObjectType.NAMESPACE.value, [ns.id])
+
+    parsed = yaml.safe_load(result["yaml_content"])
+    assert parsed["meta"]["object_counts"]["namespaces"] == 1
+    assert parsed["namespaces"][0]["password"] == "******"
+    assert result["summary"]["exported"]["namespaces"] == 1
+
+
+@pytest.mark.django_db
+def test_export_config_datasource_pulls_in_namespace():
+    ns = NameSpace.objects.create(name="ns-a", domain="d", account="a", password="p")
+    ds = DataSourceAPIModel.objects.create(
+        name="ds-a",
+        rest_api="",
+        source_type=DataSourceAPIModel.SOURCE_TYPE_MYSQL,
+        connection_config={
+            "host": "db.example.com",
+            "username": "reader",
+            "password": "db-secret",
+            "headers": {"Authorization": "Bearer secret"},
+        },
+        query_config={"table": "orders"},
+        created_by="s",
+        updated_by="s",
+    )
+    ds.namespaces.set([ns.id])
+    tag = DataSourceTag.objects.create(tag_id="t1", name="Tag1", created_by="s", updated_by="s")
+    ds.tag.set([tag.id])
+
+    result = ExportService.export_objects(ScopeType.CONFIG.value, ObjectType.DATASOURCE.value, [ds.id])
+    parsed = yaml.safe_load(result["yaml_content"])
+    assert parsed["meta"]["object_counts"]["datasources"] == 1
+    # 数据源关联的命名空间被一并导出
+    assert parsed["meta"]["object_counts"]["namespaces"] == 1
+    assert parsed["datasources"][0]["namespace_keys"] == ["ns-a"]
+    assert parsed["datasources"][0]["tags"] == ["Tag1"]
+    assert parsed["datasources"][0]["rest_api"] == ""
+    assert parsed["datasources"][0]["source_type"] == "mysql"
+    assert parsed["datasources"][0]["connection_config"] == {
+        "host": "db.example.com",
+        "username": "reader",
+        "password": "******",
+        "headers": {"Authorization": "******"},
+    }
+    assert parsed["datasources"][0]["query_config"] == {"table": "orders"}
+
+
+@pytest.mark.django_db
+def test_export_canvas_dashboard_with_datasource_dependency():
+    ds = DataSourceAPIModel.objects.create(name="ds-a", rest_api="monitor/q", created_by="s", updated_by="s")
+    dashboard = Dashboard.objects.create(
+        name="db-a",
+        groups=[1],
+        created_by="s",
+        view_sets=[{"valueConfig": {"dataSource": ds.id}}],
+    )
+
+    result = ExportService.export_objects(ScopeType.CANVAS.value, ObjectType.DASHBOARD.value, [dashboard.id])
+    parsed = yaml.safe_load(result["yaml_content"])
+    assert parsed["meta"]["object_counts"]["dashboards"] == 1
+    # 依赖收敛：引用的数据源被一并导出
+    assert parsed["meta"]["object_counts"]["datasources"] == 1
+    db_yaml = parsed["dashboards"][0]
+    # view_sets 中的 dataSource 被改写为业务键
+    assert db_yaml["view_sets"][0]["valueConfig"]["dataSource"] == "ds-a::monitor/q"
+    assert "ds-a::monitor/q" in db_yaml["refs"]["datasource_keys"]
+
+
+@pytest.mark.django_db
+def test_export_canvas_screen_and_report_sections():
+    from apps.operation_analysis.models.models import Report, Screen
+
+    screen = Screen.objects.create(
+        name="screen-a",
+        groups=[1],
+        created_by="s",
+        view_sets={"viewport": {"width": 1920, "height": 1080}, "items": [], "decorations": {"title": "大屏"}},
+    )
+    report = Report.objects.create(
+        name="report-a",
+        groups=[1],
+        created_by="s",
+        view_sets={"schema_version": 1, "filters": [], "sections": []},
+    )
+
+    screen_result = ExportService.export_objects(ScopeType.CANVAS.value, ObjectType.SCREEN.value, [screen.id])
+    report_result = ExportService.export_objects(ScopeType.CANVAS.value, ObjectType.REPORT.value, [report.id])
+
+    screen_yaml = yaml.safe_load(screen_result["yaml_content"])
+    report_yaml = yaml.safe_load(report_result["yaml_content"])
+    assert screen_yaml["meta"]["object_counts"]["screens"] == 1
+    assert screen_yaml["screens"][0]["key"] == "screen::screen-a"
+    assert report_yaml["meta"]["object_counts"]["reports"] == 1
+    assert report_yaml["reports"][0]["key"] == "report::report-a"
+
+
+def test_export_request_serializer_accepts_network_topology():
+    serializer = ExportRequestSerializer(
+        data={
+            "object_type": "networkTopology",
+            "object_ids": [1],
+        }
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["scope"] == ScopeType.CANVAS.value
+
+
+@pytest.mark.django_db
+def test_export_canvas_network_topology_yaml_section_and_secret_mask():
+    directory = Directory.objects.create(name="网络拓扑目录", groups=[1], created_by="s")
+    network_topology = NetworkTopology.objects.create(
+        name="net-a",
+        directory=directory,
+        groups=[1],
+        created_by="s",
+        base_url="https://weops.example.com",
+        token="plain-token",
+        view_sets={"nodes": [], "links": []},
+    )
+
+    result = ExportService.export_objects(ScopeType.CANVAS.value, ObjectType.NETWORK_TOPOLOGY.value, [network_topology.id])
+    parsed = yaml.safe_load(result["yaml_content"])
+
+    assert parsed["meta"]["object_counts"]["network_topologies"] == 1
+    assert parsed["network_topologies"][0]["key"] == "networkTopology::net-a"
+    assert parsed["network_topologies"][0]["base_url"] == "https://weops.example.com"
+    assert parsed["network_topologies"][0]["token"] == "******"
+
+
+@pytest.mark.django_db
+def test_export_excel_new_model_strips_imported_items_and_keeps_transform():
+    ds = DataSourceAPIModel.objects.create(
+        name="excel-new",
+        rest_api="",
+        source_type=DataSourceAPIModel.SOURCE_TYPE_EXCEL,
+        query_config={"imported_items": [{"a": 1}], "sheet_name": "Sheet1"},
+        transform_config={
+            "enabled": True,
+            "language": "python",
+            "script": "def transform(rows, params):\n    return rows\n",
+        },
+        excel_materialization_generation=1,
+        created_by="s",
+        updated_by="s",
+    )
+    payload = ExportService.convert_datasource_to_yaml(ds)
+    assert "imported_items" not in payload["query_config"]
+    assert payload["query_config"].get("sheet_name") == "Sheet1"
+    assert payload["transform_config"]["enabled"] is True
+
+
+@pytest.mark.django_db
+def test_export_datasource_canonicalizes_blank_date_range_value():
+    ds = DataSourceAPIModel.objects.create(
+        name="云资源账单明细",
+        rest_api="cmdb/get_cloud_resource_cost_bill_detail",
+        created_by="s",
+        updated_by="s",
+        params=[
+            {"name": "department", "type": "string", "value": "", "filterType": "filter"},
+            {"name": "billing_period", "type": "dateRange", "value": "", "filterType": "filter"},
+        ],
+    )
+
+    payload = ExportService.convert_datasource_to_yaml(ds)
+
+    assert payload["params"][0]["value"] == ""
+    assert payload["params"][1]["value"] is None
+
+
+@pytest.mark.django_db
+def test_export_shared_connection_expands_to_redacted_inline():
+    from apps.operation_analysis.models.datasource_models import DataConnection
+    from apps.operation_analysis.services.data_connection.config_crypto import encrypt_connection_config
+
+    connection = DataConnection.objects.create(
+        name="shared-mysql",
+        connection_type=DataConnection.TYPE_MYSQL,
+        groups=[1],
+        config=encrypt_connection_config(
+            {
+                "host": "db.example.com",
+                "port": 3306,
+                "database": "ops",
+                "username": "reader",
+                "password": "secret",
+            }
+        ),
+        created_by="s",
+        updated_by="s",
+    )
+    ds = DataSourceAPIModel.objects.create(
+        name="ds-shared",
+        rest_api="",
+        source_type=DataSourceAPIModel.SOURCE_TYPE_MYSQL,
+        connection=connection,
+        groups=[1],
+        connection_overrides={"database": "ops"},
+        query_config={"sql": "select 1"},
+        created_by="s",
+        updated_by="s",
+    )
+    payload = ExportService.convert_datasource_to_yaml(ds)
+    assert "connection_id" not in payload
+    assert payload["connection_config"]["host"] == "db.example.com"
+    assert payload["connection_config"]["password"] == "******"

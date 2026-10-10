@@ -1,0 +1,108 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_asentria",
+  "plugin": "NetworkService Asentria SiteBoss SNMP",
+  "plugin_desc": "Asentria SiteBoss SNMP collection for remote-site monitors under Asentria PEN 3052. The shared SNMP floor supplies MIB-II uptime and IF-MIB 64-bit HC interface traffic. This child template probes the SiteBoss 450 product subtree and collects esPoint temperature and humidity. Contact, relay and analog points are not promoted.",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='network_service', collect_type='snmp_asentria'}) by (instance_id)",
+  "name": "NetworkService",
+  "icon": "mm-network_service_网络服务",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='network_service'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "network_service_asentria_temperature",
+    "network_service_asentria_humidity"
+  ],
+  "metrics": [
+    {
+      "metric_group": "NetworkService",
+      "name": "network_service_asentria_temperature",
+      "query": "network_service_asentria_espoint_value{instance_type='network_service', esIndexPC='1', __$labels__}",
+      "display_name": "Asentria Temperature",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [
+        {
+          "name": "esPointName",
+          "description": "EventSensor point name"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "SiteBoss esPoint temperature from product subtree 3052.17 where point class is temperature. The reading uses the device-configured scale."
+    },
+    {
+      "metric_group": "NetworkService",
+      "name": "network_service_asentria_humidity",
+      "query": "network_service_asentria_espoint_value{instance_type='network_service', esIndexPC='3', __$labels__}",
+      "display_name": "Asentria Humidity",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [
+        {
+          "name": "esPointName",
+          "description": "EventSensor point name"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "SiteBoss esPoint relative humidity percent from product subtree 3052.17 where point class is humidity."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCInOctets",
+      "query": "rate(interface_ifHCInOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Incoming Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Average inbound interface bytes per second over five minutes from the 64-bit IF-MIB ifHCInOctets counter."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCOutOctets",
+      "query": "rate(interface_ifHCOutOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Outgoing Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Average outbound interface bytes per second over five minutes from the 64-bit IF-MIB ifHCOutOctets counter."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='network_service', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Device uptime since the last restart, derived from sysUpTime."
+    }
+  ]
+}

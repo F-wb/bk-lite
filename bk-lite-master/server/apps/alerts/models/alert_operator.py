@@ -1,0 +1,194 @@
+# -- coding: utf-8 --
+# @File: alert_operator.py
+# @Time: 2026/2/5 16:19
+# @Author: windyzhao
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import models
+from django.db.models import JSONField
+from django.db.models.signals import pre_delete
+from django.dispatch import receiver
+
+from apps.alerts.constants.constants import AlarmStrategyType, AlertAssignmentMatchType, AlertShieldMatchType, NotifyResultStatus
+from apps.core.models.maintainer_info import MaintainerInfo
+from apps.core.models.time_info import TimeInfo
+
+
+class AlertAssignment(MaintainerInfo, TimeInfo):
+    """
+    分派策略
+    """
+
+    name = models.CharField(max_length=200, unique=True, help_text="分派策略名称")
+    match_type = models.CharField(max_length=32, choices=AlertAssignmentMatchType.CHOICES, help_text="匹配类型")
+    match_rules = JSONField(default=list, help_text="匹配规则")
+    personnel = models.JSONField(default=list, blank=True, null=True, help_text="分派人员")
+    notify_channels = JSONField(default=list, help_text="通知渠道")
+    notification_scenario = JSONField(default=list, help_text="通知场景")
+    config = JSONField(default=dict, help_text="分派配置")
+    notification_frequency = models.JSONField(default=dict, blank=True, null=True, help_text="通知频率配置")
+    priority = models.PositiveSmallIntegerField(
+        default=100,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="分派优先级，数值越大优先级越高",
+    )
+    is_active = models.BooleanField(default=True, db_index=True, help_text="是否启用")
+
+    class Meta:
+        db_table = "alerts_alert_assignment"
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(priority__gte=0, priority__lte=100),
+                name="alert_assign_priority_range",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["is_active", "priority", "created_at", "id"],
+                name="alert_assign_order_idx",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class AlertShield(MaintainerInfo, TimeInfo):
+    """
+    告警屏蔽策略
+    """
+
+    name = models.CharField(max_length=200, unique=True, help_text="屏蔽策略名称")
+    match_type = models.CharField(max_length=32, choices=AlertShieldMatchType.CHOICES, help_text="匹配类型")
+    match_rules = JSONField(default=list, help_text="匹配规则")
+    suppression_time = models.JSONField(default=dict, help_text="屏蔽时间配置")
+    is_active = models.BooleanField(default=True, db_index=True, help_text="是否启用")
+
+    class Meta:
+        db_table = "alerts_alert_shield"
+
+    def __str__(self):
+        return self.name
+
+
+class AlertReminderTask(models.Model):
+    """
+    告警提醒任务 - 轮询版本
+    """
+
+    alert = models.OneToOneField("Alert", on_delete=models.CASCADE, help_text="关联的告警", primary_key=True)
+    assignment = models.ForeignKey(AlertAssignment, on_delete=models.CASCADE, help_text="分派策略")
+
+    # 提醒状态
+    is_active = models.BooleanField(default=True, help_text="是否激活")
+    reminder_count = models.IntegerField(default=0, help_text="已提醒次数")
+
+    # 当前配置（冗余存储，避免策略变更影响）
+    current_frequency_minutes = models.IntegerField(help_text="当前提醒频率(分钟)")
+    current_max_reminders = models.IntegerField(help_text="当前最大提醒次数")
+
+    # 时间记录
+    next_reminder_time = models.DateTimeField(help_text="下次提醒时间")
+    last_reminder_time = models.DateTimeField(null=True, blank=True, help_text="上次提醒时间")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "alerts_reminder_task"
+        indexes = [
+            models.Index(fields=["is_active", "next_reminder_time"]),
+        ]
+
+    def __str__(self):
+        return f"ReminderTask for Alert {self.alert.alert_id}"
+
+
+class AlertEscalationTask(models.Model):
+    """
+    告警升级任务 - 时间驱动，独立于提醒任务
+    """
+
+    alert = models.OneToOneField("Alert", on_delete=models.CASCADE, help_text="关联的告警", primary_key=True)
+    assignment = models.ForeignKey(AlertAssignment, on_delete=models.CASCADE, help_text="分派策略")
+
+    is_active = models.BooleanField(default=True, help_text="是否激活")
+    mode = models.CharField(max_length=16, help_text="升级模式 append/replace")
+    layers = JSONField(default=list, help_text="升级链层级快照")
+    current_layer_index = models.IntegerField(default=0, help_text="当前层级索引")
+    layer_started_at = models.DateTimeField(help_text="本层开始时间")
+    next_escalation_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="下次升级检查时间；空值为待回填旧记录",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "alerts_escalation_task"
+        indexes = [
+            models.Index(fields=["is_active", "layer_started_at"]),
+        ]
+
+    def __str__(self):
+        return f"EscalationTask for Alert {self.alert.alert_id}"
+
+
+@receiver(pre_delete, sender=AlertEscalationTask, dispatch_uid="alerts_escalation_template_references_delete")
+def release_deleted_escalation_template_references(sender, instance, using, **kwargs):
+    """父策略/告警的级联删除同样释放快照引用，且随删除事务一起回滚。"""
+    from apps.alerts.models.notification_template import NotificationTemplateReference
+
+    NotificationTemplateReference.objects.using(using).filter(source_type="escalation_task", source_id=instance.alert.alert_id).delete()
+
+
+class AlarmStrategy(MaintainerInfo, TimeInfo):
+    """告警策略模型"""
+
+    name = models.CharField(max_length=100, help_text="策略名称")
+    strategy_type = models.CharField(
+        max_length=32,
+        choices=AlarmStrategyType.CHOICES,
+        default=AlarmStrategyType.SMART_DENOISE,
+        help_text="策略类型",
+    )
+    is_active = models.BooleanField(default=True, help_text="是否启用")
+    description = models.TextField(null=True, blank=True, help_text="策略描述")
+    team = JSONField(default=list, help_text="关联组织")  # 策略组织 谁能看到这个策略
+    dispatch_team = JSONField(default=list, help_text="分派组织")  # Event聚合Alert后的组织
+    # {"match_rules":{"type":"ALL","value":[{}]}}
+    match_rules = JSONField(default=list, help_text="匹配规则")
+    params = JSONField(default=dict, help_text="策略参数")  # {"type":[],"window_size":10}
+    last_execute_time = models.DateTimeField(null=True, blank=True, help_text="所有策略通用的最后执行时间")
+    auto_close = models.BooleanField(default=True, help_text="是否自动关闭告警")
+    close_minutes = models.IntegerField(default=120, help_text="自动关闭时间(分钟)")
+
+    class Meta:
+        db_table = "alerts_alarm_strategy"
+        verbose_name = "告警策略"
+        verbose_name_plural = "告警策略"
+        unique_together = ("name", "strategy_type")
+
+
+# 通知结果存储
+class NotifyResult(models.Model):
+    """通知结果"""
+
+    notify_people = JSONField(default=list, help_text="通知人员")
+    notify_channel = models.CharField(max_length=100, null=True, blank=True, help_text="通知渠道")
+    notify_channel_name = models.CharField(max_length=100, null=True, blank=True, help_text="通知渠道名称")
+    notify_time = models.DateTimeField(auto_now_add=True, help_text="通知时间")
+    notify_result = models.CharField(max_length=30, choices=NotifyResultStatus.CHOICES, help_text="通知结果")
+    failure_reason = models.TextField(null=True, blank=True, help_text="通知失败原因")
+    notify_object = models.CharField(max_length=100, null=True, blank=True, help_text="通知对象ID")
+    notify_type = models.CharField(max_length=50, null=True, blank=True, help_text="通知类型")
+
+    class Meta:
+        db_table = "alerts_notify_result"
+        verbose_name = "通知结果"
+        verbose_name_plural = "通知结果"
+
+    def __str__(self):
+        return f"NotifyResult for {self.notify_object} at {self.notify_time} - {self.notify_result}"

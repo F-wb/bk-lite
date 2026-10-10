@@ -1,0 +1,140 @@
+import { isDashboardExecutionRenderRoute } from '@/app/routeScope';
+
+const SESSION_EXPIRED_EVENT = 'bk-lite:session-expired';
+
+const SESSION_EXPIRY_IGNORED_PATH_PREFIXES = [
+  '/auth/',
+  '/api/auth/',
+  '/api/locales',
+  '/api/menu',
+  '/api/versions',
+  '/api/markdown',
+];
+
+const SESSION_EXPIRY_IGNORED_REQUEST_PATHS = [
+  '/api/proxy/core/api/get_domain_list/',
+  '/api/proxy/core/api/get_bk_settings/',
+  '/api/proxy/core/api/get_wechat_settings/',
+  '/api/proxy/core/api/login/',
+  '/api/proxy/core/api/get_login_auth_bindings/',
+  '/api/proxy/core/api/start_login_auth/',
+  '/api/proxy/core/api/reset_pwd/',
+  '/api/proxy/core/api/verify_otp_code/',
+  // 分享 prepare 故意无 Bearer；401 不应当成会话过期
+  '/api/proxy/operation_analysis/api/dashboard_share/prepare/',
+];
+
+let sessionExpiredDispatched = false;
+let sessionExpiryConfirming = false;
+
+export interface SessionExpiredDetail {
+  reason?: string;
+  status?: number;
+}
+
+export const emitSessionExpired = (detail?: SessionExpiredDetail) => {
+  if (typeof window === 'undefined' || sessionExpiredDispatched || sessionExpiryConfirming) {
+    return;
+  }
+
+  // Chromium 报告渲染页：任何 401 都不得弹「登录已过期」，否则会污染 PDF
+  if (isDashboardExecutionRenderRoute(window.location.pathname)) {
+    return;
+  }
+
+  // 先进入探活，不置失效门闩。单次偶发 401 不应挡住同页其它请求。
+  sessionExpiryConfirming = true;
+  window.dispatchEvent(new CustomEvent<SessionExpiredDetail>(SESSION_EXPIRED_EVENT, { detail }));
+};
+
+export const latchSessionExpired = () => {
+  sessionExpiryConfirming = false;
+  sessionExpiredDispatched = true;
+};
+
+export const releaseSessionExpiryConfirmation = () => {
+  if (!sessionExpiredDispatched) {
+    sessionExpiryConfirming = false;
+  }
+};
+
+export const resetSessionExpiredState = () => {
+  sessionExpiredDispatched = false;
+  sessionExpiryConfirming = false;
+};
+
+export const isSessionExpiredState = () => sessionExpiredDispatched;
+
+export const isSessionExpiryConfirming = () => sessionExpiryConfirming;
+
+export const SESSION_EXPIRED_REQUEST_ERROR = 'SESSION_EXPIRED_REQUEST_ERROR';
+
+export const createSessionExpiredRequestError = () => {
+  const error = new Error(SESSION_EXPIRED_REQUEST_ERROR);
+  error.name = SESSION_EXPIRED_REQUEST_ERROR;
+  return error;
+};
+
+export const isAuthPath = (pathname?: string | null) => {
+  if (!pathname) {
+    return false;
+  }
+
+  return ['/auth/signin', '/auth/signout', '/auth/callback', '/auth/signin/login-auth-result'].includes(pathname);
+};
+
+const resolveRequestUrl = (input?: RequestInfo | URL | string | null) => {
+  if (typeof window === 'undefined' || !input) {
+    return null;
+  }
+
+  const requestUrl = input instanceof Request ? input.url : input.toString();
+
+  try {
+    return new URL(requestUrl, window.location.origin);
+  } catch {
+    return null;
+  }
+};
+
+export const shouldHandleSessionExpiry = (input?: RequestInfo | URL | string | null) => {
+  const requestUrl = resolveRequestUrl(input);
+
+  if (!requestUrl || requestUrl.origin !== window.location.origin) {
+    return false;
+  }
+
+  const { pathname } = requestUrl;
+
+  if (SESSION_EXPIRY_IGNORED_PATH_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
+    return false;
+  }
+
+  if (SESSION_EXPIRY_IGNORED_REQUEST_PATHS.some((path) => pathname.startsWith(path))) {
+    return false;
+  }
+
+  if (/^\/api\/proxy\/core\/api\/login_auth_requests\/[^/]+\/status$/.test(pathname)) {
+    return false;
+  }
+
+  return pathname.startsWith('/api/') || pathname.includes('/api/');
+};
+
+export const shouldTriggerSessionExpiry = (
+  input: RequestInfo | URL | string | null | undefined,
+  currentSessionIdentity: string | null,
+  requestSessionIdentity: string | null = currentSessionIdentity,
+) => {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  return Boolean(currentSessionIdentity)
+    && requestSessionIdentity === currentSessionIdentity
+    && !isAuthPath(window.location.pathname)
+    && !isDashboardExecutionRenderRoute(window.location.pathname)
+    && shouldHandleSessionExpiry(input);
+};
+
+export { SESSION_EXPIRED_EVENT };

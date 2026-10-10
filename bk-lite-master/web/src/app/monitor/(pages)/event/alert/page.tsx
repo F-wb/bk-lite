@@ -1,0 +1,755 @@
+'use client';
+import './register-alert-pilot';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
+import {
+  Input,
+  Button,
+  Select,
+  Tag,
+  Tabs,
+  Spin,
+  Tooltip,
+  Checkbox
+} from 'antd';
+import useApiClient from '@/utils/request';
+import { useTranslation } from '@/utils/i18n';
+import Icon from '@/components/icon';
+import { getRecentTimeRange } from '@/app/monitor/utils/common';
+import {
+  ColumnItem,
+  ModalRef,
+  Pagination,
+  TableDataItem,
+  UserItem,
+  TabItem,
+  TimeSelectorDefaultValue,
+  TimeValuesProps,
+  TreeItem,
+  ObjectItem
+} from '@/app/monitor/types';
+import { AlertOutlined } from '@ant-design/icons';
+import { FiltersConfig } from '@/app/monitor/types/event';
+import CustomTable from '@/components/custom-table';
+import TimeSelector from '@/components/time-selector';
+import Collapse from '@/components/collapse';
+import StackedBarChart from '@/app/monitor/components/charts/stackedBarChart';
+import AlertDetail from './alertDetail';
+import AlertHandlerActions from './alertHandlerActions';
+import { formatAlertHandlers } from './alertHandlerUtils';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import { useAlarmTabs, useStateList } from '@/app/monitor/hooks/event';
+import {
+  useLevelList,
+  useStateMap,
+  useAlertTypeMap
+} from '@/app/monitor/hooks';
+import dayjs, { Dayjs } from 'dayjs';
+import { useCommon } from '@/app/monitor/context/common';
+import alertStyle from './index.module.scss';
+import { LEVEL_MAP } from '@/app/monitor/constants';
+import useMonitorApi from '@/app/monitor/api/index';
+import TreeSelector from '@/app/monitor/components/treeSelector';
+import ResizableSidebar from '@/app/monitor/components/resizableSidebar';
+import { cloneDeep } from 'lodash';
+import UserAvatar from '@/components/user-avatar';
+import { useHabitExpanded } from '@/hooks/useHabitExpanded';
+import useMonitorUserHabitApi, {
+  MONITOR_ALERT_CHART_HABIT_KEY
+} from '@/app/monitor/api/userHabit';
+import { useMonitorObjectQuery } from '@/app/monitor/hooks/useMonitorObjectQuery';
+import {
+  resolveMonitorObjectQueryId,
+  resolveMonitorObjectTreeKey
+} from '@/app/monitor/utils/monitorObjectQuery';
+const { Search } = Input;
+const { Option } = Select;
+
+const Alert: React.FC = () => {
+  const { isLoading } = useApiClient();
+  const { getMonitorAlert, getMonitorObject } =
+    useMonitorApi();
+  const { getUserHabit, saveUserHabit } = useMonitorUserHabitApi();
+  const { t } = useTranslation();
+  const STATE_MAP = useStateMap();
+  const ALERT_TYPE_MAP = useAlertTypeMap();
+  const LEVEL_LIST = useLevelList();
+  const stateList = useStateList();
+  const tabs: TabItem[] = useAlarmTabs();
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const commonContext = useCommon();
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const detailRef = useRef<ModalRef>(null);
+  const userList: UserItem[] = commonContext?.userList || [];
+  const [searchText, setSearchText] = useState<string>('');
+  const [tableLoading, setTableLoading] = useState<boolean>(false);
+  const [chartLoading, setChartLoading] = useState<boolean>(false);
+  const [tableData, setTableData] = useState<TableDataItem[]>([]);
+  const [pagination, setPagination] = useState<Pagination>({
+    current: 1,
+    total: 0,
+    pageSize: 20
+  });
+  const [frequence, setFrequence] = useState<number>(0);
+  const [timeValues, setTimeValues] = useState<TimeValuesProps>({
+    timeRange: [],
+    originValue: 10080
+  });
+  const timeDefaultValue = (useRef<TimeSelectorDefaultValue>({
+    selectValue: 10080,
+    rangePickerVaule: null
+  })?.current || {}) as any;
+  const alertAbortControllerRef = useRef<AbortController | null>(null);
+  const alertRequestIdRef = useRef<number>(0);
+  const chartAbortControllerRef = useRef<AbortController | null>(null);
+  const chartRequestIdRef = useRef<number>(0);
+  const [filters, setFilters] = useState<FiltersConfig>({
+    level: [],
+    state: []
+  });
+  const [activeTab, setActiveTab] = useState<string>('activeAlarms');
+  const [chartData, setChartData] = useState<Record<string, any>[]>([]);
+  const loadChartHabit = useCallback(
+    () => getUserHabit(MONITOR_ALERT_CHART_HABIT_KEY),
+    [getUserHabit]
+  );
+  const saveChartHabit = useCallback(
+    (value: { expanded: boolean }) =>
+      saveUserHabit(MONITOR_ALERT_CHART_HABIT_KEY, value),
+    [saveUserHabit]
+  );
+  const [chartExpanded, onChartToggle] = useHabitExpanded({
+    enabled: !isLoading,
+    load: loadChartHabit,
+    save: saveChartHabit
+  });
+  const [treeLoading, setTreeLoading] = useState<boolean>(false);
+  const [objects, setObjects] = useState<ObjectItem[]>([]);
+  const [treeData, setTreeData] = useState<TreeItem[]>([]);
+  const [objectId, setObjectId] = useState<React.Key>('');
+  const [defaultSelectObj, setDefaultSelectObj] = useState<React.Key>('');
+  const [myAlert, setMyAlert] = useState(false);
+  const { syncObjectId, searchParams } = useMonitorObjectQuery();
+
+  const columns: ColumnItem[] = [
+    {
+      title: t('monitor.events.level'),
+      dataIndex: 'level',
+      key: 'level',
+      render: (_, { level }) => (
+        <Tag icon={<AlertOutlined />} color={LEVEL_MAP[level] as string}>
+          {LEVEL_LIST.find((item) => item.value === level)?.label || '--'}
+        </Tag>
+      )
+    },
+    {
+      title: t('common.time'),
+      dataIndex: 'updated_at',
+      key: 'updated_at',
+      sorter: (a: any, b: any) => a.id - b.id,
+      render: (_, { updated_at }) => (
+        <>{updated_at ? convertToLocalizedTime(updated_at) : '--'}</>
+      )
+    },
+    {
+      title: t('monitor.events.alertName'),
+      dataIndex: 'content',
+      key: 'content'
+    },
+    {
+      title: t('monitor.events.alertType'),
+      dataIndex: 'alert_type',
+      key: 'alert_type',
+      render: (_, { alert_type }) => (
+        <Tag color="default">{ALERT_TYPE_MAP[alert_type] || '--'}</Tag>
+      )
+    },
+    {
+      title: t('monitor.asset'),
+      dataIndex: 'monitor_instance_name',
+      key: 'monitor_instance_name'
+    },
+    {
+      title: t('monitor.events.assetType'),
+      dataIndex: 'assetType',
+      key: 'assetType',
+      render: (_, record) => <>{showObjName(record)}</>
+    },
+    {
+      title: t('monitor.events.state'),
+      dataIndex: 'status',
+      key: 'status',
+      render: (_, { status }) => (
+        <Tag color={status === 'new' ? 'blue' : 'var(--color-text-4)'}>
+          {STATE_MAP[status]}
+        </Tag>
+      )
+    },
+    {
+      title: t('monitor.events.notify'),
+      dataIndex: 'notify',
+      key: 'notify',
+      render: (_, record) => (
+        <>
+          {t(
+            `monitor.events.${
+              record.policy?.notice ? 'notified' : 'unnotified'
+            }`
+          )}
+        </>
+      )
+    },
+    {
+      title: t('monitor.events.handler'),
+      dataIndex: 'handlers',
+      key: 'handlers',
+      render: (_: unknown, record: TableDataItem) => {
+        const text = formatAlertHandlers(
+          record.handlers,
+          record.handlers_display,
+          userList
+        );
+        return text !== '--' ? (
+          <UserAvatar userName={text} size="small" />
+        ) : (
+          <>--</>
+        );
+      }
+    },
+    {
+      title: t('common.action'),
+      key: 'action',
+      dataIndex: 'action',
+      width: 280,
+      fixed: 'right',
+      render: (_, record) => (
+        <>
+          <Button
+            className="mr-[10px]"
+            type="link"
+            onClick={() => openAlertDetail(record)}
+          >
+            {t('common.detail')}
+          </Button>
+          <AlertHandlerActions
+            record={record}
+            closeText={t('common.close')}
+            onSuccess={onRefresh}
+          />
+        </>
+      )
+    }
+  ];
+
+  const isActiveAlarm = useMemo(() => {
+    return activeTab === 'activeAlarms';
+  }, [activeTab]);
+
+  const activeStateList = useMemo(() => {
+    const filterArr = isActiveAlarm ? ['new'] : ['recovered', 'closed'];
+    return stateList.filter((item) => filterArr.includes(item.value));
+  }, [stateList, isActiveAlarm]);
+
+  useEffect(() => {
+    if (!frequence) {
+      clearTimer();
+      return;
+    }
+    timerRef.current = setInterval(() => {
+      if (objectId) {
+        getAssetInsts('timer');
+        getChartData('timer');
+      }
+    }, frequence);
+    return () => {
+      clearTimer();
+    };
+  }, [
+    frequence,
+    timeValues,
+    objectId,
+    searchText,
+    pagination.current,
+    pagination.pageSize
+  ]);
+
+  useEffect(() => {
+    if (isLoading || !objectId) return;
+    getAssetInsts('refresh');
+  }, [
+    isLoading,
+    timeValues,
+    objectId,
+    pagination.current,
+    pagination.pageSize
+  ]);
+
+  useEffect(() => {
+    if (isLoading || !objectId) return;
+    getChartData('refresh');
+  }, [isLoading, timeValues, objectId]);
+
+  useEffect(() => {
+    if (isLoading) return;
+    getObjects();
+  }, [isLoading]);
+
+  useEffect(() => {
+    return () => {
+      cancelAllRequests();
+    };
+  }, []);
+
+  const changeTab = (val: string) => {
+    setActiveTab(val);
+    const filtersConfig = {
+      level: [],
+      state: []
+    };
+    setFilters(filtersConfig);
+    setSearchText('');
+    getAssetInsts('refresh', { tab: val, filtersConfig, text: 'clear' });
+    getChartData('refresh', { tab: val, filtersConfig });
+  };
+
+  const getObjects = async () => {
+    setTreeLoading(true);
+    try {
+      const data: ObjectItem[] = await getMonitorObject({
+        add_policy_count: true
+      });
+      setObjects(data);
+      const _treeData = getTreeData(cloneDeep(data));
+      setTreeData(_treeData);
+      setDefaultSelectObj(
+        resolveMonitorObjectTreeKey(
+          data,
+          resolveMonitorObjectQueryId({
+            searchParams,
+            objects: data,
+            allowAll: true,
+            fallback: 'all'
+          }),
+          'all'
+        )
+      );
+    } finally {
+      setTreeLoading(false);
+    }
+  };
+
+  const getTreeData = (data: ObjectItem[]): TreeItem[] => {
+    const groupedData = data.reduce(
+      (acc, item) => {
+        if (!acc[item.type]) {
+          acc[item.type] = {
+            title: item.display_type || '--',
+            key: item.type,
+            children: []
+          };
+        }
+        acc[item.type].children.push({
+          title: item.display_name || '--',
+          label: item.name || '--',
+          key: item.id,
+          icon: item.icon,
+          children: []
+        });
+        return acc;
+      },
+      {} as Record<string, TreeItem>
+    );
+    return [
+      {
+        title: t('common.all'),
+        key: 'all',
+        children: []
+      },
+      ...Object.values(groupedData)
+    ];
+  };
+
+  const clearTimer = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+  };
+
+  const getParams = (tab: string, filtersMap: FiltersConfig, mine = myAlert) => {
+    const recentTimeRange = getRecentTimeRange(timeValues);
+    const isActive = tab === 'activeAlarms';
+    const params = {
+      status_in: isActive
+        ? 'new'
+        : filtersMap.state.join(',') || 'recovered,closed',
+      level_in: filtersMap.level.join(','),
+      monitor_object_id: objectId === 'all' ? '' : objectId,
+      content: searchText || '',
+      page: pagination.current,
+      page_size: pagination.pageSize,
+      created_at_after: isActive ? '' : dayjs(recentTimeRange[0]).toISOString(),
+      created_at_before: isActive ? '' : dayjs(recentTimeRange[1]).toISOString(),
+      ...(mine ? { my_alert: 1 } : {})
+    };
+    return params;
+  };
+
+  const showObjName = (row: TableDataItem) => {
+    return (
+      objects.find((item) => item.id === row.policy?.monitor_object)
+        ?.display_name || '--'
+    );
+  };
+
+  const handleTableChange = (pagination: any) => {
+    setPagination(pagination);
+  };
+
+  const getAssetInsts = async (
+    type: string,
+    extra?: {
+      text?: string;
+      tab?: string;
+      filtersConfig?: FiltersConfig;
+      myAlert?: boolean;
+    }
+  ) => {
+    alertAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    alertAbortControllerRef.current = abortController;
+    const currentRequestId = ++alertRequestIdRef.current;
+    const params: any = getParams(
+      extra?.tab || activeTab,
+      extra?.filtersConfig || filters,
+      extra?.myAlert
+    );
+    if (extra?.text === 'clear') {
+      params.content = '';
+    }
+    try {
+      setTableLoading(type !== 'timer');
+      const data = await getMonitorAlert(params, {
+        signal: abortController.signal
+      });
+      if (currentRequestId !== alertRequestIdRef.current) return;
+      setTableData(data.results || []);
+      setPagination((pre) => ({
+        ...pre,
+        total: data.count || 0
+      }));
+    } finally {
+      if (currentRequestId === alertRequestIdRef.current) {
+        setTableLoading(false);
+      }
+    }
+  };
+
+  const getChartData = async (
+    type: string,
+    extra?: {
+      tab?: string;
+      filtersConfig?: FiltersConfig;
+      myAlert?: boolean;
+    }
+  ) => {
+    chartAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    chartAbortControllerRef.current = abortController;
+    const currentRequestId = ++chartRequestIdRef.current;
+    const params = getParams(
+      extra?.tab || activeTab,
+      extra?.filtersConfig || filters,
+      extra?.myAlert
+    );
+    const chartParams: any = cloneDeep(params);
+    delete chartParams.page;
+    delete chartParams.page_size;
+    chartParams.content = '';
+    chartParams.type = 'count';
+    try {
+      setChartLoading(type !== 'timer');
+      const data = await getMonitorAlert(chartParams, {
+        signal: abortController.signal
+      });
+      if (currentRequestId !== chartRequestIdRef.current) return;
+      setChartData(
+        processDataForStackedBarChart(
+          (data.results || []).filter((item: TableDataItem) => !!item.level)
+        ) as any
+      );
+    } finally {
+      if (currentRequestId === chartRequestIdRef.current) {
+        setChartLoading(false);
+      }
+    }
+  };
+
+  const onFrequenceChange = (val: number) => {
+    setFrequence(val);
+  };
+
+  const onRefresh = () => {
+    getAssetInsts('refresh');
+    getChartData('refresh');
+  };
+
+  const openAlertDetail = (row: TableDataItem) => {
+    detailRef.current?.showModal({
+      title: t('monitor.events.alertDetail'),
+      type: 'add',
+      form: {
+        ...row,
+        alertTitle: showObjName(row)
+      }
+    });
+  };
+
+  const onTimeChange = (val: number[], originValue: number | null) => {
+    setTimeValues({
+      timeRange: val,
+      originValue
+    });
+  };
+
+  const processDataForStackedBarChart = (
+    data: TableDataItem,
+    desiredSegments = 12
+  ) => {
+    if (!data?.length) return [];
+    // 1. 找到最早时间和最晚时间
+    const timestamps = data.map((item: TableDataItem) =>
+      dayjs(item.created_at)
+    );
+    const minTime = timestamps.reduce(
+      (min: Dayjs, curr: Dayjs) => (curr.isBefore(min) ? curr : min),
+      timestamps[0]
+    ); // 最早时间
+    const maxTime = timestamps.reduce(
+      (max: Dayjs, curr: Dayjs) => (curr.isAfter(max) ? curr : max),
+      timestamps[0]
+    ); // 最晚时间
+    // 2. 计算时间跨度（以分钟为单位）
+    const totalMinutes = maxTime.diff(minTime, 'minute');
+    // 3. 动态计算时间区间（每段的分钟数）
+    const intervalMinutes = Math.max(
+      Math.ceil(totalMinutes / desiredSegments),
+      1
+    ); // 确保 intervalMinutes 至少为 1
+    // 4. 按动态时间区间划分数据
+    const groupedData = data.reduce(
+      (acc: TableDataItem, curr: TableDataItem) => {
+        // 根据 created_at 时间戳，计算所属时间区间
+        const timestamp = dayjs(curr.created_at).startOf('minute'); // 转为分钟级别时间戳
+        const roundedTime = convertToLocalizedTime(
+          minTime.add(
+            Math.floor(timestamp.diff(minTime, 'minute') / intervalMinutes) *
+              intervalMinutes,
+            'minute'
+          )
+        );
+        if (!acc[roundedTime]) {
+          acc[roundedTime] = {
+            time: roundedTime,
+            critical: 0,
+            error: 0,
+            warning: 0
+          };
+        }
+        // 根据 level 统计数量
+        if (curr.level === 'critical') {
+          acc[roundedTime].critical += 1;
+        } else if (curr.level === 'error') {
+          acc[roundedTime].error += 1;
+        } else if (curr.level === 'warning') {
+          acc[roundedTime].warning += 1;
+        }
+        return acc;
+      },
+      {}
+    );
+    // 5. 将分组后的对象转为数组
+    return Object.values(groupedData).sort(
+      (a: any, b: any) => dayjs(b.time).valueOf() - dayjs(a.time).valueOf()
+    );
+  };
+
+  const onFilterChange = (
+    checkedValues: string[],
+    field: keyof FiltersConfig
+  ) => {
+    const filtersConfig = cloneDeep(filters);
+    filtersConfig[field] = checkedValues;
+    setFilters(filtersConfig);
+    getAssetInsts('refresh', { filtersConfig });
+    getChartData('refresh', { filtersConfig });
+  };
+
+  const handleSearch = (text: string) => {
+    setSearchText(text);
+    getAssetInsts('refresh', { text: text || 'clear' });
+  };
+
+  const cancelAllRequests = () => {
+    alertAbortControllerRef.current?.abort();
+    chartAbortControllerRef.current?.abort();
+  };
+
+  const handleObjectChange = async (id: string) => {
+    cancelAllRequests();
+    setObjectId(id);
+    syncObjectId(id);
+  };
+
+  return (
+    <div className="flex h-full min-h-0 w-full min-w-0 max-w-full flex-1 flex-col">
+      <div className={alertStyle.alert}>
+        <ResizableSidebar collapseStorageKey="monitor.event.alert.sidebarCollapsed">
+          <div className={alertStyle.filters}>
+            <TreeSelector
+              loading={treeLoading}
+              showAllMenu
+              data={treeData}
+              defaultSelectedKey={defaultSelectObj as string}
+              onNodeSelect={handleObjectChange}
+            />
+          </div>
+        </ResizableSidebar>
+        <div className={alertStyle.alarmList}>
+          <Tabs className="shrink-0" activeKey={activeTab} items={tabs} onChange={changeTab} />
+          <div className={alertStyle.searchCondition}>
+            <div className="mb-[10px]">
+              {t('monitor.search.searchCriteria')}
+            </div>
+            <div className={alertStyle.condition}>
+              <ul className="flex">
+                <li className="mr-[8px]">
+                  <span className="mr-[8px] text-[12px] text-[var(--color-text-3)]">
+                    {t('monitor.events.level')}
+                  </span>
+                  <Select
+                    style={{ width: 200 }}
+                    dropdownStyle={{ width: 130 }}
+                    showSearch
+                    allowClear
+                    mode="multiple"
+                    optionFilterProp="label"
+                    maxTagCount="responsive"
+                    value={filters.level}
+                    onChange={(val) => onFilterChange(val, 'level')}
+                  >
+                    {LEVEL_LIST.map((item) => (
+                      <Option
+                        key={item.value}
+                        value={item.value}
+                        label={item.label}
+                      >
+                        <Tag
+                          icon={<AlertOutlined />}
+                          color={LEVEL_MAP[item.value as string] as string}
+                        >
+                          {LEVEL_LIST.find((tex) => tex.value === item.value)
+                            ?.label || '--'}
+                        </Tag>
+                      </Option>
+                    ))}
+                  </Select>
+                </li>
+                <li>
+                  <span className="mr-[8px] text-[12px] text-[var(--color-text-3)]">
+                    {t('monitor.events.state')}
+                  </span>
+                  <Select
+                    style={{ width: 200 }}
+                    showSearch
+                    allowClear
+                    mode="multiple"
+                    optionFilterProp="label"
+                    maxTagCount="responsive"
+                    value={filters.state}
+                    onChange={(val) => onFilterChange(val, 'state')}
+                    options={activeStateList}
+                  ></Select>
+                </li>
+              </ul>
+              <TimeSelector
+                defaultValue={timeDefaultValue}
+                onlyRefresh={isActiveAlarm}
+                onChange={onTimeChange}
+                onFrequenceChange={onFrequenceChange}
+                onRefresh={onRefresh}
+              />
+            </div>
+          </div>
+          <Spin spinning={chartLoading}>
+            <div className={alertStyle.chartWrapper}>
+              <Collapse
+                title={t('monitor.events.distributionMap')}
+                icon={
+                  <Tooltip
+                    placement="top"
+                    title={t(`monitor.events.${activeTab}MapTips`)}
+                  >
+                    <span className="cursor-pointer">
+                      <Icon
+                        type="a-shuoming2"
+                        className="text-[14px] text-[var(--color-text-3)]"
+                      />
+                    </span>
+                  </Tooltip>
+                }
+                isOpen={chartExpanded}
+                onToggle={onChartToggle}
+              >
+                <div className={alertStyle.chart}>
+                  <StackedBarChart data={chartData} colors={LEVEL_MAP as any} />
+                </div>
+              </Collapse>
+            </div>
+          </Spin>
+          <div className={alertStyle.table}>
+            <div className="mb-[10px] flex shrink-0 items-center gap-3">
+              <Search
+                allowClear
+                className="w-[240px]"
+                placeholder={t('common.searchPlaceHolder')}
+                value={searchText}
+                enterButton
+                onChange={(e) => setSearchText(e.target.value)}
+                onSearch={handleSearch}
+              />
+              <Checkbox
+                checked={myAlert}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setMyAlert(checked);
+                  getAssetInsts('refresh', { myAlert: checked });
+                  getChartData('refresh', { myAlert: checked });
+                }}
+              >
+                {t('monitor.events.myAlert')}
+              </Checkbox>
+            </div>
+            <div className="min-h-0 flex-1 overflow-hidden">
+            <CustomTable
+              className="w-full"
+              scroll={{ x: 'max-content' }}
+              columns={columns}
+              dataSource={tableData}
+              pagination={pagination}
+              loading={tableLoading}
+              rowKey="id"
+              onChange={handleTableChange}
+            />
+            </div>
+          </div>
+        </div>
+      </div>
+      <AlertDetail
+        ref={detailRef}
+        objects={objects}
+        userList={userList}
+        onSuccess={() => getAssetInsts('refresh')}
+      />
+    </div>
+  );
+};
+
+export default Alert;

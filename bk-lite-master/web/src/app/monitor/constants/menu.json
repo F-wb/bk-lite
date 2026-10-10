@@ -1,0 +1,336 @@
+{
+  "zh": [
+    {
+      "title": "视图",
+      "icon": "daohang-yunyingfenxishi",
+      "url": "/monitor/view",
+      "name": "view_list",
+      "children": [
+        {
+          "url": "/monitor/view/detail",
+          "name": "Detail",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/mysql",
+          "name": "mysql_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/redis",
+          "name": "redis_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/mongodb",
+          "name": "mongodb_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/nginx",
+          "name": "nginx_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/mssql",
+          "name": "mssql_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/elasticsearch",
+          "name": "elasticsearch_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/postgres",
+          "name": "postgres_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/host",
+          "name": "host_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/process",
+          "name": "process_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/website",
+          "name": "website_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/ping",
+          "name": "ping_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/tcp",
+          "name": "tcp_dashboard",
+          "isNotMenuItem": true
+        }
+      ]
+    },
+    {
+      "title": "搜索",
+      "icon": "search-f",
+      "url": "/monitor/search",
+      "name": "search"
+    },
+    {
+      "title": "事件",
+      "icon": "shujumoxingguanli",
+      "url": "/monitor/event",
+      "name": "Event",
+      "children": [
+        {
+          "icon": "weiwangguanicon-defuben-",
+          "title": "告警",
+          "url": "/monitor/event/alert",
+          "name": "alert_list"
+        },
+        {
+          "icon": "mulu",
+          "title": "策略",
+          "url": "/monitor/event/strategy",
+          "name": "strategy_list",
+          "children": [
+            {
+              "url": "/monitor/event/strategy/detail",
+              "name": "strategy_list_detail",
+              "isNotMenuItem": true
+            }
+          ]
+        },
+        {
+          "icon": "zichan-quanbushebei",
+          "title": "模板",
+          "url": "/monitor/event/template",
+          "name": "template_list"
+        }
+      ]
+    },
+    {
+      "title": "集成",
+      "icon": "zichan-quanbushebei",
+      "url": "/monitor/integration",
+      "name": "Integration",
+      "children": [
+        {
+          "title": "集成",
+          "icon": "zichan-quanbushebei",
+          "url": "/monitor/integration/list",
+          "name": "integration_list",
+          "hasDetail": true,
+          "children": [
+            {
+              "title": "配置",
+              "icon": "settings-fill",
+              "url": "/monitor/integration/list/detail/configure",
+              "name": "integration_configure"
+            },
+            {
+              "title": "指标",
+              "icon": "guanli",
+              "url": "/monitor/integration/list/detail/metric",
+              "name": "integration_metric"
+            },
+            {
+              "title": "采集",
+              "icon": "caijiqi",
+              "url": "/monitor/integration/list/detail/collect",
+              "name": "integration_collect"
+            }
+          ]
+        },
+        {
+          "title": "资产",
+          "icon": "_quota_management",
+          "url": "/monitor/integration/asset",
+          "name": "asset"
+        },
+        {
+          "title": "分组",
+          "icon": "zuzhiguanli",
+          "url": "/monitor/integration/group",
+          "name": "group"
+        },
+        {
+          "title": "对象",
+          "icon": "moxing5",
+          "url": "/monitor/integration/object",
+          "name": "object"
+        }
+      ]
+    }
+  ],
+  "en": [
+    {
+      "title": "View",
+      "icon": "daohang-yunyingfenxishi",
+      "url": "/monitor/view",
+      "name": "view_list",
+      "children": [
+        {
+          "url": "/monitor/view/detail",
+          "name": "Detail",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/mysql",
+          "name": "mysql_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/redis",
+          "name": "redis_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/mongodb",
+          "name": "mongodb_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/nginx",
+          "name": "nginx_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/mssql",
+          "name": "mssql_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/elasticsearch",
+          "name": "elasticsearch_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/postgres",
+          "name": "postgres_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/host",
+          "name": "host_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/process",
+          "name": "process_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/website",
+          "name": "website_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/ping",
+          "name": "ping_dashboard",
+          "isNotMenuItem": true
+        },
+        {
+          "url": "/monitor/view/dashboard/tcp",
+          "name": "tcp_dashboard",
+          "isNotMenuItem": true
+        }
+      ]
+    },
+    {
+      "title": "Search",
+      "icon": "search-f",
+      "url": "/monitor/search",
+      "name": "search"
+    },
+    {
+      "title": "Event",
+      "icon": "shujumoxingguanli",
+      "url": "/monitor/event",
+      "name": "Event",
+      "children": [
+        {
+          "icon": "weiwangguanicon-defuben-",
+          "title": "Alert",
+          "url": "/monitor/event/alert",
+          "name": "alert_list"
+        },
+        {
+          "icon": "mulu",
+          "title": "Strategy",
+          "url": "/monitor/event/strategy",
+          "name": "strategy_list",
+          "children": [
+            {
+              "url": "/monitor/event/strategy/detail",
+              "name": "strategy_list_detail",
+              "isNotMenuItem": true
+            }
+          ]
+        },
+        {
+          "icon": "zichan-quanbushebei",
+          "title": "Template",
+          "url": "/monitor/event/template",
+          "name": "template_list"
+        }
+      ]
+    },
+    {
+      "title": "Integration",
+      "icon": "zichan-quanbushebei",
+      "url": "/monitor/integration",
+      "name": "Integration",
+      "children": [
+        {
+          "title": "Integration",
+          "icon": "zichan-quanbushebei",
+          "url": "/monitor/integration/list",
+          "name": "integration_list",
+          "hasDetail": true,
+          "children": [
+            {
+              "title": "Configure",
+              "icon": "settings-fill",
+              "url": "/monitor/integration/list/detail/configure",
+              "name": "integration_configure"
+            },
+            {
+              "title": "Metric",
+              "icon": "guanli",
+              "url": "/monitor/integration/list/detail/metric",
+              "name": "integration_metric"
+            },
+            {
+              "title": "Collect",
+              "icon": "caijiqi",
+              "url": "/monitor/integration/list/detail/collect",
+              "name": "integration_collect"
+            }
+          ]
+        },
+        {
+          "title": "Asset",
+          "icon": "_quota_management",
+          "url": "/monitor/integration/asset",
+          "name": "asset"
+        },
+        {
+          "title": "Group",
+          "icon": "zuzhiguanli",
+          "url": "/monitor/integration/group",
+          "name": "group"
+        },
+        {
+          "title": "Object",
+          "icon": "moxing5",
+          "url": "/monitor/integration/object",
+          "name": "object"
+        }
+      ]
+    }
+  ]
+}

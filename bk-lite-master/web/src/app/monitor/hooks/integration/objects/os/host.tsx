@@ -1,0 +1,125 @@
+export const useHostConfig = () => {
+  return {
+    instance_type: 'os',
+    dashboardDisplay: [
+      {
+        indexId: 'env.procs',
+        displayType: 'single',
+        sortIndex: 0,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '15%',
+        },
+      },
+      {
+        indexId: 'load1',
+        displayType: 'dashboard',
+        sortIndex: 1,
+        displayDimension: [],
+        segments: [
+          { value: 1, color: '#27C274' }, // 绿色区域
+          { value: 2, color: '#FF9214' }, // 黄色区域
+          { value: 4, color: '#D97007' }, // 黄色区域
+          { value: 20, color: '#F43B2C' }, // 红色区域
+        ],
+        style: {
+          height: '200px',
+          width: '15%',
+        },
+      },
+      {
+        indexId: 'disk_used_percent',
+        displayType: 'lineChart',
+        sortIndex: 6,
+        displayDimension: ['device'],
+        style: {
+          height: '200px',
+          width: '15%',
+        },
+      },
+      {
+        indexId: 'disk.used',
+        displayType: 'table',
+        sortIndex: 3,
+        displayDimension: ['Device', 'Value'],
+        style: {
+          height: '200px',
+          width: '48%',
+        },
+      },
+      {
+        indexId: 'cpu_usage_total',
+        displayType: 'lineChart',
+        sortIndex: 4,
+        displayDimension: ['cpu'],
+        style: {
+          height: '200px',
+          width: '32%',
+        },
+      },
+      {
+        indexId: 'disk.is_use',
+        displayType: 'lineChart',
+        sortIndex: 5,
+        displayDimension: ['device'],
+        style: {
+          height: '200px',
+          width: '32%',
+        },
+      },
+      {
+        indexId: 'mem_used_percent',
+        displayType: 'lineChart',
+        sortIndex: 6,
+        displayDimension: ['device'],
+        style: {
+          height: '200px',
+          width: '32%',
+        },
+      },
+      {
+        indexId: 'io.util',
+        displayType: 'lineChart',
+        sortIndex: 7,
+        displayDimension: ['device'],
+        style: {
+          height: '200px',
+          width: '32%',
+        },
+      },
+      {
+        indexId: 'net.speed_sent',
+        displayType: 'lineChart',
+        sortIndex: 8,
+        displayDimension: ['device'],
+        style: {
+          height: '200px',
+          width: '32%',
+        },
+      },
+      {
+        indexId: 'net.speed_recv',
+        displayType: 'lineChart',
+        sortIndex: 9,
+        displayDimension: ['device'],
+        style: {
+          height: '200px',
+          width: '32%',
+        },
+      },
+    ],
+    groupIds: {
+      list: ['instance_id'],
+      default: ['instance_id'],
+    },
+    collectTypes: {
+      Host: 'host',
+      'Host Remote': 'http',
+      'Host AIX Remote': 'http',
+      'Host FreeBSD Remote': 'http',
+      'Host HP-UX Remote': 'http',
+      'Host Solaris Remote': 'http',
+    },
+  };
+};

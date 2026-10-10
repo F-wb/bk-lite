@@ -1,0 +1,10 @@
+[[inputs.postgresql]]
+    startup_error_behavior = "retry"
+    address = "postgres://{{ username | urlencode }}:${PASSWORD__{{ config_id }}}@{{ host }}:{{ port }}/{{ dbname | default('postgres') | urlencode }}?sslmode={{ sslmode | default('disable') }}"
+    ignored_databases = ["template0", "template1"]
+    interval = "{{ interval }}s"
+    [inputs.postgresql.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "database"
+        config_type = "postgres"

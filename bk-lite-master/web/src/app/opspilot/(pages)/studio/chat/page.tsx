@@ -1,0 +1,428 @@
+'use client';
+
+import React, { useState, useEffect, useRef } from 'react';
+import { useStudioApi } from '@/app/opspilot/api/studio';
+import { List, Button, Dropdown, Skeleton, Popconfirm, Tag } from 'antd';
+import CustomChatSSE from '@/app/opspilot/components/custom-chat-sse';
+import { processHistoryMessageWithExtras } from '@/app/opspilot/components/custom-chat-sse/historyMessageProcessor';
+import Icon from '@/components/icon';
+import { useTranslation } from '@/utils/i18n';
+import type { MenuProps } from 'antd';
+
+const StudioChatPage: React.FC = () => {
+  const { t } = useTranslation();
+  const [selectedItem, setSelectedItem] = useState<string>('k8s');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [chatKey, setChatKey] = useState(0);
+
+  const [agentList, setAgentList] = useState<any[]>([]);
+  const [currentAgent, setCurrentAgent] = useState<any | null>(null);
+  const [agentLoading, setAgentLoading] = useState(true);
+
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [functionList, setFunctionList] = useState<any[]>([]);
+  const [functionLoading, setFunctionLoading] = useState(false);
+  const [chatLoading, setChatLoading] = useState(false);
+
+  const chatLoadingTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const { fetchApplication, fetchWebChatSessions, fetchSessionMessages, fetchSkillGuide, deleteSessionHistory } = useStudioApi();
+
+  useEffect(() => {
+    return () => {
+      if (chatLoadingTimerRef.current) clearTimeout(chatLoadingTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    async function fetchAgents() {
+      setAgentLoading(true);
+      try {
+        const data = await fetchApplication({ app_type: 'web_chat' });
+        const agents = (data || []).map((item: any) => ({
+          id: item.id,
+          name: item.app_name,
+          icon: item.app_icon || item.node_config?.appIcon || 'duihuazhinengti',
+          description: item.app_description || item.node_config?.appDescription || '',
+          bot_id: item.bot,
+          node_id: item.node_id
+        }));
+        setAgentList(agents);
+        if (agents.length > 0) setCurrentAgent(agents[0]);
+      } catch {
+        setAgentList([]);
+        setCurrentAgent(null);
+      } finally {
+        setAgentLoading(false);
+      }
+    }
+    fetchAgents();
+  }, []);
+
+  // 监听 agent 变化，获取历史会话和引导语
+  useEffect(() => {
+    async function fetchSessionsAndGuide() {
+      if (!currentAgent?.bot_id) {
+        setFunctionList([]);
+        setGuide('');
+        setSessionId(null);
+        setSelectedItem('');
+        setInitialMessages([]);
+        return;
+      }
+      setFunctionLoading(true);
+      // 切换 agent 时重置状态
+      setSessionId(null);
+      setSelectedItem('');
+      setInitialMessages([]);
+      
+      try {
+        const sessions = await fetchWebChatSessions(currentAgent.bot_id, currentAgent.node_id);
+        setFunctionList(
+          (sessions || []).map((item: any) => ({
+            id: item.session_id,
+            title: item.title,
+            icon: 'jiqiren3',
+            source: item.source,
+          }))
+        );
+        if (currentAgent?.bot_id && currentAgent?.node_id) {
+          const guideRes = await fetchSkillGuide(currentAgent.bot_id, currentAgent.node_id);
+          setGuide(guideRes?.guide || '');
+        } else {
+          setGuide('');
+        }
+      } catch {
+        setFunctionList([]);
+        setGuide('');
+      } finally {
+        setFunctionLoading(false);
+      }
+    }
+    fetchSessionsAndGuide();
+  }, [currentAgent]);
+
+  // 监听 functionList 变化，自动选中第一个历史会话并展示其消息
+  useEffect(() => {
+    if (functionList.length > 0) {
+      // 如果当前已经有选中的会话，不要重新加载（避免打断正在进行的对话）
+      if (sessionId && functionList.find(item => item.id === sessionId)) {
+        return;
+      }
+      setSelectedItem(functionList[0].id);
+      handleSelectSession(functionList[0].id);
+    } else if (currentAgent?.bot_id) {
+      // 如果没有历史对话但有当前应用，创建一个新会话以便用户开始对话
+      const newId = `session_${Date.now()}`;
+      setSessionId(newId);
+      setSelectedItem(newId);
+      setInitialMessages([]);
+      setChatKey(k => k + 1);
+    }
+  }, [functionList]);
+
+  const agentMenuItems: MenuProps['items'] = agentList.map(agent => ({
+    key: agent.id,
+    label: (
+      <div className="flex items-center gap-2 py-1">
+        <Icon type={agent.icon} className="text-xl" />
+        <span>{agent.name}</span>
+      </div>
+    ),
+    onClick: () => setCurrentAgent(agent),
+  }));
+
+  const [initialMessages, setInitialMessages] = useState<any[]>([]);
+  const [guide, setGuide] = useState<string>('');
+
+  const handleSelectSession = async (id: string) => {
+    setChatLoading(true);
+    setSelectedItem(id);
+    setSessionId(id);
+    try {
+      const data = await fetchSessionMessages(id);
+      const messages = (data || []).map((item: any) => {
+        const role = item.conversation_role === 'user' ? 'user' : 'bot';
+        const processed = processHistoryMessageWithExtras(item.conversation_content, item.conversation_role);
+        return {
+          id: String(item.id),
+          role,
+          content: processed.content,
+          createAt: item.conversation_time,
+          thinking: processed.thinking,
+          isThinking: false,
+          browserStepsHistory: processed.browserStepsHistory ?? null,
+          agentStepProgress: processed.agentStepProgress,
+          plannedExecutionSteps: processed.plannedExecutionSteps,
+          wikiCitations: processed.wikiCitations,
+          toolCalls: processed.toolCalls,
+          isStreamingTools: false,
+          configDiffReports: processed.configDiffReports,
+          configAnalysisReports: processed.configAnalysisReports,
+          userChoiceRequests: processed.userChoiceRequests,
+          approvalRequests: processed.approvalRequests,
+          repairCommands: processed.repairCommands,
+          reportFileDownloads: processed.reportFileDownloads,
+        };
+      });
+      setInitialMessages(messages);
+    } catch {
+      setInitialMessages([]);
+    } finally {
+      if (chatLoadingTimerRef.current) clearTimeout(chatLoadingTimerRef.current);
+      chatLoadingTimerRef.current = setTimeout(() => {
+        setChatLoading(false);
+      }, 400);
+    }
+  };
+
+  const handleNewChat = () => {
+    setChatLoading(true);
+    setChatKey(k => k + 1);
+    const newId = `session_${Date.now()}`;
+    setFunctionList(list => [
+      {
+        id: newId,
+        title: t('skill.chat.newSession', '新会话 {time}', { time: new Date().toLocaleString('zh-CN', { hour12: false }) }),
+        icon: 'jiqiren3',
+      },
+      ...list
+    ]);
+    setSessionId(newId);
+    setSelectedItem(newId);
+    setInitialMessages([]);
+    if (chatLoadingTimerRef.current) clearTimeout(chatLoadingTimerRef.current);
+    chatLoadingTimerRef.current = setTimeout(() => {
+      setChatLoading(false);
+    }, 400);
+  };
+
+  const handleDeleteSession = async (sessionIdToDelete: string) => {
+    if (!currentAgent?.node_id) return;
+    
+    try {
+      await deleteSessionHistory(currentAgent.node_id, sessionIdToDelete);
+      setFunctionList(list => list.filter(item => item.id !== sessionIdToDelete));
+      if (selectedItem === sessionIdToDelete) {
+        setSelectedItem('');
+        setSessionId(null);
+        setInitialMessages([]);
+        setChatKey(k => k + 1);
+      }
+    } catch (error) {
+      console.error('Failed to delete session:', error);
+    }
+  };
+
+  const handleSendMessage = async (message: string) => {
+    try {
+      const bot_id = currentAgent?.bot_id;
+      const node_id = currentAgent?.node_id;
+      const baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
+      const url = `${baseUrl}/api/proxy/opspilot/bot_mgmt/execute_chat_flow/${bot_id}/${node_id}/`;
+      const payload = {
+        message: message,
+        session_id: sessionId,
+      };
+      
+      // 如果是临时会话（以 session_ 开头），在首次发送消息后添加到历史列表
+      if (sessionId && sessionId.startsWith('session_') && !functionList.find(item => item.id === sessionId)) {
+        setFunctionList(list => [
+          {
+            id: sessionId,
+            title: t('skill.chat.newSession', '新会话 {time}', { time: new Date().toLocaleString('zh-CN', { hour12: false }) }),
+            icon: 'jiqiren3',
+          },
+          ...list
+        ]);
+      }
+      
+      return {
+        url,
+        payload,
+        interruptRequest: {
+          enabled: true,
+          url: '/api/proxy/opspilot/bot_mgmt/interrupt_chat_flow_execution/',
+          reason: 'user_manual'
+        }
+      };
+    } catch (error) {
+      console.error('Failed to send message:', error);
+      return null;
+    }
+  };
+
+  // initialMessages 变化时，重置 chatKey 以强制刷新 CustomChatSSE
+  useEffect(() => {
+    setChatKey(k => k + 1);
+  }, [initialMessages]);
+
+  return (
+    <div className="absolute inset-0 flex overflow-hidden">
+      {!sidebarCollapsed && (
+        <div className="w-64 flex-shrink-0 border-r border-[var(--color-border-1)] bg-[var(--color-bg)] flex flex-col">
+          {/* 顶部智能体选择器和收缩按钮 */}
+          <div className="px-4 pt-4 pb-3 border-b border-[var(--color-border-1)] flex-shrink-0">
+            <div className="flex items-center justify-between mb-3">
+              <Dropdown menu={{ items: agentMenuItems }} trigger={['click']} placement="bottomLeft">
+                <div className="flex items-center gap-2 cursor-pointer hover:bg-[var(--color-fill-2)] rounded px-2 py-1 flex-1">
+                  {agentLoading ? (
+                    <Skeleton.Avatar active size="large" shape="circle" />
+                  ) : (
+                    <Icon 
+                      type={currentAgent?.icon || 'jiqiren3'} 
+                      className="text-3xl text-[var(--color-primary)] flex-shrink-0"
+                    />
+                  )}
+                  <span className="text-sm font-medium text-[var(--color-text-1)] truncate flex-1">
+                    {agentLoading ? <Skeleton.Input active size="small" style={{ width: 80 }} /> : (currentAgent?.name || '')}
+                  </span>
+                  <Icon type="xiala" className="text-[var(--color-text-4)] text-xs flex-shrink-0" />
+                </div>
+              </Dropdown>
+              <div 
+                className="w-8 h-8 rounded-full bg-[var(--color-bg)] border border-[var(--color-border-1)] shadow-sm hover:shadow-md cursor-pointer hover:text-[var(--color-primary)] transition-all ml-2 flex-shrink-0 flex items-center justify-center"
+                onClick={() => setSidebarCollapsed(true)}
+              >
+                <Icon type="xiangzuoshousuo" className="text-base" />
+              </div>
+            </div>
+            <Button 
+              type="primary" 
+              className="w-full" 
+              icon={<Icon type="tianjia" />}
+              onClick={handleNewChat}
+            >
+              {t('skill.chat.startNew')}
+            </Button>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto min-h-0">
+            <div className="p-2">
+              <div className="text-xs text-[var(--color-text-3)] px-3 py-2">{t('skill.chat.historyTitle')}</div>
+              <List
+                dataSource={functionList}
+                loading={functionLoading}
+                className="bg-transparent [&_.ant-list-item]:border-none"
+                renderItem={(item) => (
+                  <List.Item
+                    className={`cursor-pointer py-3 px-4 mx-2 mb-1 rounded transition-colors border-0 group ${
+                      selectedItem === item.id
+                        ? '!bg-[var(--color-primary-bg-active)] hover:!bg-[var(--color-primary-bg-active)]'
+                        : '!bg-transparent hover:!bg-[var(--color-fill-2)]'
+                    }`}
+                    onClick={() => handleSelectSession(item.id)}
+                    style={{ border: 'none' }}
+                  >
+                    <div className="flex items-center justify-between w-full gap-2">
+                      <div className={`text-sm px-2 font-normal flex-1 truncate ${selectedItem === item.id ? 'text-[var(--color-primary)]' : 'text-[var(--color-text-1)]'}`}>
+                        <span className="mr-2">
+                          {item.source === 'nats' ? (
+                            <Tag color="orange">NATS</Tag>
+                          ) : item.source === 'mobile' ? (
+                            <Tag color="green">Mobile</Tag>
+                          ) : (
+                            <Tag color="blue">Web</Tag>
+                          )}
+                        </span>
+                        {item.title}
+                      </div>
+                      <Popconfirm
+                        title={t('skill.chat.deleteTitle')}
+                        description={t('skill.chat.deleteContent')}
+                        onConfirm={() => handleDeleteSession(item.id)}
+                        okText={t('common.delete')}
+                        cancelText={t('common.cancel')}
+                        okButtonProps={{ danger: true }}
+                      >
+                        <div
+                          className="invisible group-hover:visible flex-shrink-0 p-1 rounded cursor-pointer transition-all hover:bg-[var(--color-fail)]/10"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <Icon type="shanchu" className="text-[var(--color-text-4)] hover:text-[var(--color-fail)] text-base" />
+                        </div>
+                      </Popconfirm>
+                    </div>
+                  </List.Item>
+                )}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 收缩状态的侧边栏 */}
+      {sidebarCollapsed && (
+        <div className="w-12 flex-shrink-0 border-r border-[var(--color-border-1)] bg-[var(--color-bg)] flex flex-col items-center py-4 gap-3">
+          <div 
+            className="text-xl cursor-pointer text-[var(--color-text-2)] hover:text-[var(--color-primary)] transition-colors"
+            onClick={() => setSidebarCollapsed(false)}
+          >
+            <Icon type="xiangyoushousuo" />
+          </div>
+          <div className="h-px w-8 bg-[var(--color-border-1)]" />
+          <div 
+            className="cursor-pointer"
+            onClick={() => setSidebarCollapsed(false)}
+          >
+            <Icon 
+              type={currentAgent?.icon || 'jiqiren3'}
+              className="text-3xl text-[var(--color-primary)]"
+            />
+          </div>
+          <div className="text-xl cursor-pointer text-[var(--color-text-2)] hover:text-[var(--color-primary)] transition-colors">
+            <Icon type="quanping1" />
+          </div>
+        </div>
+      )}
+
+      {/* 右侧对话区域 */}
+      <div className="flex-1 bg-[var(--color-bg)] min-w-0 h-full">
+        {chatLoading ? (
+          <div className="w-full h-full flex flex-col pt-8">
+            <div className="flex gap-4 items-end mb-6 w-full px-8">
+              <div className="rounded-full bg-[var(--color-primary-bg-active)] w-12 h-12 flex items-center justify-center">
+                <Icon type="jiqiren3" className="text-2xl text-[var(--color-primary)]" />
+              </div>
+              <div className="flex-1">
+                <div className="h-4 bg-[var(--color-fill-2)] rounded w-2/3 mb-2 animate-pulse" />
+                <div className="h-4 bg-[var(--color-fill-2)] rounded w-1/2 animate-pulse" />
+              </div>
+            </div>
+            <div className="flex gap-4 items-end justify-end mb-6 w-full px-8">
+              <div className="flex-1 text-right">
+                <div className="h-4 bg-[var(--color-fill-2)] rounded w-1/2 mb-2 animate-pulse inline-block" />
+                <div className="h-4 bg-[var(--color-fill-2)] rounded w-2/3 animate-pulse inline-block" />
+              </div>
+              <div className="rounded-full bg-[var(--color-fill-1)] w-12 h-12 flex items-center justify-center">
+                <Icon type="yonghu" className="text-2xl text-[var(--color-text-3)]" />
+              </div>
+            </div>
+            <div className="flex gap-4 items-end mb-6 w-full px-8">
+              <div className="rounded-full bg-[var(--color-primary-bg-active)] w-12 h-12 flex items-center justify-center">
+                <Icon type="jiqiren3" className="text-2xl text-[var(--color-primary)]" />
+              </div>
+              <div className="flex-1">
+                <div className="h-4 bg-[var(--color-fill-2)] rounded w-1/2 mb-2 animate-pulse" />
+                <div className="h-4 bg-[var(--color-fill-2)] rounded w-1/3 animate-pulse" />
+              </div>
+            </div>
+          </div>
+        ) : (
+          <CustomChatSSE
+            key={chatKey}
+            handleSendMessage={handleSendMessage}
+            guide={guide}
+            useAGUIProtocol={true}
+            showHeader={false}
+            requirePermission={false}
+            initialMessages={initialMessages}
+            removePendingBotMessageOnCancel={true}
+          />
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default StudioChatPage;

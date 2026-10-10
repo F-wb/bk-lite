@@ -1,0 +1,127 @@
+Firewall Huawei SNMP:
+  name: Huawei USG (Telegraf)
+  desc: "SNMP monitoring template for Huawei USG firewall. It reports uptime, CPU utilization, memory utilization, temperature, sessions/connections, session establishment rate, interface traffic, and voltage (enterprise PEN 2011)."
+monitor_object:
+  Firewall: Firewall
+monitor_object_type:
+  Network Device: Network Equipment
+monitor_object_metric:
+  Firewall:
+    snmp_uptime:
+      name: System Uptime
+      desc: Uptime of the device since the last restart.
+    device_cpu_usage:
+      name: CPU Usage
+      desc: Per-entity CPU utilization of the Huawei USG firewall (hwEntityCpuUsage,
+        0-100). Dimension descr is entPhysicalName. Sustained high CPU may indicate
+        heavy inspection load or attack traffic.
+    device_memory_usage:
+      name: Memory Usage
+      desc: Per-entity memory utilization of the Huawei USG firewall (hwEntityMemUsage;
+        USG6000 whole-device percentage 0-100). Dimension descr is entPhysicalName.
+        High memory pressure can degrade session handling.
+    device_temperature_celsius:
+      name: Temperature
+      desc: Per-entity temperature in Celsius (hwEntityTemperature). Dimension descr
+        is entPhysicalName. Abnormally high values may indicate cooling issues.
+    device_voltage_volts:
+      name: Entity Voltage
+      desc: Per-entity voltage in volts (hwEntityVoltage; device reports mV, query
+        divides by 1000). Dimension descr is entPhysicalName. Abnormal voltage may
+        indicate power-rail or board issues.
+    firewall_active_sessions:
+      name: Active Sessions
+      desc: Current concurrent sessions on the Huawei USG firewall (hwSecCurrSessNum).
+        A rapid rise can indicate a connection flood or session-table pressure.
+    firewall_new_sessions:
+      name: New Sessions
+      desc: Newly created sessions on the Huawei USG firewall (hwSecConSessNum). Combined
+        with the concurrent session count it shows whether sessions are created faster
+        than they age out.
+    firewall_total_sessions:
+      name: Total Sessions
+      desc: Current total sessions in the Huawei USG session table (hwSecStatMonTotalSess).
+        Use it with session-create rate to judge remaining session headroom.
+    firewall_session_rate:
+      name: Session Create Rate
+      desc: Current session-establishment rate on the Huawei USG firewall (hwSecStatMonCurSessSpeed).
+        A sudden spike can indicate a connection flood.
+    firewall_half_open_sessions:
+      name: Half-Open Sessions
+      desc: Current half-open sessions on the Huawei USG firewall (hwSecStatMonHalfConn).
+        A sustained rise often indicates SYN flood or incomplete handshake pressure.
+    firewall_active_sessions_tcp:
+      name: Active TCP Sessions
+      desc: Current TCP sessions on the Huawei USG firewall (hwSecStatMonTcpSess).
+        Helps show session composition versus UDP and ICMP.
+    firewall_active_sessions_udp:
+      name: Active UDP Sessions
+      desc: Current UDP sessions on the Huawei USG firewall (hwSecStatMonUdpSess).
+        Helps show session composition versus TCP and ICMP.
+    firewall_active_sessions_icmp:
+      name: Active ICMP Sessions
+      desc: Current ICMP sessions on the Huawei USG firewall (hwSecStatMonIcmpSess).
+        An abnormal rise can indicate scanning or attack traffic.
+    firewall_device_sessions:
+      name: Device Sessions
+      desc: Device-wide session count on the Huawei USG firewall (hwSecStatDeviceSessCount).
+    firewall_device_session_rate:
+      name: Device Session Create Rate
+      desc: Device-wide session-establishment rate on the Huawei USG firewall (hwSecStatDeviceSessSpeed).
+    firewall_throughput32:
+      name: Device Throughput (32-bit)
+      desc: Device forwarding throughput from the 32-bit object (hwSecStatDeviceThroughput).
+        Prefer the 64-bit throughput metric on high-speed platforms.
+    firewall_throughput:
+      name: Device Throughput
+      desc: Device forwarding throughput from the 64-bit object (hwSecStatDeviceThroughput64).
+        This is firewall inspection/forwarding throughput, not IF-MIB interface octets.
+    firewall_spu_usage:
+      name: SPU CPU Usage
+      desc: Average CPU usage of each USG9500 SPU (hwSecStatUsage, 0-100). Dimensions
+        are SPU slot and CPU. Empty on boxes without SPU boards.
+    interface_ifAdminStatus:
+      name: Interface Admin Status
+      desc: Administrative status of the network interface.
+    interface_ifOperStatus:
+      name: Interface Oper Status
+      desc: Operational status of the network interface.
+    interface_ifSpeed:
+      name: Interface Bandwidth
+      desc: Maximum data transmission speed of the interface.
+    interface_ifInErrors:
+      name: Incoming Errors Rate
+      desc: Average rate of incoming error packets over the past 5 minutes.
+    interface_ifOutErrors:
+      name: Outgoing Errors Rate
+      desc: Average rate of outgoing error packets over the past 5 minutes.
+    interface_ifInDiscards:
+      name: Incoming Discards Rate
+      desc: Average rate of incoming discarded packets over the past 5 minutes.
+    interface_ifOutDiscards:
+      name: Outgoing Discards Rate
+      desc: Average rate of outgoing discarded packets over the past 5 minutes.
+    interface_ifInUcastPkts:
+      name: Incoming Unicast Packets Rate
+      desc: Average rate of incoming unicast packets over the past 5 minutes.
+    interface_ifOutUcastPkts:
+      name: Outgoing Unicast Packets Rate
+      desc: Average rate of outgoing unicast packets over the past 5 minutes.
+    interface_ifInOctets:
+      name: Interface Incoming Traffic Rate
+      desc: Average rate of bytes received over the past 5 minutes.
+    interface_ifOutOctets:
+      name: Interface Outgoing Traffic Rate
+      desc: Average rate of bytes sent over the past 5 minutes.
+    interface_ifHCInOctets:
+      name: Interface Incoming Traffic Rate
+      desc: Average receive rate from 64-bit ifHCInOctets.
+    interface_ifHCOutOctets:
+      name: Interface Outgoing Traffic Rate
+      desc: Average transmit rate from 64-bit ifHCOutOctets.
+    device_total_incoming_traffic:
+      name: Device Total Incoming Traffic Rate
+      desc: Device-wide incoming traffic rate.
+    device_total_outgoing_traffic:
+      name: Device Total Outgoing Traffic Rate
+      desc: Device-wide outgoing traffic rate.

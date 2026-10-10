@@ -1,0 +1,344 @@
+'use client';
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+  forwardRef,
+  useImperativeHandle,
+} from 'react';
+import { Button, message, Tooltip } from 'antd';
+import {
+  FullscreenOutlined,
+  FullscreenExitOutlined,
+  ClearOutlined,
+  PauseOutlined,
+  CaretRightOutlined,
+} from '@ant-design/icons';
+import { LogTerminalProps, LogTerminalRef } from '@/app/log/types/search';
+import terminalstyles from './index.module.scss';
+import { useAuth } from '@/context/auth';
+import useApiClient from '@/utils/request';
+import { useTranslation } from '@/utils/i18n';
+import SearchHighlight from '@/app/log/components/search-highlight';
+import { extractHighlightTerms } from '@/app/log/utils/searchHighlight';
+import {
+  createSseLogStreamState,
+  parseSseLogChunk,
+} from './sseLogStream';
+
+const MAX_LOGS_COUNT = 1000;
+
+const LogTerminal = forwardRef<LogTerminalRef, LogTerminalProps>(
+  ({ query, highlightQuery, className = '', fetchData }, ref) => {
+    const { isLoading } = useApiClient();
+    const { t } = useTranslation();
+    const authContext = useAuth();
+    const token = authContext?.token || null;
+    const isStreaming = useRef(false);
+    const [isFullscreen, setIsFullscreen] = useState(false);
+    const [logs, setLogs] = useState<string[]>([]);
+    const [isPaused, setIsPaused] = useState(false);
+    const logContainerRef = useRef<HTMLDivElement>(null);
+    const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(
+      null
+    );
+    const containerRef = useRef<HTMLDivElement>(null);
+    const abortControllerRef = useRef<AbortController | null>(null);
+    const sseParseStateRef = useRef(createSseLogStreamState());
+    const highlightTerms = useMemo(
+      () => extractHighlightTerms(highlightQuery ?? query.query),
+      [highlightQuery, query.query]
+    );
+
+    // 自动滚动到底部
+    const scrollToBottom = useCallback(() => {
+      if (logContainerRef.current && !isPaused) {
+        logContainerRef.current.scrollTo({
+          top: logContainerRef.current.scrollHeight,
+          behavior: 'smooth',
+        });
+      }
+    }, [isPaused]);
+
+    // 处理全屏切换
+    const toggleFullscreen = useCallback(() => {
+      if (!containerRef.current) return;
+      if (!isFullscreen) {
+        containerRef.current.requestFullscreen?.();
+      } else {
+        document.exitFullscreen?.();
+      }
+    }, [isFullscreen]);
+
+    // 停止日志流
+    const stopLogStream = useCallback((): Promise<void> => {
+      return new Promise((resolve) => {
+        isStreaming.current = false;
+        // 优先使用AbortController来取消请求，这会自动处理reader
+        if (abortControllerRef.current) {
+          try {
+            abortControllerRef.current.abort();
+          } catch {
+            // AbortController可能已经被取消
+          }
+          abortControllerRef.current = null;
+        }
+        // 如果reader还存在，手动清理
+        if (readerRef.current) {
+          try {
+            readerRef.current.releaseLock();
+          } catch {
+            // Lock可能已经被释放
+          }
+          readerRef.current = null;
+        }
+        setTimeout(() => {
+          resolve();
+        }, 0);
+      });
+    }, []);
+
+    // 清空日志
+    const clearLogs = useCallback(() => {
+      setLogs([]);
+    }, []);
+
+    const appendLogs = useCallback((newLogs: string[]) => {
+      setLogs((prevLogs) => {
+        const logList = [...prevLogs, ...newLogs];
+        return logList.slice(-MAX_LOGS_COUNT);
+      });
+    }, []);
+
+    // 开始日志流
+    const startLogStream = useCallback(async (preserveLogs = false) => {
+      // 先停止当前流；普通重启清空日志，暂停后继续则保留冻结画面。
+      await stopLogStream();
+      setIsPaused(false);
+      if (!preserveLogs) {
+        setLogs([]);
+      }
+      if (!token) return;
+      if (isStreaming.current) return;
+      let streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+      let streamAbortController: AbortController | null = null;
+      try {
+        isStreaming.current = true;
+        // 构建查询参数
+        const groups = query.log_groups || [];
+        const queryParams = new URLSearchParams({
+          query: query.query || '*',
+          log_groups: groups.join(','),
+        });
+        if (!groups?.length) {
+          return message.error(t('log.search.searchError'));
+        }
+        // 创建AbortController用于取消请求
+        const abortController = new AbortController();
+        streamAbortController = abortController;
+        abortControllerRef.current = abortController;
+        // 直接使用fetch来处理EventStream，使用GET请求
+        fetchData?.(true);
+        const response = await fetch(
+          `/api/proxy/log/search/tail?${queryParams.toString()}`,
+          {
+            method: 'GET',
+            headers: {
+              Accept: 'text/event-stream',
+              Authorization: `Bearer ${token}`,
+            },
+            signal: abortController.signal,
+          }
+        );
+        fetchData?.(false);
+        // 检查响应状态
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        // 检查响应是否包含可读流
+        if (!response.body) {
+          isStreaming.current = false;
+          return;
+        }
+        const reader = response.body.getReader();
+        streamReader = reader;
+        readerRef.current = reader;
+        const decoder = new TextDecoder();
+        sseParseStateRef.current = createSseLogStreamState();
+        // 持续读取流数据
+        while (!abortController.signal.aborted) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value, { stream: true });
+            const messages = parseSseLogChunk(chunk, sseParseStateRef.current);
+            if (messages.length) {
+              appendLogs(messages);
+            }
+          } catch (error: any) {
+            if (error?.name === 'AbortError') {
+              console.log('Log stream was cancelled');
+              break;
+            }
+            break;
+          }
+        }
+      } catch (error: any) {
+        console.log(error);
+        fetchData?.(false);
+      } finally {
+        if (streamReader && readerRef.current === streamReader) {
+          try {
+            streamReader.releaseLock();
+          } catch {
+            // Reader可能已经被释放
+          }
+          readerRef.current = null;
+        }
+        if (!streamAbortController) {
+          isStreaming.current = false;
+        } else if (abortControllerRef.current === streamAbortController) {
+          abortControllerRef.current = null;
+          isStreaming.current = false;
+        }
+      }
+    }, [query, stopLogStream, t, fetchData, token, appendLogs]);
+
+    // 暂停会真正关闭实时查询；继续时从当前时刻建立新的 tail 连接。
+    const togglePause = useCallback(async () => {
+      if (isPaused) {
+        await startLogStream(true);
+        return;
+      }
+      setIsPaused(true);
+      await stopLogStream();
+    }, [isPaused, startLogStream, stopLogStream]);
+
+    // 通过 ref 暴露方法
+    useImperativeHandle(
+      ref,
+      () => ({
+        startLogStream,
+      }),
+      [startLogStream]
+    );
+
+    // 自动滚动效果
+    useEffect(() => {
+      scrollToBottom();
+    }, [logs, scrollToBottom]);
+
+    // 组件挂载时自动开始日志流
+    useEffect(() => {
+      if (!isLoading) {
+        startLogStream();
+      }
+      return () => {
+        stopLogStream();
+      };
+    }, [stopLogStream, isLoading, token]);
+
+    // 监听全屏状态变化
+    useEffect(() => {
+      const handleFullscreenChange = () => {
+        setIsFullscreen(!!document.fullscreenElement);
+      };
+      document.addEventListener('fullscreenchange', handleFullscreenChange);
+      return () => {
+        document.removeEventListener(
+          'fullscreenchange',
+          handleFullscreenChange
+        );
+      };
+    }, []);
+
+    return (
+      <div
+        ref={containerRef}
+        className={`${terminalstyles.logTerminal} ${
+          isFullscreen ? terminalstyles.fullscreen : ''
+        } ${className}`}
+      >
+        <div className={terminalstyles.terminalHeader}>
+          <div className={terminalstyles.controls}>
+            <Tooltip
+              autoAdjustOverflow
+              getPopupContainer={(trigger) =>
+                trigger.parentElement || document.body
+              }
+              title={
+                isPaused
+                  ? t('log.search.resumeLogs')
+                  : t('log.search.pauseLogs')
+              }
+            >
+              <Button
+                size="small"
+                aria-label={
+                  isPaused
+                    ? t('log.search.resumeLogs')
+                    : t('log.search.pauseLogs')
+                }
+                aria-pressed={isPaused}
+                icon={isPaused ? <CaretRightOutlined /> : <PauseOutlined />}
+                onClick={togglePause}
+              />
+            </Tooltip>
+            <Tooltip
+              title={t('log.search.clearLogs')}
+              autoAdjustOverflow
+              getPopupContainer={(trigger) =>
+                trigger.parentElement || document.body
+              }
+            >
+              <Button
+                size="small"
+                aria-label={t('log.search.clearLogs')}
+                icon={<ClearOutlined />}
+                onClick={clearLogs}
+              />
+            </Tooltip>
+            <Tooltip
+              title={isFullscreen ? t('log.search.exit') : t('log.search.full')}
+              autoAdjustOverflow
+              getPopupContainer={(trigger) =>
+                trigger.parentElement || document.body
+              }
+            >
+              <Button
+                size="small"
+                aria-label={
+                  isFullscreen ? t('log.search.exit') : t('log.search.full')
+                }
+                icon={
+                  isFullscreen ? (
+                    <FullscreenExitOutlined />
+                  ) : (
+                    <FullscreenOutlined />
+                  )
+                }
+                onClick={toggleFullscreen}
+              />
+            </Tooltip>
+          </div>
+        </div>
+        <div ref={logContainerRef} className={terminalstyles.logContainer}>
+          {logs.map((log, index) => (
+            <div key={index} className={terminalstyles.logLine}>
+              <span className={terminalstyles.lineNumber}>{index + 1}</span>
+              <span className={terminalstyles.logContent}>
+                <SearchHighlight text={log} terms={highlightTerms} empty="" />
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+);
+
+LogTerminal.displayName = 'LogTerminal';
+
+export default LogTerminal;

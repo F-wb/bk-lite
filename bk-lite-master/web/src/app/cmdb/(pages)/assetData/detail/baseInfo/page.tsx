@@ -1,0 +1,186 @@
+'use client';
+import { useEffect, useState, useRef } from 'react';
+import List from './list';
+import { useModelApi, useInstanceApi, useCollectApi } from '@/app/cmdb/api';
+import { useSearchParams } from 'next/navigation';
+import { Spin, Modal, Button, Space, Empty, message } from 'antd';
+import { useCmdbUserList } from '@/app/cmdb/context/common';
+import {
+  ensureCollectTaskMap,
+} from '@/app/cmdb/utils/collectTask';
+import { resolveCmdbInstUuid } from '@/app/cmdb/utils/instUuid';
+import useAssetDataStore from '@/app/cmdb/store/useAssetDataStore';
+import { useUserInfoContext } from '@/context/userInfo';
+import SubscriptionDrawer from '@/app/cmdb/components/subscription/subscriptionDrawer';
+import SubscriptionRuleForm, { type SubscriptionRuleFormRef } from '@/app/cmdb/components/subscription/subscriptionRuleForm';
+import { useQuickSubscribeDefaults, useSubscriptionMutation } from '@/app/cmdb/hooks/useSubscription';
+import { useTranslation } from '@/utils/i18n';
+import {
+  AttrFieldType,
+  UserItem,
+  InstDetail,
+} from '@/app/cmdb/types/assetManage';
+
+const BaseInfo = () => {
+  const { t } = useTranslation();
+  const { getModelAttrGroupsFullInfo } = useModelApi();
+  const { getInstanceDetail } = useInstanceApi();
+  const { getCollectTaskNames } = useCollectApi();
+
+  const searchParams = useSearchParams();
+  const { selectedGroup, userId } = useUserInfoContext();
+  const userList: UserItem[] = useCmdbUserList();
+  const [propertyList, setPropertyList] = useState<AttrFieldType[]>([]);
+  const [subscriptionDrawerOpen, setSubscriptionDrawerOpen] = useState(false);
+  const [quickSubscribeModalOpen, setQuickSubscribeModalOpen] = useState(false);
+  const quickSubscribeFormRef = useRef<SubscriptionRuleFormRef>(null);
+  const { submitting: quickSubscribeSubmitting, createRule: quickSubscribeCreateRule } = useSubscriptionMutation();
+
+  const modelId: string = searchParams.get('model_id') || '';
+  const rawInstUuid: string = searchParams.get('inst_uuid') || '';
+  const instUuid: string = resolveCmdbInstUuid(rawInstUuid) || '';
+  const modelName: string = searchParams.get('model_name') || '';
+  const instName: string = searchParams.get('inst_name') || searchParams.get('ip_addr') || '--';
+  const [instDetail, setInstDetail] = useState<InstDetail>({});
+  const [pageLoading, setPageLoading] = useState<boolean>(false);
+  const [uuidMissing, setUuidMissing] = useState<boolean>(false);
+
+  const quickDefaults = useQuickSubscribeDefaults('detail', {
+    model_id: modelId,
+    model_name: modelName,
+    currentInstanceUuid: instUuid || undefined,
+    currentInstanceName: instName,
+    currentUser: Number(userId || userList[0]?.id || 0),
+    currentOrganization: Number(selectedGroup?.id || 0),
+  });
+
+  useEffect(() => {
+    getInitData();
+  }, []);
+
+  useEffect(() => {
+    // Given 详情页也支持 collect_task 跳转，When 页面进入，Then 预热与列表页一致的映射缓存。
+    ensureCollectTaskMap(getCollectTaskNames).catch(() => {
+      const store = useAssetDataStore.getState();
+      store.setCollectTaskMap({});
+      store.setCollectTaskRouteMap({});
+      store.setCollectTaskOptions([]);
+    });
+  }, []);
+
+  const getInitData = async () => {
+    if (!instUuid) {
+      setUuidMissing(true);
+      message.warning('实例缺少合法 inst_uuid，请先完成 UUID 存量清洗');
+      return;
+    }
+    setPageLoading(true);
+    try {
+
+      // 通过Promise.all并发获取模型属性列表和实例详情
+      const [propertData, instDetailData] = await Promise.all([
+        // getModelAttrList(modelId),
+        getModelAttrGroupsFullInfo(modelId),
+        getInstanceDetail(instUuid),
+      ]);
+
+      // 模型属性列表+值：propertData.groups
+      // console.log("test7.5", propertData.groups);
+
+      setPropertyList(propertData.groups);
+      setInstDetail(instDetailData);
+    } catch {
+      console.log('获取数据失败');
+    } finally {
+      setPageLoading(false);
+    }
+  };
+
+  const onsuccessEdit = async () => {
+    setPageLoading(true);
+    try {
+      const data = await getInstanceDetail(instUuid);
+      setInstDetail(data);
+    } finally {
+      setPageLoading(false);
+    }
+  };
+
+  const handleQuickSubscribeSubmit = async (payload: any, enabled: boolean) => {
+    await quickSubscribeCreateRule({ ...payload, is_enabled: enabled });
+    setQuickSubscribeModalOpen(false);
+  };
+
+  return (
+    <Spin spinning={pageLoading} className="min-h-[calc(100vh-180px)]">
+      {uuidMissing ? (
+        <Empty description="实例缺少合法 inst_uuid，请先完成 UUID 存量清洗" />
+      ) : (
+        <>
+      {/* propertyList是模型属性列表+值 */}
+      <List
+        instDetail={instDetail}
+        propertyList={propertyList}
+        userList={userList}
+        onsuccessEdit={onsuccessEdit}
+        onSubscribe={() => setQuickSubscribeModalOpen(true)}
+      />
+      <SubscriptionDrawer
+        open={subscriptionDrawerOpen}
+        onClose={() => setSubscriptionDrawerOpen(false)}
+        modelId={modelId}
+        modelName={modelName}
+        quickDefaults={quickDefaults}
+      />
+        </>
+      )}
+      <Modal
+        open={quickSubscribeModalOpen}
+        width={800}
+        title={t('subscription.createRule')}
+        centered
+        onCancel={() => setQuickSubscribeModalOpen(false)}
+        footer={(
+          <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+            <Button
+              type="primary"
+              loading={quickSubscribeSubmitting}
+              onClick={() => void quickSubscribeFormRef.current?.submit(true)}
+            >
+              {t('subscription.saveAndEnable')}
+            </Button>
+            <Button
+              loading={quickSubscribeSubmitting}
+              onClick={() => void quickSubscribeFormRef.current?.submit(false)}
+            >
+              {t('subscription.saveOnly')}
+            </Button>
+            <Button onClick={() => setQuickSubscribeModalOpen(false)}>
+              {t('subscription.cancel')}
+            </Button>
+          </Space>
+        )}
+        destroyOnHidden
+        styles={{
+          body: {
+            maxHeight: 'calc(100vh - 220px)',
+            overflowY: 'auto',
+            paddingTop: 24,
+            paddingLeft: 24,
+            paddingRight: 24,
+          },
+        }}
+      >
+        <SubscriptionRuleForm
+          ref={quickSubscribeFormRef}
+          quickDefaults={quickDefaults}
+          modelId={modelId}
+          modelName={modelName}
+          onSubmitAndEnable={(data) => handleQuickSubscribeSubmit(data, true)}
+          onSubmitOnly={(data) => handleQuickSubscribeSubmit(data, false)}
+        />
+      </Modal>
+    </Spin>
+  );
+};
+export default BaseInfo;

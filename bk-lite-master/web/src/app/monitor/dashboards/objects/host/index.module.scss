@@ -1,0 +1,37 @@
+@use '../common/simple-dashboard.module.scss';
+
+// sectionLabel 已上收到共享壳；此处仅保留主机趋势图高度微调。
+
+.chartLegendHeader {
+  justify-content: flex-end;
+  max-width: none;
+  white-space: nowrap;
+}
+
+.compactTrend {
+  .chartWrap {
+    height: 164px;
+  }
+}
+
+@media (max-width: 768px) {
+  .chartLegendHeader {
+    justify-content: flex-start;
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .compactTrend {
+    .chartWrap {
+      height: 138px;
+    }
+  }
+}
+
+@media (max-width: 480px) {
+  .compactTrend {
+    .chartWrap {
+      height: 120px;
+    }
+  }
+}

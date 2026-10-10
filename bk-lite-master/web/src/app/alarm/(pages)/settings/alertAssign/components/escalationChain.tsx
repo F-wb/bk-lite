@@ -1,0 +1,122 @@
+'use client';
+
+import React from 'react';
+import { Form, Switch, InputNumber, Checkbox, Button, Space } from 'antd';
+import { MinusCircleOutlined, PlusOutlined } from '@ant-design/icons';
+import { useTranslation } from '@/utils/i18n';
+import NotificationTargetFields from './notificationTargetFields';
+
+interface Option {
+  label: string;
+  value: string;
+}
+
+interface EscalationChainProps {
+  enabled: boolean;
+  personnelOptions: Option[];
+  channelOptions: Option[];
+}
+
+// 当前 UI 约束最多 3 层；后端与数据模型不限层数，可后续放开。
+const MAX_LAYERS = 3;
+
+const EscalationChain: React.FC<EscalationChainProps> = ({
+  enabled,
+  personnelOptions,
+  channelOptions,
+}) => {
+  const { t } = useTranslation();
+
+  return (
+    <>
+      <Form.Item
+        name={['escalation', 'enabled']}
+        label={t('settings.assignStrategy.escalation')}
+        valuePropName="checked"
+        initialValue={false}
+      >
+        <Switch />
+      </Form.Item>
+
+      {enabled && (
+        <Form.List
+          name={['escalation', 'layers']}
+          initialValue={[{ wait_minutes: 10 }]}
+          rules={[
+            {
+              validator: async (_, layers) => {
+                if (!layers || layers.length < 1) {
+                  return Promise.reject(
+                    new Error(t('settings.assignStrategy.escalationLayerRequired'))
+                  );
+                }
+              },
+            },
+          ]}
+        >
+          {(fields, { add, remove }, { errors }) => (
+            <>
+              {fields.map((field, index) => (
+                <div
+                  key={field.key}
+                  className="border rounded p-3 mb-3"
+                >
+                  <Space align="baseline" className="w-full justify-between">
+                    <span className="font-bold">
+                      {t('settings.assignStrategy.escalationLayer')} {index + 1}
+                    </span>
+                    <MinusCircleOutlined onClick={() => remove(field.name)} />
+                  </Space>
+                  <NotificationTargetFields
+                    namePrefix={[field.name]}
+                    watchPrefix={['escalation', 'layers', field.name]}
+                    personnelOptions={personnelOptions}
+                    typeLabel={t('settings.assignStrategy.escalationTarget')}
+                  />
+                  <Form.Item
+                    {...field}
+                    key={`${field.key}-wait`}
+                    name={[field.name, 'wait_minutes']}
+                    label={t('settings.assignStrategy.escalationWaitMinutes')}
+                    tooltip={t('settings.assignStrategy.escalationWaitTip')}
+                    initialValue={10}
+                    rules={[{ required: true, type: 'number', min: 1 }]}
+                  >
+                    <InputNumber
+                      min={1}
+                      className="w-[200px]"
+                      addonAfter={t('settings.assignStrategy.frequencyUnit')}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    {...field}
+                    key={`${field.key}-channels`}
+                    name={[field.name, 'notify_channels']}
+                    label={t('settings.assignStrategy.escalationLayerChannel')}
+                  >
+                    <Checkbox.Group options={channelOptions} />
+                  </Form.Item>
+                </div>
+              ))}
+              {fields.length < MAX_LAYERS && (
+                <Form.Item>
+                  <Button
+                    type="dashed"
+                    onClick={() => add()}
+                    block
+                    icon={<PlusOutlined />}
+                  >
+                    {t('settings.assignStrategy.escalationAddLayer')}
+                  </Button>
+                  <Form.ErrorList errors={errors} />
+                </Form.Item>
+              )}
+            </>
+          )}
+        </Form.List>
+      )}
+    </>
+  );
+};
+
+export default EscalationChain;

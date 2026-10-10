@@ -1,0 +1,234 @@
+# -- coding: utf-8 --
+# @File: base.py
+# @Time: 2025/11/12 14:41
+# @Author: windyzhao
+from apps.cmdb.collection.metrics_cannula import MetricsCannula
+from apps.cmdb.models import CollectModels
+
+
+class BaseCollect(object):
+    COLLECT_PLUGIN = None
+    TASK_FORMAT_DATA_KEY = "__task_format_data__"
+    RAW_DATA_FIELDS = (
+        "id",
+        "_id",
+        "model_id",
+        "inst_name",
+        "name",
+        "ip_addr",
+        "ip",
+        "cloud",
+        "cloud_id",
+        "cloud_name",
+        "organization",
+        "organization_ids",
+        "__time__",
+        "_status",
+        "_error",
+    )
+
+    def __init__(self, instance_id, default_metrics=None, task=None):
+        self.task = task or CollectModels.objects.get(id=instance_id)
+        self.default_metrics = default_metrics
+        self.model_id, self.inst_name, self.organization, self.inst_id, self.filter_collect_task = self.format_params()
+        self.plugin_kwargs = self.build_plugin_kwargs()
+
+    def build_plugin_kwargs(self) -> dict:
+        """k8s 任务把 collector_cluster_id 透传给采集插件（VM 查询身份与显示名解耦）。"""
+        kwargs = {}
+        if self.task.is_k8s and self.task.instances:
+            instance = self.task.instances[0]
+            collector_cluster_id = instance.get("collector_cluster_id") or self.task.params.get("collector_cluster_id")
+            if collector_cluster_id:
+                kwargs["collector_cluster_id"] = collector_cluster_id
+        round_ts = getattr(self.task, "_sync_round_ts", None)
+        if round_ts is not None:
+            kwargs["round_ts"] = round_ts
+        round_completed_at = getattr(self.task, "_sync_round_completed_at", None)
+        if round_completed_at is not None:
+            kwargs["round_completed_at"] = round_completed_at
+        snapshot_complete = getattr(self.task, "_sync_snapshot_complete", None)
+        if snapshot_complete is not None:
+            kwargs["snapshot_complete"] = bool(snapshot_complete)
+        return kwargs
+
+    def format_params(self):
+        organization = self.task.team
+        if not organization:
+            organization = (self.task.params or {}).get("organization") if getattr(self.task, "params", None) else None
+            if organization is not None and not isinstance(organization, list):
+                organization = [organization]
+
+        instances = self.task.instances
+        if (self.task.params or {}).get("target_source") == "host" or not instances or not isinstance(instances, list):
+            return (
+                self.task.model_id,
+                None,
+                organization,
+                None,
+                self._should_filter_collect_task(self.task.model_id),
+            )
+
+        # 插件始终按任务族 model_id 查找；实例上的 switch 等只是 CI 类型。
+        if len(instances) == 1:
+            instance = instances[0]
+            inst_name = instance.get("inst_name")
+            inst_org = instance.get("organization") or organization
+            if inst_org is not None and not isinstance(inst_org, list):
+                inst_org = [inst_org]
+            inst_id = instance.get("_id")
+            return (
+                self.task.model_id,
+                inst_name,
+                inst_org,
+                inst_id,
+                self._should_filter_collect_task(self.task.model_id),
+            )
+
+        # 多实例没有单一图节点 _id / inst_name。执行层按 instances 对账，不能收成第一台。
+        return (
+            self.task.model_id,
+            None,
+            organization,
+            None,
+            self._should_filter_collect_task(self.task.model_id),
+        )
+
+    def _should_filter_collect_task(self, model_id):
+        # 物理服务器以 IP 作为模型唯一实例名，并由首个成功创建它的任务持续更新。
+        # 因此 SSH/host 也必须像 IPMI/Redfish protocol 一样按 collect_task 对账。
+        return model_id == "physcial_server" or not self.task.is_host
+
+    @property
+    def task_id(self):
+        # if self.task.is_k8s:
+        #     return self.inst_name
+        return self.task.id
+
+    def get_collect_plugin(self):
+        return self.COLLECT_PLUGIN
+
+    def run(self):
+        collect_plugin = self.get_collect_plugin()
+        if collect_plugin is None:
+            raise NotImplementedError("Please implement the collect plugin")
+
+        metrics_cannula = MetricsCannula(
+            inst_id=self.inst_id,
+            organization=self.organization,
+            inst_name=self.inst_name,
+            task_id=self.task_id,
+            collect_plugin=collect_plugin,
+            manual=bool(self.task.input_method),
+            default_metrics=self.default_metrics,
+            filter_collect_task=self.filter_collect_task,
+            data_cleanup_strategy=self.task.data_cleanup_strategy,
+            plugin_kwargs=self.plugin_kwargs,
+            reconcile_task_assets=True,
+            task=self.task,
+        )
+        result = metrics_cannula.collect_controller()
+        format_data = self.format_collect_data(result)
+        self.merge_task_format_data(format_data, metrics_cannula.collect_data)
+        return metrics_cannula.collect_data, format_data
+
+    def format_collect_data(self, result):
+        # 强加了一个原始数据，如果原始数据存在则删除，保留原有逻辑
+        raw_data = []
+        # 强加一个总数，这个总数是发现正常数据的总数，不是原始数据的总数
+        all_count = None
+        if result.get("__raw_data__", False) or result.get("__raw_data__", False) == []:
+            raw_data = result.pop("__raw_data__")
+        if result.get("all", False) or result.get("all", False) == 0:
+            all_count = result.pop("all")
+        format_data = {"add": [], "update": [], "delete": [], "association": []}
+        blocked_reason = result.pop("__sync_blocked_reason__", None)
+        if blocked_reason:
+            format_data["__sync_blocked_reason__"] = blocked_reason
+        for value in result.values():
+            for operator, datas in value.items():
+                for status, data in datas.items():
+                    for i in data:
+                        assos_result = i.pop("assos_result", {})
+                        format_assos_result = self.format_assos_result(assos_result)
+                        if format_assos_result:
+                            format_data["association"].extend(format_assos_result)
+
+                        _data = {"_status": status}
+                        if status == "failed":
+                            update_data = i.get("instance_info")
+                            update_data["_error"] = str(i.get("error", ""))
+                        else:
+                            update_data = i.get("inst_info")
+                        if not update_data:
+                            continue
+                        _data.update(update_data)
+                        format_data[operator].append(_data)
+        if raw_data:
+            format_data["__raw_data__"] = raw_data
+        elif all_count:
+            # When the collector reports discovered instances but raw VM rows are unavailable,
+            # derive a displayable raw_data snapshot from the normalized add/update/delete buckets.
+            derived_raw_data = []
+            seen = set()
+            for operator in ("add", "update", "delete"):
+                for item in format_data.get(operator, []):
+                    if not isinstance(item, dict):
+                        continue
+                    identity = (
+                        item.get("model_id"),
+                        item.get("inst_name"),
+                        item.get("ip_addr"),
+                        item.get("_id"),
+                        item.get("id"),
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    derived_raw_data.append(self._sanitize_raw_data_item(item))
+            if derived_raw_data:
+                format_data["__raw_data__"] = derived_raw_data
+        if all_count is not None:
+            format_data["all"] = all_count
+        return format_data
+
+    @classmethod
+    def _sanitize_raw_data_item(cls, item):
+        if not isinstance(item, dict):
+            return {}
+        sanitized = {key: item.get(key) for key in cls.RAW_DATA_FIELDS if key in item}
+        if sanitized.get("model_id") in (None, ""):
+            sanitized["model_id"] = "host"
+        return sanitized
+
+    @staticmethod
+    def format_assos_result(assos_result):
+        result = []
+        for status, data in assos_result.items():
+            for i in data:
+                i["_status"] = status
+                result.append(i)
+        return result
+
+    @classmethod
+    def merge_task_format_data(cls, format_data: dict, collect_data: dict) -> dict:
+        if not isinstance(format_data, dict) or not isinstance(collect_data, dict):
+            return format_data
+
+        extra = collect_data.get(cls.TASK_FORMAT_DATA_KEY)
+        if not isinstance(extra, dict):
+            return format_data
+
+        for key in ("add", "update", "delete", "association"):
+            if extra.get(key):
+                format_data.setdefault(key, [])
+                format_data[key].extend(extra[key])
+
+        if "all" in extra:
+            format_data["all"] = int(format_data.get("all", 0) or 0) + int(extra.get("all", 0) or 0)
+        if isinstance(extra.get("pc_summary"), dict):
+            format_data["pc_summary"] = extra["pc_summary"]
+        return format_data
+
+    def __call__(self, *args, **kwargs):
+        return self.run()

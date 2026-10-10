@@ -1,0 +1,158 @@
+import {
+  AttrFieldType,
+  ModelItem,
+  UserItem,
+  AssoTypeItem,
+  AssoFieldType,
+  ColumnItem
+} from '@/app/cmdb/types/assetManage';
+import { FilterItem } from '@/app/cmdb/store';
+  
+
+export interface TopoData {
+  src_result?: NodeData;
+  dst_result?: NodeData;
+}
+  
+export interface NodeData {
+  inst_uuid: string;
+  model_id: string;
+  inst_name: string;
+  asst_id?: string;
+  expanded?: boolean;
+  children: NodeData[];
+  has_more?: boolean;
+}
+
+export interface RecordsEnum {
+  [key: string]: string;
+}
+
+export interface RecordItemList {
+  type: string;
+  created_at: string;
+  operator: string;
+  id: number;
+  scenario?: string;
+  [key: string]: unknown;
+}
+
+export interface RecordItem {
+  date: string;
+  list: RecordItemList[];
+}
+
+export interface detailRef {
+  showModal: (config: {
+    subTitle: string;
+    title: string;
+    recordRow: any;
+  }) => void;
+}
+
+export interface FieldConfig {
+  subTitle: string;
+  title: string;
+  recordRow: any;
+}
+
+export interface AssoListProps {
+  userList: UserItem[];
+  modelList: ModelItem[]; 
+  assoTypeList: AssoTypeItem[];
+  onExpandStateChange?: (allExpanded: boolean) => void;
+}
+
+export interface SelectInstanceProps {
+  userList: UserItem[];
+  models: ModelItem[];
+  assoTypes: AssoTypeItem[];
+  needFetchAssoInstIds?: boolean;
+  onSuccess?: () => void;
+}
+
+export interface AssoTopoProps {
+  modelList: ModelItem[];
+  assoTypeList: AssoTypeItem[];
+  modelId: string;
+  instUuid: string;
+}
+
+export interface TopoDataProps {
+  modelId: string;
+  instUuid: string;
+  topoData: TopoData;
+  modelList: ModelItem[];
+  assoTypeList: AssoTypeItem[];
+}
+
+export interface FieldModalRef {
+  showModal: (info: FieldConfig) => void;
+}
+
+export interface SearchFilterProps {
+  attrList: AttrFieldType[];
+  proxyOptions: { proxy_id: string; proxy_name: string }[];
+  userList: UserItem[];
+  showExactSearch?: boolean;
+  modelId?: string;
+  displayFieldKeys?: string[];
+  onSearch: (condition: FilterItem | null, value: any) => void;
+  onChange?: (filters: FilterItem[]) => void;
+  onFilterChange?: (filters: FilterItem[]) => void;
+}
+
+export interface RelationItem extends AssoFieldType {
+  name: string;
+  relation_key: string;
+}
+
+export interface ExportModalProps {
+  canSubmit: boolean;
+  onSubmitStart?: () => void;
+  onSubmitted: (task: import('./transfer').TransferTask) => void;
+  userList: any[];
+  models: ModelItem[];
+  assoTypes: AssoTypeItem[];
+}
+
+export interface ExportModalConfig {
+  title: string;
+  modelId: string;
+  columns: ColumnItem[];
+  selectedKeys: string[];
+  exportType: 'selected' | 'currentPage' | 'all';
+  tableData?: any[];
+}
+
+export interface ExportModalRef {
+  showModal: (config: ExportModalConfig) => void;
+}
+
+export interface NetworkTopoNode {
+  id: string;
+  name: string;
+  model_id: string;
+  hop?: number;
+  expanded?: boolean;
+}
+
+export interface NetworkTopoLink {
+  relationship_id: string;
+  /** 端口 connect 边端点 UUID；删除关联时必需 */
+  src_inst_uuid?: string;
+  dst_inst_uuid?: string;
+  model_asst_id?: string;
+  source_device: string;
+  source_inst_name: string;
+  target_device: string;
+  target_inst_name: string;
+  asst_id?: string;
+}
+
+export interface NetworkTopoData {
+  center: NetworkTopoNode;
+  nodes: NetworkTopoNode[];
+  links: NetworkTopoLink[];
+  truncated?: boolean;
+}

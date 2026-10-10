@@ -1,0 +1,136 @@
+{
+  "object": "ElasticSearch",
+  "plugin": "ElasticSearch",
+  "templates": [
+    {
+      "name": "磁盘剩余空间告警",
+      "alert_name": "ES 节点 ${resource_name} 磁盘空间不足",
+      "description": "监测数据节点磁盘剩余空间，空间不足会导致索引自动设为只读甚至节点离线。建议设置预留缓冲空间，及时清理旧索引或扩容存储。",
+      "metric_name": "elasticsearch_fs_data_0_available_in_bytes",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 5,
+          "method": "<="
+        },
+        {
+          "level": "error",
+          "value": 10,
+          "method": "<="
+        },
+        {
+          "level": "warning",
+          "value": 20,
+          "method": "<="
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "磁盘写入压力告警",
+      "alert_name": "ES 节点 ${resource_name} 磁盘写入过高",
+      "description": "监控节点磁盘写入速率。持续高写入通常来自分段合并或批量索引，可能导致 IO 瓶颈并拖慢查询。Linux 节点才有 fs.io_stats。",
+      "metric_name": "elasticsearch_fs_io_stats_total_write_kilobytes_rate",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 104857600,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 52428800,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 31457280,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    },
+    {
+      "name": "HTTP连接数超限",
+      "alert_name": "ES 节点 ${resource_name} HTTP 连接泄漏",
+      "description": "检测当前HTTP连接数，异常增长可能表明连接泄漏或客户端异常。需检查长时间运行的查询和客户端连接池配置。",
+      "metric_name": "elasticsearch_http_current_open",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1000,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 800,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 500,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    },
+    {
+      "name": "父级断路器触发",
+      "alert_name": "ES 节点 ${resource_name} 父级断路器触发",
+      "description": "监控父级断路器近期触发速率。该值大于 0 表示节点因整体内存记账触顶而拒绝请求，需扩容或降低高资源消耗操作。",
+      "metric_name": "elasticsearch_breakers_parent_tripped_rate",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 0,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "Fielddata断路器触发",
+      "alert_name": "ES 节点 ${resource_name} Fielddata 超限",
+      "description": "检测 Fielddata 内存断路器近期触发速率。该值大于 0 表示节点因字段数据内存触顶而拒绝请求，需优化字段类型或增加堆内存。",
+      "metric_name": "elasticsearch_breakers_fielddata_tripped_rate",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 0,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "删除文档堆积告警",
+      "alert_name": "ES 节点 ${resource_name} 删除文档未合并",
+      "description": "监控节点上已标记删除但尚未段合并回收的文档数。堆积过大会增加查询开销，需检查合并策略或触发段合并。",
+      "metric_name": "elasticsearch_indices_docs_deleted",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1000000,
+          "method": ">="
+        },
+        {
+          "level": "error",
+          "value": 500000,
+          "method": ">="
+        },
+        {
+          "level": "warning",
+          "value": 100000,
+          "method": ">="
+        }
+      ],
+      "group_algorithm": "max"
+    }
+  ]
+}

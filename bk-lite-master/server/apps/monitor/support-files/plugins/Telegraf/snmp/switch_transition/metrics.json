@@ -1,0 +1,62 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_transition",
+  "plugin": "Switch Transition Networks SNMP",
+  "plugin_desc": "SNMP monitoring template for Transition Networks switch. It reports uptime, temperature, and interface traffic, for SISPM/SM and ION/IONMM (enterprise PEN 868).",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='switch', collect_type='snmp_transition'}) by (instance_id)",
+  "name": "Switch",
+  "icon": "mm-switch_交换机",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='switch'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "cpu_temperature_celsius",
+    "device_temperature_celsius"
+  ],
+  "metrics": [
+    {
+      "metric_group": "Temperature",
+      "name": "cpu_temperature_celsius",
+      "query": "max(cpu_temperature_celsius{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "CPU Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "CPU temperature of the Transition Networks switch in degrees Celsius (tnDevSysHwInforCPUtmp, table). Aggregated as the maximum across hardware-info rows. Abnormally high values may indicate blocked airflow, failing cooling, or excessive ambient heat, and can trigger thermal protection or hardware damage if left unaddressed."
+    },
+    {
+      "metric_group": "Temperature",
+      "name": "device_temperature_celsius",
+      "query": "max(device_temperature_celsius{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Optional board temperature of the Transition Networks switch in degrees Celsius (tnDevSysHwInforBoardtmp, table). Aggregated as the maximum across hardware-info rows when the device returns the column. Some models omit this object; missing rows are skipped. High readings may indicate blocked airflow or excessive ambient heat."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='switch', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
+    }
+  ]
+}

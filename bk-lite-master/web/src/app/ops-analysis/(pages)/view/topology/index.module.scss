@@ -1,0 +1,334 @@
+@keyframes edgeFlowAnimation {
+  0% {
+    stroke-dashoffset: 10;
+  }
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+.topologyContainer {
+  :global(.x6-graph-svg) {
+    background:
+      radial-gradient(circle at 18% 16%, rgba(76, 142, 214, 0.1) 0%, transparent 34%),
+      radial-gradient(circle at 82% 18%, rgba(42, 179, 173, 0.07) 0%, transparent 30%),
+      linear-gradient(
+        135deg,
+        #f7fbff 0%,
+        #fcfdff 48%,
+        #f5f8fc 100%
+      ) !important;
+    background-size: 100% 100%, 100% 100%, 100% 100% !important;
+  }
+
+  :global(.x6-graph-grid line) {
+    stroke: transparent !important;
+  }
+
+  :global(.x6-node foreignObject) {
+    overflow: hidden !important;
+  }
+
+  :global(.x6-node[data-shape='icon-node'] rect[selector='body']) {
+    transition:
+      stroke 0.18s ease,
+      filter 0.18s ease,
+      fill 0.18s ease;
+  }
+
+  :global(.x6-node-selected[data-shape='icon-node'] rect[selector='body']),
+  :global(.x6-node[data-shape='icon-node'].selected rect[selector='body']),
+  :global(.x6-node-selected[data-shape='icon-node']:hover rect[selector='body']),
+  :global(.x6-node[data-shape='icon-node'].selected:hover rect[selector='body']) {
+    stroke: var(--color-primary) !important;
+    stroke-width: 2 !important;
+    filter:
+      drop-shadow(0 0 0 color-mix(in srgb, var(--color-primary) 10%, transparent))
+      drop-shadow(0 16px 30px color-mix(in srgb, var(--color-primary) 18%, transparent)) !important;
+  }
+
+  :global(.x6-node-selected[data-shape='single-value-node'] rect[selector='body']),
+  :global(.x6-node[data-shape='single-value-node'].selected rect[selector='body']),
+  :global(.x6-node-selected[data-shape='single-value-node']:hover rect[selector='body']),
+  :global(.x6-node[data-shape='single-value-node'].selected:hover rect[selector='body']) {
+    stroke: var(--color-primary) !important;
+    stroke-width: 2 !important;
+  }
+
+  :global(.ops-topology-chart-node.ops-topology-chart-node--selected),
+  :global(.ops-topology-chart-node.ops-topology-chart-node--selected:hover) {
+    border-color: var(--color-primary) !important;
+    border-width: 2px !important;
+    border-style: solid !important;
+    outline: none !important;
+  }
+
+  :global(.x6-node[data-shape='icon-node'] text[selector='label']) {
+    paint-order: stroke;
+    stroke: rgba(255, 255, 255, 0.8);
+    stroke-width: 2px;
+  }
+
+  :global(.x6-edge path[selector='line']) {
+    transition:
+      stroke 0.18s ease,
+      stroke-width 0.18s ease,
+      filter 0.18s ease,
+      opacity 0.18s ease;
+  }
+
+  :global(.x6-edge:hover path[selector='line']),
+  :global(.x6-edge-selected path[selector='line']) {
+    stroke: #2d7df0 !important;
+    stroke-width: 2 !important;
+    filter: drop-shadow(0 2px 5px rgba(45, 125, 240, 0.28)) !important;
+  }
+  
+  :global(.edge-flow-animation) {
+    animation: edgeFlowAnimation 1.5s linear infinite;
+  }
+  
+  // 全局优化minimap相关样式
+  :global(.x6-widget-minimap) {
+    border-radius: 0 0 8px 8px !important;
+    overflow: hidden !important;
+    
+    // 背景优化
+    :global(.x6-graph-svg) {
+      background: linear-gradient(
+        135deg,
+        rgba(248, 250, 252, 0.98) 0%,
+        rgba(241, 246, 251, 0.96) 100%
+      ) !important;
+      background-size: 100% 100% !important;
+    }
+  }
+}
+
+.topologyContainer[data-topology-mode='edit'] {
+  :global(.x6-node[data-shape='icon-node']:hover:not(.x6-node-selected):not(.selected) rect[selector='body']) {
+    stroke: #8dbcf2;
+    filter:
+      drop-shadow(0 15px 28px rgba(42, 97, 160, 0.13))
+      drop-shadow(0 2px 5px rgba(15, 23, 42, 0.07));
+  }
+}
+
+.topologyContainer[data-topology-mode='view'] {
+  :global(.x6-node:hover) {
+    cursor: pointer;
+  }
+
+  :global(.x6-node[data-shape='icon-node']:hover:not(.x6-node-selected):not(.selected) rect[selector='body']),
+  :global(.x6-node[data-shape='single-value-node']:hover:not(.x6-node-selected):not(.selected) rect[selector='body']),
+  :global(.x6-node[data-shape='chart-node']:hover:not(.x6-node-selected):not(.selected) rect[selector='body']) {
+    stroke: var(--color-border-2);
+    stroke-width: 1px;
+    outline: none;
+    filter: none;
+  }
+
+  :global(.ops-topology-chart-node:hover:not(.ops-topology-chart-node--selected)),
+  :global(.ops-topology-chart-node.ops-topology-chart-node--hover) {
+    border-color: var(--color-border-2) !important;
+    border-width: 1px !important;
+    border-style: solid !important;
+    outline: none !important;
+    cursor: pointer;
+  }
+}
+
+.minimapContainer {
+  position: absolute;
+  bottom: 1rem;
+  right: 0.6rem;
+  width: 200px;
+  height: 135px;
+  border: 1px solid rgba(222, 228, 236, 0.92);
+  border-radius: 8px;
+  box-shadow:
+    0 8px 20px rgba(15, 23, 42, 0.05),
+    0 1px 3px rgba(15, 23, 42, 0.03);
+  background: linear-gradient(135deg,
+    rgba(255, 255, 255, 0.98) 0%,
+    rgba(249, 250, 252, 0.99) 100%);
+  backdrop-filter: blur(4px);
+  z-index: 10;
+  overflow: hidden;
+  transition: all 0.3s ease;
+  
+  &:hover {
+    box-shadow:
+      0 10px 22px rgba(15, 23, 42, 0.06),
+      0 2px 6px rgba(15, 23, 42, 0.04);
+    transform: translateY(-1px);
+  }
+  
+  &::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 18px;
+    background: linear-gradient(90deg, 
+      rgba(148, 163, 184, 0.05) 0%, 
+      rgba(148, 163, 184, 0.015) 100%);
+    border-bottom: 1px solid rgba(226, 232, 240, 0.92);
+    z-index: 1;
+  }
+}
+
+.minimapHeader {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 10;
+}
+
+.minimapCloseBtn {
+  font-size: 0.75rem;
+  color: var(--color-text-3);
+  transition: color 0.2s ease;
+  width: 1rem;
+  height: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.25rem;
+  cursor: pointer;
+  border: none;
+  background: none;
+  
+  &:hover {
+    color: var(--color-text-1);
+    background-color: var(--color-fill-3);
+  }
+}
+
+.minimapHeader {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  z-index: 20;
+}
+
+.minimapCloseBtn {
+  font-size: 10px;
+  color: var(--color-text-3);
+  transition: all 0.2s ease;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  cursor: pointer;
+  border: none;
+  background: rgba(148, 163, 184, 0.08);
+  
+  &:hover {
+    color: var(--color-text-1);
+    background: rgba(148, 163, 184, 0.14);
+  }
+}
+
+.minimapContent {
+  width: 100%;
+  height: 100%;
+  margin-top: 18px;
+  background: transparent;
+  border-radius: 0 0 8px 8px;
+  
+  // 优化缩略图内部元素样式
+  :global(.x6-widget-minimap) {
+    border-radius: 0 0 8px 8px;
+    
+    // 视窗样式
+    :global(.x6-widget-minimap-viewport) {
+      border: 1px solid rgba(148, 163, 184, 0.28) !important;
+      border-radius: 4px !important;
+      background: rgba(241, 245, 249, 0.82) !important;
+      backdrop-filter: blur(1px) !important;
+      box-shadow: 
+        0 1px 3px rgba(15, 23, 42, 0.05),
+        inset 0 1px 0 rgba(255, 255, 255, 0.22) !important;
+      transition: all 0.2s ease !important;
+      
+      &:hover {
+        background: rgba(241, 245, 249, 0.92) !important;
+        box-shadow: 
+          0 2px 5px rgba(15, 23, 42, 0.06),
+          inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+      }
+    }
+    
+    // 节点样式优化
+    :global(.x6-node) {
+      filter: drop-shadow(0 1px 2px rgba(15, 23, 42, 0.06));
+      transition: all 0.2s ease;
+      
+      &:hover {
+        filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.08));
+      }
+    }
+    
+    // 边线样式优化
+    :global(.x6-edge) {
+      opacity: 0.7;
+      transition: opacity 0.2s ease;
+      
+      &:hover {
+        opacity: 1;
+      }
+    }
+  }
+}
+
+.minimapShowBtn {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  width: 36px;
+  height: 36px;
+  background: linear-gradient(135deg, 
+    rgba(255, 255, 255, 0.98) 0%, 
+    rgba(248, 250, 252, 1) 100%);
+  border: 1px solid rgba(222, 228, 236, 0.92);
+  border-radius: 10px;
+  box-shadow:
+    0 8px 18px rgba(15, 23, 42, 0.05),
+    0 1px 3px rgba(15, 23, 42, 0.03);
+  backdrop-filter: blur(5px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 10;
+  cursor: pointer;
+  
+  &:hover {
+    background: linear-gradient(135deg, 
+      rgba(248, 250, 252, 1) 0%, 
+      rgba(241, 245, 249, 1) 100%);
+    border-color: rgba(203, 213, 225, 0.92);
+    box-shadow: 
+      0 10px 20px rgba(15, 23, 42, 0.06),
+      0 2px 6px rgba(15, 23, 42, 0.04);
+    transform: translateY(-1px);
+  }
+  
+  &:active {
+    transform: translateY(-1px) scale(1.02);
+  }
+  
+  .anticon {
+    font-size: 16px;
+    color: var(--color-text-2);
+    transition: all 0.2s ease;
+  }
+  
+  &:hover .anticon {
+    color: #64748b;
+  }
+}

@@ -1,0 +1,527 @@
+{
+  "plugin": "Oracle-Exporter",
+  "plugin_desc": "It is used to collect metrics on Oracle's uptime, operation counts, transaction commits/rollbacks, and various wait times in real-time via the exporter method, assisting users in health checks and performance tuning.",
+  "status_query": "any({instance_type='oracle', collect_type='exporter'}) by (instance_id)",
+  "instance_fact_bindings": [{"fact":"asset.ip","value_type":"ip","resolver":"input","options":{"field":"ENV_HOST"}}],
+  "instance_summary_columns": [{"fact":"asset.ip","title":"monitor.views.assetIp","order":10}],
+  "name": "Oracle",
+  "icon": "mm-oracle_Oracle",
+  "type": "Database",
+  "description": "",
+  "default_metric": "any({instance_type='oracle'}) by (instance_id)",
+  "instance_id_keys": ["instance_id"],
+  "supplementary_indicators": ["oracledb_up_gauge", "oracledb_wait_time_user_io_gauge", "oracledb_tablespace_used_percent_gauge"],
+  "display_fields": [
+    {
+      "name": "表空间使用率",
+      "sort_order": 0,
+      "metrics": [
+        {
+          "plugin": "Oracle-Exporter",
+          "metric": "oracledb_tablespace_used_percent_gauge"
+        }
+      ]
+    },
+    {
+      "name": "会话数",
+      "sort_order": 1,
+      "metrics": [
+        {
+          "plugin": "Oracle-Exporter",
+          "metric": "oracledb_sessions_value_gauge"
+        }
+      ]
+    },
+    {
+      "name": "执行速率",
+      "sort_order": 2,
+      "metrics": [
+        {
+          "plugin": "Oracle-Exporter",
+          "metric": "oracledb_activity_execute_count_gauge_rate"
+        }
+      ]
+    },
+    {
+      "name": "用户I/O等待时间",
+      "sort_order": 3,
+      "metrics": [
+        {
+          "plugin": "Oracle-Exporter",
+          "metric": "oracledb_wait_time_user_io_gauge"
+        }
+      ]
+    },
+    {
+      "name": "资源使用率",
+      "sort_order": 4,
+      "metrics": [
+        {
+          "plugin": "Oracle-Exporter",
+          "metric": "oracledb_resource_utilization_rate"
+        }
+      ]
+    }
+  ],
+  "metrics": [
+  {
+    "metric_group": "Base",
+    "name": "oracledb_up_gauge",
+    "display_name": "OracleDb Status",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Enum",
+    "unit": "[{\"name\":\"正常\",\"id\":1,\"color\":\"#1ac44a\"},{\"name\":\"异常\",\"id\":0,\"color\":\"#ff4d4f\"}]",
+    "dimensions": [],
+    "description": "The current Oracle database is running in the current state, 0 is normal, and 1 is abnormal.",
+    "query": "oracledb_up_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Base",
+    "name": "oracledb_uptime_seconds_gauge",
+    "display_name": "OracleDb Instance Uptime",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "s",
+    "dimensions": [
+        {
+            "name": "inst_id",
+            "description": "Instance ID"
+        },
+        {
+            "name": "instance_name",
+            "description": "Instance Name"
+        },
+        {
+            "name": "node_name",
+            "description": "Node Name"
+        }
+    ],
+    "description": "The duration for which the Oracle database has been running.",
+    "query": "oracledb_uptime_seconds_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Activity",
+    "name": "oracledb_activity_execute_count_gauge_rate",
+    "display_name": "OracleDb Execution Rate",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "cps",
+    "dimensions": [],
+    "description": "Monitors the rate of SQL executions over a period (e.g., 5m) to reflect load changes.",
+    "query": "rate(oracledb_activity_execute_count_gauge{__$labels__}[5m])"
+  },
+  {
+    "metric_group": "Activity",
+    "name": "oracledb_activity_parse_count_total_gauge_rate",
+    "display_name": "OracleDb Parse Count Rate",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "cps",
+    "dimensions": [],
+    "description": "Monitors the rate of SQL parses in a period (e.g., 5m) to help identify frequent parsing issues.",
+    "query": "rate(oracledb_activity_parse_count_total_gauge{__$labels__}[5m])"
+  },
+  {
+    "metric_group": "Activity",
+    "name": "oracledb_activity_user_commits_gauge_rate",
+    "display_name": "OracleDb User Commits Rate",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "cps",
+    "dimensions": [],
+    "description": "Monitors the rate of user transaction commits over a period (e.g., 5m) to reflect transactional activity.",
+    "query": "rate(oracledb_activity_user_commits_gauge{__$labels__}[5m])"
+  },
+  {
+    "metric_group": "Activity",
+    "name": "oracledb_activity_user_rollbacks_gauge_rate",
+    "display_name": "OracleDb User Rollbacks Rate",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "cps",
+    "dimensions": [],
+    "description": "Monitors the rate of user transaction rollbacks over a period (e.g., 5m) to identify unusual transactions.",
+    "query": "rate(oracledb_activity_user_rollbacks_gauge{__$labels__}[5m])"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_application_gauge",
+    "display_name": "OracleDb Application Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The waiting time for communication between the database client application and the database.",
+    "query": "oracledb_wait_time_application_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_commit_gauge",
+    "display_name": "OracleDb Commit Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The time waiting for transaction commit completion.",
+    "query": "oracledb_wait_time_commit_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_concurrency_gauge",
+    "display_name": "OracleDb Concurrency Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The waiting time caused by database resource contention, such as waiting for locks.",
+    "query": "oracledb_wait_time_concurrency_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_configuration_gauge",
+    "display_name": "OracleDb Configuration Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The time waiting for system resource configuration, such as waiting for parameter changes to take effect.",
+    "query": "oracledb_wait_time_configuration_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_network_gauge",
+    "display_name": "OracleDb Network Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The time waiting for network transmission, such as waiting for data to be sent from the client to the server.",
+    "query": "oracledb_wait_time_network_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_other_gauge",
+    "display_name": "OracleDb Other Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The waiting time that cannot be classified into other waiting times.",
+    "query": "oracledb_wait_time_other_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_system_io_gauge",
+    "display_name": "OracleDb System I/O Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The time waiting for the system to perform I/O operations, such as waiting for data to be read from the disk.",
+    "query": "oracledb_wait_time_system_io_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Wait",
+    "name": "oracledb_wait_time_user_io_gauge",
+    "display_name": "OracleDb User I/O Wait Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "ms",
+    "dimensions": [],
+    "description": "The time waiting for the user I/O operation to complete.",
+    "query": "oracledb_wait_time_user_io_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Resource",
+    "name": "oracledb_resource_utilization_rate",
+    "display_name": "OracleDb Resource Utilization Rate",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "percent",
+    "dimensions": [
+      {
+        "name": "resource_name",
+        "description": "Resource Name"
+      }
+    ],
+    "description": "The utilization rate of a resource in the current Oracle DB instance, which reflects the percentage of resources such as sessions, processes, memory, and so on that resource limits are used",
+    "query": "clamp_min(oracledb_resource_current_utilization_gauge{__$labels__}/oracledb_resource_limit_value_gauge{__$labels__}*100, -1)"
+  },
+  {
+    "metric_group": "Resource",
+    "name": "oracledb_process_count_gauge",
+    "display_name": "OracleDb Processes",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "counts",
+    "dimensions": [],
+    "description": "The number of currently active database processes.",
+    "query": "oracledb_process_count_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Resource",
+    "name": "oracledb_sessions_value_gauge",
+    "display_name": "OracleDb Sessions",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "counts",
+    "dimensions": [
+        {
+            "name": "status",
+            "description": "Session status"
+        },
+        {
+            "name": "type",
+            "description": "Session type"
+        }
+    ],
+    "description": "The current number of open sessions in the database",
+    "query": "oracledb_sessions_value_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "SGA",
+    "name": "oracledb_sga_total_gauge",
+    "display_name": "OracleDb SGA Total Size",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [],
+    "description": "SGA is a shared memory area allocated in memory by an Oracle database instance to store global data and information",
+    "query": "oracledb_sga_total_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "SGA",
+    "name": "oracledb_sga_free_gauge",
+    "display_name": "OracleDb SGA Free Size",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [],
+    "description": "Represents the amount of memory currently available for the Oracle Database SGA, reflecting the amount of unused idle resources in the SGA.",
+    "query": "oracledb_sga_free_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "SGA",
+    "name": "oracledb_sga_used_percent_gauge",
+    "display_name": "OracleDb SGA Usage Percentage",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "percent",
+    "dimensions": [],
+    "description": "Represents the memory usage of the Oracle Database SGA and is used to evaluate the efficiency of the SGA's resources.",
+    "query": "oracledb_sga_used_percent_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "PGA",
+    "name": "oracledb_pga_total_gauge",
+    "display_name": "OracleDb PGA Total Size",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [],
+    "description": "A PGA is an independently allocated area of memory for each user process or server process in an Oracle database instance",
+    "query": "oracledb_pga_total_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "PGA",
+    "name": "oracledb_pga_used_gauge",
+    "display_name": "OracleDb PGA Used Size",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [],
+    "description": "Represents the amount of memory currently used by the Oracle Database PGA, reflecting the actual consumption of PGA resources.",
+    "query": "oracledb_pga_used_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "PGA",
+    "name": "oracledb_pga_used_percent_gauge",
+    "display_name": "OracleDb PGA Usage Percentage",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "percent",
+    "dimensions": [],
+    "description": "Represents the memory usage of the Oracle Database PGA, which is a measure of how efficiently the PGA resources are being utilized.",
+    "query": "oracledb_pga_used_percent_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Tablespace",
+    "name": "oracledb_tablespace_bytes_gauge",
+    "display_name": "OracleDb Table Used Space",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [
+        {
+            "name": "tablespace",
+            "description": "Tablespace Name"
+        },
+        {
+            "name": "type",
+            "description": "Tablespace Type"
+        }
+    ],
+    "description": "The total size of the used disk space in the specified tablespace.",
+    "query": "oracledb_tablespace_bytes_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Tablespace",
+    "name": "oracledb_tablespace_max_bytes_gauge",
+    "display_name": "OracleDb Table Maximum Capacity",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [
+        {
+            "name": "tablespace",
+            "description": "Tablespace Name"
+        },
+        {
+            "name": "type",
+            "description": "Tablespace Type"
+        }
+    ],
+    "description": "The maximum disk space limit of the specified tablespace.",
+    "query": "oracledb_tablespace_max_bytes_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Tablespace",
+    "name": "oracledb_tablespace_free_gauge",
+    "display_name": "OracleDb Table Available Space",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [
+        {
+            "name": "tablespace",
+            "description": "Tablespace Name"
+        },
+        {
+            "name": "type",
+            "description": "Tablespace Type"
+        }
+    ],
+    "description": "The size of the remaining disk space in the specified tablespace.",
+    "query": "oracledb_tablespace_free_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Tablespace",
+    "name": "oracledb_tablespace_used_percent_gauge",
+    "display_name": "OracleDb Tablespace Usage Percentage",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "percent",
+    "dimensions": [
+        {
+            "name": "tablespace",
+            "description": "Tablespace Name"
+        },
+        {
+            "name": "type",
+            "description": "Tablespace Type"
+        }
+    ],
+    "description": "The percentage of the used capacity of the specified tablespace.",
+    "query": "oracledb_tablespace_used_percent_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "RAC",
+    "name": "oracledb_rac_node_gauge",
+    "display_name": "OracleDb RAC Node Count",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "counts",
+    "dimensions": [],
+    "description": "The current number of Oracle database cluster nodes.",
+    "query": "oracledb_rac_node_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "Process",
+    "name": "process_cpu_seconds_total_counter",
+    "display_name": "OracleDb Monitoring Probe Process CPU Time",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "s",
+    "dimensions": [],
+    "description": "The total amount of CPU time used by the Oracle Database Monitoring Probe process.",
+    "query": "process_cpu_seconds_total_counter{__$labels__,instance_type=\"oracle\"}"
+  },
+  {
+    "metric_group": "Process",
+    "name": "process_max_fds_gauge",
+    "display_name": "OracleDb Monitoring Probe Process Max File Descriptors",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "counts",
+    "dimensions": [],
+    "description": "The maximum number of file descriptors that can be opened by the Oracle Database monitoring probe process.",
+    "query": "process_max_fds_gauge{__$labels__,instance_type=\"oracle\"}"
+  },
+  {
+    "metric_group": "Process",
+    "name": "process_open_fds_gauge",
+    "display_name": "OracleDb Monitoring Probe Process Open File Descriptors",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "counts",
+    "dimensions": [],
+    "description": "The number of file descriptors that are currently open by the Oracle Database monitoring probe process.",
+    "query": "process_open_fds_gauge{__$labels__,instance_type=\"oracle\"}"
+  },
+  {
+    "metric_group": "Process",
+    "name": "process_resident_memory_bytes_gauge",
+    "display_name": "OracleDb Monitoring Probe Process Resident Memory",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [],
+    "description": "The size of the current resident memory of the Oracle Database monitoring probe process.",
+    "query": "process_resident_memory_bytes_gauge{__$labels__,instance_type=\"oracle\"}"
+  },
+  {
+    "metric_group": "Process",
+    "name": "process_virtual_memory_bytes_gauge",
+    "display_name": "OracleDb Monitoring Probe Process Virtual Memory",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "bytes",
+    "dimensions": [],
+    "description": "The current virtual memory size of the Oracle Database Monitoring Probe process.",
+    "query": "process_virtual_memory_bytes_gauge{__$labels__,instance_type=\"oracle\"}"
+  },
+  {
+    "metric_group": "SelfMonitor",
+    "name": "oracledb_exporter_last_scrape_duration_seconds_gauge",
+    "display_name": "OracleDb Exporter Last Scrape Duration",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "s",
+    "dimensions": [],
+    "description": "The time spent on the most recent collection of indicators from the Oracle database.",
+    "query": "oracledb_exporter_last_scrape_duration_seconds_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "SelfMonitor",
+    "name": "oracledb_exporter_last_scrape_error_gauge",
+    "display_name": "OracleDb Exporter Last Scrape Status",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Enum",
+    "unit": "[{\"name\":\"正常\",\"id\":0,\"color\":\"#1ac44a\"},{\"name\":\"异常\",\"id\":1,\"color\":\"#ff4d4f\"}]",
+    "dimensions": [],
+    "description": "Whether an error occurred when the OracleDB monitoring probe collected indicators in the most recent time.",
+    "query": "oracledb_exporter_last_scrape_error_gauge{__$labels__}"
+  },
+  {
+    "metric_group": "SelfMonitor",
+    "name": "oracledb_exporter_scrapes_total_counter",
+    "display_name": "OracleDb Exporter Scrape Metrics Total",
+    "instance_id_keys": ["instance_id"],
+    "data_type": "Number",
+    "unit": "counts",
+    "dimensions": [],
+    "description": "The total number of times of collecting indicators since the OracleDB monitoring probe was started, and if the process is restarted, it will be recalculated.",
+    "query": "oracledb_exporter_scrapes_total_counter{__$labels__}"
+  }
+]
+}

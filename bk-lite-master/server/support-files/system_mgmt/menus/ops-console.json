@@ -1,0 +1,20 @@
+{
+  "client_id": "ops-console",
+  "name": "OpsConsole",
+  "url": "/ops-console/home",
+  "description": "app.ops-console",
+  "icon": "ops-console",
+  "menus": [],
+  "roles": [
+    {
+      "name": "admin",
+      "role_name": "ops-console_admin",
+      "menus": []
+    },
+    {
+      "name": "normal",
+      "role_name": "ops-console_normal",
+      "menus": []
+    }
+  ]
+}

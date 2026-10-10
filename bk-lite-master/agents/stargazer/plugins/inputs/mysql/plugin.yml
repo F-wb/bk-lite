@@ -1,0 +1,34 @@
+name: mysql
+version: 2.0.0
+category: database
+metadata:
+  display_name: MySQL 数据库
+  description: MySQL 数据库采集插件，支持脚本和协议两种方式
+  author: WeOps
+  tags:
+  - database
+  - mysql
+  cloud_protocol: false
+  model_id: mysql
+executors:
+  job:
+    type: job
+    execution_mode: remote
+    capacity_group: remote_job
+    scripts:
+      linux: plugins/shell/mysql_default_discover.sh
+      windows: plugins/shell/mysql_windows_discover.ps1
+    default_script: linux
+    target_policy:
+      mode: remote_channel
+  protocol:
+    type: protocol
+    execution_mode: async
+    capacity_group: default
+    collector:
+      module: plugins.inputs.mysql.mysql_info
+      class: MysqlInfo
+    target_policy:
+      mode: tcp
+      port: 3306
+default_executor: protocol

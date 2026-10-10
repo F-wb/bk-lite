@@ -1,0 +1,55 @@
+{
+  "client_id": "ops-analysis",
+  "name": "OpsAnalysis",
+  "url": "/ops-analysis/view",
+  "icon": "ops-analysis",
+  "tags": ["tag.dashboard", "tag.canvas", "tag.data_integration"],
+  "description": "app.ops-analysis",
+  "menus": [
+    {
+      "name": "Operations Analysis",
+      "children": [
+        {
+          "id": "view",
+          "name": "View",
+          "operation": [
+            "View",
+            "AddCatalogue",
+            "EditCatalogue",
+            "DeleteCatalogue",
+            "AddChart",
+            "EditChart",
+            "DeleteChart"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Settings",
+      "children": [
+        {
+          "id": "data_source",
+          "name": "Data Source",
+          "operation": ["View", "Add", "Edit", "Delete"]
+        },
+        {
+          "id": "namespace",
+          "name": "NameSpace",
+          "operation": ["View", "Add", "Edit", "Delete"]
+        }
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "name": "admin",
+      "role_name": "node_admin",
+      "menus": []
+    },
+    {
+      "name": "normal",
+      "role_name": "node_normal",
+      "menus": ["view-View","view-AddCatalogue","view-EditCatalogue","view-DeleteCatalogue","view-AddChart","view-EditChart","view-DeleteChart", "data_source-View", "namespace-View"]
+    }
+  ]
+}

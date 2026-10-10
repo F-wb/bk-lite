@@ -1,0 +1,167 @@
+import uuid
+
+from rest_framework import serializers
+
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.utils.current_team_scope import _normalize_organization_ids
+from apps.log.models.log_group import LogGroup, LogGroupOrganization, SearchCondition
+from apps.log.services.access_scope import LogAccessScopeService
+from apps.log.utils.locale_text import serializer_text
+from apps.log.utils.log_group import LogGroupQueryBuilder
+
+
+class CanonicalOrganizationIdField(serializers.Field):
+    default_error_messages = {
+        "invalid": "组织ID必须是规范正整数",
+    }
+
+    def to_internal_value(self, data):
+        try:
+            organization_ids = _normalize_organization_ids([data])
+        except BaseAppException:
+            self.fail("invalid")
+        if len(organization_ids) != 1:
+            self.fail("invalid")
+        return next(iter(organization_ids))
+
+    def to_representation(self, value):
+        return value
+
+
+class LogGroupSerializer(serializers.ModelSerializer):
+    # 使用 ListField 处理输入，SerializerMethodField 处理输出
+    organizations = serializers.ListField(
+        child=CanonicalOrganizationIdField(),
+        required=False,
+        allow_empty=False,
+        help_text="关联的组织ID列表",
+    )
+
+    # ID字段改为可选，支持自动生成UUID
+    id = serializers.CharField(required=False, allow_blank=False, max_length=200, help_text="日志分组ID，如不提供将自动生成UUID")
+
+    class Meta:
+        model = LogGroup
+        fields = ["id", "name", "description", "rule", "created_by", "created_at", "organizations"]
+        read_only_fields = ["created_by", "created_at"]
+
+    def to_representation(self, instance):
+        """自定义输出格式，在输出时获取组织信息"""
+        data = super().to_representation(instance)
+        organization_queryset = LogGroupOrganization.objects.filter(log_group=instance)
+        request = self.context.get("request") if hasattr(self, "context") else None
+        if request is not None:
+            try:
+                visible_organizations = LogAccessScopeService.get_visible_organization_ids(request)
+            except ValueError:
+                visible_organizations = frozenset()
+            organization_queryset = organization_queryset.filter(organization__in=list(visible_organizations))
+        data["organizations"] = list(organization_queryset.values_list("organization", flat=True))
+        return data
+
+    def create(self, validated_data):
+        # 如果没有提供ID，自动生成UUID
+        if "id" not in validated_data or not validated_data["id"]:
+            validated_data["id"] = str(uuid.uuid4())
+
+        organizations = validated_data.pop("organizations", [])
+        log_group = super().create(validated_data)
+
+        # 创建组织关联
+        if organizations:
+            LogGroupOrganization.objects.bulk_create(
+                [LogGroupOrganization(log_group=log_group, organization=org_id) for org_id in organizations], ignore_conflicts=True
+            )
+
+        return log_group
+
+    def update(self, instance, validated_data):
+        # 在更新时，移除ID字段，防止主键被修改
+        validated_data.pop("id", None)
+        organizations = validated_data.pop("organizations", None)
+        log_group = super().update(instance, validated_data)
+
+        # 更新组织关联
+        if organizations is not None:
+            LogGroupOrganization.objects.filter(log_group=log_group).delete()
+            LogGroupOrganization.objects.bulk_create(
+                [LogGroupOrganization(log_group=log_group, organization=org_id) for org_id in organizations], ignore_conflicts=True
+            )
+
+        return log_group
+
+    def validate_organizations(self, value):
+        """验证组织ID列表"""
+        if not isinstance(value, list):
+            raise serializers.ValidationError(serializer_text(self, "error.must_be_list"))
+
+        if not all(isinstance(org_id, int) for org_id in value):
+            raise serializers.ValidationError(serializer_text(self, "error.list_items_must_be_int"))
+
+        request = self.context.get("request") if hasattr(self, "context") else None
+        if request is not None:
+            try:
+                LogAccessScopeService.validate_organizations(request, value)
+            except ValueError as exc:
+                raise serializers.ValidationError(str(exc))
+
+        return value
+
+    def validate_rule(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError(serializer_text(self, "error.log_group_rule_object"))
+
+        value = LogGroupQueryBuilder.normalize_star_rule(value)
+
+        try:
+            LogGroupQueryBuilder.validate_rule(
+                value,
+                require_legacy_safe=LogGroupQueryBuilder._legacy_migration_mode_enabled(),
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+        return value
+
+    def validate(self, attrs):
+        if self.instance is None and "organizations" not in attrs:
+            raise serializers.ValidationError({"organizations": serializer_text(self, "error.organization_required")})
+        return attrs
+
+
+class SearchConditionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SearchCondition
+        fields = ["id", "name", "condition", "organization", "created_by", "created_at", "updated_at"]
+        read_only_fields = ["id", "organization", "created_by", "created_at", "updated_at"]
+
+    def validate_condition(self, value):
+        """验证搜索条件配置"""
+        if not isinstance(value, dict):
+            raise serializers.ValidationError(serializer_text(self, "error.search_condition_object"))
+
+        # 验证必要字段
+        if "query" not in value:
+            raise serializers.ValidationError(serializer_text(self, "error.search_condition_query_required"))
+
+        if "log_groups" not in value:
+            raise serializers.ValidationError(serializer_text(self, "error.search_condition_groups_required"))
+
+        # 验证日志分组是否存在
+        log_groups = value.get("log_groups", [])
+        if not isinstance(log_groups, list):
+            raise serializers.ValidationError(serializer_text(self, "error.log_groups_must_be_list"))
+
+        request = self.context.get("request") if hasattr(self, "context") else None
+        if request is not None:
+            try:
+                LogAccessScopeService.resolve_scope(request, log_groups)
+            except ValueError as exc:
+                raise serializers.ValidationError(str(exc))
+        elif log_groups:
+            existing_groups = LogGroup.objects.filter(id__in=log_groups).values_list("id", flat=True)
+            invalid_groups = set(log_groups) - set(existing_groups)
+            if invalid_groups:
+                raise serializers.ValidationError(serializer_text(self, "error.log_groups_missing", names=", ".join(invalid_groups)))
+
+        return value

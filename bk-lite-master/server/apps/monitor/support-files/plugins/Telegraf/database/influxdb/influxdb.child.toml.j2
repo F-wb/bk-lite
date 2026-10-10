@@ -1,0 +1,24 @@
+[[inputs.influxdb]]
+    startup_error_behavior = "retry"
+    urls = ["{{ server }}"]
+    interval = "{{ interval }}s"
+    {% if username %}
+    username = "{{ username }}"
+    password = "${PASSWORD__{{ config_id }}}"
+    {% endif %}
+    timeout = "{{ timeout }}s"
+    {% if tls_ca %}
+    tls_ca = "{{ tls_ca }}"
+    {% endif %}
+    {% if tls_cert %}
+    tls_cert = "{{ tls_cert }}"
+    {% endif %}
+    {% if tls_key %}
+    tls_key = "{{ tls_key }}"
+    {% endif %}
+    insecure_skip_verify = {{ insecure_skip_verify | default(false, true) | lower }}
+    [inputs.influxdb.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "database"
+        config_type = "influxdb"

@@ -1,0 +1,309 @@
+from apps.rpc.base import RpcClient
+
+RPC_TIMEOUT_GRACE_SECONDS = 1
+
+
+def _resolve_rpc_timeout(timeout):
+    return timeout + RPC_TIMEOUT_GRACE_SECONDS
+
+
+class ExecutorRpcClient(RpcClient):
+    def __init__(self, namespace):
+        self.namespace = namespace
+
+
+class Executor(object):
+    def __init__(self, instance_id):
+        """
+        命令执行客户端
+        :param instance_id: 执行器实例ID
+        """
+        self.instance_id = instance_id
+        self.local_client = ExecutorRpcClient("local.execute")
+        self.ssh_client = ExecutorRpcClient("ssh.execute")
+        self.download_to_local_client = ExecutorRpcClient("download.local")
+        self.download_to_remote_client = ExecutorRpcClient("download.remote")
+        self.transfer_file_to_remote_client = ExecutorRpcClient("upload.remote")
+        self.unzip_local_client = ExecutorRpcClient("unzip.local")
+        self.health_check_client = ExecutorRpcClient("health.check")
+
+    def health_check(self, timeout=5):
+        """
+        健康检查
+        :param timeout: 执行超时时间(秒)，默认5秒
+        :return: 健康检查结果
+        """
+        request_data = {"execute_timeout": timeout}
+        return_data = self.health_check_client.run(self.instance_id, request_data, _timeout=timeout)
+        return return_data
+
+    def execute_local(self, command, timeout=60, shell=None, env=None):
+        """
+        执行本地命令
+        :param command: 要执行的命令
+        :param timeout: 执行超时时间(秒)
+        :param shell: 脚本类型，支持: "sh"(默认), "bash", "python", "python3", "bat", "cmd", "powershell", "pwsh"
+        :return: 命令执行结果
+        """
+        request_data = {"command": command, "execute_timeout": timeout}
+        if shell:
+            request_data["shell"] = shell
+        if env:
+            request_data["env"] = env
+        return_data = self.local_client.run(self.instance_id, request_data, _timeout=timeout)
+        return return_data
+
+    def execute_local_stream(self, command, timeout=60, shell=None, execution_id=None, stream_log_topic=None, env=None):
+        """
+        执行本地命令（流式）：在阻塞返回全量结果的同时，agent 按行 publish stdout/stderr
+        到 stream_log_topic。返回值与 execute_local 一致。
+
+        :param command: 要执行的命令
+        :param timeout: 执行超时时间(秒)
+        :param shell: 脚本类型，支持: "sh", "bash", "python", "python3", "bat", "cmd", "powershell", "pwsh"
+        :param execution_id: 执行 ID（写入流事件）
+        :param stream_log_topic: 行事件发布主题
+        :return: 命令执行结果
+        """
+        request_data = {"command": command, "execute_timeout": timeout, "stream_logs": True}
+        if shell:
+            request_data["shell"] = shell
+        if env:
+            request_data["env"] = env
+        if execution_id:
+            request_data["execution_id"] = execution_id
+        if stream_log_topic:
+            request_data["stream_log_topic"] = stream_log_topic
+        return_data = self.local_client.run(self.instance_id, request_data, _timeout=timeout)
+        return return_data
+
+    def execute_ssh(
+        self,
+        command,
+        host,
+        username,
+        password=None,
+        private_key=None,
+        passphrase=None,
+        timeout=60,
+        port=22,
+        connection_test=False,
+        fast_fail=False,
+    ):
+        """
+        通过SSH执行远程命令
+        :param command: 要执行的命令
+        :param host: 远程主机地址
+        :param port: 远程主机端口(可选)
+        :param username: SSH用户名
+        :param password: SSH密码(可选)
+        :param private_key: SSH私钥内容(PEM格式，可选)
+        :param passphrase: 私钥密码短语(可选)
+        :param timeout: 执行超时时间(秒)
+        :return: 命令执行结果
+        """
+        request_data = {
+            "command": command,
+            "host": host,
+            "port": port,
+            "user": username,
+            "execute_timeout": timeout,
+        }
+
+        # 添加可选参数
+        if password:
+            request_data["password"] = password
+        if private_key:
+            request_data["private_key"] = private_key
+        if passphrase:
+            request_data["passphrase"] = passphrase
+        if connection_test:
+            request_data["connection_test"] = True
+        if fast_fail:
+            request_data["connection_test"] = True
+
+        return_data = self.ssh_client.run(self.instance_id, request_data, _timeout=_resolve_rpc_timeout(timeout))
+        return return_data
+
+    def execute_ssh_stream(
+        self,
+        command,
+        host,
+        username,
+        password=None,
+        private_key=None,
+        passphrase=None,
+        timeout=60,
+        port=22,
+        execution_id=None,
+        stream_log_topic=None,
+        fast_fail=False,
+    ):
+        request_data = {
+            "command": command,
+            "host": host,
+            "port": port,
+            "user": username,
+            "execute_timeout": timeout,
+            "stream_logs": True,
+        }
+
+        if password:
+            request_data["password"] = password
+        if private_key:
+            request_data["private_key"] = private_key
+        if passphrase:
+            request_data["passphrase"] = passphrase
+        if execution_id:
+            request_data["execution_id"] = execution_id
+        if stream_log_topic:
+            request_data["stream_log_topic"] = stream_log_topic
+        if fast_fail:
+            request_data["connection_test"] = True
+
+        return self.ssh_client.run(self.instance_id, request_data, _timeout=_resolve_rpc_timeout(timeout))
+
+    def download_to_local(self, bucket_name, file_key, file_name, target_path, timeout=60, overwrite=True):
+        """
+        下载文件
+        :param bucket_name: 存储桶名称
+        :param file_key: 文件在存储桶中的键
+        :param file_name: 文件名称
+        :param target_path: 本地目标路径
+        :param timeout: 执行超时时间(秒)
+        :param overwrite: 是否覆盖已存在文件，默认True
+        :return: 下载结果
+        """
+        request_data = {
+            "bucket_name": bucket_name,
+            "file_key": file_key,
+            "file_name": file_name,
+            "target_path": target_path,
+            "execute_timeout": timeout,
+            "overwrite": overwrite,
+        }
+        return_data = self.download_to_local_client.run(self.instance_id, request_data, _timeout=timeout)
+        return return_data
+
+    def download_to_remote(
+        self,
+        bucket_name,
+        file_key,
+        file_name,
+        target_path,
+        host,
+        username,
+        password=None,
+        private_key=None,
+        passphrase=None,
+        timeout=60,
+        port=22,
+        overwrite=True,
+        local_path="/tmp",
+        fast_fail=False,
+    ):
+        """
+        下载文件到远程
+        :param bucket_name: 存储桶名称
+        :param file_key: 文件在存储桶中的键
+        :param file_name: 文件名称
+        :param target_path: 远程目标路径
+        :param host: 远程主机地址
+        :param port: 远程主机端口(可选)
+        :param username: SSH用户名
+        :param password: SSH密码(可选)
+        :param private_key: SSH私钥内容(PEM格式，可选)
+        :param passphrase: 私钥密码短语(可选)
+        :param timeout: 执行超时时间(秒)
+        :param overwrite: 是否覆盖已存在文件，默认True
+        :param local_path: 执行器本地下载目录（可选，默认/tmp）
+        :return: 下载结果
+        """
+        request_data = {
+            "bucket_name": bucket_name,
+            "file_key": file_key,
+            "file_name": file_name,
+            "target_path": target_path,
+            "local_path": local_path,
+            "host": host,
+            "port": port,
+            "user": username,
+            "execute_timeout": timeout,
+            "overwrite": overwrite,
+        }
+        # 添加可选参数
+        if password:
+            request_data["password"] = password
+        if private_key:
+            request_data["private_key"] = private_key
+        if passphrase:
+            request_data["passphrase"] = passphrase
+        if fast_fail:
+            request_data["fast_fail"] = True
+        return_data = self.download_to_remote_client.run(
+            self.instance_id,
+            request_data,
+            _timeout=_resolve_rpc_timeout(timeout),
+        )
+        return return_data
+
+    def unzip_local(self, file_path, target_path, timeout=60):
+        """
+        解压本地文件
+        :param file_path: 要解压的文件路径
+        :param target_path: 解压目标路径
+        :return: 解压结果
+        """
+        request_data = {
+            "zip_path": file_path,
+            "dest_dir": target_path,
+        }
+        return_data = self.unzip_local_client.run(self.instance_id, request_data, _timeout=timeout)
+        return return_data
+
+    def transfer_file_to_remote(
+        self,
+        source_path,
+        target_path,
+        host,
+        username,
+        password=None,
+        private_key=None,
+        passphrase=None,
+        timeout=60,
+        port=22,
+    ):
+        """
+        传递文件到远程主机
+        :param source_path: 要传递的文件路径
+        :param target_path: 远程目标路径
+        :param host: 远程主机地址
+        :param port: 远程主机端口(可选)
+        :param username: SSH用户名
+        :param password: SSH密码(可选)
+        :param private_key: SSH私钥内容(PEM格式，可选)
+        :param passphrase: 私钥密码短语(可选)
+        :param timeout: 执行超时时间(秒)
+        :return: 传递结果
+        """
+        request_data = {
+            "source_path": source_path,
+            "target_path": target_path,
+            "host": host,
+            "port": port,
+            "user": username,
+            "execute_timeout": timeout,
+        }
+        # 添加可选参数
+        if password:
+            request_data["password"] = password
+        if private_key:
+            request_data["private_key"] = private_key
+        if passphrase:
+            request_data["passphrase"] = passphrase
+        return_data = self.transfer_file_to_remote_client.run(
+            self.instance_id,
+            request_data,
+            _timeout=_resolve_rpc_timeout(timeout),
+        )
+        return return_data

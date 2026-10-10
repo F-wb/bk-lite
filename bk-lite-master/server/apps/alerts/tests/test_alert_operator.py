@@ -1,0 +1,724 @@
+"""告警操作状态机覆盖测试。
+
+对照 specs/capabilities/legacy-prd-告警中心-告警.md：未分派→待响应→处理中→关闭，含转派/认领与权限校验。
+"""
+
+from datetime import datetime
+from unittest import mock
+from zoneinfo import ZoneInfo
+
+import pytest
+from django.utils import timezone as django_timezone
+
+from apps.alerts.constants.constants import AlertStatus
+from apps.alerts.models.models import Alert
+from apps.alerts.models.operator_log import OperatorLog
+from apps.alerts.service.alter_operator import AlertOperator
+
+
+@pytest.fixture
+def sys_user(db):
+    from apps.system_mgmt.models.user import User
+
+    return User.objects.create(username="op1", domain="domain.com", group_list=[{"id": 1}])
+
+
+def _make_alert(alert_id="A1", status=AlertStatus.UNASSIGNED, operator=None, team=None):
+    return Alert.objects.create(
+        alert_id=alert_id,
+        level="0",
+        title="t",
+        content="c",
+        fingerprint="fp",
+        status=status,
+        operator=operator or [],
+        team=team or [1],
+    )
+
+
+# --------------------------------------------------------------------------
+# operate dispatch
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_operate_unknown_action_raises():
+    _make_alert()
+    op = AlertOperator(user="op1")
+    with pytest.raises(ValueError):
+        op.operate("teleport", "A1", {})
+
+
+@pytest.mark.django_db
+def test_operate_not_allowed_alert():
+    _make_alert()
+    op = AlertOperator(user="op1", allowed_alert_ids=["other"])
+    result = op.operate("assign", "A1", {})
+    assert result["result"] is False
+    assert "权限" in result["message"]
+
+
+# --------------------------------------------------------------------------
+# assign
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_assign_success(sys_user):
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1])
+    op = AlertOperator(user="system")
+    result = op.operate("assign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is True
+    alert = Alert.objects.get(alert_id="A1")
+    assert alert.status == AlertStatus.PENDING
+    assert alert.operator == ["op1"]
+    assert alert.closed_at is None
+    assert OperatorLog.objects.filter(operator_object="告警处理-分派").exists()
+
+
+@pytest.mark.django_db
+def test_assign_wrong_status():
+    _make_alert(status=AlertStatus.PROCESSING)
+    op = AlertOperator(user="system")
+    result = op.operate("assign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is False
+    assert "无法进行分派" in result["message"]
+
+
+@pytest.mark.django_db
+def test_assign_no_assignee():
+    _make_alert(status=AlertStatus.UNASSIGNED)
+    op = AlertOperator(user="system")
+    result = op.operate("assign", "A1", {"assignee": []})
+    assert result["result"] is False
+    assert "请指定处理人" in result["message"]
+
+
+@pytest.mark.django_db
+def test_assign_nonexistent_alert():
+    op = AlertOperator(user="system")
+    result = op.operate("assign", "missing", {"assignee": ["op1"]})
+    assert result["result"] is False
+    assert "不存在" in result["message"]
+
+
+@pytest.mark.django_db
+def test_assign_invalid_assignee_disabled():
+    from apps.system_mgmt.models.user import User
+
+    User.objects.create(username="disabled-op", domain="domain.com", group_list=[{"id": 1}], disabled=True)
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1])
+    op = AlertOperator(user="system")
+    result = op.operate("assign", "A1", {"assignee": ["disabled-op"]})
+    assert result["result"] is False
+    assert "禁用" in result["message"]
+
+
+# --------------------------------------------------------------------------
+# acknowledge
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_acknowledge_success():
+    _make_alert(status=AlertStatus.PENDING, operator=["op1"])
+    op = AlertOperator(user="op1")
+    result = op.operate("acknowledge", "A1", {})
+    assert result["result"] is True
+    assert Alert.objects.get(alert_id="A1").status == AlertStatus.PROCESSING
+
+
+@pytest.mark.django_db
+def test_acknowledge_wrong_status():
+    _make_alert(status=AlertStatus.UNASSIGNED, operator=["op1"])
+    op = AlertOperator(user="op1")
+    result = op.operate("acknowledge", "A1", {})
+    assert result["result"] is False
+
+
+@pytest.mark.django_db
+def test_acknowledge_no_permission():
+    _make_alert(status=AlertStatus.PENDING, operator=["someoneelse"])
+    op = AlertOperator(user="op1")
+    result = op.operate("acknowledge", "A1", {})
+    assert result["result"] is False
+    assert "权限" in result["message"]
+
+
+# --------------------------------------------------------------------------
+# close
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_close_success():
+    _make_alert(status=AlertStatus.PROCESSING, operator=["op1"])
+    op = AlertOperator(user="op1")
+    result = op.operate("close", "A1", {"reason": "已修复"})
+    assert result["result"] is True
+    alert = Alert.objects.get(alert_id="A1")
+    assert alert.status == AlertStatus.CLOSED
+    assert alert.closed_at is not None
+    assert result["data"]["close_reason"] == "已修复"
+
+
+@pytest.mark.django_db
+def test_close_wrong_status():
+    _make_alert(status=AlertStatus.PENDING, operator=["op1"])
+    op = AlertOperator(user="op1")
+    result = op.operate("close", "A1", {})
+    assert result["result"] is False
+
+
+@pytest.mark.django_db
+def test_close_no_permission():
+    _make_alert(status=AlertStatus.PROCESSING, operator=["other"])
+    op = AlertOperator(user="op1")
+    result = op.operate("close", "A1", {})
+    assert result["result"] is False
+    assert "没有权限关闭" in result["message"]
+
+
+@pytest.mark.django_db
+def test_api_close_pending_without_assignee():
+    _make_alert(status=AlertStatus.PENDING, operator=["other"])
+    op = AlertOperator(user="api-user", api_close=True)
+    result = op.operate("close", "A1", {"reason": "自动化关闭"})
+    assert result["result"] is True
+    alert = Alert.objects.get(alert_id="A1")
+    assert alert.status == AlertStatus.CLOSED
+    assert alert.closed_at is not None
+    assert result["data"]["close_reason"] == "自动化关闭"
+
+
+@pytest.mark.django_db
+def test_api_close_processing_without_assignee():
+    _make_alert(status=AlertStatus.PROCESSING, operator=["other"])
+    op = AlertOperator(user="api-user", api_close=True)
+    result = op.operate("close", "A1", {})
+    assert result["result"] is True
+    alert = Alert.objects.get(alert_id="A1")
+    assert alert.status == AlertStatus.CLOSED
+    assert alert.closed_at is not None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [AlertStatus.UNASSIGNED, AlertStatus.RESOLVED, AlertStatus.CLOSED, AlertStatus.AUTO_CLOSE, AlertStatus.AUTO_RECOVERY],
+)
+@pytest.mark.django_db
+def test_api_close_rejects_disallowed_status(status):
+    _make_alert(status=status, operator=["other"])
+    op = AlertOperator(user="api-user", api_close=True)
+    result = op.operate("close", "A1", {})
+    assert result["result"] is False
+    assert "无法进行关闭" in result["message"]
+    assert Alert.objects.get(alert_id="A1").status == status
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# reassign
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_reassign_success(sys_user):
+    # 转派要求当前用户是现处理人之一
+    _make_alert(status=AlertStatus.PROCESSING, operator=["mover"], team=[1])
+    op = AlertOperator(user="mover")
+    result = op.operate("reassign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is True
+    alert = Alert.objects.get(alert_id="A1")
+    assert alert.status == AlertStatus.PENDING
+    assert alert.operator == ["op1"]
+
+
+@pytest.mark.django_db
+def test_reassign_wrong_status():
+    _make_alert(status=AlertStatus.CLOSED, operator=["mover"])
+    op = AlertOperator(user="mover")
+    result = op.operate("reassign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is False
+
+
+@pytest.mark.django_db
+def test_reassign_no_assignee():
+    _make_alert(status=AlertStatus.PROCESSING, operator=["mover"])
+    op = AlertOperator(user="mover")
+    result = op.operate("reassign", "A1", {"assignee": []})
+    assert result["result"] is False
+
+
+@pytest.mark.django_db
+def test_superuser_can_reassign_pending_alert(sys_user, caplog):
+    secret = "must-not-log-reassign-payload"
+    alert = _make_alert(status=AlertStatus.PENDING, operator=["other"], team=[1])
+    alert.content = secret
+    alert.save(update_fields=["content"])
+    op = AlertOperator(user="admin", is_superuser=True)
+    with caplog.at_level("INFO", logger="alert"):
+        result = op.operate("reassign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is True
+    assert result["data"]["status"] == AlertStatus.PENDING
+    alert = Alert.objects.get(alert_id="A1")
+    assert alert.status == AlertStatus.PENDING
+    assert alert.operator == ["op1"]
+
+    success_records = [record for record in caplog.records if record.name == "alert" and record.msg.startswith("[AlertOperator] 告警转派成功:")]
+    assert len(success_records) == 1
+    record = success_records[0]
+    assert record.msg == "[AlertOperator] 告警转派成功: alert_id=%s, old_assignee=%s, new_assignee=%s, 状态变更: %s -> %s"
+    assert record.args == ("A1", ["other"], ["op1"], AlertStatus.PENDING, AlertStatus.PENDING)
+    assert record.getMessage() == ("[AlertOperator] 告警转派成功: alert_id=A1, old_assignee=['other'], new_assignee=['op1'], " "状态变更: pending -> pending")
+    assert secret not in caplog.text
+    assert secret not in record.getMessage()
+
+
+@pytest.mark.django_db
+def test_non_superuser_cannot_reassign_pending_alert(sys_user):
+    _make_alert(status=AlertStatus.PENDING, operator=["op1"], team=[1])
+    op = AlertOperator(user="admin")
+    result = op.operate("reassign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is False
+    assert "无法进行转派" in result["message"]
+
+
+@pytest.mark.django_db
+def test_superuser_cannot_reassign_processing_unless_assignee(sys_user):
+    _make_alert(status=AlertStatus.PROCESSING, operator=["op1"], team=[1])
+    op = AlertOperator(user="admin", is_superuser=True)
+    result = op.operate("reassign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is False
+    assert "没有权限转派" in result["message"]
+
+
+@pytest.mark.django_db
+def test_superuser_assignee_can_reassign_processing(sys_user):
+    _make_alert(status=AlertStatus.PROCESSING, operator=["op1"], team=[1])
+    op = AlertOperator(user="op1", is_superuser=True)
+    result = op.operate("reassign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is True
+    assert Alert.objects.get(alert_id="A1").status == AlertStatus.PENDING
+
+
+@pytest.mark.django_db
+def test_superuser_cannot_reassign_unassigned(sys_user):
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1])
+    op = AlertOperator(user="admin", is_superuser=True)
+    result = op.operate("reassign", "A1", {"assignee": ["op1"]})
+    assert result["result"] is False
+    assert "无法进行转派" in result["message"]
+
+
+@pytest.mark.django_db
+def test_superuser_reassign_judges_each_alert(sys_user):
+    _make_alert(alert_id="P1", status=AlertStatus.PENDING, operator=["other"], team=[1])
+    Alert.objects.create(
+        alert_id="R1",
+        level="0",
+        title="t2",
+        content="c2",
+        fingerprint="fp-R1",
+        status=AlertStatus.PROCESSING,
+        operator=["op1"],
+        team=[1],
+    )
+    op = AlertOperator(user="admin", is_superuser=True)
+    pending = op.operate("reassign", "P1", {"assignee": ["op1"]})
+    processing = op.operate("reassign", "R1", {"assignee": ["op1"]})
+    assert pending["result"] is True
+    assert Alert.objects.get(alert_id="P1").status == AlertStatus.PENDING
+    assert processing["result"] is False
+    assert "没有权限转派" in processing["message"]
+    assert Alert.objects.get(alert_id="R1").status == AlertStatus.PROCESSING
+
+
+# --------------------------------------------------------------------------
+# resolve
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_resolve_success():
+    _make_alert(status=AlertStatus.PROCESSING, operator=["op1"])
+    op = AlertOperator(user="op1")
+    result = op.operate("resolve", "A1", {"note": "已处理"})
+    assert result["result"] is True
+    alert = Alert.objects.get(alert_id="A1")
+    assert alert.status == AlertStatus.RESOLVED
+    assert alert.closed_at is not None
+
+
+@pytest.mark.django_db
+def test_resolve_wrong_status():
+    _make_alert(status=AlertStatus.PENDING, operator=["op1"])
+    op = AlertOperator(user="op1")
+    result = op.operate("resolve", "A1", {})
+    assert result["result"] is False
+
+
+@pytest.mark.django_db
+def test_resolve_no_permission():
+    _make_alert(status=AlertStatus.PROCESSING, operator=["other"])
+    op = AlertOperator(user="op1")
+    result = op.operate("resolve", "A1", {})
+    assert result["result"] is False
+
+
+@pytest.mark.django_db
+def test_assign_with_assignment_id_creates_reminder(sys_user):
+    from apps.alerts.models.alert_operator import AlertAssignment, AlertReminderTask
+
+    assignment = AlertAssignment.objects.create(
+        name="分派",
+        match_type="all",
+        is_active=True,
+        notification_frequency={"0": {"interval_minutes": 30}},
+    )
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1], alert_id="A1")
+    op = AlertOperator(user="system")
+    result = op.operate("assign", "A1", {"assignee": ["op1"], "assignment_id": assignment.id})
+    assert result["result"] is True
+    assert AlertReminderTask.objects.filter(alert__alert_id="A1").exists()
+
+
+@pytest.mark.django_db
+def test_format_notify_data_no_channel_returns_empty():
+    alert = _make_alert(status=AlertStatus.PENDING)
+    op = AlertOperator(user="u1")
+    # 收口后统一返回 list(sync_notify 期望 list[dict]);无渠道 → 空列表
+    assert op.format_notify_data(["op1"], alert) == []
+
+
+@pytest.mark.django_db
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="c")
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="t")
+@mock.patch(
+    "apps.alerts.notification_templates.operation.get_alert_operation_channel",
+    return_value={"channel_type": "email", "id": 5},
+)
+def test_format_notify_data_returns_list_of_params(_mock_chan, _mt, _mc):
+    """收口后:配了默认渠道时返回 list[dict](修掉原先返回单 dict 致 sync_notify 崩的 bug)。"""
+    alert = _make_alert(status=AlertStatus.PENDING, alert_id="A-NOTIFY")
+    op = AlertOperator(user="u1")
+    result = op.format_notify_data(["op1", "u1"], alert)
+    assert isinstance(result, list) and len(result) == 1
+    assert result[0]["channel_type"] == "email"
+    assert result[0]["channel_id"] == 5
+    assert result[0]["username_list"] == ["op1", "u1"]
+    assert result[0]["object_id"] == alert.alert_id
+
+
+@pytest.mark.django_db
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="c")
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="t")
+@mock.patch(
+    "apps.alerts.notification_templates.operation.get_alert_operation_channel",
+    return_value={"channel_type": "email", "id": 5},
+)
+def test_manual_assignment_notifies_when_operator_assigns_to_self(_mock_chan, _mt, _mc):
+    alert = _make_alert(status=AlertStatus.PENDING, alert_id="A-SELF-NOTIFY")
+    op = AlertOperator(user="u1")
+
+    result = op.format_notify_data(["u1"], alert)
+
+    assert len(result) == 1
+    assert result[0]["username_list"] == ["u1"]
+
+
+@pytest.mark.django_db
+def test_manual_assignment_uses_team_alert_operation_template():
+    from apps.alerts.models.notification_template import NotificationTemplate, NotificationTemplateContent
+    from apps.system_mgmt.models.channel import Channel
+
+    channel = Channel.objects.create(
+        name="告警操作企微",
+        channel_type="enterprise_wechat_bot",
+        config={},
+        description="test",
+        team=[1],
+    )
+    template = NotificationTemplate.objects.create(
+        name="告警操作通知",
+        team=[1],
+        scope="alert_operation",
+        builtin_key="alert_operation:1",
+        channel_id=channel.id,
+    )
+    NotificationTemplateContent.objects.create(
+        template=template,
+        channel_type="enterprise_wechat_bot",
+        subject_template="",
+        body_template="### {{ notification.scene_name }}｜{{ alert.title }}",
+    )
+    alert = _make_alert(status=AlertStatus.PENDING, alert_id="A-OPERATION", team=[1])
+
+    result = AlertOperator(user="op1").format_notify_data(["op1"], alert)
+
+    assert len(result) == 1
+    assert result[0]["channel_id"] == channel.id
+    assert result[0]["channel_type"] == "enterprise_wechat_bot"
+    assert result[0]["content"] == "### 告警分派｜t"
+    assert result[0]["template_snapshot"]["id"] == template.id
+
+
+@pytest.mark.django_db
+def test_reassignment_operation_template_receives_actor_previous_receiver_and_action_time():
+    from apps.alerts.models.notification_template import NotificationTemplate, NotificationTemplateContent
+    from apps.system_mgmt.models.channel import Channel
+
+    channel = Channel.objects.create(
+        name="告警操作文本",
+        channel_type="custom_webhook",
+        config={},
+        description="test",
+        team=[1],
+    )
+    template = NotificationTemplate.objects.create(
+        name="告警操作通知",
+        team=[1],
+        scope="alert_operation",
+        builtin_key="alert_operation:1",
+        channel_id=channel.id,
+    )
+    NotificationTemplateContent.objects.create(
+        template=template,
+        channel_type="custom_webhook",
+        subject_template="",
+        body_template=(
+            "{{ notification.action_summary }}\n"
+            "操作人：{{ notification.actor_name }}\n"
+            "原处理人：{{ notification.previous_receiver_names }}\n"
+            "操作时间：{{ notification.action_time }}"
+        ),
+    )
+    alert = _make_alert(status=AlertStatus.PENDING, alert_id="A-OPERATION-CONTEXT", team=[1])
+    alert.updated_at = datetime(2026, 9, 10, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with django_timezone.override(ZoneInfo("Asia/Shanghai")):
+        result = AlertOperator(user="admin").format_notify_data(
+            ["zhangsan"],
+            alert,
+            scene="reassignment",
+            previous_assignee=["lisi"],
+        )
+
+    assert result[0]["content"] == ("该告警已由 admin 从 lisi 转派给 zhangsan，请新的处理人及时认领并处理。\n" "操作人：admin\n" "原处理人：lisi\n" "操作时间：2026-09-10 11:30:00")
+
+
+@pytest.mark.django_db
+def test_stop_reminder_tasks_noop_when_none():
+    alert = _make_alert()
+    op = AlertOperator(user="u1")
+    op._stop_reminder_tasks(alert)
+
+
+@pytest.mark.django_db
+def test_assign_missing_assignment_id_is_graceful(sys_user):
+    from apps.alerts.models.alert_operator import AlertReminderTask
+
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1], alert_id="A1")
+    op = AlertOperator(user="system")
+    result = op.operate("assign", "A1", {"assignee": ["op1"], "assignment_id": 999999})
+    assert result["result"] is True
+    assert not AlertReminderTask.objects.filter(alert__alert_id="A1").exists()
+
+
+@pytest.mark.django_db
+def test_ensure_reminder_tasks_invalid_assignment_id():
+    alert = _make_alert()
+    op = AlertOperator(user="u1")
+    op._ensure_reminder_tasks(alert, assignment_id="notanint")
+
+
+@pytest.mark.django_db
+def test_get_alert_raises_when_missing():
+    from django.db import transaction
+
+    op = AlertOperator(user="u1")
+    with pytest.raises(Alert.DoesNotExist):
+        with transaction.atomic():
+            op.get_alert("missing")
+
+
+def test_is_alert_allowed_none_allows_all():
+    op = AlertOperator(user="op1", allowed_alert_ids=None)
+    assert op._is_alert_allowed("anything") is True
+
+
+def test_is_alert_allowed_restricts():
+    op = AlertOperator(user="op1", allowed_alert_ids=["A1"])
+    assert op._is_alert_allowed("A1") is True
+    assert op._is_alert_allowed("A2") is False
+
+
+# --------------------------------------------------------------------------
+# format_assignment_notify_data（auto-dispatch 按策略勾选的 notify_channels）
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="正文")
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="标题")
+def test_format_assignment_notify_data_builds_from_notify_channels(_mt, _mc):
+    from apps.alerts.models.alert_operator import AlertAssignment
+
+    assignment = AlertAssignment.objects.create(
+        name="分派",
+        match_type="all",
+        is_active=True,
+        notify_channels=[{"id": 9, "channel_type": "nats"}, {"id": 3, "channel_type": "email"}],
+    )
+    alert = _make_alert(status=AlertStatus.PENDING, alert_id="A-AN", team=[2])
+    # 自动分派操作人=系统(SYSTEM_OPERATOR_USER="admin")；策略也分派给 admin，
+    # 不能把与操作人同名的收件人过滤掉，否则收件人为空、不发通知。
+    op = AlertOperator(user="admin")
+
+    result = op.format_assignment_notify_data(assignment, ["admin", "op1"], alert)
+
+    nats = next(p for p in result if p["channel_type"] == "nats")
+    assert nats["channel_id"] == 9
+    from datetime import datetime
+    from uuid import UUID
+
+    content = nats["content"]
+    prefix, event_id = content["event_id"].split(":", 1)
+    assert prefix == "alert-notification"
+    assert UUID(event_id).version == 4
+    assert datetime.fromisoformat(content["occurred_at"]).tzinfo is not None
+    assert content == {
+        "message": "正文", "team": 2, "user_ids": ["admin", "op1"],
+        "event_id": content["event_id"], "occurred_at": content["occurred_at"],
+        "producer": "alerts", "object_id": "A-AN", "scene": "assignment",
+    }
+    assert nats["object_id"] == "A-AN"
+    email = next(p for p in result if p["channel_type"] == "email")
+    assert email["channel_id"] == 3
+    assert email["content"] == "正文"
+    assert email["username_list"] == ["admin", "op1"]
+
+
+@pytest.mark.django_db
+def test_format_assignment_notify_data_none_returns_empty():
+    alert = _make_alert(status=AlertStatus.PENDING, alert_id="A-NF")
+    op = AlertOperator(user="system")
+    assert op.format_assignment_notify_data(None, ["op1"], alert) == []
+
+
+@pytest.mark.django_db
+def test_format_assignment_notify_data_empty_channels_returns_empty():
+    from apps.alerts.models.alert_operator import AlertAssignment
+
+    assignment = AlertAssignment.objects.create(
+        name="分派",
+        match_type="all",
+        is_active=True,
+        notify_channels=[],
+    )
+    alert = _make_alert(status=AlertStatus.PENDING, alert_id="A-EC", team=[2])
+    op = AlertOperator(user="system")
+    assert op.format_assignment_notify_data(assignment, ["op1"], alert) == []
+
+
+# --------------------------------------------------------------------------
+# _assign_alert 通知分流：auto→notify_channels / manual→告警操作内置模板
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="正文")
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="标题")
+@mock.patch("apps.alerts.common.notify.dispatcher.enqueue_notifications")
+def test_assign_auto_dispatch_notifies_via_notify_channels(mock_enqueue, _mt, _mc, sys_user):
+    from apps.alerts.models.alert_operator import AlertAssignment
+
+    assignment = AlertAssignment.objects.create(
+        name="分派",
+        match_type="all",
+        is_active=True,
+        personnel=["op1"],
+        notify_channels=[{"id": 9, "channel_type": "nats"}],
+        notification_frequency={"0": {"interval_minutes": 30}},
+    )
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1], alert_id="A1")
+    op = AlertOperator(user="system")
+
+    result = op.operate("assign", "A1", {"assignee": ["op1"], "assignment_id": assignment.id})
+
+    assert result["result"] is True
+    assert mock_enqueue.called
+    params = mock_enqueue.call_args.args[0]
+    assert len(params) == 1
+    nats = next((p for p in params if p["channel_type"] == "nats"), None)
+    assert nats is not None, "expected nats channel in enqueued params"
+    from datetime import datetime
+    from uuid import UUID
+
+    content = nats["content"]
+    prefix, event_id = content["event_id"].split(":", 1)
+    assert prefix == "alert-notification"
+    assert UUID(event_id).version == 4
+    assert datetime.fromisoformat(content["occurred_at"]).tzinfo is not None
+    assert content == {
+        "message": "正文", "team": 1, "user_ids": ["op1"],
+        "event_id": content["event_id"], "occurred_at": content["occurred_at"],
+        "producer": "alerts", "object_id": "A1", "scene": "assignment",
+    }
+    assert all(p["channel_type"] != "email" for p in params)
+
+
+@pytest.mark.django_db
+@mock.patch(
+    "apps.alerts.notification_templates.operation.get_alert_operation_channel",
+    return_value={"channel_type": "email", "id": 5},
+)
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="c")
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="t")
+@mock.patch("apps.alerts.common.notify.dispatcher.enqueue_notifications")
+def test_assign_manual_uses_alert_operation_channel(mock_enqueue, _mt, _mc, _chan, sys_user):
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1], alert_id="A1")
+    op = AlertOperator(user="op1")
+
+    result = op.operate("assign", "A1", {"assignee": ["op1"]})  # 人工分派给自己
+
+    assert result["result"] is True
+    assert mock_enqueue.called
+    params = mock_enqueue.call_args.args[0]
+    assert len(params) == 1
+    assert params[0]["channel_type"] == "email" and params[0]["channel_id"] == 5
+    assert params[0]["username_list"] == ["op1"]
+
+
+@pytest.mark.django_db
+@mock.patch(
+    "apps.alerts.notification_templates.operation.get_alert_operation_channel",
+    return_value={"channel_type": "email", "id": 5},
+)
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="c")
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="t")
+@mock.patch("apps.alerts.common.notify.dispatcher.enqueue_notifications")
+def test_assign_inactive_assignment_uses_alert_operation_channel(mock_enqueue, _mt, _mc, _chan, sys_user):
+    from apps.alerts.models.alert_operator import AlertAssignment
+
+    # 非活跃策略：_assign_alert 用 is_active=True 查不到 → assignment=None → 使用告警操作模板
+    assignment = AlertAssignment.objects.create(
+        name="分派",
+        match_type="all",
+        is_active=False,
+        notify_channels=[{"id": 9, "channel_type": "nats"}],
+    )
+    _make_alert(status=AlertStatus.UNASSIGNED, team=[1], alert_id="A1")
+    op = AlertOperator(user="system")
+
+    result = op.operate("assign", "A1", {"assignee": ["op1"], "assignment_id": assignment.id})
+
+    assert result["result"] is True
+    assert mock_enqueue.called
+    params = mock_enqueue.call_args.args[0]
+    assert len(params) == 1
+    assert params[0]["channel_type"] == "email" and params[0]["channel_id"] == 5

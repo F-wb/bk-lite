@@ -1,0 +1,26 @@
+{
+  "name": "docker",
+  "collector": "Vector",
+  "icon": "mm-docker_Docker",
+  "description": "Collects logs from Docker containers",
+  "default_query": "collect_type: docker | last 1 by (_time) partition by (instance_id)",
+  "attrs": [
+    "collect_type",
+    "collector",
+    "instance_id",
+    "container_created_at",
+    "container_id",
+    "container_name",
+    "host",
+    "host_name",
+    "host_ip",
+    "image",
+    "label",
+    "message",
+    "source_type",
+    "stream",
+    "timestamp",
+    "collect_timestamp"
+  ],
+  "display_category": "container"
+}

@@ -1,0 +1,158 @@
+{
+  "client_id": "monitor",
+  "name": "Monitor",
+  "url": "/monitor/view",
+  "tags": [
+    "tag.multi_object_access",
+    "tag.quick_search",
+    "tag.monitor_dashboard",
+    "tag.monitor_strategy",
+    "tag.smart_alert"
+  ],
+  "description": "app.monitor",
+  "icon": "monitor",
+  "menus": [
+    {
+      "name": "Search",
+      "children": [
+        {
+          "id": "search",
+          "name": "Search",
+          "operation": [
+            "View"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "View",
+      "children": [
+        {
+          "id": "view_list",
+          "name": "List",
+          "operation": [
+            "View",
+            "Detail"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Event",
+      "children": [
+        {
+          "id": "alert_list",
+          "name": "Alert",
+          "operation": [
+            "View",
+            "Operate"
+          ]
+        },
+        {
+          "id": "strategy_list",
+          "name": "Strategy",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "template_list",
+          "name": "Template",
+          "operation": [
+            "View"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Integration",
+      "children": [
+        {
+          "id": "integration_list",
+          "name": "Integration-list",
+          "operation": [
+            "View",
+            "Setting"
+          ]
+        },
+        {
+          "id": "integration_configure",
+          "name": "Integration-configure",
+          "operation": [
+            "View",
+            "Add"
+          ]
+        },
+        {
+          "id": "integration_metric",
+          "name": "Integration-metric",
+          "operation": [
+            "View",
+            "Add Group",
+            "Add Metric",
+            "Edit Group",
+            "Edit Metric",
+            "Delete Group",
+            "Delete Metric"
+          ]
+        },
+        {
+          "id": "integration_collect",
+          "name": "Integration-collect",
+          "operation": [
+            "View"
+          ]
+        },
+        {
+          "id": "asset",
+          "name": "Asset",
+          "operation": [
+            "View",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "group",
+          "name": "Group",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        },
+        {
+          "id": "object",
+          "name": "Object",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete"
+          ]
+        }
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "name": "admin",
+      "role_name": "monitor_admin",
+      "menus": []
+    },
+    {
+      "name": "normal",
+      "role_name": "monitor_normal",
+      "menus": [
+        "search-View",
+        "view_list-View",
+        "alert_list-View",
+        "strategy_list-View"
+      ]
+    }
+  ]
+}

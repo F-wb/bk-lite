@@ -1,0 +1,27 @@
+name: keepalived
+version: 2.0.0
+category: middleware
+metadata:
+  display_name: Keepalived 高可用
+  description: Keepalived 高可用服务采集插件，支持脚本方式采集
+  author: WeOps
+  tags:
+  - middleware
+  - keepalived
+  - ha
+  cloud_protocol: false
+  model_id: keepalived
+executors:
+  job:
+    type: job
+    execution_mode: remote
+    capacity_group: remote_job
+    scripts:
+      linux: plugins/inputs/keepalived/keepalived_default_discover.sh
+    collector:
+      module: plugins.script_executor
+      class: SSHPlugin
+    default_script: linux
+    target_policy:
+      mode: remote_channel
+default_executor: job

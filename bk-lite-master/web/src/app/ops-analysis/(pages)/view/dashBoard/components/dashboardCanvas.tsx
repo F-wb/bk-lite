@@ -1,0 +1,1337 @@
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import type { RefObject } from 'react';
+import { createPortal } from 'react-dom';
+import { Button, Empty, Spin } from 'antd';
+import { PlusOutlined } from '@ant-design/icons';
+import type {
+  GridItemHTMLElement,
+  GridStack as GridStackInstance,
+  GridStackNode,
+  GridStackWidget,
+} from 'gridstack';
+
+import { useTranslation } from '@/utils/i18n';
+import type {
+  DashboardLayoutItem,
+  DashboardWidgetLayoutItem,
+  FilterValue,
+  UnifiedFilterDefinition,
+} from '@/app/ops-analysis/types/dashBoard';
+import type { DatasourceItem } from '@/app/ops-analysis/types/dataSource';
+import PermissionWrapper from '@/components/permission';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import {
+  buildDashboardGridStackLayout,
+  buildDashboardGridStackStructureKey,
+  deserializeDashboardGridStackLayout,
+  flattenDashboardGridStackLayout,
+  type DashboardGridStackStoredWidget,
+} from '@/app/ops-analysis/utils/dashboardGridStack';
+import {
+  createDashboardWidgetHostRegistry,
+  getOrCreateDashboardWidgetHost,
+  prepareDashboardWidgetHosts,
+} from '@/app/ops-analysis/utils/dashboardWidgetHosts';
+import {
+  isDashboardWidgetItem,
+  sortDashboardLayoutItems,
+} from '@/app/ops-analysis/utils/dashboardGroups';
+import {
+  activateAllRuntimeWidgets,
+  mergeRuntimeActivationStates,
+  resolveRuntimeActivation,
+  type RuntimeActivationState,
+} from '@/app/ops-analysis/utils/dashboardRuntimeActivation';
+
+import GroupHeader from './groupHeader';
+import type { CanvasRuntimeRefreshCause } from '@/app/ops-analysis/utils/canvasRefreshTimer';
+import { WidgetHeaderRuntimeSlotProvider } from '@/app/ops-analysis/components/widgetHeaderRuntimeSlot';
+import WidgetWrapper from '@/app/ops-analysis/components/widgetDataRenderer';
+import { DashboardRuntimeSchedulerProvider, useDashboardRuntimeScheduler } from '@/app/ops-analysis/context/dashboardRuntimeScheduler';
+import type { DashboardRuntimeScheduler, RuntimeRequestPriority } from '@/app/ops-analysis/utils/dashboardRuntimeScheduler';
+
+import 'gridstack/dist/gridstack.min.css';
+import type { DashboardWidgetRenderResult } from '@/app/ops-analysis/renderContract';
+import {
+  resolveAnalysisCanvasInteraction,
+  shouldShowAnalysisWidgetCopyAction,
+} from '@/app/ops-analysis/utils/widgetCopy';
+
+const DASHBOARD_GRID_COLS = 12;
+const DASHBOARD_GRID_ROW_HEIGHT = 60;
+const DASHBOARD_GRID_MARGIN: [number, number] = [4, 4];
+const DASHBOARD_GRID_CONTAINER_PADDING: [number, number] = [6, 2];
+const DASHBOARD_WIDGET_RESIZE_HANDLES = 'se,sw,ne,nw';
+const DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE = 14;
+
+const acceptOnlyWidgetNodes = (element: Element) =>
+  element instanceof HTMLElement && element.dataset.nodeKind === 'widget';
+
+const getDashboardGridInteractionOptions = (editable: boolean) => ({
+  acceptWidgets: editable ? acceptOnlyWidgetNodes : false,
+  disableDrag: !editable,
+  disableResize: !editable,
+  draggable: {
+    cancel: '.no-drag, .widget-body',
+  },
+  resizable: {
+    handles: DASHBOARD_WIDGET_RESIZE_HANDLES,
+  },
+});
+
+const SchedulerRefBinder = ({
+  schedulerRef,
+}: {
+  schedulerRef: React.MutableRefObject<DashboardRuntimeScheduler | null>;
+}) => {
+  schedulerRef.current = useDashboardRuntimeScheduler();
+  return null;
+};
+
+interface DashboardWidgetCardProps {
+  item: DashboardWidgetLayoutItem;
+  runtimeActive: boolean;
+  runtimePriority?: RuntimeRequestPriority;
+  isEditMode: boolean;
+  dashboardId?: number | string;
+  chartTheme: {
+    panelBg: string;
+    panelBorderColor: string;
+  };
+  filterSearchVersion: number;
+  namespaceSearchVersion: number;
+  dashboardReloadVersion: number;
+  refreshCause: CanvasRuntimeRefreshCause;
+  widgetReloadVersion: number;
+  dataSourceResolver: DashboardCanvasProps['dataSourceResolver'];
+  appliedFilterValues: Record<string, FilterValue>;
+  appliedFilterDefinitions: UnifiedFilterDefinition[];
+  appliedNamespaceId: number | undefined;
+  selectedDashboardLocked?: boolean;
+  shareMode: boolean;
+  onEditWidget: (id: string) => void;
+  onCopyWidget?: (id: string) => void;
+  onDeleteWidget: (id: string) => void;
+  onTopologyLayoutChange?: DashboardCanvasProps['onTopologyLayoutChange'];
+  onWidgetRenderStatus?: DashboardCanvasProps['onWidgetRenderStatus'];
+}
+
+const DashboardWidgetCard = React.memo(function DashboardWidgetCard({
+  item,
+  runtimeActive,
+  runtimePriority,
+  isEditMode,
+  dashboardId,
+  chartTheme,
+  filterSearchVersion,
+  namespaceSearchVersion,
+  dashboardReloadVersion,
+  refreshCause,
+  widgetReloadVersion,
+  dataSourceResolver,
+  appliedFilterValues,
+  appliedFilterDefinitions,
+  appliedNamespaceId,
+  selectedDashboardLocked,
+  shareMode,
+  onEditWidget,
+  onCopyWidget,
+  onDeleteWidget,
+  onTopologyLayoutChange,
+  onWidgetRenderStatus,
+}: DashboardWidgetCardProps) {
+  const { t } = useTranslation();
+  const copyMenuItem = shouldShowAnalysisWidgetCopyAction({
+    interaction: resolveAnalysisCanvasInteraction({
+      editMode: isEditMode,
+      shareMode,
+      isBuiltIn: selectedDashboardLocked,
+    }),
+    sceneWidgetType: item.valueConfig?.sceneWidgetType,
+    chartType: item.valueConfig?.chartType,
+  })
+    ? {
+      key: 'copy',
+      label: t('common.copy'),
+      onClick: () => onCopyWidget?.(item.i),
+    }
+    : null;
+  const menuItems = [
+    { key: 'edit', label: t('common.edit'), onClick: () => onEditWidget(item.i) },
+    ...(copyMenuItem ? [copyMenuItem] : []),
+    { key: 'delete', label: t('common.delete'), danger: true, onClick: () => onDeleteWidget(item.i) },
+  ];
+
+  return (
+    <WidgetHeaderRuntimeSlotProvider>
+      {(runtimeSlotRef) => (
+        <div
+          className="widget rounded-lg overflow-hidden p-3 flex h-full flex-col"
+          style={{
+            backgroundColor: chartTheme.panelBg,
+            border: `1px solid ${chartTheme.panelBorderColor}`,
+          }}
+        >
+          <div className="widget-header mb-2 flex justify-between items-start gap-2">
+            <div className="flex-1 min-w-0">
+              <h4 className="truncate text-[14px] font-medium leading-5 text-(--color-text-2)">
+                {item.name}
+              </h4>
+              {item.description?.trim() && (
+                <p className="mt-0.5 text-[11px] leading-4 text-(--color-text-3) wrap-break-word whitespace-normal">
+                  {item.description}
+                </p>
+              )}
+            </div>
+            <div
+              ref={runtimeSlotRef}
+              className="no-drag ml-auto max-w-[70%] shrink-0 overflow-x-auto"
+            />
+            {isEditMode && (
+              <MoreActionsDropdown
+                items={menuItems}
+                trigger={['hover']}
+                labelAlign="start"
+                buttonClassName="no-drag cursor-pointer text-(--color-text-2) transition-colors hover:!bg-transparent hover:text-(--color-text-1)"
+                iconStyle={{ fontSize: '18px' }}
+              />
+            )}
+          </div>
+          <div
+            className="widget-body flex-1 h-full min-h-0"
+            style={{
+              overflow: 'hidden',
+            }}
+          >
+            <WidgetWrapper
+              dashboardId={dashboardId}
+              widgetId={item.i}
+              surface="dashboard"
+              key={`${dashboardId ?? 'dashboard'}:${item.i}`}
+              chartType={item.valueConfig?.chartType}
+              config={item.valueConfig}
+              filterSearchVersion={filterSearchVersion}
+              namespaceSearchVersion={namespaceSearchVersion}
+              reloadVersion={`${dashboardReloadVersion}:${widgetReloadVersion || 0}`}
+              refreshCause={refreshCause}
+              dataSource={dataSourceResolver(item.valueConfig?.dataSource)}
+              unifiedFilterValues={appliedFilterValues}
+              filterDefinitions={appliedFilterDefinitions}
+              builtinNamespaceId={appliedNamespaceId}
+              onRenderStatus={onWidgetRenderStatus}
+              runtimeActive={runtimeActive}
+              runtimePriority={runtimePriority}
+              layoutEditable={isEditMode}
+              onTopologyLayoutChange={
+                isEditMode && onTopologyLayoutChange
+                  ? (next) => onTopologyLayoutChange(item.i, next)
+                  : undefined
+              }
+            />
+          </div>
+        </div>
+      )}
+    </WidgetHeaderRuntimeSlotProvider>
+  );
+});
+
+interface DashboardCanvasProps {
+  loading: boolean;
+  isEditMode: boolean;
+  isDarkTheme: boolean;
+  dashboardId?: number | string;
+  layout: DashboardLayoutItem[];
+  collapsedGroups: Record<string, true>;
+  chartTheme: {
+    panelBg: string;
+    panelBorderColor: string;
+  };
+  filterSearchVersion: number;
+  namespaceSearchVersion: number;
+  dashboardReloadVersion: number;
+  refreshCause?: CanvasRuntimeRefreshCause;
+  widgetReloadVersions: Record<string, number>;
+  dataSourceResolver: (
+    dataSource?: string | number,
+  ) => DatasourceItem | undefined;
+  appliedFilterValues: Record<string, FilterValue>;
+  appliedFilterDefinitions: UnifiedFilterDefinition[];
+  appliedNamespaceId: number | undefined;
+  selectedDashboardLocked?: boolean;
+  shareMode?: boolean;
+  onLayoutChange: (newLayout: DashboardLayoutItem[]) => void;
+  onOpenAddModal: (groupId?: string) => void;
+  onToggleCollapsedGroup: (groupId: string) => void;
+  onRenameGroup: (groupId: string) => void;
+  onRemoveGroup: (groupId: string) => void;
+  onDeleteEntireGroup: (groupId: string) => void;
+  onEditWidget: (id: string) => void;
+  onCopyWidget?: (id: string) => void;
+  onDeleteWidget: (id: string) => void;
+  onTopologyLayoutChange?: (
+    widgetId: string,
+    next: NonNullable<
+      NonNullable<DashboardWidgetLayoutItem['valueConfig']>['networkStatusTopology']
+    >,
+  ) => void;
+  renderMode?: boolean;
+  scrollRootRef: RefObject<HTMLDivElement | null>;
+  onWidgetRenderStatus?: (result: DashboardWidgetRenderResult) => void;
+}
+
+const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
+  loading,
+  isEditMode,
+  isDarkTheme,
+  dashboardId,
+  layout,
+  collapsedGroups,
+  chartTheme,
+  filterSearchVersion,
+  namespaceSearchVersion,
+  dashboardReloadVersion,
+  refreshCause = 'manual',
+  widgetReloadVersions,
+  dataSourceResolver,
+  appliedFilterValues,
+  appliedFilterDefinitions,
+  appliedNamespaceId,
+  selectedDashboardLocked,
+  shareMode = false,
+  onOpenAddModal,
+  onLayoutChange,
+  onToggleCollapsedGroup,
+  onRenameGroup,
+  onRemoveGroup,
+  onDeleteEntireGroup,
+  onEditWidget,
+  onCopyWidget,
+  onDeleteWidget,
+  onTopologyLayoutChange,
+  renderMode = false,
+  scrollRootRef,
+  onWidgetRenderStatus,
+}) => {
+  const { t } = useTranslation();
+  const gridRootRef = useRef<HTMLDivElement>(null);
+  const rootGridRef = useRef<GridStackInstance | null>(null);
+  const subGridRefs = useRef<Map<string, GridStackInstance>>(new Map());
+  const rootItemElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const subGridRootElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const widgetHostRegistryRef = useRef(
+    createDashboardWidgetHostRegistry<HTMLDivElement>(),
+  );
+  const groupHeaderHostsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const groupBodyElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const commitFrameRef = useRef<number | null>(null);
+  const syncingRef = useRef(false);
+  const preservedScrollTopRef = useRef(0);
+  const preservedScrollDashboardRef = useRef<string | number | undefined>(
+    dashboardId,
+  );
+
+  const gridStackLayout = useMemo(
+    () => buildDashboardGridStackLayout(layout),
+    [layout],
+  );
+  const gridStructureKey = useMemo(
+    () => buildDashboardGridStackStructureKey(layout),
+    [layout],
+  );
+  const dashboardInstanceKey = useMemo(
+    () => `${dashboardId ?? 'dashboard'}:${gridStructureKey}`,
+    [dashboardId, gridStructureKey],
+  );
+  const dashboardScopeKey = String(dashboardId ?? 'dashboard');
+  const layoutRef = useRef(layout);
+  const collapsedGroupsRef = useRef(collapsedGroups);
+  const gridStackLayoutRef = useRef(gridStackLayout);
+  const emitLayoutChangeRef = useRef<() => void>(() => undefined);
+  const handleWidgetMutationStopRef = useRef<
+    (element: HTMLElement | null) => void
+      >(() => undefined);
+  const [portalVersion, setPortalVersion] = useState(0);
+  const [runtimeStates, setRuntimeStates] = useState<Record<string, RuntimeActivationState>>({});
+  const runtimeSchedulerRef = useRef<DashboardRuntimeScheduler | null>(null);
+
+  useEffect(() => {
+    if (renderMode) {
+      const widgetIds = gridStackLayout.topLevelNodes
+        .filter((node) => node.kind === 'widget')
+        .map((node) => node.id)
+        .concat(gridStackLayout.groupNodes.flatMap((node) => node.children.map((child) => child.id)));
+      setRuntimeStates(activateAllRuntimeWidgets(widgetIds));
+      return undefined;
+    }
+
+    const root = scrollRootRef.current;
+    if (!root) return undefined;
+    let frame: number | null = null;
+    const update = () => {
+      frame = null;
+      const rootRect = root.getBoundingClientRect();
+      const margin = root.clientHeight;
+      const widgetOrder = new Map(
+        sortDashboardLayoutItems(flattenDashboardGridStackLayout(gridStackLayout))
+          .filter(isDashboardWidgetItem)
+          .map((item, index) => [item.i, index]),
+      );
+      const next: Record<string, RuntimeActivationState> = {};
+      const scheduler = runtimeSchedulerRef.current;
+      widgetHostRegistryRef.current.hosts.forEach((host, id) => {
+        const shell = host.closest<HTMLElement>('[data-node-kind="widget"]');
+        if (!shell) return;
+        const rect = shell.getBoundingClientRect();
+        next[id] = resolveRuntimeActivation({
+          root: rootRect,
+          widget: rect,
+          activationMargin: margin,
+          order: widgetOrder.get(id) ?? Number.MAX_SAFE_INTEGER,
+        });
+        scheduler?.updateOwnerPriority(id, next[id].priority);
+      });
+      setRuntimeStates((previous) => mergeRuntimeActivationStates(previous, next));
+    };
+    const scheduleUpdate = () => {
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(update);
+    };
+    scheduleUpdate();
+    root.addEventListener('scroll', scheduleUpdate, { passive: true });
+    const resizeObserver = new ResizeObserver(scheduleUpdate);
+    resizeObserver.observe(root);
+    if (gridRootRef.current) resizeObserver.observe(gridRootRef.current);
+    return () => {
+      root.removeEventListener('scroll', scheduleUpdate);
+      resizeObserver.disconnect();
+      if (frame !== null) window.cancelAnimationFrame(frame);
+    };
+  }, [layout, portalVersion, renderMode, scrollRootRef, gridStackLayout]);
+
+  useEffect(() => {
+    layoutRef.current = layout;
+    collapsedGroupsRef.current = collapsedGroups;
+    gridStackLayoutRef.current = gridStackLayout;
+  }, [layout, collapsedGroups, gridStackLayout]);
+
+  useEffect(() => {
+    const root = scrollRootRef.current;
+    if (!root) {
+      return undefined;
+    }
+
+    const syncScrollPosition = () => {
+      if (syncingRef.current && root.scrollTop === 0) {
+        return;
+      }
+      preservedScrollTopRef.current = root.scrollTop;
+      preservedScrollDashboardRef.current = dashboardId;
+    };
+
+    syncScrollPosition();
+    root.addEventListener('scroll', syncScrollPosition, { passive: true });
+    return () => root.removeEventListener('scroll', syncScrollPosition);
+  }, [dashboardId, scrollRootRef]);
+
+  const restoreScrollPosition = useCallback(() => {
+    const root = scrollRootRef.current;
+    if (
+      !root ||
+      preservedScrollDashboardRef.current !== dashboardId ||
+      preservedScrollTopRef.current <= 0
+    ) {
+      return false;
+    }
+
+    const targetScrollTop = preservedScrollTopRef.current;
+    const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    if (maxScrollTop < targetScrollTop) {
+      return false;
+    }
+
+    root.scrollTop = targetScrollTop;
+    return true;
+  }, [dashboardId, scrollRootRef]);
+
+  const scheduleScrollRestore = useCallback((isCancelled: () => boolean) => {
+    let attempts = 0;
+    const tryRestore = () => {
+      if (isCancelled()) {
+        return;
+      }
+      if (attempts >= 12) {
+        syncingRef.current = false;
+        return;
+      }
+      attempts += 1;
+      if (restoreScrollPosition()) {
+        syncingRef.current = false;
+        return;
+      }
+      requestAnimationFrame(tryRestore);
+    };
+
+    requestAnimationFrame(tryRestore);
+  }, [restoreScrollPosition]);
+
+  const clearElementMaps = useCallback(() => {
+    rootItemElementsRef.current.clear();
+    subGridRootElementsRef.current.clear();
+    groupHeaderHostsRef.current.clear();
+    groupBodyElementsRef.current.clear();
+  }, []);
+
+  const createWidgetShell = useCallback((itemId: string) => {
+    const itemElement = document.createElement('div');
+    itemElement.className = 'grid-stack-item';
+    itemElement.dataset.nodeId = itemId;
+    itemElement.dataset.nodeKind = 'widget';
+    itemElement.setAttribute('gs-id', itemId);
+
+    const contentElement = document.createElement('div');
+    contentElement.className =
+      'grid-stack-item-content overflow-visible! bg-transparent! shadow-none!';
+
+    const hostElement = getOrCreateDashboardWidgetHost(
+      widgetHostRegistryRef.current,
+      itemId,
+      () => document.createElement('div'),
+    );
+    hostElement.className = 'h-full';
+    hostElement.dataset.widgetHost = itemId;
+
+    contentElement.appendChild(hostElement);
+    itemElement.appendChild(contentElement);
+    return itemElement;
+  }, []);
+
+  const createGroupShell = useCallback(
+    (
+      node: Extract<
+        (typeof gridStackLayout.topLevelNodes)[number],
+        { kind: 'group' }
+      >,
+    ) => {
+      const itemElement = document.createElement('div');
+      itemElement.className = 'grid-stack-item';
+      itemElement.dataset.nodeId = node.id;
+      itemElement.dataset.nodeKind = 'group';
+      itemElement.setAttribute('gs-id', node.id);
+
+      const contentElement = document.createElement('div');
+      contentElement.className =
+        'grid-stack-item-content overflow-visible! bg-transparent! shadow-none!';
+
+      const cardElement = document.createElement('div');
+      cardElement.className =
+        'flex min-h-0 flex-col overflow-hidden rounded-lg border';
+      cardElement.style.backgroundColor = isDarkTheme
+        ? 'rgba(255,255,255,0.02)'
+        : '#f7f8fa';
+      cardElement.style.borderColor = isDarkTheme
+        ? 'rgba(255,255,255,0.12)'
+        : 'rgba(61,79,104,0.14)';
+
+      const headerElement = document.createElement('div');
+      headerElement.className = 'shrink-0 overflow-hidden rounded-t-lg';
+      headerElement.style.backgroundColor = isDarkTheme
+        ? 'rgba(255,255,255,0.03)'
+        : '#f1f3f8';
+      headerElement.style.borderBottom = isDarkTheme
+        ? '1px solid rgba(255,255,255,0.08)'
+        : '1px solid rgba(61,79,104,0.08)';
+
+      const headerHost = document.createElement('div');
+      headerHost.dataset.groupHeaderHost = node.id;
+      headerElement.appendChild(headerHost);
+
+      const bodyElement = document.createElement('div');
+      bodyElement.className = 'px-1.5 pb-1.5 pt-1';
+      bodyElement.dataset.groupBody = node.id;
+
+      const subGridRoot = document.createElement('div');
+      subGridRoot.className = 'grid-stack min-h-0';
+      subGridRoot.dataset.subgridRoot = node.id;
+      bodyElement.appendChild(subGridRoot);
+
+      cardElement.append(headerElement, bodyElement);
+      contentElement.appendChild(cardElement);
+      itemElement.appendChild(contentElement);
+
+      groupHeaderHostsRef.current.set(node.id, headerHost);
+      groupBodyElementsRef.current.set(node.id, bodyElement);
+      subGridRootElementsRef.current.set(node.id, subGridRoot);
+
+      return itemElement;
+    },
+    [isDarkTheme],
+  );
+
+  const buildCurrentLayout = useCallback((): DashboardLayoutItem[] => {
+    const rootGrid = rootGridRef.current;
+    const currentLayout = layoutRef.current;
+    const currentCollapsedGroups = collapsedGroupsRef.current;
+
+    if (!rootGrid) {
+      return currentLayout;
+    }
+
+    const itemById = new Map(currentLayout.map((item) => [item.i, item]));
+    const topLevelWidgets = (rootGrid.save(false, false) ||
+      []) as GridStackWidget[];
+    const storedWidgets: DashboardGridStackStoredWidget[] = [];
+
+    topLevelWidgets.forEach((widget) => {
+      const itemId = String(widget.id ?? '');
+      const item = itemById.get(itemId);
+
+      if (!item) {
+        return;
+      }
+
+      const nextX = widget.x ?? item.x;
+      const nextY = Math.max(widget.y ?? item.y, 0);
+      const nextW = widget.w ?? item.w;
+
+      if (item.itemType === 'group') {
+        const subGrid = subGridRefs.current.get(item.i);
+        const subGridRoot = subGridRootElementsRef.current.get(item.i);
+        const savedChildren = (subGrid?.save(false, false) ||
+          []) as GridStackWidget[];
+        const childById = new Map<string, GridStackWidget>();
+
+        savedChildren.forEach((child) => {
+          const childId = String(child.id ?? '');
+          if (childId) {
+            childById.set(childId, child);
+          }
+        });
+
+        // Fall back to DOM when acceptWidgets has moved a node but save() is
+        // briefly incomplete during cross-grid drop.
+        subGridRoot
+          ?.querySelectorAll<HTMLElement>(':scope > .grid-stack-item[data-node-kind="widget"]')
+          .forEach((element) => {
+            const childId = element.dataset.nodeId ?? element.getAttribute('gs-id');
+            if (!childId || childById.has(childId)) {
+              return;
+            }
+            const node = (element as GridItemHTMLElement).gridstackNode;
+            childById.set(childId, {
+              id: childId,
+              x: node?.x,
+              y: node?.y,
+              w: node?.w,
+              h: node?.h,
+            });
+          });
+
+        const children = [...childById.values()].flatMap((child) => {
+          const childId = String(child.id ?? '');
+          const childItem = itemById.get(childId);
+
+          if (!childItem || childItem.itemType === 'group') {
+            return [];
+          }
+
+          return [
+            {
+              id: childItem.i,
+              x: child.x ?? childItem.x,
+              y: Math.max(child.y ?? 0, 0),
+              w: child.w ?? childItem.w,
+              h: child.h ?? childItem.h,
+              itemType: 'widget' as const,
+              name: childItem.name,
+              description: childItem.description,
+              valueConfig: childItem.valueConfig,
+            } satisfies DashboardGridStackStoredWidget,
+          ];
+        });
+
+        storedWidgets.push({
+          id: item.i,
+          x: nextX,
+          y: nextY,
+          w: nextW,
+          h: widget.h ?? item.h,
+          itemType: 'group',
+          name: item.name,
+          description: item.description,
+          headerH: item.h,
+          sizeToContent: !currentCollapsedGroups[item.i],
+          subGridOpts: {
+            children,
+          },
+        });
+        return;
+      }
+
+      storedWidgets.push({
+        id: item.i,
+        x: nextX,
+        y: nextY,
+        w: nextW,
+        h: widget.h ?? item.h,
+        itemType: 'widget',
+        name: item.name,
+        description: item.description,
+        valueConfig: item.valueConfig,
+      });
+    });
+
+    return deserializeDashboardGridStackLayout(storedWidgets);
+  }, []);
+
+  const scheduleGridCommit = useCallback((callback: () => void) => {
+    if (typeof window === 'undefined') {
+      callback();
+      return;
+    }
+
+    if (commitFrameRef.current !== null) {
+      window.cancelAnimationFrame(commitFrameRef.current);
+    }
+
+    commitFrameRef.current = window.requestAnimationFrame(() => {
+      commitFrameRef.current = null;
+      callback();
+    });
+  }, []);
+
+  const resizeParentGroupToContent = useCallback(
+    (element: HTMLElement | null) => {
+      const rootGrid = rootGridRef.current;
+
+      if (!rootGrid || !element) {
+        return;
+      }
+
+      const groupElement =
+        element.dataset.nodeKind === 'group'
+          ? element
+          : element.closest('[data-node-kind="group"]');
+
+      if (!(groupElement instanceof HTMLElement)) {
+        return;
+      }
+
+      rootGrid.resizeToContent(groupElement as GridItemHTMLElement);
+    },
+    [],
+  );
+
+  const syncGroupPresentation = useCallback(
+    (
+      node: Extract<
+        (typeof gridStackLayout.topLevelNodes)[number],
+        { kind: 'group' }
+      >,
+      options?: { preservePosition?: boolean },
+    ) => {
+      const rootGrid = rootGridRef.current;
+      const bodyElement = groupBodyElementsRef.current.get(node.id);
+      const groupElement = rootItemElementsRef.current.get(node.id);
+      const isCollapsed = Boolean(collapsedGroupsRef.current[node.id]);
+
+      if (bodyElement) {
+        bodyElement.style.display = isCollapsed ? 'none' : '';
+        // bodyElement.style.minHeight =
+        //   visibleChildRows > 0
+        //     ? `${visibleChildRows * DASHBOARD_GRID_ROW_HEIGHT + Math.max(visibleChildRows - 1, 0) * DASHBOARD_GRID_MARGIN[1] + 8}px`
+        //     : '0';
+      }
+
+      if (!rootGrid || !groupElement) {
+        return;
+      }
+
+      const nextOptions = options?.preservePosition
+        ? {
+          id: node.id,
+          h: isCollapsed ? node.item.h : node.h,
+          sizeToContent: !isCollapsed,
+        }
+        : {
+          id: node.id,
+          x: node.x,
+          y: node.y,
+          w: node.w,
+          h: isCollapsed ? node.item.h : node.h,
+          sizeToContent: !isCollapsed,
+        };
+
+      rootGrid.update(groupElement, nextOptions);
+
+      if (!isCollapsed) {
+        rootGrid.resizeToContent(groupElement as GridItemHTMLElement);
+      }
+    },
+    [],
+  );
+
+  const syncRootGridNode = useCallback(
+    (node: (typeof gridStackLayout.topLevelNodes)[number]) => {
+      const rootGrid = rootGridRef.current;
+      const element = rootItemElementsRef.current.get(node.id);
+
+      if (!rootGrid || !element) {
+        return;
+      }
+
+      const isCollapsedGroup =
+        node.kind === 'group' && Boolean(collapsedGroupsRef.current[node.id]);
+
+      rootGrid.update(element, {
+        id: node.id,
+        x: node.x,
+        y: node.y,
+        w: node.w,
+        h: node.kind === 'group' && isCollapsedGroup ? node.item.h : node.h,
+        sizeToContent: node.kind === 'group' && !isCollapsedGroup,
+      });
+    },
+    [],
+  );
+
+  const emitLayoutChange = useCallback(() => {
+    if (!isEditMode || syncingRef.current) {
+      return;
+    }
+
+    scheduleGridCommit(() => {
+      if (!isEditMode || syncingRef.current) {
+        return;
+      }
+
+      onLayoutChange(buildCurrentLayout());
+    });
+  }, [buildCurrentLayout, isEditMode, onLayoutChange, scheduleGridCommit]);
+
+  const handleWidgetMutationStop = useCallback(
+    (element: HTMLElement | null) => {
+      if (!isEditMode || syncingRef.current || !element) {
+        return;
+      }
+
+      scheduleGridCommit(() => {
+        resizeParentGroupToContent(element);
+        if (!isEditMode || syncingRef.current) {
+          return;
+        }
+
+        onLayoutChange(buildCurrentLayout());
+      });
+    },
+    [
+      buildCurrentLayout,
+      isEditMode,
+      onLayoutChange,
+      resizeParentGroupToContent,
+      scheduleGridCommit,
+    ],
+  );
+
+  useEffect(() => {
+    emitLayoutChangeRef.current = emitLayoutChange;
+    handleWidgetMutationStopRef.current = handleWidgetMutationStop;
+  }, [emitLayoutChange, handleWidgetMutationStop]);
+
+  useEffect(() => {
+    if (!gridRootRef.current) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const destroyGrids = () => {
+      subGridRefs.current.forEach((grid) => grid.destroy(false));
+      subGridRefs.current.clear();
+      rootGridRef.current?.destroy(false);
+      rootGridRef.current = null;
+
+      if (gridRootRef.current) {
+        gridRootRef.current.replaceChildren();
+      }
+
+      clearElementMaps();
+      setPortalVersion((previous) => previous + 1);
+    };
+
+    const initGrid = async () => {
+      syncingRef.current = true;
+      destroyGrids();
+
+      const { GridStack } = await import('gridstack');
+
+      if (cancelled || !gridRootRef.current) {
+        return;
+      }
+
+      const nextGridStackLayout = gridStackLayoutRef.current;
+      prepareDashboardWidgetHosts(
+        widgetHostRegistryRef.current,
+        dashboardScopeKey,
+        [
+          ...nextGridStackLayout.ungroupedNodes.map((node) => node.id),
+          ...nextGridStackLayout.groupNodes.flatMap((node) =>
+            node.children.map((child) => child.id),
+          ),
+        ],
+      );
+
+      nextGridStackLayout.topLevelNodes.forEach((node) => {
+        if (node.kind === 'group') {
+          const itemElement = createGroupShell(node);
+          rootItemElementsRef.current.set(node.id, itemElement);
+          gridRootRef.current?.appendChild(itemElement);
+          return;
+        }
+
+        const itemElement = createWidgetShell(node.id);
+        rootItemElementsRef.current.set(node.id, itemElement);
+        gridRootRef.current?.appendChild(itemElement);
+      });
+
+      const rootGrid = GridStack.init(
+        {
+          column: DASHBOARD_GRID_COLS,
+          cellHeight: DASHBOARD_GRID_ROW_HEIGHT,
+          margin: DASHBOARD_GRID_MARGIN[0],
+          float: false,
+          animate: false,
+          ...getDashboardGridInteractionOptions(isEditMode),
+        },
+        gridRootRef.current,
+      );
+
+      rootGridRef.current = rootGrid;
+
+      nextGridStackLayout.topLevelNodes.forEach((node) => {
+        const element = rootItemElementsRef.current.get(node.id);
+        const isCollapsedGroup =
+          node.kind === 'group' && Boolean(collapsedGroupsRef.current[node.id]);
+
+        if (!element) {
+          return;
+        }
+
+        rootGrid.makeWidget(element, {
+          id: node.id,
+          x: node.x,
+          y: node.y,
+          w: node.w,
+          h: node.kind === 'group' && isCollapsedGroup ? node.item.h : node.h,
+          sizeToContent: node.kind === 'group' && !isCollapsedGroup,
+          noMove: false,
+          noResize: node.kind === 'group',
+        });
+
+        rootGrid.update(element, {
+          id: node.id,
+          x: node.x,
+          y: node.y,
+          w: node.w,
+          h: node.kind === 'group' && isCollapsedGroup ? node.item.h : node.h,
+          sizeToContent: node.kind === 'group' && !isCollapsedGroup,
+        });
+      });
+      const bindGridMutationEvents = (
+        grid: GridStackInstance,
+        options?: { rootGrid?: boolean },
+      ) => {
+        grid.on('dragstop', (_event: Event, element: GridItemHTMLElement) => {
+          if ((element as HTMLElement).dataset.nodeKind === 'widget') {
+            handleWidgetMutationStopRef.current(element as HTMLElement);
+            return;
+          }
+
+          if (options?.rootGrid) {
+            emitLayoutChangeRef.current();
+          }
+        });
+        grid.on(
+          'resizestop',
+          (_event: Event, element: GridItemHTMLElement) => {
+            if ((element as HTMLElement).dataset.nodeKind === 'widget') {
+              handleWidgetMutationStopRef.current(element as HTMLElement);
+              return;
+            }
+
+            if (options?.rootGrid) {
+              emitLayoutChangeRef.current();
+            }
+          },
+        );
+        // Cross-grid acceptWidgets may fire added/removed without a reliable
+        // dragstop on the destination; commit so React layout.groupId catches up.
+        grid.on('added', (_event: Event, items: GridStackNode[]) => {
+          if (syncingRef.current) {
+            return;
+          }
+          const nodes = Array.isArray(items) ? items : [items];
+          const widgetElement = nodes
+            .map((node) => node?.el)
+            .find(
+              (element): element is GridItemHTMLElement =>
+                element instanceof HTMLElement &&
+                element.dataset.nodeKind === 'widget',
+            );
+          if (widgetElement) {
+            handleWidgetMutationStopRef.current(widgetElement);
+            return;
+          }
+          emitLayoutChangeRef.current();
+        });
+        grid.on('removed', () => {
+          if (syncingRef.current) {
+            return;
+          }
+          emitLayoutChangeRef.current();
+        });
+      };
+
+      bindGridMutationEvents(rootGrid, { rootGrid: true });
+
+      nextGridStackLayout.groupNodes.forEach((node) => {
+        const subGridRoot = subGridRootElementsRef.current.get(node.id);
+
+        if (!subGridRoot) {
+          return;
+        }
+
+        const subGrid = GridStack.init(
+          {
+            column: 'auto',
+            cellHeight: DASHBOARD_GRID_ROW_HEIGHT,
+            margin: DASHBOARD_GRID_MARGIN[0],
+            float: false,
+            animate: false,
+            ...getDashboardGridInteractionOptions(isEditMode),
+          },
+          subGridRoot,
+        );
+
+        subGridRefs.current.set(node.id, subGrid);
+
+        node.children.forEach((child) => {
+          const element = createWidgetShell(child.id);
+          subGridRoot.appendChild(element);
+
+          subGrid.makeWidget(element, {
+            id: child.id,
+            x: child.x,
+            y: child.y,
+            w: child.w,
+            h: child.h,
+            noMove: false,
+            noResize: false,
+          });
+        });
+
+        const groupElement = rootItemElementsRef.current.get(node.id) ?? null;
+        if (groupElement) {
+          requestAnimationFrame(() => {
+            if (!cancelled) {
+              syncGroupPresentation(node);
+            }
+          });
+        }
+        bindGridMutationEvents(subGrid);
+      });
+
+      setPortalVersion((previous) => previous + 1);
+
+      scheduleScrollRestore(() => cancelled);
+    };
+
+    void initGrid();
+
+    return () => {
+      cancelled = true;
+      syncingRef.current = true;
+      if (commitFrameRef.current !== null) {
+        window.cancelAnimationFrame(commitFrameRef.current);
+        commitFrameRef.current = null;
+      }
+      destroyGrids();
+    };
+  }, [
+    clearElementMaps,
+    createGroupShell,
+    createWidgetShell,
+    dashboardInstanceKey,
+    dashboardScopeKey,
+    scheduleScrollRestore,
+    syncGroupPresentation,
+  ]);
+
+  useEffect(() => {
+    const rootGrid = rootGridRef.current;
+
+    if (!rootGrid) {
+      return;
+    }
+
+    rootGrid.updateOptions(getDashboardGridInteractionOptions(isEditMode));
+    rootGrid.enableMove(isEditMode);
+    rootGrid.enableResize(isEditMode);
+
+    subGridRefs.current.forEach((subGrid) => {
+      subGrid.updateOptions(getDashboardGridInteractionOptions(isEditMode));
+      subGrid.enableMove(isEditMode);
+      subGrid.enableResize(isEditMode);
+    });
+  }, [isEditMode]);
+
+  useEffect(() => {
+    if (!rootGridRef.current) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const frameId = window.requestAnimationFrame(() => {
+      if (cancelled || !rootGridRef.current) {
+        return;
+      }
+
+      gridStackLayout.topLevelNodes.forEach((node) => {
+        if (node.kind === 'group') {
+          syncGroupPresentation(node);
+          return;
+        }
+
+        syncRootGridNode(node);
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [gridStackLayout.topLevelNodes, syncGroupPresentation, syncRootGridNode]);
+
+  useEffect(() => {
+    if (!rootGridRef.current) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const frameId = window.requestAnimationFrame(() => {
+      if (cancelled) {
+        return;
+      }
+
+      gridStackLayout.groupNodes.forEach((node) => {
+        syncGroupPresentation(node, { preservePosition: true });
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [collapsedGroups, gridStackLayout.groupNodes, syncGroupPresentation]);
+
+  if (loading) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <Spin size="large" />
+      </div>
+    );
+  }
+
+  if (!layout.length) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center">
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description={
+            <span className="text-(--color-text-2)">
+              {t('dashboard.addView')}
+            </span>
+          }
+        >
+          <PermissionWrapper requiredPermissions={['EditChart']}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined aria-hidden="true" />}
+              onClick={() => onOpenAddModal()}
+              disabled={selectedDashboardLocked}
+            >
+              {t('dashboard.addView')}
+            </Button>
+          </PermissionWrapper>
+        </Empty>
+      </div>
+    );
+  }
+
+  const groupHeaderPortals = gridStackLayout.groupNodes.map((node) => {
+    const host = groupHeaderHostsRef.current.get(node.id);
+
+    if (!host) {
+      return null;
+    }
+
+    return createPortal(
+      <GroupHeader
+        item={node.item}
+        collapsed={!!collapsedGroups[node.id]}
+        isEditMode={isEditMode}
+        onAddView={() => onOpenAddModal(node.id)}
+        onToggle={() => onToggleCollapsedGroup(node.id)}
+        onRename={() => onRenameGroup(node.id)}
+        onRemoveGroup={() => onRemoveGroup(node.id)}
+        onDeleteGroup={() => onDeleteEntireGroup(node.id)}
+      />,
+      host,
+      `group-header:${dashboardId ?? 'dashboard'}:${node.id}`,
+    );
+  });
+
+  const widgetPortals = [
+    ...gridStackLayout.topLevelNodes
+      .filter(
+        (
+          node,
+        ): node is Extract<
+          (typeof gridStackLayout.topLevelNodes)[number],
+          { kind: 'widget' }
+        > => node.kind === 'widget',
+      )
+      .map((node) => ({ id: node.id, item: node.item })),
+    ...gridStackLayout.groupNodes.flatMap((node) =>
+      !renderMode && collapsedGroups[node.id]
+        ? []
+        : node.children.map((child) => ({ id: child.id, item: child.item })),
+    ),
+  ].map(({ id, item }) => {
+    const host =
+      widgetHostRegistryRef.current.dashboardScopeKey === dashboardScopeKey
+        ? widgetHostRegistryRef.current.hosts.get(id)
+        : undefined;
+
+    if (!host) {
+      return null;
+    }
+
+    return createPortal(
+      <DashboardWidgetCard
+        item={item}
+        runtimeActive={runtimeStates[item.i]?.active ?? Boolean(renderMode)}
+        runtimePriority={runtimeStates[item.i]?.priority}
+        isEditMode={isEditMode}
+        dashboardId={dashboardId}
+        chartTheme={chartTheme}
+        filterSearchVersion={filterSearchVersion}
+        namespaceSearchVersion={namespaceSearchVersion}
+        dashboardReloadVersion={dashboardReloadVersion}
+        refreshCause={refreshCause}
+        widgetReloadVersion={widgetReloadVersions[item.i] || 0}
+        dataSourceResolver={dataSourceResolver}
+        appliedFilterValues={appliedFilterValues}
+        appliedFilterDefinitions={appliedFilterDefinitions}
+        appliedNamespaceId={appliedNamespaceId}
+        selectedDashboardLocked={selectedDashboardLocked}
+        shareMode={shareMode}
+        onEditWidget={onEditWidget}
+        onCopyWidget={onCopyWidget}
+        onDeleteWidget={onDeleteWidget}
+        onTopologyLayoutChange={onTopologyLayoutChange}
+        onWidgetRenderStatus={onWidgetRenderStatus}
+      />,
+      host,
+      `widget:${id}`,
+    );
+  });
+
+  return (
+    <DashboardRuntimeSchedulerProvider>
+      <SchedulerRefBinder schedulerRef={runtimeSchedulerRef} />
+      <div
+        className="relative w-full"
+        style={{
+          padding: `${DASHBOARD_GRID_CONTAINER_PADDING[1]}px ${DASHBOARD_GRID_CONTAINER_PADDING[0]}px`,
+        }}
+      >
+      <style jsx global>{`
+        .grid-stack > .grid-stack-item > .grid-stack-item-content,
+        .grid-stack > .grid-stack-placeholder > .placeholder-content {
+          overflow: visible;
+        }
+
+        .grid-stack-item > .ui-resizable-handle {
+          width: ${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px;
+          height: ${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px;
+          z-index: 1;
+          background-repeat: no-repeat;
+          background-origin: content-box;
+          box-sizing: border-box;
+          background-image: url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2IDYiIHN0eWxlPSJiYWNrZ3JvdW5kLWNvbG9yOiNmZmZmZmYwMCIgeD0iMHB4IiB5PSIwcHgiIHdpZHRoPSI2cHgiIGhlaWdodD0iNnB4Ij48ZyBvcGFjaXR5PSIwLjMwMiI+PHBhdGggZD0iTSA2IDYgTCAwIDYgTCAwIDQuMiBMIDQgNC4yIEwgNC4yIDQuMiBMIDQuMiAwIEwgNiAwIEwgNiA2IEwgNiA2IFoiIGZpbGw9IiMwMDAwMDAiLz48L2c+PC9zdmc+');
+          background-position: bottom right;
+          padding: 1px;
+        }
+
+        .grid-stack-item .widget-header .no-drag {
+          position: relative;
+          z-index: 2;
+        }
+
+        .grid-stack-item > .ui-resizable-se {
+          right: calc(var(--gs-item-margin-right) + 2px);
+          bottom: calc(var(--gs-item-margin-bottom));
+          transform: rotate(0deg);
+        }
+
+        .grid-stack-item > .ui-resizable-sw {
+          left: calc(var(--gs-item-margin-left) + 2px);
+          bottom: calc(var(--gs-item-margin-bottom));
+          transform: rotate(90deg);
+        }
+
+        .grid-stack-item > .ui-resizable-nw {
+          left: calc(var(--gs-item-margin-left) + 2px);
+          top: calc(var(--gs-item-margin-top));
+          transform: rotate(180deg);
+        }
+
+        .grid-stack-item > .ui-resizable-ne {
+          right: calc(var(--gs-item-margin-right) + 2px);
+          top: calc(var(--gs-item-margin-top));
+          transform: rotate(270deg);
+        }
+
+        .grid-stack-item[data-node-kind='group'] > .ui-resizable-handle {
+          display: none !important;
+        }
+
+        .dark .grid-stack-item > .ui-resizable-handle,
+        [data-theme='dark'] .grid-stack-item > .ui-resizable-handle {
+          filter: invert(1) opacity(0.65);
+        }
+
+        .grid-stack-item > .ui-resizable-n,
+        .grid-stack-item > .ui-resizable-e,
+        .grid-stack-item > .ui-resizable-s,
+        .grid-stack-item > .ui-resizable-w {
+          display: none !important;
+        }
+      `}</style>
+      <div ref={gridRootRef} className="grid-stack relative z-10 w-full" />
+      {groupHeaderPortals as unknown as React.ReactNode}
+      {widgetPortals as unknown as React.ReactNode}
+      </div>
+    </DashboardRuntimeSchedulerProvider>
+  );
+};
+
+export default React.memo(DashboardCanvas);

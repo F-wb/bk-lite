@@ -1,0 +1,305 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { Tree, Spin, Input, Empty } from 'antd';
+import { TreeItem, TableDataItem, TreeSortData } from '@/app/monitor/types';
+import { useTranslation } from '@/utils/i18n';
+import type { TreeProps, TreeDataNode } from 'antd';
+import { cloneDeep } from 'lodash';
+import ObjectIcon from '@/app/monitor/components/objectIcon';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import styles from './index.module.scss';
+import { shouldNotifyTreeNodeSelect } from './selectionNotify';
+
+const { Search } = Input;
+
+interface TreeComponentProps {
+  data: TreeItem[];
+  defaultSelectedKey?: React.Key;
+  loading?: boolean;
+  draggable?: boolean;
+  showAllMenu?: boolean;
+  /** 允许选中带 children 的一级分类（如「数据库」），用于按分类展示全部能力 */
+  allowParentSelect?: boolean;
+  onNodeSelect?: (key: string) => void;
+  onNodeDrag?: (sortNodes: TreeSortData[], nodes: TreeDataNode[]) => void;
+}
+
+const TreeComponent: React.FC<TreeComponentProps> = ({
+  data,
+  defaultSelectedKey,
+  loading = false,
+  draggable = false,
+  showAllMenu = false,
+  allowParentSelect = false,
+  onNodeSelect,
+  onNodeDrag
+}) => {
+  const { t } = useTranslation();
+  const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
+  const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([]);
+  const [treeSearchValue, setTreeSearchValue] = useState<string>('');
+  const [originalTreeData, setOriginalTreeData] = useState<TreeItem[]>([]);
+  const [treeData, setTreeData] = useState<TreeItem[]>([]);
+  const lastNotifiedKeyRef = useRef('');
+
+  const notifyNodeSelect = (key: React.Key) => {
+    if (!shouldNotifyTreeNodeSelect(lastNotifiedKeyRef.current, key)) {
+      return;
+    }
+    lastNotifiedKeyRef.current = String(key);
+    onNodeSelect?.(String(key));
+  };
+
+  useEffect(() => {
+    if (!defaultSelectedKey) return;
+    setSelectedKeys([defaultSelectedKey]);
+    notifyNodeSelect(defaultSelectedKey);
+  }, [defaultSelectedKey]);
+
+  useEffect(() => {
+    setOriginalTreeData(data);
+    const filteredData = filterAllMenu(data);
+    setTreeData(filteredData);
+    setExpandedKeys(filteredData.map((item) => item.key));
+  }, [data]);
+
+  const filterAllMenu = (data: TreeItem[], searchValue: string = '') => {
+    if (!showAllMenu) {
+      return data.filter((item) => item.key !== 'all');
+    }
+    if (searchValue) {
+      return data.filter((item) => item.key !== 'all');
+    }
+    return data;
+  };
+
+  const handleSelect = (selectedKeys: React.Key[], info: any) => {
+    const hasChildren = !!info.node?.children?.length;
+    // 默认仅叶子可选；allowParentSelect 时一级分类也可选（如点「数据库」看该类全部能力）
+    if ((!hasChildren || allowParentSelect) && selectedKeys?.length) {
+      setSelectedKeys(selectedKeys);
+      notifyNodeSelect(selectedKeys[0]);
+    }
+  };
+
+  const filterTree = (data: TreeItem[], searchValue: string): TreeItem[] => {
+    return data
+      .map((item: any) => {
+        const children = filterTree(item.children || [], searchValue);
+        if (
+          item.title.toLowerCase().includes(searchValue.toLowerCase()) ||
+          children.length
+        ) {
+          return {
+            ...item,
+            children
+          };
+        }
+        return null;
+      })
+      .filter(Boolean) as TreeItem[];
+  };
+
+  const handleSearchTree = (value: string) => {
+    if (!value) {
+      const filteredData = filterAllMenu(originalTreeData);
+      setTreeData(filteredData);
+      setExpandedKeys(filteredData.map((item) => item.key));
+      return;
+    }
+    const filteredData = filterTree(originalTreeData, value);
+    const allMenuFilteredData = filterAllMenu(filteredData, value);
+    // 检查是否只有一级菜单匹配，如果是，则展开并显示所有子节点
+    const expandedFilteredData = allMenuFilteredData.map((item: any) => {
+      // 如果一级菜单匹配但没有子节点匹配到搜索条件，则显示所有子节点
+      const originalItem = originalTreeData.find(
+        (orig) => orig.key === item.key
+      );
+      if (
+        originalItem &&
+        item.title.toLowerCase().includes(value.toLowerCase()) &&
+        (!item.children || item.children.length === 0) &&
+        originalItem.children
+      ) {
+        return {
+          ...item,
+          children: originalItem.children
+        };
+      }
+      return item;
+    });
+    setTreeData(expandedFilteredData);
+    // 自动展开所有包含匹配结果的一级节点
+    const keysToExpand: React.Key[] = [];
+    expandedFilteredData.forEach((item: any) => {
+      // 展开一级菜单匹配的节点
+      if (item.title.toLowerCase().includes(value.toLowerCase())) {
+        keysToExpand.push(item.key);
+      }
+      // 展开包含匹配子节点的一级节点
+      if (item.children && item.children.length > 0) {
+        keysToExpand.push(item.key);
+      }
+    });
+    setExpandedKeys(keysToExpand);
+  };
+
+  const onDrop: TreeProps['onDrop'] = (info) => {
+    const { dragNode, node: dropNode } = info;
+    const dropKey = dropNode.key;
+    const dragKey = dragNode.key;
+    const dropPos = dropNode.pos.split('-');
+    const dragPos = dragNode.pos.split('-');
+    const dropLevel = dropPos.length; // 层级
+    const dragLevel = dragPos.length; // 层级
+    const dropPosition =
+      info.dropPosition - Number(dropPos[dropPos.length - 1]);
+    const _data = cloneDeep(data);
+    // 一级节点只能在同级节点中排序
+    if (dragLevel === 2) {
+      if (
+        dropNode.dragOverGapTop ||
+        dropLevel === 2 ||
+        dropNode.dragOverGapBottom
+      ) {
+        // 拖拽到最后一个下方时，dropNode.dragOverGapBottom 为 true
+        // 此时 targetKey 应该是 dropNode 自身（一级节点没有父节点）
+        const targetKey = dropNode.dragOverGapBottom
+          ? dropKey // 直接使用 dropKey，因为一级节点没有父节点
+          : dropKey;
+        const draggingIndex = _data.findIndex((item) => item.key === dragKey);
+        const targetIndex = _data.findIndex((item) => item.key === targetKey);
+        if (draggingIndex === -1 || targetIndex === -1) return;
+        const [draggedItem] = _data.splice(draggingIndex, 1);
+        // 如果拖到下方，需要插入到 targetIndex 后面
+        const insertIndex = dropNode.dragOverGapBottom
+          ? targetIndex + 1
+          : targetIndex;
+        // 考虑删除元素后索引的变化
+        const adjustedIndex =
+          draggingIndex < insertIndex ? insertIndex - 1 : insertIndex;
+        _data.splice(adjustedIndex, 0, draggedItem);
+        onNodeDrag && onNodeDrag(getTreeSortData(_data), _data);
+      }
+      return;
+    }
+    // 子节点不能拖拽到非父节点内
+    if (
+      dragLevel === 3 &&
+      (dragPos[0] !== dropPos[0] ||
+        dragPos[1] !== dropPos[1] ||
+        (dropLevel === 2 && info.dropToGap) ||
+        (dropLevel === 3 && !info.dropToGap))
+    ) {
+      return;
+    }
+    const loop = (
+      data: TreeDataNode[],
+      key: React.Key,
+      callback: (node: TreeDataNode, i: number, data: TreeDataNode[]) => void
+    ) => {
+      for (let i = 0; i < data.length; i++) {
+        if (data[i].key === key) {
+          return callback(data[i], i, data);
+        }
+        if (data[i].children) {
+          loop(data[i].children!, key, callback);
+        }
+      }
+    };
+    let dragObj: TreeDataNode;
+    loop(_data, dragKey, (item, index, arr) => {
+      arr.splice(index, 1);
+      dragObj = item;
+    });
+    if (!info.dropToGap) {
+      loop(_data, dropKey, (item) => {
+        item.children = item.children || [];
+        item.children.unshift(dragObj);
+      });
+    } else {
+      let ar: TreeDataNode[] = [];
+      let i: number;
+      loop(_data, dropKey, (_item, index, arr) => {
+        ar = arr;
+        i = index;
+      });
+      if (dropPosition === -1) {
+        ar.splice(i!, 0, dragObj!);
+      } else {
+        ar.splice(i! + 1, 0, dragObj!);
+      }
+    }
+    onNodeDrag && onNodeDrag(getTreeSortData(_data), _data);
+  };
+
+  // 叶子节点带 icon/count 时渲染「图标 + 标签 + 计数徽标」,否则按纯文本(向后兼容既有调用方)。
+  const renderTitle = (node: TreeDataNode) => {
+    const item = node as unknown as TreeItem;
+    const hasMeta = !!item.icon || item.count != null;
+    if (!hasMeta) {
+      return <span>{item.title}</span>;
+    }
+    return (
+      <span className={`${styles.node} treeMetaNode`}>
+        <span className={styles.icon}>
+          <ObjectIcon icon={item.icon} />
+        </span>
+        <span className={styles.label}>
+          {typeof item.title === 'string' ? (
+            <EllipsisWithTooltip className={styles.ellipsis} text={item.title} />
+          ) : (
+            item.title
+          )}
+        </span>
+        {item.count != null ? (
+          <span className={styles.count}>{item.count}</span>
+        ) : null}
+      </span>
+    );
+  };
+
+  const getTreeSortData = (data: any[]) => {
+    return data.map((item) => {
+      return {
+        type: item.key,
+        object_list: (item.children || []).map(
+          (child: TableDataItem) => child.label
+        )
+      };
+    });
+  };
+
+  return (
+    <div className="h-full">
+      <Spin spinning={loading}>
+        <Search
+          className="mb-[10px]"
+          placeholder={t('common.searchPlaceHolder')}
+          value={treeSearchValue}
+          enterButton
+          onChange={(e) => setTreeSearchValue(e.target.value)}
+          onSearch={handleSearchTree}
+        />
+        {treeData.length ? (
+          <div className={styles.treeWrap}>
+            <Tree
+              showLine
+              draggable={draggable}
+              selectedKeys={selectedKeys}
+              expandedKeys={expandedKeys}
+              treeData={treeData}
+              titleRender={renderTitle}
+              onExpand={(keys) => setExpandedKeys(keys)}
+              onSelect={handleSelect}
+              onDrop={onDrop}
+            />
+          </div>
+        ) : (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        )}
+      </Spin>
+    </div>
+  );
+};
+
+export default TreeComponent;

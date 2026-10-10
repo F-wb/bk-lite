@@ -1,0 +1,71 @@
+{# Macro: Check if all dimensions are non-null #}
+{% macro all_dimensions_present(dimensions) %}
+  {%- for dim in dimensions -%}
+    NULLIF(CAST({{ dim.expression }} AS VARCHAR), '') IS NOT NULL{{ " OR " if not loop.last else "" }}
+  {%- endfor -%}
+{% endmacro %}
+
+{# Macro: Build dimension segment only for non-empty values #}
+{% macro present_dimension_segment(dim) %}
+  CASE
+    WHEN NULLIF(CAST({{ dim.expression }} AS VARCHAR), '') IS NOT NULL THEN
+      '{{ dim.name }}=' || CAST({{ dim.expression }} AS VARCHAR)
+    ELSE NULL
+  END
+{% endmacro %}
+
+{# Macro: Build effective grouping dimension (降级逻辑) #}
+{% macro effective_dimension(dimensions) %}
+CASE
+    WHEN {{ all_dimensions_present(dimensions) }} THEN
+      CONCAT_WS(
+        '|'
+        {%- for dim in dimensions -%}
+          , {{ present_dimension_segment(dim) }}
+        {%- endfor -%}
+      )
+    {{ " " }}ELSE external_id
+  END
+{%- endmacro %}
+
+{# Macro: 全部聚合维度为空时降级到 external_id #}
+{% macro dimension_fallback_flag(dimensions) %}
+CASE
+    WHEN {{ all_dimensions_present(dimensions) }} THEN FALSE
+    ELSE TRUE
+  END
+{%- endmacro %}
+
+{# Macro: Build dimension columns for GROUP BY #}
+{% macro dimension_columns(dimensions) %}
+  {%- for dim in dimensions -%}
+    {{ dim.expression }}{{ ", " if not loop.last else "" }}
+  {%- endfor -%}
+{% endmacro %}
+
+{# Macro: Build fingerprint expression #}
+{% macro fingerprint_expr(dimensions, strategy_id) %}
+    '{{ strategy_id }}' || '|' || {{ effective_dimension(dimensions) }}
+{% endmacro %}
+
+{# Macro: Aggregate event fields #}
+{% macro aggregate_fields() %}
+  COUNT(*) as event_count,
+  MIN(received_at) as first_event_time,
+  MAX(received_at) as last_event_time,
+  MIN(TRY_CAST(level AS INTEGER)) as alert_level,
+  LIST(event_id) as event_ids,
+  FIRST(title) as alert_title,
+  FIRST(description) as first_event_description,
+  STRING_AGG(DISTINCT CAST(resource_name AS VARCHAR), ',') as alert_description
+{% endmacro %}
+
+{# Macro: Window time filter #}
+{% macro time_filter(window_start) %}
+  received_at >= TIMESTAMP '{{ window_start }}'
+{% endmacro %}
+
+{# Macro: Event action filter (action=created for new events) #}
+{% macro event_action_filter() %}
+  action = 'created'
+{% endmacro %}

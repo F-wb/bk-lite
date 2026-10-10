@@ -1,0 +1,263 @@
+export interface Skill {
+  id: number;
+  name: string;
+  introduction: string;
+  created_by: string;
+  team: string[];
+  team_name: string;
+  usage_team?: number[] | string[];
+  is_pinned?: boolean;
+  permissions?: string[];
+  skill_type?: number;
+  is_template?: boolean;
+  llm_model_name?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ModifySkillModalProps {
+  visible: boolean;
+  onCancel: () => void;
+  onConfirm: (values: Skill) => void;
+  initialValues?: Skill | null;
+}
+
+export interface SelectorOption {
+  id: number;
+  name: string;
+  icon?: string;
+  description?: string;
+}
+
+export interface InvocationLogParams {
+  skill_id?: string | number;
+  start_time?: string;
+  end_time?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface InvocationLog {
+  id: number;
+  created_at: string;
+  input_data: string;
+  output_data: string;
+  status: string;
+  execution_duration?: number;
+}
+
+export interface InvocationLogResponse {
+  items: InvocationLog[];
+  count: number;
+}
+
+export interface SkillListParams {
+  page?: number;
+  page_size?: number;
+  search?: string;
+  is_template?: boolean | number;
+}
+
+export interface SkillListResponse {
+  items: Skill[];
+  count: number;
+}
+
+export interface SkillParam {
+  key: string;
+  value: string;
+  type: 'text' | 'password';
+}
+
+export interface SkillPackageParam {
+  key: string;
+  value: string;
+  type: 'text' | 'password' | 'textarea';
+  multiline?: boolean;
+}
+
+export interface SkillPackageVariableDecl {
+  name: string;
+  required?: boolean;
+  secret?: boolean;
+  description?: string;
+  /** 声明类型：text 单行明文、password 加密、textarea 多行明文。 */
+  type?: 'text' | 'password' | 'textarea';
+  /** 兼容旧声明；优先认 type。 */
+  input?: 'text' | 'textarea';
+  multiline?: boolean;
+}
+
+export interface SkillDetail extends Skill {
+  llm_model?: number;
+  tool_ids?: number[];
+  prompt_template?: string;
+  temperature?: number;
+  skill_prompt?: string;
+  skill_params?: SkillParam[];
+  skill_package_params?: Record<string, SkillPackageParam[]>;
+  guide?: string;
+  show_think?: boolean;
+  enable_suggest?: boolean;
+  enable_query_rewrite?: boolean;
+  enable_conversation_history?: boolean;
+  conversation_window_size?: number;
+  tools?: unknown[];
+  wiki_knowledge_bases?: number[];
+  force_wiki_grounded?: boolean;
+  memory_space?: number | null;
+  memory_write_rounds?: number;
+  desc?: string;
+  skill_packages?: SkillPackage[];
+}
+
+export interface Rule {
+  id: number;
+  key: string;
+  name: string;
+  description?: string;
+  condition: RuleCondition | string;
+  action: string;
+  action_set?: RuleActionSet;
+  skill_id?: number;
+  priority?: number;
+  enabled?: boolean;
+  is_enabled?: boolean;
+  created_at?: string;
+  created_by?: string;
+}
+
+export interface RuleCondition {
+  operator: string;
+  conditions: RuleConditionItem[];
+}
+
+export interface RuleConditionItem {
+  type: string;
+  obj: string;
+  value: string;
+}
+
+export interface RuleActionSet {
+  skill_prompt?: string;
+}
+
+export interface RuleParams {
+  skill_id?: string | number;
+  page?: number;
+  page_size?: number;
+  name?: string;
+}
+
+export interface RuleResponse {
+  items: Rule[];
+  count: number;
+}
+
+export interface RulePayload {
+  skill?: string | number | null;
+  name: string;
+  description?: string;
+  condition: RuleCondition | string;
+  action: string;
+  action_set?: RuleActionSet;
+  skill_id?: number;
+  priority?: number;
+  enabled?: boolean;
+  is_enabled?: boolean;
+}
+
+export interface LlmModel {
+  id: number;
+  name: string;
+  enabled: boolean;
+  provider?: string;
+  llm_model_type?: string;
+  vendor_name?: string;
+}
+
+export interface SkillDetailPayload {
+  name?: string;
+  introduction?: string;
+  team?: string[];
+  llm_model?: number;
+  tool_ids?: number[];
+  prompt_template?: string;
+  skill_packages?: Partial<SkillPackage>[];
+  wiki_knowledge_bases?: number[];
+  force_wiki_grounded?: boolean;
+  [key: string]: unknown;
+}
+
+/** skill_tools API 返回的 kwarg 条目 */
+export interface SkillToolKwarg {
+  key: string;
+  value: unknown;
+  description?: string;
+  type?: string;
+  isRequired?: boolean;
+  [k: string]: unknown;
+}
+
+/** skill_tools API 返回的 params 结构 */
+export interface SkillToolParams {
+  kwargs: SkillToolKwarg[];
+  [k: string]: unknown;
+}
+
+export interface SkillTool {
+  id: number;
+  name: string;
+  /** 翻译后的展示名称（内置工具按当前语言返回，自定义工具回退为 name） */
+  display_name?: string;
+  description?: string;
+  description_tr?: string;
+  icon?: string;
+  enabled: boolean;
+  params: SkillToolParams;
+}
+
+export interface SkillTemplate {
+  id: number;
+  name: string;
+  introduction: string;
+  skill_type: number;
+}
+
+export interface CreateSkillPayload {
+  name: string;
+  introduction: string;
+  team: string[];
+  usage_team?: number[] | string[];
+  skill_type: number;
+}
+
+export interface SkillPackage {
+  id: number;
+  package_id: string;
+  name: string;
+  version: string;
+  description?: string;
+  display_name?: string;
+  description_tr?: string;
+  category?: string;
+  source_type?: string;
+  source_url?: string;
+  storage_path?: string;
+  manifest?: Record<string, unknown>;
+  skill_markdown?: string;
+  required_tools?: string[];
+  triggers?: string[];
+  team?: string[];
+  is_enabled?: boolean;
+  is_build_in?: boolean;
+  permissions?: string[];
+  created_at?: string;
+  updated_at?: string;
+  variables?: SkillPackageVariableDecl[];
+}
+
+export interface SkillPackageListResponse {
+  items: SkillPackage[];
+  count: number;
+}

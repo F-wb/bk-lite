@@ -1,0 +1,274 @@
+'use client';
+
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
+import OperateModal from './components/operateModal';
+import AlertListDrawer from './components/alertListDrawer';
+import CustomTable from '@/components/custom-table';
+import PermissionWrapper from '@/components/permission';
+import Introduction from '@/components/introduction';
+import { CorrelationRule } from '@/app/alarm/types/settings';
+import { useSettingApi } from '@/app/alarm/api/settings';
+import { Button, Input, Modal, message } from 'antd';
+import { useTranslation } from '@/utils/i18n';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+
+const CorrelationRulesPage: React.FC = () => {
+  const { t } = useTranslation();
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const { getCorrelationRuleList, deleteCorrelationRule } = useSettingApi();
+  const listCount = useRef<number>(0);
+  const [tableLoading, setTableLoading] = useState<boolean>(false);
+  const [operateVisible, setOperateVisible] = useState<boolean>(false);
+  const [searchKey, setSearchKey] = useState<string>('');
+  const [dataList, setDataList] = useState<CorrelationRule[]>([]);
+  const [currentRow, setCurrentRow] = useState<CorrelationRule | null>(null);
+  const [pagination, setPagination] = useState({
+    current: 1,
+    total: 0,
+    pageSize: 20,
+  });
+  const [alertDrawerVisible, setAlertDrawerVisible] = useState<boolean>(false);
+  const [currentRuleId, setCurrentRuleId] = useState<number | null>(null);
+
+  useEffect(() => {
+    getTableList();
+  }, []);
+
+  const handleEdit = useCallback((type: 'add' | 'edit', row?: CorrelationRule) => {
+    if (type === 'edit' && row) {
+      setCurrentRow(row);
+    } else {
+      setCurrentRow(null);
+    }
+    setOperateVisible(true);
+  }, []);
+
+  const handleDelete = useCallback((row: CorrelationRule) => {
+    Modal.confirm({
+      title: t('common.delConfirm'),
+      content: t('common.delConfirmCxt'),
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+      okButtonProps: { danger: true },
+      centered: true,
+      maskClosable: false,
+      onOk: async () => {
+        try {
+          await deleteCorrelationRule(row.id);
+          message.success(t('successfullyDeleted'));
+          if (pagination.current > 1 && listCount.current === 1) {
+            setPagination((prev) => ({ ...prev, current: prev.current - 1 }));
+            getTableList({
+              current: pagination.current - 1,
+              pageSize: pagination.pageSize,
+            });
+          } else {
+            getTableList();
+          }
+        } catch {
+          message.error(t('alarmCommon.operateFailed'));
+        }
+      },
+    });
+  }, [t, deleteCorrelationRule, pagination.current, pagination.pageSize]);
+
+  const getTableList = async (params: any = {}) => {
+    try {
+      setTableLoading(true);
+      const searchVal =
+        params.searchKey !== undefined ? params.searchKey : searchKey;
+      const queryParams = {
+        page: params.current || pagination.current,
+        page_size: params.pageSize || pagination.pageSize,
+        name: searchVal || undefined,
+      };
+      const data: any = await getCorrelationRuleList(queryParams);
+      setDataList(data.items || []);
+      listCount.current = data.items?.length || 0;
+      setPagination((prev) => ({
+        ...prev,
+        total: data.count || 0,
+      }));
+    } catch {
+      message.error(t('alarmCommon.operateFailed'));
+      return { data: [], total: 0, success: false };
+    } finally {
+      setTableLoading(false);
+    }
+  };
+
+  const handleFilterChange = () => {
+    setPagination({ ...pagination, current: 1 });
+    getTableList({
+      ...pagination,
+      current: 1,
+    });
+  };
+
+  const handleFilterClear = () => {
+    setSearchKey('');
+    setPagination((prev) => ({ ...prev, current: 1 }));
+    getTableList({
+      current: 1,
+      pageSize: pagination.pageSize,
+      searchKey: '',
+    });
+  };
+
+  const handleTableChange = (newPagination: any) => {
+    const curPage = newPagination;
+    setPagination(curPage);
+    getTableList({
+      ...curPage,
+    });
+  };
+
+  const columns = useMemo(() => [
+    {
+      title: t('settings.name'),
+      dataIndex: 'name',
+      key: 'name',
+      width: 150,
+    },
+    {
+      title: t('settings.correlation.type'),
+      dataIndex: 'strategy_type',
+      key: 'strategy_type',
+      width: 150,
+      render: (text: string) => {
+        if (text === 'smart_denoise') return t('settings.correlation.noiseReduction');
+        if (text === 'missing_detection') return t('settings.correlation.missingDetection');
+        if (text === 'instant') return t('settings.correlation.instantAlert');
+        return text || '-';
+      },
+    },
+    {
+      title: t('settings.correlation.scope'),
+      dataIndex: 'match_rules',
+      key: 'scope',
+      width: 120,
+      render: (matchRules: any[]) => {
+        const hasRules = matchRules && matchRules.length > 0;
+        return hasRules ? t('settings.correlation.filter') : t('alarmCommon.all');
+      },
+    },
+    {
+      title: t('settings.assignCreateTime'),
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 180,
+      render: (text: string) => text ? convertToLocalizedTime(text) : '-',
+    },
+    {
+      title: t('settings.correlation.executionTime'),
+      dataIndex: 'last_execute_time',
+      key: 'last_execute_time',
+      width: 180,
+      render: (text: string) => text ? convertToLocalizedTime(text) : '-',
+    },
+    {
+      title: t('settings.correlation.lastUpdateTime'),
+      dataIndex: 'updated_at',
+      key: 'updated_at',
+      width: 180,
+      render: (text: string) => text ? convertToLocalizedTime(text) : '-',
+    },
+    {
+      title: t('settings.assignActions'),
+      key: 'operation',
+      width: 180,
+      render: (_: any, row: CorrelationRule) => (
+        <div className="flex gap-4">
+          <Button
+            type="link"
+            size="small"
+            onClick={() => {
+              setCurrentRuleId(row.id);
+              setAlertDrawerVisible(true);
+            }}
+          >
+            {t('settings.correlation.effectiveAlerts')}
+          </Button>
+          <PermissionWrapper requiredPermissions={['Edit']}>
+            <Button
+              type="link"
+              size="small"
+              onClick={() => handleEdit('edit', row)}
+            >
+              {t('settings.correlation.modify')}
+            </Button>
+          </PermissionWrapper>
+          <PermissionWrapper requiredPermissions={['Delete']}>
+            <Button
+              type="link"
+              size="small"
+              danger
+              onClick={() => handleDelete(row)}
+            >
+              {t('common.delete')}
+            </Button>
+          </PermissionWrapper>
+        </div>
+      ),
+    },
+  ], [t, handleEdit, handleDelete, convertToLocalizedTime]);
+
+  return (
+    <div className="flex h-full min-h-0 w-full flex-1 flex-col">
+      <Introduction
+        title={t('settings.correlationRules')}
+        message={t('settings.correlationRulesMessage')}
+      />
+      <div className="flex min-h-0 flex-1 flex-col rounded-lg bg-[var(--color-bg-1)] p-4 shadow">
+        <div className="nav-box mb-[14px] flex shrink-0 justify-between">
+          <div className="flex items-center">
+            <Input
+              allowClear
+              value={searchKey}
+              placeholder={t('common.search')}
+              style={{ width: 250 }}
+              onChange={(e) => setSearchKey(e.target.value)}
+              onPressEnter={handleFilterChange}
+              onClear={handleFilterClear}
+            />
+          </div>
+          <PermissionWrapper requiredPermissions={['Add']}>
+            <Button type="primary" onClick={() => handleEdit('add')}>
+              {t('common.addNew')}
+            </Button>
+          </PermissionWrapper>
+        </div>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <CustomTable
+            size="middle"
+            rowKey="id"
+            loading={tableLoading}
+            columns={columns}
+            dataSource={dataList}
+            pagination={pagination}
+            onChange={handleTableChange}
+          />
+        </div>
+        <OperateModal
+          open={operateVisible}
+          onClose={() => setOperateVisible(false)}
+          currentRow={currentRow}
+          onSuccess={() => {
+            setPagination((prev) => ({ ...prev, current: 1 }));
+            getTableList({ current: 1, pageSize: pagination.pageSize });
+          }}
+        />
+        <AlertListDrawer
+          visible={alertDrawerVisible}
+          ruleId={currentRuleId}
+          onClose={() => {
+            setAlertDrawerVisible(false);
+            setCurrentRuleId(null);
+          }}
+        />
+      </div>
+    </div>
+  );
+};
+
+export default CorrelationRulesPage;

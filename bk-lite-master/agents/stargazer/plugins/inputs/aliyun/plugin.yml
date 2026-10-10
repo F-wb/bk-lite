@@ -1,0 +1,27 @@
+name: aliyun
+version: 2.0.0
+category: cloud
+metadata:
+  display_name: 阿里云平台
+  description: 阿里云平台资源采集插件
+  author: WeOps
+  tags:
+  - cloud
+  - aliyun
+  - alibaba
+  cloud_protocol: true
+  model_id: aliyun
+executors:
+  protocol:
+    type: protocol
+    execution_mode: sync
+    capacity_group: sync_sdk
+    collector:
+      module: plugins.inputs.aliyun.aliyun_info
+      class: CwAliyun
+    target_policy:
+      mode: cloud_endpoint
+      tls: true
+      trusted_domains:
+      - aliyuncs.com
+default_executor: protocol

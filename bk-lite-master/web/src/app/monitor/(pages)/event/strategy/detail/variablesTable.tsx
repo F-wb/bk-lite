@@ -1,0 +1,184 @@
+'use client';
+import React, { useMemo } from 'react';
+import { Button } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
+import { useTranslation } from '@/utils/i18n';
+import CustomTable from '@/components/custom-table';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import { ObjectItem } from '@/app/monitor/types';
+import { buildMetricDimensionVariables } from './strategyDetailUtils';
+
+interface VariableItem {
+  key: string;
+  variable: string;
+  description: string;
+}
+
+interface VariablesTableProps {
+  onVariableSelect?: (variable: string) => void;
+  displayFields?: ObjectItem['display_fields'];
+  groupBy?: string[];
+}
+
+const VariablesTable: React.FC<VariablesTableProps> = ({
+  onVariableSelect,
+  displayFields,
+  groupBy
+}) => {
+  const { t } = useTranslation();
+
+  const variableData: VariableItem[] = useMemo(() => {
+    const builtin: VariableItem[] = [
+      {
+        key: 'monitor_object',
+        variable: '${monitor_object}',
+        description: t('monitor.events.variableMonitorObject')
+      },
+      {
+        key: 'resource_id',
+        variable: '${resource_id}',
+        description: t('monitor.events.variableResourceId')
+      },
+      {
+        key: 'resource_name',
+        variable: '${resource_name}',
+        description: t('monitor.events.variableResourceName')
+      },
+      {
+        key: 'resource_ip',
+        variable: '${resource_ip}',
+        description: t('monitor.events.variableResourceIp')
+      },
+      {
+        key: 'parent_resource_id',
+        variable: '${parent_resource_id}',
+        description: t('monitor.events.variableParentResourceId')
+      },
+      {
+        key: 'parent_resource_name',
+        variable: '${parent_resource_name}',
+        description: t('monitor.events.variableParentResourceName')
+      },
+      {
+        key: 'level',
+        variable: '${level}',
+        description: t('monitor.events.variableLevel')
+      },
+      {
+        key: 'metric_name',
+        variable: '${metric_name}',
+        description: t('monitor.events.variableMetricName')
+      },
+      {
+        key: 'value',
+        variable: '${value}',
+        description: t('monitor.events.variableValue')
+      },
+      {
+        key: 'current_value',
+        variable: '${current_value}',
+        description: t('monitor.events.variableCurrentValue')
+      },
+      {
+        key: 'baseline_value',
+        variable: '${baseline_value}',
+        description: t('monitor.events.variableBaselineValue')
+      },
+      {
+        key: 'dimension_value',
+        variable: '${dimension_value}',
+        description: t('monitor.events.variableDimensionValue')
+      }
+    ];
+    const extra: VariableItem[] = [];
+    const seen = new Set(builtin.map((item) => item.key));
+    for (const col of displayFields || []) {
+      const variableId = (col.variable_id || '').trim();
+      if (!variableId || seen.has(variableId)) {
+        continue;
+      }
+      seen.add(variableId);
+      const columnName = col.name || variableId;
+      extra.push({
+        key: variableId,
+        variable: `\${${variableId}}`,
+        description: t(
+          'monitor.events.variableDisplayField',
+          '展示指标配置 · {name}',
+          { name: columnName }
+        )
+      });
+    }
+    for (const item of buildMetricDimensionVariables(groupBy)) {
+      if (seen.has(item.key)) continue;
+      seen.add(item.key);
+      extra.push({
+        key: item.key,
+        variable: item.variable,
+        description: t(
+          'monitor.events.variableMetricDimension',
+          undefined,
+          { name: item.dimension }
+        )
+      });
+    }
+    return [...builtin, ...extra];
+  }, [displayFields, groupBy, t]);
+
+  const variableColumns: ColumnsType<VariableItem> = [
+    {
+      title: t('monitor.events.variableName'),
+      dataIndex: 'variable',
+      key: 'variable',
+      width: '44%',
+      ellipsis: true,
+      render: (text: string) => (
+        <EllipsisWithTooltip
+          text={text}
+          className="w-full truncate font-mono text-[var(--color-primary)]"
+        />
+      )
+    },
+    {
+      title: t('common.description'),
+      dataIndex: 'description',
+      key: 'description',
+      ellipsis: true
+    },
+    {
+      title: t('common.actions'),
+      key: 'action',
+      width: 64,
+      render: (_: unknown, record: VariableItem) => (
+        <Button
+          type="link"
+          size="small"
+          className="px-0"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onVariableSelect?.(record.variable)}
+        >
+          {t('monitor.events.useVariable')}
+        </Button>
+      )
+    }
+  ];
+
+  return (
+    <div className="mb-4 min-w-0 overflow-hidden rounded-md border border-[var(--color-border-2)] bg-[var(--color-bg-1)] p-4 shadow-md">
+      <div className="mb-3 text-[14px] font-medium">
+        {t('monitor.events.optionalVariables')}
+      </div>
+      <CustomTable
+        autoScrollX={false}
+        tableLayout="fixed"
+        columns={variableColumns}
+        dataSource={variableData}
+        pagination={false}
+        size="small"
+        rowKey="key"
+      />
+    </div>
+  );
+};
+
+export default VariablesTable;

@@ -1,0 +1,118 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_avaya"
+        config_type = "avaya"
+        brand = "avaya"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB) + 64-bit HC ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- 内存容量（UTILIZATION-MANAGEMENT-MIB genMemUtilization 1.3.6.1.4.1.6889.2.1.11.1.2，单位 MB，标量带 .0）----
+    # genMemUtilizationTotalRAM：物理内存总量；DynAllocMemUsed / DynAllocMemAvailable：动态分配内存的已用 / 可用量。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.6889.2.1.11.1.2.1.0"
+        name = "mem_total_mb"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.6889.2.1.11.1.2.3.1.0"
+        name = "mem_dyn_used_mb"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.6889.2.1.11.1.2.3.3.0"
+        name = "mem_dyn_avail_mb"
+    # ---- CPU（genCpuUtilizationTable 1.3.6.1.4.1.6889.2.1.11.1.1.1.1，按 genCpuIndex 多行，table.field 不带 .0）----
+    # genCpuAverageUtilization（.5）：60 秒窗口平均 CPU 使用率 0-100；
+    # genCpuUtilizationEnableMonitoring（.2）：disabled(1) / enabled(2)，未开启监控的行没有有效均值，丢弃。
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6889.2.1.11.1.1.1.1.2"
+        name = "monitoring_raw"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6889.2.1.11.1.1.1.1.5"
+        name = "usage"
+    # ---- 内存使用率（genMemUtilizationTable 1.3.6.1.4.1.6889.2.1.11.1.2.6，按 genMemUtilizationID 多行）----
+    # genMemUtilizationPercentUsed（.3）：内存使用百分比。
+    [[inputs.snmp.table]]
+        name = "device_memory"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6889.2.1.11.1.2.6.1.3"
+        name = "usage"
+
+# ---- 内存 MB 标量换算为字节（device_memory_total / device_memory_used / device_memory_free），负值丢弃；
+# ---- CPU 行未开启监控或均值不在 0-100 时丢弃；内存使用率不在 0-100 时丢弃。
+[[processors.starlark]]
+    namepass = ["snmp", "device_cpu", "device_memory"]
+    source = '''
+MB_FIELDS = [("mem_total_mb", "device_memory_total"), ("mem_dyn_used_mb", "device_memory_used"), ("mem_dyn_avail_mb", "device_memory_free")]
+
+def pct(v):
+    if type(v) != "int" or v < 0 or v > 100:
+        return None
+    return v
+
+def apply(metric):
+    if metric.name == "snmp":
+        for src, dst in MB_FIELDS:
+            v = metric.fields.pop(src, None)
+            if type(v) == "int" and v >= 0:
+                metric.fields[dst] = v * 1048576
+        return metric
+    if metric.name == "device_cpu":
+        mon = metric.fields.pop("monitoring_raw", None)
+        if mon == 1:
+            return None
+    v = pct(metric.fields.pop("usage", None))
+    if v == None:
+        return None
+    metric.fields["usage"] = v
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["avaya"]

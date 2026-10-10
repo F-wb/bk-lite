@@ -1,0 +1,22 @@
+error:
+  verification_code_empty: 验证码不能为空
+  email_required: 邮箱地址不能为空
+  email_send_failed: 发送邮件失败
+  verification_code_incorrect: 验证码错误
+  user_id_required: 用户ID不能为空
+  user_not_found: 用户不存在
+  not_first_login: 用户已完成初始化
+  parse_request_failed: 请求体解析失败
+  group_name_required: group_name 不能为空
+  password_required: 密码不能为空
+  invalid_json_format: 请求体格式错误，请发送合法的 JSON
+  email_change_verification_required: 修改邮箱需要先完成验证码校验
+email:
+  verification_code_validity: 验证码有效期为10分钟,请及时使用。
+  verification_code_body: 您的验证码是
+  verification_code_ignore: 如果这不是您的操作,请忽略此邮件。
+  verification_code_title: 邮箱验证码
+success:
+  verification_code_sent: 验证码已发送
+  update_success: 更新成功
+  verification_success: 验证成功

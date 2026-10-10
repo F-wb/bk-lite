@@ -1,0 +1,292 @@
+import React from 'react';
+import { Button, Popconfirm, Dropdown, Menu, Tooltip } from 'antd';
+import { ColumnsType } from 'antd/es/table';
+import PermissionWrapper from '@/components/permission';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import Icon from '@/components/icon';
+import type { Key } from 'react';
+import type { ChangeUserStatusAction, UserDataType } from '@/app/system-manager/types/user';
+import { getRandomColor } from '@/app/system-manager/utils';
+import { canDirectlyDeleteUser } from '@/app/system-manager/utils/userDeleteGuards';
+
+interface TableColumnsProps {
+  t: (key: string) => string;
+  appIconMap: Map<string, string>;
+  onEditUser: (userId: Key) => void;
+  onOpenPasswordModal: (userId: Key) => void;
+  onDeleteUser: (userId: Key) => void;
+  onChangeUserStatus: (userId: Key, action: ChangeUserStatusAction) => void;
+  otpEnabled?: boolean;
+  convertToLocalizedTime: (isoString: string, format?: string) => string;
+}
+
+export const createUserTableColumns = ({
+  t,
+  appIconMap,
+  onEditUser,
+  onOpenPasswordModal,
+  onDeleteUser,
+  onChangeUserStatus,
+  otpEnabled = false,
+  convertToLocalizedTime,
+}: TableColumnsProps): ColumnsType<UserDataType> => {
+  return [
+    {
+      title: t('system.user.table.username'),
+      dataIndex: 'username',
+      width: 230,
+      fixed: 'left',
+      render: (text: string) => {
+        const color = getRandomColor();
+        return (
+          <div className="flex h-[17px] min-w-0 items-center">
+            <span
+              className="mr-1 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-[10px] text-center leading-5 text-[var(--color-bg)]"
+              style={{ backgroundColor: color }}
+            >
+              {text?.substring(0, 1)}
+            </span>
+            <EllipsisWithTooltip text={text} className="min-w-0 truncate" />
+          </div>
+        );
+      },
+    },
+    {
+      title: t('system.user.table.lastName'),
+      dataIndex: 'name',
+      width: 100,
+    },
+    {
+      title: t('system.user.table.status') || 'Status',
+      dataIndex: 'status',
+      width: 120,
+      render: (status?: UserDataType['status']) => {
+        let dotColor = 'var(--color-text-4)';
+        let text: string = status || '-';
+
+        switch (status) {
+          case 'normal':
+            dotColor = 'var(--color-success)';
+            text = t('system.user.status.normal') || 'Normal';
+            break;
+          case 'disabled':
+            dotColor = 'var(--color-text-4)';
+            text = t('system.user.status.disabled') || 'Disabled';
+            break;
+          case 'locked':
+            dotColor = 'var(--color-fail)';
+            text = t('system.user.status.locked') || 'Locked';
+            break;
+          case 'password_expired':
+            dotColor = '#FF9C01';
+            text = t('system.user.status.password_expired') || 'Password Expired';
+            break;
+        }
+
+        return (
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full flex-shrink-0 relative top-[0.5px]" style={{ backgroundColor: dotColor }}></span>
+            <span className="text-[13px] leading-none" style={{ color: 'var(--color-text-2)' }}>{text}</span>
+          </div>
+        );
+      },
+    },
+    {
+      title: t('system.user.table.email'),
+      dataIndex: 'email',
+      width: 185,
+    },
+    {
+      title: t('system.user.table.phone'),
+      dataIndex: 'phone',
+      width: 140,
+    },
+    {
+      title: t('system.user.table.lastLogin'),
+      dataIndex: 'last_login',
+      width: 180,
+      render: (text: string) => text ? convertToLocalizedTime(text) : '-'
+    },
+    {
+      title: t('system.user.table.role'),
+      dataIndex: 'roles',
+      width: 280,
+      render: (_: string[], record: UserDataType) => {
+        const personalRoles = (record.roles || []).reduce((acc: Record<string, string[]>, role: any) => {
+          const roleName = typeof role === 'string' ? role : role.name;
+          const parts = roleName.split('@@');
+          if (parts.length >= 2) {
+            const appName = parts.slice(0, -1).join('@@');
+            const roleNamePart = parts[parts.length - 1];
+            if (!acc[appName]) acc[appName] = [];
+            acc[appName].push(roleNamePart);
+          } else {
+            if (!acc['default']) acc['default'] = [];
+            acc['default'].push(roleName);
+          }
+          return acc;
+        }, {});
+
+        const groupRoles = (record.group_role_list || []).reduce((acc: Record<string, string[]>, role: string) => {
+          const parts = role.split('@@');
+          if (parts.length >= 2) {
+            const appName = parts.slice(0, -1).join('@@');
+            const roleName = parts[parts.length - 1];
+            if (!acc[appName]) acc[appName] = [];
+            acc[appName].push(roleName);
+          } else {
+            if (!acc['default']) acc['default'] = [];
+            acc['default'].push(role);
+          }
+          return acc;
+        }, {});
+
+        const allApps = new Set([...Object.keys(personalRoles), ...Object.keys(groupRoles)]);
+        const appEntries = Array.from(allApps).map(appName => ({
+          appName,
+          personalRoles: personalRoles[appName] || [],
+          groupRoles: groupRoles[appName] || [],
+        }));
+
+        const visibleApps = appEntries.slice(0, 2);
+        const hiddenApps = appEntries.slice(2);
+
+        return (
+          <div className="flex flex-wrap gap-2">
+            {visibleApps.map(({ appName, personalRoles: pRoles, groupRoles: gRoles }) => (
+              <div key={appName} className="flex items-center gap-1 rounded-xl border px-2 py-1">
+                {appIconMap.get(appName) && (
+                  <Tooltip title={appName} placement="top">
+                    <div>
+                      <Icon type={appIconMap.get(appName) || appName} className="w-4 h-4" />
+                    </div>
+                  </Tooltip>
+                )}
+                <span className="text-xs">
+                  {gRoles.length > 0 && (
+                    <span className="text-[var(--color-success)]">{gRoles.join(', ')}</span>
+                  )}
+                  {gRoles.length > 0 && pRoles.length > 0 && <span>, </span>}
+                  {pRoles.length > 0 && (
+                    <span className="text-[var(--color-primary)]">{pRoles.join(', ')}</span>
+                  )}
+                </span>
+              </div>
+            ))}
+            {hiddenApps.length > 0 && (
+              <Dropdown
+                overlay={
+                  <Menu>
+                    {hiddenApps.map(({ appName, personalRoles: pRoles, groupRoles: gRoles }) => (
+                      <Menu.Item key={appName}>
+                        <div className="flex items-center gap-1">
+                          {appIconMap.get(appName) && (
+                            <Tooltip title={appName} placement="top" zIndex={10000}>
+                              <div>
+                                <Icon type={appIconMap.get(appName) || appName} className="w-4 h-4" />
+                              </div>
+                            </Tooltip>
+                          )}
+                          <span>
+                            {gRoles.length > 0 && (
+                              <span className="text-[var(--color-success)]">{gRoles.join(', ')}</span>
+                            )}
+                            {gRoles.length > 0 && pRoles.length > 0 && <span>, </span>}
+                            {pRoles.length > 0 && (
+                              <span className="text-[var(--color-primary)]">{pRoles.join(', ')}</span>
+                            )}
+                          </span>
+                        </div>
+                      </Menu.Item>
+                    ))}
+                  </Menu>
+                }
+                trigger={["click"]}
+              >
+                <span className="cursor-pointer text-blue-500 ml-1">...</span>
+              </Dropdown>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      title: t('common.actions'),
+      dataIndex: 'key',
+      width: 280,
+      fixed: 'right',
+      render: (key: Key, record: UserDataType) => {
+        const { status } = record;
+        return (
+          <>
+            <PermissionWrapper requiredPermissions={['Edit User']}>
+              <Button type="link" className="mr-[8px] p-0" onClick={() => onEditUser(key)}>
+                {t('common.edit')}
+              </Button>
+            </PermissionWrapper>
+            <PermissionWrapper requiredPermissions={['Edit User']}>
+              <Button type="link" className="mr-[8px] p-0" onClick={() => onOpenPasswordModal(key)}>
+                {t('system.common.password')}
+              </Button>
+            </PermissionWrapper>
+            {status === 'locked' && (
+              <PermissionWrapper requiredPermissions={['Edit User']}>
+                <Popconfirm
+                  title={t('system.user.status.unlockConfirm')}
+                  okText={t('common.confirm')}
+                  cancelText={t('common.cancel')}
+                  onConfirm={() => onChangeUserStatus(key, 'unlock')}
+                >
+                  <Button type="link" className="mr-[8px] p-0">{t('system.user.status.unlock') || 'Unlock'}</Button>
+                </Popconfirm>
+              </PermissionWrapper>
+            )}
+            {status === 'disabled' ? (
+              <PermissionWrapper requiredPermissions={['Edit User']}>
+                <Popconfirm
+                  title={t('system.user.status.enableConfirm')}
+                  okText={t('common.confirm')}
+                  cancelText={t('common.cancel')}
+                  onConfirm={() => onChangeUserStatus(key, 'enable')}
+                >
+                  <Button type="link" className="mr-[8px] p-0">{t('common.enable') || 'Enable'}</Button>
+                </Popconfirm>
+              </PermissionWrapper>
+            ) : (
+              <PermissionWrapper requiredPermissions={['Edit User']}>
+                <Popconfirm
+                  title={t('system.user.status.disableConfirm')}
+                  okText={t('common.confirm')}
+                  cancelText={t('common.cancel')}
+                  onConfirm={() => onChangeUserStatus(key, 'disable')}
+                >
+                  <Button type="link" className="mr-[8px] p-0">{t('common.disable') || 'Disable'}</Button>
+                </Popconfirm>
+              </PermissionWrapper>
+            )}
+            {otpEnabled && record.has_otp && (
+              <PermissionWrapper requiredPermissions={['Edit User']}>
+                <Popconfirm title={t('system.user.status.unbindOtpConfirm')} okText={t('common.confirm')} cancelText={t('common.cancel')} onConfirm={() => onChangeUserStatus(key, 'unbind_otp')}>
+                  <Button type="link" className="mr-[8px] p-0">{t('system.user.status.unbindOtp')}</Button>
+                </Popconfirm>
+              </PermissionWrapper>
+            )}
+            <PermissionWrapper requiredPermissions={['Delete User']}>
+              <Popconfirm
+                title={t('common.delConfirm')}
+                okText={t('common.confirm')}
+                cancelText={t('common.cancel')}
+                disabled={!canDirectlyDeleteUser(record)}
+                onConfirm={() => onDeleteUser(key)}
+              >
+                <Button type="link" className="p-0" disabled={!canDirectlyDeleteUser(record)}>
+                  {t('common.delete')}
+                </Button>
+              </Popconfirm>
+            </PermissionWrapper>
+          </>
+        );
+      },
+    },
+  ];
+};

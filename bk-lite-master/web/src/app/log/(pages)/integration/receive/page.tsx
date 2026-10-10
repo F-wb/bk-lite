@@ -1,0 +1,664 @@
+'use client';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
+import {
+  Input,
+  Button,
+  message,
+  Dropdown,
+  Popconfirm,
+  Space,
+  Modal
+} from 'antd';
+import CatalogScopeSegmented from '@/components/catalog-scope-segmented';
+import useApiClient from '@/utils/request';
+import useLogApi from '@/app/log/api/integration';
+import { useTranslation } from '@/utils/i18n';
+import {
+  ColumnItem,
+  ModalRef,
+  Organization,
+  Pagination,
+  TableDataItem,
+  TreeItem
+} from '@/app/log/types';
+import { ObjectItem } from '@/app/log/types/event';
+import CustomTable from '@/components/custom-table';
+import TimeSelector from '@/components/time-selector';
+import { DownOutlined } from '@ant-design/icons';
+import { useCommon } from '@/app/log/context/common';
+import { useAssetMenuItems } from '@/app/log/hooks/integration/common/other';
+import { showGroupName } from '@/app/log/utils/common';
+import EditConfig from './updateConfig';
+import EditK8sConfig from './updateK8sConfig';
+import EditInstance from './editInstance';
+import Permission from '@/components/permission';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import type { TableProps, MenuProps } from 'antd';
+import TreeSelector from '@/app/log/components/tree-selector';
+import { useRouter, useSearchParams } from 'next/navigation';
+import LogExtractorDrawer from './logExtractorDrawer';
+import {
+  consumeExtractorCreateHandoff,
+  consumeExtractorCreateSample
+} from './logExtractorLogic';
+const { confirm } = Modal;
+
+type TableRowSelection<T extends object = object> =
+  TableProps<T>['rowSelection'];
+
+const Asset = () => {
+  const { isLoading } = useApiClient();
+  const {
+    getInstanceList,
+    deleteLogInstance,
+    getCollectTypes,
+    getDisplayCategoryEnum,
+    getLogExtractors
+  } = useLogApi();
+  const { t } = useTranslation();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const commonContext = useCommon();
+  const organizationList: Organization[] =
+    commonContext?.authOrganizations || [];
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const configRef = useRef<ModalRef>(null);
+  const k8sConfigRef = useRef<ModalRef>(null);
+  const instanceRef = useRef<ModalRef>(null);
+  const instanceAbortControllerRef = useRef<AbortController | null>(null);
+  const instanceRequestIdRef = useRef<number>(0);
+  const treeAbortControllerRef = useRef<AbortController | null>(null);
+  const treeRequestIdRef = useRef<number>(0);
+  const assetMenuItems = useAssetMenuItems();
+  const [pagination, setPagination] = useState<Pagination>({
+    current: 1,
+    total: 0,
+    pageSize: 20
+  });
+  const [tableLoading, setTableLoading] = useState<boolean>(false);
+  const [tableData, setTableData] = useState<TableDataItem[]>([]);
+  const [searchText, setSearchText] = useState<string>('');
+  const [unassignedOnly, setUnassignedOnly] = useState(false);
+  const [frequence, setFrequence] = useState<number>(0);
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+  const [treeData, setTreeData] = useState<TreeItem[]>([]);
+  const [objectId, setObjectId] = useState<React.Key>('');
+  const [treeLoading, setTreeLoading] = useState<boolean>(false);
+  const [collectTypeMap, setCollectTypeMap] = useState<Record<number, string>>(
+    {}
+  );
+  const [extractorInstance, setExtractorInstance] = useState<{
+    id: string;
+    name: string;
+    canOperate: boolean;
+  } | null>(null);
+  const [extractorAutoCreate, setExtractorAutoCreate] = useState(false);
+  const [extractorInitialSample, setExtractorInitialSample] = useState<
+    Record<string, unknown> | null
+  >(null);
+  const [extractorInitialSourceField, setExtractorInitialSourceField] =
+    useState<string | null>(null);
+  const extractorQueryHandled = useRef<string | null>(null);
+
+  const handleAssetMenuClick: MenuProps['onClick'] = (e) => {
+    openInstanceModal(
+      {
+        keys: selectedRowKeys
+      },
+      e.key
+    );
+  };
+
+  const assetMenuProps = {
+    items: assetMenuItems,
+    onClick: handleAssetMenuClick
+  };
+
+  const columns: ColumnItem[] = [
+    {
+      title: t('common.name'),
+      dataIndex: 'name',
+      key: 'name'
+    },
+    {
+      title: t('common.belongingGroup'),
+      dataIndex: 'organization',
+      key: 'organization',
+      render: (_, { organization }) => (
+        <EllipsisWithTooltip
+          className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
+          text={
+            organization?.length
+              ? showGroupName(organization, organizationList)
+              : t('common.unassigned')
+          }
+        />
+      )
+    },
+    {
+      title: t('log.integration.collectionMethod'),
+      dataIndex: 'collect_type__name',
+      key: 'collect_type__name',
+      render: (_: string, record: TableDataItem) => {
+        return (
+          collectTypeMap[record.collect_type_id] ||
+          record.collect_type__name ||
+          '--'
+        );
+      }
+    },
+    {
+      title: t('log.integration.collector'),
+      dataIndex: 'collect_type__collector',
+      key: 'collect_type__collector'
+    },
+    {
+      title: t('log.integration.collectionNode'),
+      dataIndex: 'node_name',
+      key: 'node_name'
+    },
+    {
+      title: t('common.action'),
+      key: 'action',
+      dataIndex: 'action',
+      width: 340,
+      fixed: 'right',
+      render: (_, record) => (
+        <>
+          <Permission requiredPermissions={['Edit']}>
+            <Button
+              type="link"
+              onClick={() => openInstanceModal(record, 'edit')}
+            >
+              {t('common.edit')}
+            </Button>
+          </Permission>
+          <Permission requiredPermissions={['Edit']}>
+            <Button
+              className="ml-[10px]"
+              type="link"
+              onClick={() => openConfigModal(record)}
+            >
+              {t('log.integration.updateConfigration')}
+            </Button>
+          </Permission>
+          <Button
+            className="ml-[10px]"
+            type="link"
+            onClick={() => viewLog(record)}
+          >
+            {t('log.integration.viewLogs')}
+          </Button>
+          <Button
+            className="ml-[10px]"
+            type="link"
+            onClick={() =>
+              setExtractorInstance({
+                id: String(record.id),
+                name: String(record.name || record.id),
+                canOperate:
+                  Array.isArray(record.permission) &&
+                  record.permission.includes('Operate')
+              })
+            }
+          >
+            {t('log.extractor.title')}
+          </Button>
+          <Permission requiredPermissions={['Delete']}>
+            <Popconfirm
+              title={t('common.deleteTitle')}
+              description={t('common.deleteContent')}
+              okText={t('common.confirm')}
+              cancelText={t('common.cancel')}
+              okButtonProps={{ loading: confirmLoading }}
+              onConfirm={() => deleteInstConfirm(record)}
+            >
+              <Button type="link" className="ml-[10px]">
+                {t('common.remove')}
+              </Button>
+            </Popconfirm>
+          </Permission>
+        </>
+      )
+    }
+  ];
+
+  const enableOperateAsset = useMemo(() => {
+    if (!selectedRowKeys.length) return true;
+    return false;
+  }, [selectedRowKeys]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      getAssetInsts();
+    }
+  }, [pagination.current, pagination.pageSize, objectId, unassignedOnly]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      getObjects();
+    }
+  }, [isLoading]);
+
+  // 组件卸载时取消所有请求
+  useEffect(() => {
+    return () => {
+      cancelAllRequests();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!frequence) {
+      clearTimer();
+      return;
+    }
+    timerRef.current = setInterval(() => {
+      getAssetInsts('timer');
+    }, frequence);
+    return () => {
+      clearTimer();
+    };
+  }, [
+    frequence,
+    pagination.current,
+    pagination.pageSize,
+    searchText,
+    objectId,
+    unassignedOnly
+  ]);
+
+  useEffect(() => {
+    const extractorId = searchParams.get('extractor');
+    if (!extractorId || isLoading) return;
+    const matched = tableData.find((row) => String(row.id) === extractorId);
+    if (extractorQueryHandled.current === extractorId) {
+      if (!matched) return;
+      setExtractorInstance((current) => {
+        if (!current || current.id !== extractorId) return current;
+        return {
+          ...current,
+          name: String(matched.name || extractorId)
+        };
+      });
+      return;
+    }
+    extractorQueryHandled.current = extractorId;
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await getLogExtractors({ collect_instance: extractorId });
+        if (cancelled) return;
+        const canOperate = list.can_operate === true;
+        const shouldCreate = searchParams.get('create') === '1';
+        if (shouldCreate && !canOperate) {
+          message.error(t('log.extractor.instanceUnavailable'));
+        }
+        setExtractorInstance({
+          id: extractorId,
+          name: String(matched?.name || extractorId),
+          canOperate
+        });
+        setExtractorAutoCreate(shouldCreate && canOperate);
+        const handoff = shouldCreate
+          ? consumeExtractorCreateHandoff(searchParams.get('handoff'))
+          : null;
+        setExtractorInitialSample(
+          handoff?.event ||
+            (shouldCreate
+              ? consumeExtractorCreateSample({
+                kind: 'instance',
+                id: extractorId
+              })
+              : null)
+        );
+        setExtractorInitialSourceField(
+          handoff?.source_field ||
+            (shouldCreate ? searchParams.get('source_field') : null)
+        );
+      } catch {
+        if (!cancelled) {
+          message.error(t('log.extractor.instanceUnavailable'));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading, searchParams, tableData]);
+
+  const viewLog = (row: TableDataItem) => {
+    const queryString = new URLSearchParams([
+      ['query', `instance_id:"${row.id}"`],
+      ['log_groups', 'default']
+    ]).toString();
+    const url = `/log/search?${queryString}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
+  const getObjects = async () => {
+    // 取消上一次请求
+    treeAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    treeAbortControllerRef.current = abortController;
+    const currentRequestId = ++treeRequestIdRef.current;
+    try {
+      setTreeLoading(true);
+      const [data, categoryEnum] = await Promise.all([
+        getCollectTypes(
+          { add_instance_count: true },
+          { signal: abortController.signal }
+        ),
+        getDisplayCategoryEnum()
+      ]);
+      // 只有最新请求才处理数据
+      if (currentRequestId !== treeRequestIdRef.current) return;
+      // 构建 collectType id 到 display_name 的映射
+      const typeMap = (data || []).reduce(
+        (acc: Record<number, string>, item: ObjectItem) => {
+          acc[item.id] = item.display_name || item.name;
+          return acc;
+        },
+        {}
+      );
+      setCollectTypeMap(typeMap);
+      setTreeData(getTreeData(data || [], categoryEnum || []));
+    } finally {
+      // 只有最新请求才控制 loading
+      if (currentRequestId === treeRequestIdRef.current) {
+        setTreeLoading(false);
+      }
+    }
+  };
+
+  const getTreeData = (
+    data: ObjectItem[],
+    categoryEnum: { id: string; name: string }[]
+  ): TreeItem[] => {
+    // Build category id to name map
+    const categoryMap = categoryEnum.reduce(
+      (acc: Record<string, string>, item) => {
+        acc[item.id] = item.name;
+        return acc;
+      },
+      {}
+    );
+
+    const groupedData = data.reduce(
+      (acc, item) => {
+        const category = item.display_category || 'other';
+        if (!acc[category]) {
+          acc[category] = {
+            title: categoryMap[category] || category,
+            key: category,
+            children: []
+          };
+        }
+        acc[category].children.push({
+          title: `${item.display_name || item.name}(${item.instance_count || 0})`,
+          label: item.display_name || item.name || '--',
+          key: item.id,
+          children: []
+        });
+        return acc;
+      },
+      {} as Record<string, TreeItem>
+    );
+
+    // Build tree in the order of categoryEnum
+    const orderedTree: TreeItem[] = categoryEnum
+      .filter((cat) => groupedData[cat.id])
+      .map((cat) => groupedData[cat.id]);
+
+    return [
+      {
+        title: t('common.all'),
+        key: 'all',
+        children: []
+      },
+      ...orderedTree
+    ];
+  };
+
+  const onRefresh = () => {
+    getObjects();
+    getAssetInsts();
+  };
+
+  const showDeleteConfirm = () => {
+    confirm({
+      title: t('common.delConfirm'),
+      content: t('common.delConfirmCxt'),
+      centered: true,
+      onOk() {
+        return new Promise(async (resolve) => {
+          try {
+            await deleteLogInstance({
+              clean_child_config: true,
+              instance_ids: selectedRowKeys
+            });
+            message.success(t('common.successfullyDeleted'));
+            if (pagination?.current) {
+              pagination.current > 1 &&
+                tableData.length === 1 &&
+                pagination.current--;
+            }
+            setSelectedRowKeys([]);
+            getObjects();
+            getAssetInsts();
+          } finally {
+            resolve(true);
+          }
+        });
+      }
+    });
+  };
+
+  const clearTimer = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+  };
+
+  const onFrequenceChange = (val: number) => {
+    setFrequence(val);
+  };
+
+  const openConfigModal = (row: TableDataItem = {}) => {
+    const targetRef =
+      row.collect_type__name === 'kubernetes' ? k8sConfigRef : configRef;
+    targetRef.current?.showModal({
+      title: t('log.integration.updateConfigration'),
+      type: 'edit',
+      form: {
+        ...row,
+        objName: ''
+      }
+    });
+  };
+
+  const openInstanceModal = (row = {}, type: string) => {
+    if (type === 'batchDelete') {
+      showDeleteConfirm();
+      return;
+    }
+    instanceRef.current?.showModal({
+      title: t(`common.${type}`),
+      type,
+      form: row
+    });
+  };
+
+  const handleTableChange = (pagination: any) => {
+    setPagination(pagination);
+  };
+
+  const getAssetInsts = async (type?: string) => {
+    // 取消上一次请求
+    instanceAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    instanceAbortControllerRef.current = abortController;
+    const currentRequestId = ++instanceRequestIdRef.current;
+    try {
+      setTableLoading(type !== 'timer');
+      const params = {
+        page: pagination.current,
+        page_size: pagination.pageSize,
+        collect_type_id: objectId === 'all' ? '' : String(objectId),
+        name: type === 'clear' ? '' : searchText,
+        ...(unassignedOnly ? { unassigned: true } : {})
+      };
+      const data = await getInstanceList(params, {
+        signal: abortController.signal
+      });
+      // 只有最新请求才处理数据
+      if (currentRequestId !== instanceRequestIdRef.current) return;
+      setTableData(data?.items || []);
+      setPagination((prev: Pagination) => ({
+        ...prev,
+        total: data?.count || 0
+      }));
+    } finally {
+      // 只有最新请求才控制 loading
+      if (currentRequestId === instanceRequestIdRef.current) {
+        setTableLoading(false);
+      }
+    }
+  };
+
+  const deleteInstConfirm = async (row: any) => {
+    setConfirmLoading(true);
+    try {
+      const data = {
+        instance_ids: [row.id],
+        clean_child_config: true
+      };
+      await deleteLogInstance(data);
+      message.success(t('common.successfullyDeleted'));
+      getAssetInsts();
+      getObjects();
+    } finally {
+      setConfirmLoading(false);
+    }
+  };
+
+  const clearText = () => {
+    setSearchText('');
+    getAssetInsts('clear');
+  };
+
+  //判断是否禁用按钮
+  const onSelectChange = (newSelectedRowKeys: React.Key[]) => {
+    setSelectedRowKeys(newSelectedRowKeys);
+  };
+
+  const rowSelection: TableRowSelection<TableDataItem> = {
+    selectedRowKeys,
+    onChange: onSelectChange
+  };
+
+  // 取消所有请求
+  const cancelAllRequests = () => {
+    instanceAbortControllerRef.current?.abort();
+    treeAbortControllerRef.current?.abort();
+  };
+
+  const handleObjectChange = async (id: string) => {
+    cancelAllRequests();
+    setTableData([]);
+    setObjectId(id);
+  };
+
+  return (
+    <div className="flex h-full min-h-0 w-full min-w-0 overflow-hidden">
+      <TreeSelector
+        data={treeData}
+        loading={treeLoading}
+        showAllMenu
+        defaultSelectedKey="all"
+        onNodeSelect={handleObjectChange}
+        style={{ width: 236, height: 'calc(100vh - 146px)' }}
+      />
+      <div className="min-w-0 flex-1 bg-[var(--color-bg-1)] p-[20px]">
+        <div className="mb-[10px] flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Input
+              allowClear
+              className="w-[320px]"
+              placeholder={t('common.searchPlaceHolder')}
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              onPressEnter={() => getAssetInsts()}
+              onClear={clearText}
+            />
+          </div>
+          <div className="flex items-center">
+            <CatalogScopeSegmented
+              unassignedOnly={unassignedOnly}
+              onChange={(checked) => {
+                setUnassignedOnly(checked);
+                setSelectedRowKeys([]);
+                setPagination((prev) => ({ ...prev, current: 1 }));
+              }}
+              className="mr-[8px]"
+            />
+            <Dropdown
+              className="mr-[8px]"
+              overlayClassName="customMenu"
+              menu={assetMenuProps}
+              disabled={enableOperateAsset}
+            >
+              <Button>
+                <Space>
+                  {t('common.action')}
+                  <DownOutlined />
+                </Space>
+              </Button>
+            </Dropdown>
+            <TimeSelector
+              onlyRefresh
+              onFrequenceChange={onFrequenceChange}
+              onRefresh={onRefresh}
+            />
+          </div>
+        </div>
+        <CustomTable
+          className="w-full"
+          scroll={{ y: 'calc(100vh - 340px)', x: 'max-content' }}
+          columns={columns}
+          dataSource={tableData}
+          pagination={pagination}
+          loading={tableLoading}
+          rowKey="id"
+          onChange={handleTableChange}
+          rowSelection={rowSelection}
+        ></CustomTable>
+        <EditConfig ref={configRef} onSuccess={() => getAssetInsts()} />
+        <EditK8sConfig ref={k8sConfigRef} onSuccess={() => getAssetInsts()} />
+        <EditInstance
+          ref={instanceRef}
+          organizationList={organizationList}
+          onSuccess={() => getAssetInsts()}
+        />
+        <LogExtractorDrawer
+          instance={extractorInstance}
+          open={Boolean(extractorInstance)}
+          autoCreate={extractorAutoCreate}
+          initialSample={extractorInitialSample}
+          initialSourceField={extractorInitialSourceField}
+          onClose={() => {
+            setExtractorInstance(null);
+            setExtractorAutoCreate(false);
+            setExtractorInitialSample(null);
+            setExtractorInitialSourceField(null);
+            extractorQueryHandled.current = null;
+            if (searchParams.get('extractor')) {
+              router.replace('/log/integration/receive');
+            }
+          }}
+        />
+      </div>
+    </div>
+  );
+};
+
+export default Asset;

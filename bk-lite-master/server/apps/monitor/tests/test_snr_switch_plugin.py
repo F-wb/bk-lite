@@ -1,0 +1,450 @@
+"""Contract tests for the SNR (NAG) MES switch SNMP plugin.
+
+Validates Telegraf/snmp_snr/switch against the Cisco baseline and the
+cross-vendor design decisions for the SNMP brand-plugin family.
+
+SNR (НАГ, NAG-MIB, IANA PEN 40418) exposes device health from the sysSlotTable:
+per-slot CPU (sysCpuUsage), memory (sysMemorySize / sysMemoryBusy), a dedicated
+temperature column (sysTemperature) and a fan status column (sysFanStatus).
+Power state comes from priPowerSupply (priPowerTable, INDEX priPowerIndex),
+normalized via starlark: 1->1 (healthy), 0/2->2 (fault). The fan raw codes
+are 0=Normal / 1=Abnormal (note the inverted polarity vs Eltex's 1=OK),
+normalized via starlark so 0->1 (healthy) and everything else ->2 (fault).
+Uninstalled fan positions (sysFanInserted=0) are kept and reported as 1
+(healthy, no alert).
+
+  - device_cpu_usage: sysCpuUsage percent, per-slot (index dimension)
+  - device_memory_total/used: bytes; usage = used/total*100 (per-slot)
+  - device_temperature_celsius: sysTemperature, per-slot
+  - device_fan_state: Enum 1=healthy/2=fault; policy alerts on state > 1
+  - device_psu_state: Enum 1=healthy/2=fault; policy alerts on state = 2
+  - interface_ifHCIn/OutOctets: byte-identical Cisco
+
+SNR reuses the shared Switch metric names + existing Temperature / Hardware
+Status groups, so i18n and the shared switch dashboard are already in place. New
+brand `snr` adds a common.tsx match + icon.
+
+OID correctness is intentionally NOT tested here.
+"""
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from apps.core.utils.loader import LanguageLoader
+
+SERVER_ROOT = Path(__file__).resolve().parents[3]
+PLUGINS = SERVER_ROOT / "apps" / "monitor" / "support-files" / "plugins" / "Telegraf"
+SNR_DIR = PLUGINS / "snmp" / "switch_snr"
+CISCO_DIR = PLUGINS / "snmp" / "switch_cisco"
+LANGUAGE_DIR = SERVER_ROOT / "apps" / "monitor" / "language"
+WEB_ROOT = SERVER_ROOT.parents[0] / "web"
+
+BRAND = "snr"
+COLLECT_TYPE = "snmp_snr"
+CONFIG_TYPE = "snr"
+INSTANCE_TYPE = "switch"
+PLUGIN_NAME = "Switch SNR SNMP"
+OBJECT_NAME = "Switch"
+
+SUPPORTED_SCALAR_UNITS = {
+    "byteps", "bytes", "counts", "cps", "percent", "celsius", "s", "short", "none",
+}
+INTERFACE_METRICS = ("interface_ifHCInOctets", "interface_ifHCOutOctets")
+MEMORY_METRICS = ("device_memory_total", "device_memory_used", "device_memory_usage")
+ENUM_METRICS = ("device_fan_state", "device_psu_state")
+PSU_SUPPLY_OID = "1.3.6.1.4.1.40418.7.100.1.23.1.3"
+INDEX_DIMENSION = [{"name": "index", "description": "SNMP table row index"}]
+MEMORY_USAGE_QUERY = (
+    "device_memory_used{instance_type='switch', __$labels__} / "
+    "device_memory_total{instance_type='switch', __$labels__} * 100"
+)
+
+
+def _read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture(scope="module")
+def metrics():
+    return _read_json(SNR_DIR / "metrics.json")
+
+
+@pytest.fixture(scope="module")
+def cisco_metrics():
+    return _read_json(CISCO_DIR / "metrics.json")
+
+
+@pytest.fixture(scope="module")
+def policy():
+    return _read_json(SNR_DIR / "policy.json")
+
+
+@pytest.fixture(scope="module")
+def ui():
+    return _read_json(SNR_DIR / "UI.json")
+
+
+@pytest.fixture(scope="module")
+def toml_text():
+    return (SNR_DIR / "snr.child.toml.j2").read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def languages():
+    return {
+        lang: LanguageLoader("monitor", lang).translations
+        for lang in ("zh-Hans", "en")
+    }
+
+
+# --------------------------------------------------------------------------- #
+# directory / cross-file identity
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_plugin_lives_under_correct_dir(metrics):
+    assert metrics["collect_type"] == COLLECT_TYPE  # 身份来自 metrics.json,不依赖目录(#3590 解耦)
+    assert SNR_DIR.parent.name == "snmp"  # 扁平布局:厂商目录直接在 snmp/ 下
+
+
+@pytest.mark.unit
+def test_toml_filename_follows_convention():
+    assert (SNR_DIR / f"{CONFIG_TYPE}.child.toml.j2").exists()
+
+
+@pytest.mark.unit
+def test_collect_type_consistent_across_files(metrics, policy, ui, toml_text):
+    assert COLLECT_TYPE in metrics["status_query"]
+    assert f"instance_type='{INSTANCE_TYPE}'" in metrics["status_query"]
+    assert ui["collect_type"] == COLLECT_TYPE
+    assert f'collect_type = "{COLLECT_TYPE}"' in toml_text
+    assert f'instance_type = "{{{{ instance_type }}}}"' in toml_text
+    assert metrics["plugin"] == PLUGIN_NAME
+    assert policy["plugin"] == PLUGIN_NAME
+    assert metrics["name"] == OBJECT_NAME
+    assert ui["object_name"] == OBJECT_NAME
+    assert policy["object"] == OBJECT_NAME
+
+
+@pytest.mark.unit
+def test_config_type_consistent(ui, toml_text):
+    assert ui["config_type"] == [CONFIG_TYPE]
+    assert f'config_type = "{CONFIG_TYPE}"' in toml_text
+    assert f'brand = "{BRAND}"' in toml_text
+
+
+@pytest.mark.unit
+def test_ui_is_pure_snmp_form(ui):
+    assert not any(f["name"] == "brand" for f in ui["form_fields"])
+
+
+# --------------------------------------------------------------------------- #
+# CPU + interface parity with Cisco (group + unit; CPU query legitimately
+# differs because SNR aggregates the per-slot table)
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_shared_metrics_match_cisco_group_and_unit(metrics, cisco_metrics):
+    cisco = {m["name"]: m for m in cisco_metrics["metrics"]}
+    drift = []
+    for m in metrics["metrics"]:
+        base = cisco.get(m["name"])
+        if base is None:
+            continue
+        if m["metric_group"] != base["metric_group"]:
+            drift.append(f'{m["name"]}.group')
+        # fan/psu units are vendor-normalized and need not match Cisco native codes
+        if m["name"] not in ENUM_METRICS and m["unit"] != base["unit"]:
+            drift.append(f'{m["name"]}.unit')
+    assert drift == [], f"shared-metric drift vs Cisco: {drift}"
+
+
+@pytest.mark.unit
+def test_cpu_is_per_slot_percent(metrics):
+    cpu = {m["name"]: m for m in metrics["metrics"]}["device_cpu_usage"]
+    assert cpu["unit"] == "percent"
+    assert cpu["metric_group"] == "CPU"
+    assert cpu["dimensions"] == INDEX_DIMENSION
+    assert "device_cpu_usage{" in cpu["query"]
+
+
+@pytest.mark.unit
+def test_interface_hc_metrics_match_cisco(metrics, cisco_metrics):
+    ext = {m["name"]: m for m in metrics["metrics"]}
+    cis = {m["name"]: m for m in cisco_metrics["metrics"]}
+    for name in INTERFACE_METRICS:
+        assert name in ext, f"{name} must be declared"
+        for field in ("metric_group", "unit", "query", "dimensions"):
+            assert ext[name][field] == cis[name][field], f"{name}.{field} drift vs Cisco"
+
+
+# --------------------------------------------------------------------------- #
+# memory: total/used bytes, usage = used/total*100
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_memory_metrics_present(metrics):
+    names = {m["name"] for m in metrics["metrics"]}
+    missing = [m for m in MEMORY_METRICS if m not in names]
+    assert missing == [], f"memory metrics missing: {missing}"
+
+
+@pytest.mark.unit
+def test_memory_total_and_used_are_bytes(metrics):
+    by = {m["name"]: m for m in metrics["metrics"]}
+    for name in ("device_memory_total", "device_memory_used"):
+        assert by[name]["unit"] == "bytes", f"{name} must be bytes"
+        assert by[name]["metric_group"] == "Memory"
+        assert by[name]["dimensions"] == INDEX_DIMENSION
+
+
+@pytest.mark.unit
+def test_memory_usage_is_used_over_total(metrics):
+    ext = {m["name"]: m for m in metrics["metrics"]}["device_memory_usage"]
+    assert ext["unit"] == "percent"
+    assert ext["query"] == MEMORY_USAGE_QUERY
+    assert ext["dimensions"] == INDEX_DIMENSION
+
+
+# --------------------------------------------------------------------------- #
+# Environment: temperature + fan + PSU
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_temperature_is_celsius_per_slot(metrics):
+    t = {m["name"]: m for m in metrics["metrics"]}["device_temperature_celsius"]
+    assert t["unit"] == "celsius"
+    assert t["metric_group"] == "Temperature"
+    assert t["dimensions"] == INDEX_DIMENSION
+    assert "device_temperature_celsius{" in t["query"]
+
+
+@pytest.mark.unit
+def test_fan_is_normalized_enum(metrics):
+    fan = {m["name"]: m for m in metrics["metrics"]}["device_fan_state"]
+    assert fan["data_type"] == "Enum"
+    assert fan["metric_group"] == "Hardware Status"
+    assert fan["dimensions"] == INDEX_DIMENSION
+    opts = json.loads(fan["unit"])
+    ids = sorted(o["id"] for o in opts)
+    assert ids == [1, 2], f"fan enum must be normalized to 1=healthy/2=fault, got {ids}"
+    assert "device_fan_state{" in fan["query"]
+
+
+@pytest.mark.unit
+def test_psu_is_normalized_enum(metrics):
+    psu = {m["name"]: m for m in metrics["metrics"]}["device_psu_state"]
+    assert psu["data_type"] == "Enum"
+    assert psu["metric_group"] == "Hardware Status"
+    assert psu["dimensions"] == INDEX_DIMENSION
+    opts = json.loads(psu["unit"])
+    ids = sorted(o["id"] for o in opts)
+    assert ids == [1, 2], f"psu enum must be normalized to 1=healthy/2=fault, got {ids}"
+    assert "device_psu_state{" in psu["query"]
+    assert "max(" not in psu["query"]
+
+
+# --------------------------------------------------------------------------- #
+# telegraf starlark: fan namepass-isolated; uninstalled → 1; raw 0 → 1, else → 2
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_toml_has_no_enum_processor_block(toml_text):
+    assert toml_text.count("[[processors.enum]]") == 0
+
+
+@pytest.mark.unit
+def test_fan_starlark_maps_normal_zero(toml_text):
+    assert 'namepass = ["device_fan"]' in toml_text
+    assert "[[processors.starlark]]" in toml_text
+    assert 'int(metric.fields["state"]) == 0' in toml_text
+    assert 'metric.fields["state"] = 1' in toml_text
+    assert 'metric.fields["state"] = 2' in toml_text
+    assert "int(inserted) == 0" in toml_text
+    # 未安装位输出 1 并保留行，不丢弃
+    assert 'if inserted != None and int(inserted) == 0:\n        return None' not in toml_text
+    assert 'metric.fields["state"] = 3' not in toml_text
+
+
+@pytest.mark.unit
+def test_psu_starlark_maps_up_one_fault_zero_and_two(toml_text):
+    assert 'name = "device_psu"' in toml_text
+    assert PSU_SUPPLY_OID in toml_text
+    assert f"{PSU_SUPPLY_OID}.0" not in toml_text
+    assert 'namepass = ["device_psu"]' in toml_text
+    start = toml_text.find('namepass = ["device_psu"]')
+    assert start != -1
+    block = toml_text[start:start + 500]
+    assert 'int(metric.fields["state"]) == 1' in block
+    assert 'metric.fields["state"] = 1' in block
+    assert 'metric.fields["state"] = 2' in block
+
+
+@pytest.mark.unit
+def test_toml_collects_ifhc_counters(toml_text):
+    assert "ifHCInOctets" in toml_text and "ifHCOutOctets" in toml_text
+
+
+# --------------------------------------------------------------------------- #
+# policy / supplementary / units / dimensions hygiene
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_policy_covers_cpu_mem_temp_fan_psu(policy):
+    names = {t["metric_name"] for t in policy["templates"]}
+    required = {
+        "device_cpu_usage", "device_memory_usage",
+        "device_temperature_celsius", "device_fan_state",
+        "device_psu_state",
+    }
+    assert required <= names, f"SNR policy missing: {required - names}"
+
+
+@pytest.mark.unit
+def test_fan_policy_threshold_fault_above_one(policy):
+    by = {t["metric_name"]: t for t in policy["templates"]}
+    thr = by["device_fan_state"]["threshold"]
+    assert any(t["method"] == ">" and t["value"] == 1 for t in thr), \
+        "fan alert must fire when normalized state > 1"
+
+
+@pytest.mark.unit
+def test_psu_policy_threshold_equals_two(policy):
+    by = {t["metric_name"]: t for t in policy["templates"]}
+    thr = by["device_psu_state"]["threshold"]
+    assert any(t["method"] == "=" and t["value"] == 2 for t in thr), \
+        "psu alert must fire when normalized state = 2"
+
+
+@pytest.mark.unit
+def test_policy_templates_reference_existing_metrics(metrics, policy):
+    known = {m["name"] for m in metrics["metrics"]}
+    bad = [t["metric_name"] for t in policy["templates"] if t["metric_name"] not in known]
+    assert bad == [], f"policy references unknown metrics: {bad}"
+
+
+@pytest.mark.unit
+def test_supplementary_indicators_have_no_dangling_refs(metrics):
+    names = {m["name"] for m in metrics["metrics"]}
+    dangling = [s for s in metrics.get("supplementary_indicators", []) if s not in names]
+    assert dangling == [], f"supplementary_indicators reference absent metrics: {dangling}"
+
+
+@pytest.mark.unit
+def test_no_dangling_descr_in_alert_names(policy):
+    for t in policy["templates"]:
+        assert "${metric_descr}" not in t["alert_name"], f"{t['metric_name']} dangling descr"
+
+
+@pytest.mark.unit
+def test_all_scalar_metric_units_supported(metrics):
+    bad = [
+        f'{m["name"]}:{m["unit"]}'
+        for m in metrics["metrics"]
+        if m["data_type"] != "Enum" and m["unit"] not in SUPPORTED_SCALAR_UNITS
+    ]
+    assert bad == [], f"unsupported units: {bad}"
+
+
+@pytest.mark.unit
+def test_dimensions_well_formed(metrics):
+    bad = [
+        m["name"]
+        for m in metrics["metrics"]
+        for d in m.get("dimensions", [])
+        if not d.get("name") or not d.get("description")
+    ]
+    assert bad == [], f"malformed dimensions: {bad}"
+
+
+# --------------------------------------------------------------------------- #
+# i18n completeness (zh-Hans + en) — reuses shared Switch names + groups
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_plugin_has_bilingual_name_and_desc(languages):
+    for lang, data in languages.items():
+        entry = (data.get("monitor_object_plugin") or {}).get(PLUGIN_NAME) or {}
+        assert entry.get("name"), f"{lang}: plugin name missing"
+        assert entry.get("desc"), f"{lang}: plugin desc missing"
+
+
+@pytest.mark.unit
+def test_psu_language_enum_is_bilingual():
+    expected = {
+        "zh-Hans": {"1": "正常", "2": "异常"},
+        "en": {"1": "Normal", "2": "Abnormal"},
+    }
+    for lang, labels in expected.items():
+        data = yaml.safe_load((SNR_DIR / "language" / f"{lang}.yaml").read_text(encoding="utf-8"))
+        entry = ((data.get("monitor_object_metric") or {}).get(OBJECT_NAME) or {}).get("device_psu_state") or {}
+        assert entry.get("name"), f"{lang}: device_psu_state name missing"
+        assert entry.get("enum") == labels, f"{lang}: device_psu_state enum mismatch"
+
+
+@pytest.mark.unit
+def test_every_metric_has_bilingual_translation(metrics, languages):
+    missing = []
+    for lang, data in languages.items():
+        group = (data.get("monitor_object_metric") or {}).get(OBJECT_NAME) or {}
+        for m in metrics["metrics"]:
+            entry = group.get(m["name"]) or {}
+            if not entry.get("name") or not entry.get("desc"):
+                missing.append(f'{lang}:{m["name"]}')
+    assert missing == [], f"metrics missing translation: {missing}"
+
+
+@pytest.mark.unit
+def test_every_metric_group_has_bilingual_translation(metrics, languages):
+    groups = {m["metric_group"] for m in metrics["metrics"]}
+    missing = []
+    for lang, data in languages.items():
+        trans = (data.get("monitor_object_metric_group") or {}).get(OBJECT_NAME) or {}
+        missing += [f"{lang}:{g}" for g in groups if not trans.get(g)]
+    assert missing == [], f"metric groups missing translation: {missing}"
+
+
+@pytest.mark.unit
+def test_object_has_bilingual_translation(languages):
+    for lang, data in languages.items():
+        obj = (data.get("monitor_object") or {}).get(OBJECT_NAME)
+        assert obj, f"{lang}: object {OBJECT_NAME} missing translation"
+
+
+# --------------------------------------------------------------------------- #
+# frontend wiring
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_frontend_collecttype_wired_to_switch_object():
+    switch_tsx = (
+        WEB_ROOT / "src" / "app" / "monitor" / "hooks" / "integration"
+        / "objects" / "networkDevice" / "switch.tsx"
+    )
+    text = switch_tsx.read_text(encoding="utf-8")
+    assert f"'{PLUGIN_NAME}': '{COLLECT_TYPE}'" in text
+
+
+@pytest.mark.unit
+def test_frontend_brand_match_registered():
+    common = WEB_ROOT / "src" / "app" / "monitor" / "utils" / "common.tsx"
+    text = common.read_text(encoding="utf-8")
+    assert "snr" in text.lower(), "common.tsx must register an SNR brand match"
+
+
+@pytest.mark.unit
+def test_brand_icon_asset_present():
+    icon = WEB_ROOT / "public" / "assets" / "icons" / "mm-snr_snr.svg"
+    assert icon.exists(), "SNR brand icon mm-snr_snr.svg must exist"
+
+
+@pytest.mark.unit
+def test_shared_dashboard_no_brand_special_case():
+    config_ts = (
+        WEB_ROOT / "src" / "app" / "monitor" / "dashboards"
+        / "objects" / "switch" / "config.ts"
+    )
+    assert BRAND not in config_ts.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# secrets never inlined as plaintext
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_passwords_use_template_vars_not_plaintext(toml_text):
+    assert 'auth_password = "${AUTH_PASSWORD__{{ config_id }}}"' in toml_text
+    assert 'priv_password = "${PRIV_PASSWORD__{{ config_id }}}"' in toml_text

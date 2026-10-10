@@ -1,0 +1,663 @@
+"""management 命令 + services/role_manage 单元测试。
+
+调用真实 management 命令（call_command），断言真实 DB 副作用；
+只在涉及外部缓存时 mock permission_cache。
+"""
+
+from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
+from threading import Barrier
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+from django.contrib.auth.hashers import check_password, make_password
+from django.core.cache.backends.locmem import LocMemCache
+from django.core.cache.backends.redis import RedisCache
+from django.core.management import CommandError, call_command
+from django.db import close_old_connections
+
+import apps.core.management.commands.batch_init as batch_init
+from apps.core.utils.permission_cache import get_user_permission_version
+from apps.system_mgmt.models import App, CustomMenuGroup, Group, LoginModule, Menu, Role, SystemSettings, User
+from apps.system_mgmt.nats.login import login
+from apps.system_mgmt.services.role_manage import RoleManage
+
+pytestmark = [pytest.mark.integration, pytest.mark.django_db]
+
+
+# ---------------------------------------------------------------------------
+# create_user 命令
+# ---------------------------------------------------------------------------
+def test_create_user_basic():
+    out = StringIO()
+    # 必须显式传 email：不传时 argparse 置 None，EmailField 非空约束会失败
+    call_command("create_user", "newuser", "secret123", "--email", "newuser@x.com", stdout=out)
+    user = User.objects.get(username="newuser")
+    # 密码已被 hash
+    assert user.password != "secret123"
+    assert user.display_name == "newuser"
+    # Default 组被加入 group_list
+    default_group = Group.objects.get(name="Default", parent_id=0)
+    assert default_group.id in user.group_list
+    assert "成功创建用户" in out.getvalue()
+
+
+def test_create_user_storage_failure_is_reported_as_command_error(monkeypatch):
+    monkeypatch.setattr(User.objects, "create", MagicMock(side_effect=RuntimeError("database unavailable")))
+
+    with pytest.raises(CommandError, match="创建用户失败: RuntimeError"):
+        call_command("create_user", "failed-user", "Managed-Secret-1!", "--email", "failed@x.com")
+
+
+def test_create_user_partial_initialization_failure_rolls_back(monkeypatch):
+    monkeypatch.setattr(Role.objects, "get_or_create", MagicMock(side_effect=RuntimeError("role unavailable")))
+
+    with pytest.raises(CommandError, match="创建用户失败: RuntimeError"):
+        call_command(
+            "create_user",
+            "partial-admin",
+            "Managed-Secret-1!",
+            "--email",
+            "partial-admin@x.com",
+            "--is_superuser",
+        )
+
+    assert not User.objects.filter(username="partial-admin", domain="domain.com").exists()
+
+
+def test_create_user_concurrent_bootstrap_is_idempotent(monkeypatch):
+    original_create = User.objects.create
+    create_barrier = Barrier(2)
+    username = "concurrent-bootstrap-admin"
+
+    def synchronized_create(*args, **kwargs):
+        create_barrier.wait(timeout=5)
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(User.objects, "create", synchronized_create)
+
+    def bootstrap():
+        close_old_connections()
+        try:
+            call_command(
+                "create_user",
+                username,
+                "Managed-Secret-1!",
+                "--email",
+                "concurrent-bootstrap-admin@x.com",
+                "--is_superuser",
+            )
+        finally:
+            close_old_connections()
+
+    def cleanup():
+        close_old_connections()
+        try:
+            User.objects.filter(username=username, domain="domain.com").delete()
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(cleanup).result(timeout=10)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(bootstrap) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=10)
+
+        users = User.objects.filter(username=username, domain="domain.com")
+        assert users.count() == 1
+        user = users.get()
+        assert check_password("Managed-Secret-1!", user.password)
+        assert Role.objects.get(name="admin", app="").id in user.role_list
+    finally:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(cleanup).result(timeout=10)
+
+
+def test_batch_init_fresh_admin_defaults_to_password(monkeypatch):
+    real_call_command = call_command
+
+    def route_call_command(name, *args, **kwargs):
+        if name == "create_user":
+            return real_call_command(name, *args, **kwargs)
+        return None
+
+    monkeypatch.setattr(batch_init, "call_command", route_call_command)
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_FILE", raising=False)
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", raising=False)
+
+    batch_init.Command()._init_system_mgmt()
+
+    admin = User.objects.get(username="admin", domain="domain.com")
+    assert check_password("password", admin.password)
+    assert Role.objects.get(name="admin", app="").id in admin.role_list
+    login_result = login("admin", "password")
+    assert login_result["result"] is True
+    assert login_result["data"]["token"]
+
+
+def test_batch_init_admin_bootstrap_and_repeat_use_real_create_user(monkeypatch):
+    real_call_command = call_command
+    dispatched = []
+
+    def route_call_command(name, *args, **kwargs):
+        dispatched.append(name)
+        if name == "create_user":
+            return real_call_command(name, *args, **kwargs)
+        return None
+
+    monkeypatch.setattr(batch_init, "call_command", route_call_command)
+    monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD", "Managed-Secret-1!")
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_FILE", raising=False)
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", raising=False)
+
+    batch_init.Command()._init_system_mgmt()
+
+    admin = User.objects.get(username="admin", domain="domain.com")
+    original_password = admin.password
+    assert check_password("Managed-Secret-1!", original_password)
+    assert "create_user" in dispatched
+
+    dispatched.clear()
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", "/missing/optional-secret")
+
+    batch_init.Command()._init_system_mgmt()
+
+    admin.refresh_from_db()
+    assert admin.password == original_password
+    assert "create_user" not in dispatched
+
+
+def test_create_user_superuser_assigns_admin_role():
+    out = StringIO()
+    call_command("create_user", "boss", "pw", "--email", "boss@x.com", "--display_name", "Boss", "--is_superuser", stdout=out)
+    user = User.objects.get(username="boss")
+    assert user.email == "boss@x.com"
+    assert user.display_name == "Boss"
+    admin_role = Role.objects.get(name="admin", app="")
+    assert admin_role.id in user.role_list
+
+
+def test_create_user_already_exists():
+    existing_user = User.objects.create(username="dup", password="x", display_name="dup", email="d@x.com")
+    original_password = existing_user.password
+    out = StringIO()
+    call_command("create_user", "dup", "pw", stdout=out)
+    existing_user.refresh_from_db()
+    assert "已存在" in out.getvalue()
+    # 不应创建第二个
+    assert User.objects.filter(username="dup").count() == 1
+    assert existing_user.password == original_password
+
+
+def test_create_user_explicit_migration_updates_existing_password():
+    existing_user = User.objects.create(username="migrate-admin", password=make_password("password"), display_name="admin", email="admin@x.com")
+
+    call_command("create_user", "migrate-admin", "Managed-Secret-1!", "--update_existing_password")
+
+    existing_user.refresh_from_db()
+    assert check_password("Managed-Secret-1!", existing_user.password)
+    assert existing_user.temporary_pwd is False
+
+
+def test_create_user_explicit_migration_is_idempotent():
+    existing_user = User.objects.create(
+        username="migrate-admin-idempotent",
+        password=make_password("password"),
+        display_name="admin",
+        email="admin-idempotent@x.com",
+    )
+    call_command("create_user", existing_user.username, "Managed-Secret-1!", "--update_existing_password")
+    existing_user.refresh_from_db()
+    migrated_password = existing_user.password
+
+    call_command("create_user", existing_user.username, "Managed-Secret-1!", "--update_existing_password")
+
+    existing_user.refresh_from_db()
+    assert existing_user.password == migrated_password
+
+
+def test_create_user_concurrent_migration_serializes_legacy_password_update():
+    username = "concurrent-migrate-admin"
+    migrate_barrier = Barrier(2)
+
+    def reset_legacy_user():
+        close_old_connections()
+        try:
+            User.objects.filter(username=username, domain="domain.com").delete()
+            return User.objects.create(
+                username=username,
+                password=make_password("password"),
+                display_name="admin",
+                email="concurrent-migrate-admin@x.com",
+            ).pk
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        existing_user_id = executor.submit(reset_legacy_user).result(timeout=10)
+
+    def migrate(password):
+        close_old_connections()
+        output = StringIO()
+        try:
+            migrate_barrier.wait(timeout=5)
+            call_command(
+                "create_user",
+                username,
+                password,
+                "--update_existing_password",
+                stdout=output,
+            )
+            return output.getvalue()
+        finally:
+            close_old_connections()
+
+    passwords = ("Managed-Secret-A!", "Managed-Secret-B!")
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outputs = list(executor.map(migrate, passwords))
+
+        existing_user = User.objects.get(pk=existing_user_id)
+        assert any(check_password(password, existing_user.password) for password in passwords)
+        assert sum("成功迁移用户密码" in output for output in outputs) == 1
+        assert sum("用户密码已完成轮换" in output for output in outputs) == 1
+    finally:
+
+        def cleanup():
+            close_old_connections()
+            try:
+                User.objects.filter(pk=existing_user_id).delete()
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(cleanup).result(timeout=10)
+
+
+def test_create_user_migration_failure_rolls_back(monkeypatch):
+    existing_user = User.objects.create(
+        username="rollback-migrate-admin",
+        password=make_password("password"),
+        display_name="admin",
+        email="rollback-migrate-admin@x.com",
+    )
+    original_save = User.save
+
+    def fail_migration_save(user, *args, **kwargs):
+        if user.pk == existing_user.pk and not check_password("password", user.password):
+            raise RuntimeError("migration storage unavailable")
+        return original_save(user, *args, **kwargs)
+
+    monkeypatch.setattr(User, "save", fail_migration_save)
+
+    with pytest.raises(RuntimeError, match="migration storage unavailable"):
+        call_command("create_user", existing_user.username, "Managed-Secret-1!", "--update_existing_password")
+
+    existing_user.refresh_from_db()
+    assert check_password("password", existing_user.password)
+
+
+def test_create_user_migration_survives_rollback_to_legacy_invocation():
+    existing_user = User.objects.create(
+        username="migrate-admin-rollback",
+        password=make_password("password"),
+        display_name="admin",
+        email="admin-rollback@x.com",
+    )
+    call_command("create_user", existing_user.username, "Managed-Secret-1!", "--update_existing_password")
+
+    call_command("create_user", existing_user.username, "password")
+
+    existing_user.refresh_from_db()
+    assert check_password("Managed-Secret-1!", existing_user.password)
+    assert existing_user.temporary_pwd is False
+
+
+def test_create_user_migration_preserves_password_after_first_rotation():
+    existing_user = User.objects.create(
+        username="rotated-admin",
+        password=make_password("User-Rotated-1!"),
+        display_name="admin",
+        email="rotated-admin@x.com",
+    )
+
+    call_command("create_user", existing_user.username, "Managed-Secret-1!", "--update_existing_password")
+
+    existing_user.refresh_from_db()
+    assert check_password("User-Rotated-1!", existing_user.password)
+    assert existing_user.temporary_pwd is False
+
+
+def test_create_user_preserves_cross_domain_same_name_noop():
+    non_default_user = User.objects.create(
+        username="domain-admin",
+        domain="other.example",
+        password=make_password("password"),
+        display_name="admin",
+        email="other-admin@x.com",
+    )
+
+    call_command(
+        "create_user",
+        non_default_user.username,
+        "Managed-Secret-1!",
+        "--email",
+        "default-admin@x.com",
+        "--update_existing_password",
+    )
+
+    non_default_user.refresh_from_db()
+    assert check_password("password", non_default_user.password)
+    assert not User.objects.filter(username="domain-admin", domain="domain.com").exists()
+
+
+def test_create_user_migration_targets_default_domain_only():
+    default_user = User.objects.create(
+        username="shared-admin",
+        domain="domain.com",
+        password=make_password("password"),
+        display_name="admin",
+        email="default-admin@x.com",
+    )
+    non_default_user = User.objects.create(
+        username="shared-admin",
+        domain="other.example",
+        password=make_password("password"),
+        display_name="admin",
+        email="other-admin@x.com",
+    )
+
+    call_command(
+        "create_user",
+        "shared-admin",
+        "Managed-Secret-1!",
+        "--update_existing_password",
+    )
+
+    default_user.refresh_from_db()
+    non_default_user.refresh_from_db()
+    assert check_password("Managed-Secret-1!", default_user.password)
+    assert default_user.temporary_pwd is False
+    assert check_password("password", non_default_user.password)
+    assert non_default_user.temporary_pwd is False
+
+
+# ---------------------------------------------------------------------------
+# clean_group_data 命令
+# ---------------------------------------------------------------------------
+def test_clean_group_creates_default_when_missing():
+    # 确保 id=1 不存在
+    Group.objects.filter(id=1).delete()
+    User.objects.create(username="g1u", password="x", display_name="u", email="u@x.com", group_list=[])
+    out = StringIO()
+    with patch("apps.system_mgmt.management.commands.clean_group_data.clear_users_permission_cache"):
+        call_command("clean_group_data", stdout=out)
+    g = Group.objects.get(id=1)
+    assert g.name == "Default" and g.parent_id == 0
+    # 所有用户 group_list 被设为 [1]
+    assert User.objects.get(username="g1u").group_list == [1]
+
+
+def test_clean_group_noop_when_correct():
+    Group.objects.filter(id=1).delete()
+    Group.objects.create(id=1, name="Default", parent_id=0)
+    out = StringIO()
+    call_command("clean_group_data", stdout=out)
+    assert "默认组数据正确" in out.getvalue()
+
+
+def test_clean_group_migrates_wrong_id1():
+    Group.objects.filter(id=1).delete()
+    # id=1 是个错误的组（非 Default）
+    Group.objects.create(id=1, name="WrongOne", parent_id=0, description="d")
+    u = User.objects.create(username="mig", password="x", display_name="u", email="m@x.com", group_list=[1])
+    out = StringIO()
+    call_command("clean_group_data", stdout=out)
+    # id=1 现在应是 Default
+    assert Group.objects.get(id=1).name == "Default"
+    # 旧组被迁移到新 id，仍存在
+    assert Group.objects.filter(name="WrongOne").exists()
+    new_id = Group.objects.get(name="WrongOne").id
+    u.refresh_from_db()
+    assert 1 not in u.group_list
+    assert new_id in u.group_list
+
+
+# ---------------------------------------------------------------------------
+# init_login_settings 命令
+# ---------------------------------------------------------------------------
+def test_init_login_settings_creates_module_and_settings():
+    LoginModule.objects.filter(source_type="wechat").delete()
+    call_command("init_login_settings")
+    assert LoginModule.objects.filter(source_type="wechat", is_build_in=True).exists()
+    assert SystemSettings.objects.filter(key="login_expired_time").exists()
+    assert SystemSettings.objects.filter(key="enable_otp").exists()
+    assert SystemSettings.objects.filter(key="watermark_text").exists()
+
+
+def test_init_login_settings_idempotent():
+    call_command("init_login_settings")
+    call_command("init_login_settings")
+    assert LoginModule.objects.filter(source_type="wechat", is_build_in=True).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# init_custom_menu 命令
+# ---------------------------------------------------------------------------
+def test_init_custom_menu_creates_groups_for_builtin_apps():
+    app = App.objects.create(name="myapp", display_name="My App", url="/m", is_build_in=True)
+    CustomMenuGroup.objects.filter(app="myapp").delete()
+    out = StringIO()
+    call_command("init_custom_menu", stdout=out)
+    grp = CustomMenuGroup.objects.get(app="myapp", display_name="默认菜单")
+    assert grp.is_build_in is True
+    assert grp.is_enabled is True
+    assert app.display_name in grp.description
+
+
+# ---------------------------------------------------------------------------
+# init_realm_resource / create_guest_role 权限代际
+# ---------------------------------------------------------------------------
+def test_init_realm_resource_advances_permission_version():
+    user = User.objects.create(
+        username="realm-version",
+        password="x",
+        display_name="Realm version",
+        email="realm-version@example.com",
+    )
+    initial_version = get_user_permission_version(user.username, user.domain)
+
+    with (
+        patch(
+            "apps.system_mgmt.management.commands.init_realm_resource.get_install_apps",
+            return_value=set(),
+        ),
+        patch(
+            "apps.system_mgmt.management.commands.init_realm_resource.os.walk",
+            return_value=[],
+        ),
+        patch(
+            "apps.system_mgmt.management.commands.init_realm_resource._permission_signature",
+            side_effect=[("before",), ("after",)],
+        ),
+    ):
+        call_command("init_realm_resource")
+
+    assert get_user_permission_version(user.username, user.domain) > initial_version
+
+
+def test_init_realm_resource_noop_keeps_permission_version():
+    user = User.objects.create(
+        username="realm-version-noop",
+        password="x",
+        display_name="Realm version noop",
+        email="realm-version-noop@example.com",
+    )
+    initial_version = get_user_permission_version(user.username, user.domain)
+
+    with (
+        patch(
+            "apps.system_mgmt.management.commands.init_realm_resource.get_install_apps",
+            return_value=set(),
+        ),
+        patch(
+            "apps.system_mgmt.management.commands.init_realm_resource.os.walk",
+            return_value=[],
+        ),
+    ):
+        call_command("init_realm_resource")
+
+    assert get_user_permission_version(user.username, user.domain) == initial_version
+
+
+def test_create_guest_role_advances_permission_version():
+    from apps.system_mgmt.nats.users import create_guest_role
+
+    user = User.objects.create(
+        username="guest-role-version",
+        password="x",
+        display_name="Guest role version",
+        email="guest-role-version@example.com",
+    )
+    initial_version = get_user_permission_version(user.username, user.domain)
+
+    result = create_guest_role()
+
+    assert result["result"] is True
+    assert get_user_permission_version(user.username, user.domain) > initial_version
+    second_version = get_user_permission_version(user.username, user.domain)
+    create_guest_role()
+    assert get_user_permission_version(user.username, user.domain) == second_version
+
+
+def test_prepare_permission_cache_rollback_requires_confirmation(mocker):
+    clear_namespaces = mocker.patch(
+        "apps.system_mgmt.management.commands.prepare_permission_cache_rollback._clear_permission_namespaces",
+    )
+
+    with pytest.raises(CommandError, match="必须先排空"):
+        call_command("prepare_permission_cache_rollback")
+
+    clear_namespaces.assert_not_called()
+
+
+def test_prepare_permission_cache_rollback_only_clears_permission_namespaces(mocker):
+    clear_namespaces = mocker.patch(
+        "apps.system_mgmt.management.commands.prepare_permission_cache_rollback._clear_permission_namespaces",
+        return_value=7,
+    )
+
+    out = StringIO()
+    call_command("prepare_permission_cache_rollback", confirm=True, stdout=out)
+
+    clear_namespaces.assert_called_once()
+    assert "删除 7 个键" in out.getvalue()
+
+
+def test_prepare_permission_cache_rollback_fails_closed_when_pattern_delete_fails(mocker):
+    mocker.patch(
+        "apps.system_mgmt.management.commands.prepare_permission_cache_rollback._clear_permission_namespaces",
+        side_effect=RuntimeError("redis unavailable"),
+    )
+
+    with pytest.raises(CommandError, match="禁止启动旧版本"):
+        call_command("prepare_permission_cache_rollback", confirm=True)
+
+
+def test_prepare_permission_cache_rollback_uses_django_redis_scan_contract():
+    from apps.system_mgmt.management.commands.prepare_permission_cache_rollback import (
+        ROLLBACK_PERMISSION_CACHE_PATTERNS,
+        _clear_permission_namespaces,
+    )
+
+    backend = RedisCache("redis://127.0.0.1:6379/1", {"OPTIONS": {}})
+    client = MagicMock()
+    client.scan_iter.side_effect = [
+        iter([b":1:perm_rules:a", b":1:perm_rules:b"]),
+        iter([]),
+        iter([b":1:token_info:a"]),
+        iter([]),
+        iter([]),
+    ]
+    client.delete.side_effect = [2, 1]
+    backend.__dict__["_cache"] = SimpleNamespace(get_client=lambda key, write: client)
+
+    deleted = _clear_permission_namespaces(backend)
+
+    assert deleted == 3
+    assert client.scan_iter.call_args_list == [call(match=backend.make_key(pattern), count=1000) for pattern in ROLLBACK_PERMISSION_CACHE_PATTERNS]
+    assert client.delete.call_args_list == [
+        call(b":1:perm_rules:a", b":1:perm_rules:b"),
+        call(b":1:token_info:a"),
+    ]
+    client.flushdb.assert_not_called()
+
+
+def test_prepare_permission_cache_rollback_noops_for_drained_locmem():
+    from apps.system_mgmt.management.commands.prepare_permission_cache_rollback import _clear_permission_namespaces
+
+    assert _clear_permission_namespaces(LocMemCache("rollback-test", {})) == 0
+
+
+# ---------------------------------------------------------------------------
+# init_bk_login_settings 命令
+# ---------------------------------------------------------------------------
+def test_init_bk_login_settings_creates_bk_module():
+    Role.objects.get_or_create(app="opspilot", name="normal")
+    LoginModule.objects.filter(source_type="bk_login").delete()
+    call_command("init_bk_login_settings")
+    lm = LoginModule.objects.get(source_type="bk_login", name="蓝鲸平台")
+    assert lm.is_build_in is True
+    assert lm.other_config["app_id"] == "weops_saas"
+    assert lm.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# RoleManage 服务
+# ---------------------------------------------------------------------------
+def _make_menus():
+    Menu.objects.create(name="host-view", display_name="主机-查看-x", order=1, app="cmdb", menu_type="资产")
+    Menu.objects.create(name="host-edit", display_name="主机-编辑-x", order=2, app="cmdb", menu_type="资产")
+    Menu.objects.create(name="alarm", display_name="告警-x", order=3, app="cmdb", menu_type="监控")
+
+
+def test_role_manage_superuser_gets_all_menus():
+    _make_menus()
+    rm = RoleManage()
+    result = rm.get_all_menus("cmdb", user_menus=None, is_superuser=True)
+    # 两个 type 分组
+    type_names = {r["name"] for r in result}
+    assert type_names == {"资产", "监控"}
+    asset = next(r for r in result if r["name"] == "资产")
+    host = next(c for c in asset["children"] if c["name"] == "host")
+    assert set(host["operation"]) == {"view", "edit"}
+    # display_name = "-".join(split("-")[:-1]) -> "主机-查看-x" 去掉末段 "x" 并以空格连接
+    assert host["display_name"] == "主机 查看"
+
+
+def test_role_manage_non_superuser_no_menus_returns_empty():
+    _make_menus()
+    rm = RoleManage()
+    result = rm.get_all_menus("cmdb", user_menus=[], is_superuser=False)
+    assert result == []
+
+
+def test_role_manage_filters_by_user_menus():
+    _make_menus()
+    rm = RoleManage()
+    result = rm.get_all_menus("cmdb", user_menus=["host-view"], is_superuser=False)
+    # 仅保留 host-view
+    asset = next(r for r in result if r["name"] == "资产")
+    host = next(c for c in asset["children"] if c["name"] == "host")
+    assert host["operation"] == ["view"]
+    # 没有监控分组（alarm 被过滤）
+    assert all(r["name"] != "监控" for r in result)
+
+
+def test_role_manage_transform_empty():
+    assert RoleManage.transform_data([]) == []

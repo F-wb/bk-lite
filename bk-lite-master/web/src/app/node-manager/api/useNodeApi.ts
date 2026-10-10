@@ -1,0 +1,255 @@
+import useApiClient from '@/utils/request';
+import type { AxiosResponse } from 'axios';
+import type {
+  ControllerInstallFields,
+  NodeItem,
+  UpdateConfigReq
+} from '../types/cloudregion';
+import {
+  BatchUpdateNodeOrganizationsParams,
+  NodeParams
+} from '../types/node';
+import { SearchFilters } from '@/components/search-combination/types';
+import { parseContentDispositionFilename } from '../utils/nodeListExport';
+
+/**
+ * 节点管理API Hook
+ * 职责：处理节点相关的所有操作，包括节点管理、控制器和采集器安装等
+ */
+const useNodeApi = () => {
+  const { get, post, del, patch } = useApiClient();
+
+  // 获取节点列表
+  const getNodeList = async (params: {
+    cloud_region_id?: number;
+    filters?: SearchFilters;
+    page?: number;
+    page_size?: number;
+    unassigned?: boolean;
+  }) => {
+    const { page, page_size, unassigned, ...bodyParams } = params;
+    // 构建 URL 查询参数
+    const queryParams = new URLSearchParams();
+    if (page !== undefined) {
+      queryParams.append('page', page.toString());
+    }
+    if (page_size !== undefined) {
+      queryParams.append('page_size', page_size.toString());
+    }
+    if (unassigned) {
+      queryParams.append('unassigned', 'true');
+    }
+    const queryString = queryParams.toString();
+    const url = queryString
+      ? `/node_mgmt/api/node/search/?${queryString}`
+      : '/node_mgmt/api/node/search/';
+    return await post(url, bodyParams);
+  };
+
+  const exportNodeList = async (params: {
+    cloud_region_id?: number;
+    filters?: SearchFilters;
+    selected_ids?: string[];
+    unassigned?: boolean;
+  }) => {
+    const { unassigned, ...bodyParams } = params;
+    const queryParams = new URLSearchParams();
+    if (unassigned) {
+      queryParams.append('unassigned', 'true');
+    }
+    const queryString = queryParams.toString();
+    const url = queryString
+      ? `/node_mgmt/api/node/export_excel/?${queryString}`
+      : '/node_mgmt/api/node/export_excel/';
+    const res = await post<{
+      data: Blob;
+      headers: AxiosResponse['headers'];
+    }>(url, bodyParams, {
+      responseType: 'blob',
+      blobMeta: true,
+      suppressErrorNotification: true
+    });
+    const disposition =
+      res.headers?.['content-disposition'] ??
+      res.headers?.['Content-Disposition'];
+    return {
+      blob: res.data,
+      filename:
+        parseContentDispositionFilename(
+          typeof disposition === 'string' ? disposition : undefined
+        ) || 'nodes.xlsx'
+    };
+  };
+
+  // 删除节点必清 CMDB 悬挂 node_id（实例保留）。retire_linked=true 时额外退役监控。
+  const delNode = async (
+    id: React.Key,
+    options?: { retire_linked?: boolean }
+  ) => {
+    const query = options?.retire_linked
+      ? '?retire_linked=true'
+      : '';
+    return await del(`/node_mgmt/api/node/${String(id)}/${query}`);
+  };
+
+  // 详情补推 / 重新同步（无级联，仅推送列出的 targets）
+  const modulePush = async (
+    id: React.Key,
+    targets: Array<'cmdb' | 'monitor'>
+  ) => {
+    return await post(`/node_mgmt/api/node/${String(id)}/module_push/`, {
+      targets
+    });
+  };
+
+  // 获取节点管理的状态枚举值
+  const getNodeStateEnum = async () => {
+    return await get('/node_mgmt/api/node/enum/');
+  };
+
+  // 获取包列表
+  const getPackages = async (params: {
+    os?: string;
+    cpu_architecture?: string;
+    type?: string;
+    object?: string;
+    operating_system?: string;
+  }) => {
+    return await get('/node_mgmt/api/package/', { params });
+  };
+
+  // 卸载控制器
+  const uninstallController = async (params: {
+    cloud_region_id?: number;
+    work_node?: number;
+    nodes?: NodeItem[];
+  }) => {
+    return await post('/node_mgmt/api/installer/controller/uninstall/', params);
+  };
+
+  // 安装控制器
+  const installController = async (params: ControllerInstallFields) => {
+    return await post('/node_mgmt/api/installer/controller/install/', params);
+  };
+
+  // 安装采集器
+  const installCollector = async (params: {
+    collector_package: number;
+    nodes: string[];
+  }) => {
+    return await post('/node_mgmt/api/installer/collector/install/', params);
+  };
+
+  // 获取控制器节点信息
+  const getControllerNodes = async (params: { taskId: string | number }) => {
+    const res = await post(
+      `/node_mgmt/api/installer/controller/task/${params.taskId}/nodes/`
+    );
+    return res?.data || res?.items || res || [];
+  };
+
+  // 获取采集器安装节点信息（返回完整响应，包含status和summary）
+  const getCollectorNodes = async (params: {
+    taskId: string | number;
+    page?: number;
+    page_size?: number;
+  }) => {
+    const body: { page?: number; page_size?: number } = {};
+    if (params.page !== undefined) {
+      body.page = params.page;
+    }
+    if (params.page_size !== undefined) {
+      body.page_size = params.page_size;
+    }
+    const res = await post(
+      `/node_mgmt/api/installer/collector/install/${params.taskId}/nodes/`,
+      body
+    );
+    // 返回完整响应，让调用方处理 status 和 summary
+    return (
+      res || {
+        items: [],
+        status: 'running',
+        summary: { total: 0, waiting: 0, running: 0, success: 0, error: 0 }
+      }
+    );
+  };
+
+  // 获取采集器操作节点信息（启动、停止、重启，返回完整响应，包含status和summary）
+  const getCollectorOperationNodes = async (params: {
+    taskId: string | number;
+    page?: number;
+    page_size?: number;
+  }) => {
+    const body: { page?: number; page_size?: number } = {};
+    if (params.page !== undefined) {
+      body.page = params.page;
+    }
+    if (params.page_size !== undefined) {
+      body.page_size = params.page_size;
+    }
+    const res = await post(
+      `/node_mgmt/api/node/collector/action/${params.taskId}/nodes/`,
+      body
+    );
+    // 返回完整响应，让调用方处理 status 和 summary
+    return (
+      res || {
+        items: [],
+        status: 'running',
+        summary: { total: 0, waiting: 0, running: 0, success: 0, error: 0 }
+      }
+    );
+  };
+
+  // 批量绑定或更新节点的采集器配置
+  const batchBindCollector = async (data: UpdateConfigReq) => {
+    return await post('/node_mgmt/api/node/batch_binding_configuration/', data);
+  };
+
+  // 更新节点名称和组织
+  const updateNode = async (data: NodeParams) => {
+    const { id, ...remain } = data;
+    return await patch(`/node_mgmt/api/node/${String(id)}/update/`, remain);
+  };
+
+  // 为所选节点统一替换所属组织
+  const batchUpdateNodeOrganizations = async (
+    data: BatchUpdateNodeOrganizationsParams
+  ) => {
+    return await post(
+      '/node_mgmt/api/node/batch_update_organizations/',
+      data
+    );
+  };
+
+  // 批量操作节点的采集器（启动、停止、重启）
+  const batchOperationCollector = async (data: {
+    node_ids?: string[];
+    collector_id?: string;
+    operation?: string;
+  }) => {
+    return await post('/node_mgmt/api/node/batch_operate_collector/', data);
+  };
+
+  return {
+    getNodeList,
+    exportNodeList,
+    delNode,
+    modulePush,
+    getNodeStateEnum,
+    getPackages,
+    uninstallController,
+    installController,
+    installCollector,
+    getControllerNodes,
+    getCollectorNodes,
+    getCollectorOperationNodes,
+    batchBindCollector,
+    batchOperationCollector,
+    updateNode,
+    batchUpdateNodeOrganizations
+  };
+};
+
+export default useNodeApi;

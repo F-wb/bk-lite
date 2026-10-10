@@ -1,0 +1,213 @@
+"""企业微信 ChatFlow 工具类
+
+继承 BaseChatFlowUtils，实现企业微信特定的消息发送逻辑
+"""
+
+import io
+import time
+
+import xmltodict
+from django.http import HttpResponse
+from wechatpy.enterprise import WeChatClient
+from wechatpy.enterprise.events import EVENT_TYPES
+from wechatpy.enterprise.messages import MESSAGE_TYPES
+from wechatpy.messages import UnknownMessage
+from wechatpy.utils import to_text
+
+from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.utils.base_chat_flow_utils import BaseChatFlowUtils
+
+
+class WechatChatFlowUtils(BaseChatFlowUtils):
+    """企业微信 ChatFlow 工具类"""
+
+    # 渠道配置
+    channel_name = "企业微信"
+    channel_code = "enterprise_wechat"
+    cache_key_prefix = "wechat_msg"
+
+    def send_message_chunks(self, user_id, text: str, agent_id, corp_id, secret):
+        """分片发送较长的消息"""
+        if not text:
+            return
+        wechat_client = WeChatClient(
+            corp_id,
+            secret,
+        )
+        if len(text) <= 500:
+            wechat_client.message.send_markdown(agent_id, user_id, text)
+            return
+
+        # 按最大长度切分消息
+        start = 0
+        while start < len(text):
+            end = start + 500
+            chunk = text[start:end]
+            time.sleep(0.2)
+            wechat_client.message.send_markdown(agent_id, user_id, chunk)
+            start = end
+
+    @staticmethod
+    def parse_message(xml):
+        """解析企业微信消息"""
+        if not xml:
+            return
+        message = xmltodict.parse(to_text(xml))["xml"]
+        message_type = message["MsgType"].lower()
+        if message_type == "event":
+            event_type = message["Event"].lower()
+            message_class = EVENT_TYPES.get(event_type, UnknownMessage)
+        else:
+            message_class = MESSAGE_TYPES.get(message_type, UnknownMessage)
+        return message_class(message)
+
+    def get_wechat_node_config(self, bot_chat_flow):
+        """从ChatFlow中获取企业微信节点配置
+
+        Returns:
+            tuple: (wechat_config_dict, error_response)
+                   成功时返回配置字典和None，失败时返回None和错误响应
+        """
+        flow_nodes = bot_chat_flow.flow_json.get("nodes", [])
+        wechat_nodes = [node for node in flow_nodes if node.get("type") == "enterprise_wechat"]
+
+        if not wechat_nodes:
+            logger.error(f"企业微信ChatFlow执行失败：Bot {self.bot_id} 工作流中没有企业微信节点")
+            return None, HttpResponse("success")
+
+        wechat_node = wechat_nodes[0]
+        wechat_data = wechat_node.get("data", {})
+        wechat_config = wechat_data.get("config", {})
+
+        # 验证必需参数
+        required_params = ["token", "aes_key", "corp_id", "agent_id", "secret"]
+        missing_params = [p for p in required_params if not wechat_config.get(p)]
+        wechat_config["node_id"] = wechat_node["id"]
+        if missing_params:
+            logger.error(f"企业微信ChatFlow执行失败：Bot {self.bot_id} 缺少配置参数: {', '.join(missing_params)}")
+            return None, HttpResponse("success")
+
+        return wechat_config, None
+
+    def handle_url_verification(self, crypto, signature, timestamp, nonce, echostr):
+        """处理企业微信URL验证
+
+        Returns:
+            HttpResponse: URL验证响应
+        """
+        if not echostr:
+            logger.error("企业微信URL验证失败：缺少echostr参数")
+            return HttpResponse("fail")
+
+        try:
+            logger.info(f"各参数如下： signature【{signature}】, timestamp【{timestamp}】, nonce【{nonce}】, echostr【{echostr}】")
+            echo_str = crypto.check_signature(signature, timestamp, nonce, echostr)
+            logger.info(f"企业微信URL验证成功，Bot {self.bot_id}")
+            return HttpResponse(echo_str)
+        except Exception as e:
+            logger.error(f"企业微信URL验证失败，Bot {self.bot_id}，错误: {str(e)}")
+            return HttpResponse("fail")
+
+    def send_reply(self, reply_text: str, sender_id: str, config: dict):
+        """发送回复消息到企业微信（实现基类抽象方法）
+
+        Args:
+            reply_text: 回复文本
+            sender_id: 发送者ID
+            config: 企业微信配置，包含 agent_id, corp_id, secret
+        """
+        agent_id = config["agent_id"]
+        corp_id = config["corp_id"]
+        secret = config["secret"]
+
+        # 处理换行符
+        reply_text = reply_text.replace("\r\n", "\n").replace("\r", "\n")
+        reply_text_list = reply_text.split("\n")
+
+        # 每50行发送一次，避免消息过长
+        for i in range(0, len(reply_text_list), 50):
+            msg_chunk = "\n".join(reply_text_list[i : i + 50])
+            if msg_chunk.strip():  # 只发送非空消息
+                try:
+                    self.send_message_chunks(sender_id, msg_chunk, agent_id, corp_id, secret)
+                except Exception as send_err:
+                    logger.error(f"企业微信发送消息失败，Bot {self.bot_id}，错误: {str(send_err)}")
+
+    def send_image_reply(self, image, sender_id: str, config: dict):
+        """上传临时素材并以 image 消息发送。"""
+
+        agent_id = config["agent_id"]
+        corp_id = config["corp_id"]
+        secret = config["secret"]
+        wechat_client = WeChatClient(corp_id, secret)
+        name = f"{(getattr(image, 'alt', None) or 'image').strip() or 'image'}.png"
+        media = wechat_client.media.upload("image", (name, io.BytesIO(image.content)))
+        media_id = media.get("media_id") if isinstance(media, dict) else getattr(media, "media_id", None)
+        if not media_id:
+            raise RuntimeError("企业微信图片上传未返回 media_id")
+        wechat_client.message.send_image(agent_id, sender_id, media_id)
+
+    def handle_wechat_message(self, request, crypto, bot_chat_flow, wechat_config):
+        """处理企业微信消息
+
+        采用 Celery 异步处理模式：
+        1. 立即返回 success 给企业微信（避免 5 秒超时重试）
+        2. 使用两阶段去重（processing → completed）
+        3. 通过 Celery 任务异步执行 ChatFlow 并回复
+
+        Returns:
+            HttpResponse: 消息处理响应
+        """
+        signature = request.GET.get("signature", "") or request.GET.get("msg_signature", "")
+        timestamp = request.GET.get("timestamp", "")
+        nonce = request.GET.get("nonce", "")
+
+        # 验证参数完整性
+        if not signature or not timestamp or not nonce:
+            logger.error(f"企业微信消息处理失败：缺少签名参数，Bot {self.bot_id}")
+            return HttpResponse("success")
+
+        try:
+            # 解密消息
+            decrypted_xml = crypto.decrypt_message(request.body, signature, timestamp, nonce)
+
+            # 解析消息
+            msg = self.parse_message(decrypted_xml)
+
+            # 只处理文本消息
+            if msg.type != "text":
+                logger.info(f"企业微信收到非文本消息，类型: {msg.type}，Bot {self.bot_id}，忽略处理")
+                return HttpResponse("success")
+
+            # 获取消息内容和发送者
+            message = getattr(msg, "content", "")
+            sender_id = getattr(msg, "source", "")
+            msg_id = getattr(msg, "id", "") or f"{sender_id}:{hash(message)}:{timestamp}"
+
+            if not message:
+                logger.warning(f"企业微信收到空消息，Bot {self.bot_id}，发送者: {sender_id}")
+                return HttpResponse("success")
+
+            # 两阶段去重检查（标记为 processing）
+            if self.is_message_processed(msg_id):
+                logger.info(f"企业微信消息已处理或处理中，跳过，Bot {self.bot_id}，MsgId {msg_id}")
+                return HttpResponse("success")
+
+            # 使用 Celery 任务异步处理（替代 daemon 线程）
+            from apps.opspilot.tasks import process_wechat_message
+
+            process_wechat_message.delay(
+                bot_id=self.bot_id,
+                msg_id=msg_id,
+                message=message,
+                sender_id=sender_id,
+                config=wechat_config,
+            )
+
+            logger.info(f"企业微信消息已接收，Celery 任务已投递，Bot {self.bot_id}，MsgId {msg_id}")
+            return HttpResponse("success")
+
+        except Exception as e:
+            logger.error(f"企业微信ChatFlow流程执行失败，Bot {self.bot_id}，错误: {str(e)}")
+            logger.exception(e)
+            return HttpResponse("success")

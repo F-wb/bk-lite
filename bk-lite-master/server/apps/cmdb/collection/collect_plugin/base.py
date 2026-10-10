@@ -1,0 +1,142 @@
+# -- coding: utf-8 --
+# @File: base.py
+# @Time: 2025/3/25 17:15
+# @Author: windyzhao
+from abc import ABCMeta, abstractmethod
+from datetime import datetime, timezone
+
+from apps.cmdb.collection.query_vm import Collection
+from apps.cmdb.models import CollectModels
+from apps.core.logger import cmdb_logger as logger
+
+
+def is_failed_vm_metric(row):
+    """识别仅用于原始详情展示、不能进入 CMDB 计算的失败指标。"""
+    metric = row.get("metric", {}) if isinstance(row, dict) else {}
+    return str(metric.get("collect_status", "")).lower() == "failed" or bool(metric.get("cmdb_collect_error"))
+
+
+class CollectBase(metaclass=ABCMeta):
+    """
+     k8s、阿里云、vc 在vm对比后把旧数据自动删除，如果无数据，定义为这个采集任务异常，任务的数据清空，但是不碰cmdb的数据
+    然后其他对象模型的采集，不删除数据
+    """
+
+    _MODEL_ID = None  # 模型ID，需要删除cmdb数据的采集子类需要定义 不定义不删除
+
+    def __init__(self, inst_name, inst_id, task_id, *args, collect_inst=None, **kwargs):
+        self._collect_inst = collect_inst
+        self.inst_id = inst_id
+        self.task_id = task_id
+        self.inst_name = inst_name
+        self._instance_id = f"cmdb_{self.task_id}"
+        self.round_ts = kwargs.pop("round_ts", None)
+        self.round_completed_at = kwargs.pop("round_completed_at", None)
+        self.snapshot_complete = kwargs.pop("snapshot_complete", None)
+        if self.round_ts is None and collect_inst is not None:
+            self.round_ts = getattr(collect_inst, "_sync_round_ts", None)
+        if self.round_completed_at is None and collect_inst is not None:
+            self.round_completed_at = getattr(collect_inst, "_sync_round_completed_at", None)
+        if self.snapshot_complete is None and collect_inst is not None:
+            self.snapshot_complete = getattr(collect_inst, "_sync_snapshot_complete", None)
+        if not self.inst_name:
+            self.inst_name = self._resolve_inst_name_from_task() or self.inst_name
+        assert self.check_metrics(), "请定义_metrics"
+        self.collection_metrics_dict = {i: [] for i in self._metrics}
+        try:
+            # [T, C] 已由 VM 查询限定时，该轮次可能是恢复窗口内的历史快照，
+            # 不能再用“距当前时间超过一天”把它丢弃。
+            self.timestamp_gt = (
+                self.round_ts is not None and self.round_completed_at is not None and float(self.round_completed_at) >= float(self.round_ts)
+            )
+        except (TypeError, ValueError):
+            self.timestamp_gt = False
+        self.asso = "assos"
+        self.result = {}
+        self.raw_data = []
+
+    def _resolve_inst_name_from_task(self) -> str:
+        task_inst_data = self.get_collect_inst().instances
+        # 多实例任务没有单一 inst_name；回填第一台会让后续主机/组件全部挂到同一 CI。
+        if not isinstance(task_inst_data, list) or len(task_inst_data) != 1:
+            return ""
+        first_item = task_inst_data[0]
+        if not isinstance(first_item, dict):
+            return ""
+        return str(first_item.get("inst_name") or "")
+
+    @property
+    @abstractmethod
+    def _metrics(self):
+        """指标名称"""
+        raise NotImplementedError
+
+    def check_metrics(self):
+        return hasattr(self, "_metrics")
+
+    @abstractmethod
+    def format_data(self, data):
+        """格式化数据"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def format_metrics(self):
+        """格式化指标"""
+        raise NotImplementedError
+
+    def prom_sql(self):
+        sql = " or ".join("{}{{instance_id='{}'}}".format(m, self._instance_id) for m in self._metrics)
+        return sql
+
+    def get_collect_inst(self):
+        if self._collect_inst is not None:
+            return self._collect_inst
+        instance = CollectModels.objects.get(id=self.task_id)
+        return instance
+
+    @property
+    def model_id(self):
+        instance = self.get_collect_inst()
+        return instance.model_id
+
+    def query_data(self):
+        """查询数据"""
+        sql = self.prom_sql()
+        collection = Collection()
+        if self.round_ts is None:
+            data = collection.query(sql)
+        else:
+            data = collection.query(
+                sql,
+                min_timestamp=self.round_ts,
+                max_timestamp=self.round_completed_at,
+            )
+        return data.get("data", [])
+
+    def run(self):
+        """执行"""
+        data = self.query_data()
+        # 原始详情保留失败指标，CMDB 计算只处理成功返回的数据。
+        self.raw_data = list(data.get("result", []))
+        success_data = dict(data)
+        success_data["result"] = [row for row in self.raw_data if not is_failed_vm_metric(row)]
+        self.format_data(success_data)
+        self.format_metrics()
+        return self.result
+
+    @staticmethod
+    def convert_datetime_format(time_str):
+        if not time_str:
+            return ""
+        try:
+            # 解析为 datetime 对象
+            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            # 添加微秒并设置为 UTC 时区
+            dt_utc = dt.replace(tzinfo=timezone.utc)
+            # 转换为 ISO 8601 格式
+            iso_format = dt_utc.isoformat()
+        except Exception as err:
+            logger.error("==Time Change Error! error={}==".format(err))
+            iso_format = ""
+
+        return iso_format

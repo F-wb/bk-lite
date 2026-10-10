@@ -1,0 +1,145 @@
+"""作业执行相关模型"""
+
+from django.db import models
+
+from apps.core.models.maintainer_info import MaintainerInfo
+from apps.core.models.time_info import TimeInfo
+from apps.job_mgmt.constants import CallbackType, ExecutionStatus, JobType, OverwriteStrategy, ScriptType, TargetSource, TriggerSource
+from apps.job_mgmt.models.playbook import Playbook
+from apps.job_mgmt.models.script import Script
+
+
+class JobExecution(TimeInfo, MaintainerInfo):
+    """
+    作业执行记录
+
+    记录每次作业执行的主记录
+    """
+
+    class TerminalSource(models.TextChoices):
+        ANSIBLE_CALLBACK = "ansible_callback", "Ansible 真实回调"
+        CANCEL_TIMEOUT = "cancel_timeout", "取消超时兜底"
+        EXECUTION_TIMEOUT = "execution_timeout", "执行超时兜底"
+        DISPATCH_TIMEOUT = "dispatch_timeout", "调度超时兜底"
+
+    name = models.CharField(max_length=256, verbose_name="作业名称")
+
+    job_type = models.CharField(max_length=32, choices=JobType.CHOICES, verbose_name="作业类型")
+    trigger_source = models.CharField(max_length=32, choices=TriggerSource.CHOICES, default=TriggerSource.MANUAL, verbose_name="触发来源")
+    status = models.CharField(max_length=32, choices=ExecutionStatus.CHOICES, default=ExecutionStatus.PENDING, db_index=True, verbose_name="执行状态")
+    terminal_source = models.CharField(
+        max_length=32,
+        choices=TerminalSource.choices,
+        blank=True,
+        default="",
+        null=True,
+        verbose_name="终态写入来源",
+    )
+    cancel_finalize_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="取消兜底收敛时间",
+    )
+    converge_deadline_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="执行状态收敛截止时间",
+    )
+    callback_attempt_id = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        null=True,
+        verbose_name="Ansible 回调执行 attempt ID",
+    )
+    callback_token_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        null=True,
+        verbose_name="Ansible 回调令牌摘要",
+    )
+
+    # 关联的脚本/Playbook（可为空，快速执行场景）
+    script = models.ForeignKey(Script, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="关联脚本")
+    playbook = models.ForeignKey(Playbook, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="关联Playbook")
+    playbook_version = models.CharField(max_length=32, blank=True, default="", verbose_name="执行时Playbook版本")
+    playbook_temp_file_key = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        null=True,
+        verbose_name="Playbook NATS 临时文件 Key",
+    )
+
+    # 关联的定时任务（定时触发时设置，用于并发策略判断）
+    scheduled_task = models.ForeignKey("job_mgmt.ScheduledTask", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="关联定时任务")
+    enforce_scheduled_team_boundary = models.BooleanField(
+        default=False,
+        verbose_name="执行时强制定时任务团队边界",
+    )
+
+    # 目标来源
+    target_source = models.CharField(max_length=32, choices=TargetSource.CHOICES, default=TargetSource.MANUAL, verbose_name="目标来源")
+
+    # 目标列表（JSONField 存储）
+    # node_mgmt 来源: [{"node_id": "xxx", "name": "xxx", "ip": "1.2.3.4", "os": "linux", "cloud_region_id": 1}]
+    # manual 来源: [{"target_id": 1, "name": "xxx", "ip": "1.2.3.4"}]
+    target_list = models.JSONField(default=list, verbose_name="目标列表")
+
+    # 执行结果（每个目标的执行结果）
+    execution_results = models.JSONField(default=list, verbose_name="执行结果")
+
+    # 执行参数（脚本/Playbook 的参数值）
+    params = models.TextField(blank=True, default="", verbose_name="执行参数")
+
+    # 脚本执行专用字段
+    script_type = models.CharField(max_length=32, choices=ScriptType.CHOICES, blank=True, default="", verbose_name="脚本类型")
+    script_content = models.TextField(blank=True, default="", verbose_name="脚本内容")
+
+    # 文件分发专用字段
+    # [{"name": "app.tar.gz", "size": 1024000, "file_key": "xxx", "bucket_name": "job-mgmt-files"}]
+    files = models.JSONField(default=list, verbose_name="分发文件列表")
+    target_path = models.CharField(max_length=512, blank=True, default="", verbose_name="目标路径")
+    overwrite_strategy = models.CharField(max_length=32, choices=OverwriteStrategy.CHOICES, default=OverwriteStrategy.OVERWRITE, verbose_name="覆盖策略")
+
+    # 超时设置
+    timeout = models.IntegerField(default=600, verbose_name="超时时间")
+
+    # 执行时间
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name="开始时间")
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name="结束时间")
+
+    # 统计信息
+    total_count = models.IntegerField(default=0, verbose_name="总目标数")
+    success_count = models.IntegerField(default=0, verbose_name="成功数")
+    failed_count = models.IntegerField(default=0, verbose_name="失败数")
+
+    # 执行用户（快照，记录执行时的凭据用户名）
+    executor_user = models.CharField(max_length=128, blank=True, default="", verbose_name="执行用户")
+
+    # 任务完成回调（第三方 API 调用时传入，任务完成后通知）
+    # callback_type 选择投递通道：web=HTTP POST 到 callback_url；nats=publish 到 callback_subject；both=两者都投
+    callback_type = models.CharField(max_length=16, choices=CallbackType.CHOICES, default=CallbackType.WEB, verbose_name="回调通道")
+    callback_url = models.CharField(max_length=512, null=True, blank=True, verbose_name="回调地址（web通道）")
+    callback_subject = models.CharField(max_length=256, null=True, blank=True, verbose_name="NATS回调主题（nats通道）")
+
+    # Celery 任务 ID（用于 revoke 取消队列中的任务）
+    celery_task_id = models.CharField(max_length=256, blank=True, default="", verbose_name="Celery任务ID")
+
+    # 组织归属
+    team = models.JSONField(default=list, verbose_name="团队ID列表")
+
+    class Meta:
+        verbose_name = "作业执行"
+        verbose_name_plural = verbose_name
+        db_table = "job_execution"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["scheduled_task", "status"], name="jobexec_task_status_idx"),
+            models.Index(fields=["status", "converge_deadline_at"], name="jobexec_status_deadline_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.name}({self.get_status_display()})"

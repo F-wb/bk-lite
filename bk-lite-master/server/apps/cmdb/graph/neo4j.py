@@ -1,0 +1,1233 @@
+import json
+import os
+from typing import List, Union
+
+from dotenv import load_dotenv
+from neo4j import GraphDatabase, Query
+from neo4j.graph import Path
+
+from apps.cmdb.constants.constants import INSTANCE, ModelConstraintKey
+from apps.cmdb.display_field import ExcludeFieldsCache
+from apps.cmdb.graph.format_type import FORMAT_TYPE_PARAMS, ParameterCollector, attr_values_equal, coerce_cloud_id_properties
+from apps.cmdb.graph.validators import CQLValidator
+from apps.cmdb.services.unique_rule import raise_unique_rule_conflict_if_needed
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.logger import cmdb_logger as logger
+
+load_dotenv()
+
+
+class Neo4jClient:
+    # 与 FalkorDBClient 对齐：全文检索权限条件走参数化 Cypher。
+    ENABLE_PARAMETERIZATION = True
+
+    def __init__(self):
+        self.driver = GraphDatabase.driver(
+            os.getenv("NEO4J_URI"),
+            auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
+        )
+        self.session = None
+
+    def close(self):
+        """关闭连接"""
+        if self.session:
+            self.session.close()
+        if self.driver:
+            self.driver.close()
+
+    def __enter__(self):
+        self.session = self.driver.session()
+        # print("连接了neo4j")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        # print("关闭了neo4j连接")
+
+    def entity_to_list(self, data: iter):
+        """将使用fetchall查询的结果转换成列表类型"""
+        return [self.entity_to_dict(i) for i in data]
+
+    def entity_to_dict(self, data: tuple):
+        """将使用single查询的结果转换成字典类型"""
+        return dict(_id=data[0].id, _label=list(data[0].labels)[0], **coerce_cloud_id_properties(dict(data[0]._properties)))
+
+    def edge_to_list(self, data: iter, return_entity: bool):
+        """将使用fetchall查询的结果转换成列表类型"""
+        result = []
+        for i in data:
+            result.append(
+                {
+                    "src": self.entity_to_dict((i[0].start_node,)),
+                    "edge": self.edge_to_dict((i[0].relationships[0],)),
+                    "dst": self.entity_to_dict((i[0].end_node,)),
+                }
+            )
+        return result if return_entity else [i["edge"] for i in result]
+
+    def edge_to_dict(self, data: tuple):
+        """将使用single查询的结果转换成字典类型"""
+        return dict(_id=data[0].id, _label=data[0].type, **data[0]._properties)
+
+    def format_properties(self, properties: dict):
+        """将属性格式化为CQL中的字符串格式，正确处理字符串转义"""
+        properties_str = "{"
+        for key, value in properties.items():
+            if isinstance(value, str):
+                # 转义字符串中的单引号和反斜杠
+                escaped_value = value.replace("\\", "\\\\").replace("'", "\\'")
+                properties_str += f"{key}:'{escaped_value}',"
+            else:
+                properties_str += f"{key}:{value},"
+        properties_str = properties_str[:-1]
+        properties_str += "}"
+        return properties_str
+
+    def create_entity(
+        self,
+        label: str,
+        properties: dict,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+        attrs: list = None,
+    ):
+        """
+        快速创建一个实体
+        """
+        result = self._create_entity(label, properties, check_attr_map, exist_items, operator, attrs)
+        return result
+
+    @staticmethod
+    def check_unique_attr(item, check_attr_map, exist_items, is_update=False):
+        """校验唯一属性"""
+        not_only_attr = set()
+
+        check_attrs = [i for i in check_attr_map.keys() if i in item] if is_update else check_attr_map.keys()
+
+        for exist_item in exist_items:
+            for attr in check_attrs:
+                if attr_values_equal(attr, exist_item[attr], item[attr]):
+                    not_only_attr.add(attr)
+
+        if not not_only_attr:
+            return
+
+        message = ""
+        for attr in not_only_attr:
+            message += f"{check_attr_map[attr]} exist；"
+
+        raise BaseAppException(message)
+
+    @staticmethod
+    def check_unique_rules(
+        items,
+        unique_rules,
+        exist_items,
+        attrs_by_id,
+        exclude_instance_ids=None,
+    ):
+        raise_unique_rule_conflict_if_needed(
+            unique_rules=unique_rules,
+            items=items,
+            exist_items=exist_items,
+            attrs_by_id=attrs_by_id,
+            exclude_instance_ids=exclude_instance_ids,
+        )
+
+    def check_required_attr(self, item, check_attr_map, is_update=False):
+        """校验必填属性"""
+        not_required_attr = set()
+
+        check_attrs = [i for i in check_attr_map.keys() if i in item] if is_update else check_attr_map.keys()
+
+        for attr in check_attrs:
+            if not item.get(attr):
+                not_required_attr.add(attr)
+
+        if not not_required_attr:
+            return
+
+        message = ""
+        for attr in not_required_attr:
+            # 记录必填项目为空
+            message += f"{check_attr_map[attr]} is empty；"
+
+        raise BaseAppException(message)
+
+    def get_editable_attr(self, item, check_attr_map):
+        """取可编辑属性"""
+        return {k: v for k, v in item.items() if k in check_attr_map}
+
+    def _create_entity(
+        self,
+        label: str,
+        properties: dict,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+        attrs: list = None,
+    ):
+        # 校验必填项标签非空
+        if not label:
+            raise BaseAppException("label is empty")
+
+        if attrs:
+            from apps.cmdb.validators import FieldValidator
+
+            validation_errors = FieldValidator.validate_instance_data(properties, attrs)
+            if validation_errors:
+                error_msg = "; ".join([f"{err['field_name']}: {err['error']}" for err in validation_errors])
+                raise BaseAppException(f"字段校验失败: {error_msg}")
+
+        # 校验唯一属性
+        self.check_unique_attr(properties, check_attr_map.get("is_only", {}), exist_items)
+
+        self.check_unique_rules(
+            [properties],
+            check_attr_map.get("unique_rules", []),
+            exist_items,
+            check_attr_map.get("attrs_by_id", {}),
+        )
+
+        # 校验必填项
+        self.check_required_attr(properties, check_attr_map.get("is_required", {}))
+
+        # 补充创建人
+        if operator:
+            properties.update(_creator=operator)
+
+        # 创建实体
+        properties_str = self.format_properties(properties)
+        entity = self.session.run(f"CREATE (n:{label} {properties_str}) RETURN n").single()
+
+        return self.entity_to_dict(entity)
+
+    def create_edge(
+        self,
+        label: str,
+        a_id: int,
+        a_label: str,
+        b_id: int,
+        b_label: str,
+        properties: dict,
+        check_asst_key: str,
+    ):
+        """
+        快速创建一条边
+        """
+        result = self._create_edge(label, a_id, a_label, b_id, b_label, properties, check_asst_key)
+        return result
+
+    def _create_edge(
+        self,
+        label: str,
+        a_id: int,
+        a_label: str,
+        b_id: int,
+        b_label: str,
+        properties: dict,
+        check_asst_key: str = "model_asst_id",
+    ):
+        # 校验必填项标签非空
+        if not label:
+            raise BaseAppException("label is empty")
+
+        # 校验边是否已经存在
+        check_asst_val = properties.get(check_asst_key)
+        edge_count = self.session.run(
+            f"MATCH (a:{a_label})-[e]-(b:{b_label}) "
+            f"WHERE id(a) = {a_id} AND id(b) = {b_id} "
+            f"AND e.{check_asst_key} = '{check_asst_val}' "
+            "RETURN COUNT(e) AS count"
+            # noqa
+        ).single()["count"]
+        if edge_count > 0:
+            raise BaseAppException("edge already exists")
+
+        # 创建边
+        properties_str = self.format_properties(properties)
+        edge = self.session.run(
+            # f"MATCH (a:{a_label}), (b:{b_label}) WHERE id(a) = {a_id} AND id(b) = {b_id} CREATE (a)-[e:{label} {properties_str}]->(b) RETURN e"  # noqa
+            f"MATCH (a:{a_label}) WHERE id(a) = {a_id} "
+            f"WITH a MATCH (b:{b_label}) WHERE id(b) = {b_id} "
+            f"CREATE (a)-[e:{label} {properties_str}]->(b) RETURN e"
+            # noqa
+        ).single()
+
+        return self.edge_to_dict(edge)
+
+    def batch_create_entity(
+        self,
+        label: str,
+        properties_list: list,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+        attrs: list = None,
+    ):
+        """批量创建实体"""
+        results = []
+        for index, properties in enumerate(properties_list):
+            result = {}
+            try:
+                entity = self._create_entity(label, properties, check_attr_map, exist_items, operator, attrs)
+                result.update(data=entity, success=True, message="")
+                exist_items.append(entity)
+            except Exception as e:
+                message = f"article {index + 1} data, {e}"
+                result.update(message=message, success=False, data=properties)
+            results.append(result)
+        return results
+
+    def batch_create_edge(
+        self,
+        label: str,
+        a_label: str,
+        b_label: str,
+        edge_list: list,
+        check_asst_key: str,
+    ):
+        """批量创建边"""
+        results = []
+        for index, edge_info in enumerate(edge_list):
+            result = {}
+            try:
+                a_id = edge_info["src_id"]
+                b_id = edge_info["dst_id"]
+                edge = self._create_edge(label, a_id, a_label, b_id, b_label, edge_info, check_asst_key)
+                result.update(data=edge, success=True)
+            except Exception as e:
+                message = f"article {index + 1} data, {e}"
+                result.update(message=message, success=False)
+            results.append(result)
+        return results
+
+    def format_search_params(
+        self,
+        params: list,
+        param_type: str = "AND",
+        collector: ParameterCollector = None,
+        param_collector: ParameterCollector = None,
+    ):
+        """
+        参数化查询格式化（使用 FORMAT_TYPE_PARAMS 消除 Cypher 注入风险）。
+
+        返回 (params_str, query_params) 元组：
+          - params_str: 带 $placeholder 的 Cypher WHERE 子句片段
+          - query_params: 传给 session.run 的参数字典
+
+        bool: {"field": "is_host", "type": "bool", "value": True} -> "n.is_host = $bool1"
+        str=: {"field": "name", "type": "str=", "value": "host"} -> "n.name = $str1"
+        id=:  {"field": "id",   "type": "id=",  "value": 115}   -> "ID(n) = $id1"
+        """
+        if collector is None:
+            collector = param_collector
+        if collector is None:
+            collector = ParameterCollector()
+
+        parts = []
+        sep = f" {param_type} "
+        for param in params:
+            method = FORMAT_TYPE_PARAMS.get(param["type"])
+            if not method:
+                continue
+            parts.append(method(param, collector))
+
+        params_str = f"({sep.join(parts)})" if parts else ""
+        return params_str, collector.get_params()
+
+    def format_final_params(self, search_params: list, search_param_type: str = "AND", permission_params=""):
+        """组合用户查询条件与权限条件，返回 (combined_str, query_params) 元组。"""
+        collector = ParameterCollector()
+        search_params_str, query_params = self.format_search_params(search_params, search_param_type, collector)
+
+        if not search_params_str:
+            return permission_params, query_params
+
+        if not permission_params:
+            return search_params_str, query_params
+
+        return f"{search_params_str} AND {permission_params}", query_params
+
+    def query_entity(
+        self,
+        label: str,
+        params: list,
+        page: dict = None,
+        order: str = None,
+        order_type: str = "ASC",
+        param_type="AND",
+        permission_params: str = "",
+        permission_or_creator_filter: dict = None,
+        format_permission_dict: dict = None,
+        organization_field: str = "organization",
+        case_sensitive: bool = True,
+        include_count: bool = True,
+        fields: list[str] | None = None,
+    ):
+        """
+        查询实体
+        """
+        label_str = f":{label}" if label else ""
+
+        # 处理权限或创建人的OR条件
+        if format_permission_dict:
+            collector = ParameterCollector()
+            base_params, _ = self.format_search_params(params, param_type=param_type, collector=collector)
+            permission_filters = []
+            for organization_id, query_list in format_permission_dict.items():
+                organization_params, _ = self.format_search_params(
+                    [{"field": organization_field, "type": "list[]", "value": [organization_id]}],
+                    collector=collector,
+                )
+                scoped_params, _ = self.format_search_params(query_list, param_type="OR", collector=collector)
+                parts = [part for part in (organization_params, scoped_params) if part]
+                if parts:
+                    permission_filters.append(f"({' AND '.join(parts)})")
+            permission_clause = f"({' OR '.join(permission_filters)})" if permission_filters else ""
+            params_str = " AND ".join(part for part in (base_params, permission_clause) if part)
+            query_params = collector.get_params()
+        elif permission_or_creator_filter:
+            inst_names = permission_or_creator_filter.get("inst_names", [])
+            creator = permission_or_creator_filter.get("creator")
+
+            # 构建OR条件：有权限的实例 OR 自己创建的实例（参数化，避免注入）
+            perm_collector = ParameterCollector()
+            or_conditions = []
+            if inst_names:
+                perm_param = perm_collector.add_param(inst_names, prefix="perm_inst")
+                or_conditions.append(f"n.inst_name IN {perm_param}")
+            if creator:
+                perm_param = perm_collector.add_param(creator, prefix="perm_creator")
+                or_conditions.append(f"n._creator = {perm_param}")
+
+            or_condition_str = " OR ".join(or_conditions)
+
+            # 将OR条件与其他条件结合
+            params_str, query_params = self.format_search_params(params, param_type=param_type, collector=perm_collector)
+            query_params = perm_collector.get_params()
+            if params_str:
+                params_str = f"({params_str}) AND ({or_condition_str})"
+            else:
+                params_str = f"({or_condition_str})"
+
+            # 结合权限参数
+            if permission_params:
+                params_str = f"{params_str} AND {permission_params}"
+        else:
+            # 原有逻辑
+            params_str, query_params = self.format_final_params(params, search_param_type=param_type, permission_params=permission_params)
+
+        params_str = f"WHERE {params_str}" if params_str else params_str
+
+        from apps.cmdb.graph.export_query import entity_projection
+
+        projection = "n" if fields is None else entity_projection(fields)
+        sql_str = f"MATCH (n{label_str}) {params_str} RETURN {projection}"
+
+        # order by
+        sql_str += f" ORDER BY n.{order} {order_type}" if order else f" ORDER BY ID(n) {order_type}"
+
+        count_str = f"MATCH (n{label_str}) {params_str} RETURN COUNT(n) AS count"
+        count = None
+        if page and include_count:
+            count = self.session.run(count_str, **query_params).single()["count"]
+        if page:
+            sql_str += f" SKIP {page['skip']} LIMIT {page['limit']}"
+
+        objs = self.session.run(sql_str, **query_params)
+        if fields is not None:
+            return [coerce_cloud_id_properties(dict(record[0])) for record in objs], count
+        return self.entity_to_list(objs), count
+
+    def query_cloud_cost(self, plan):
+        """执行云成本只读查询计划并返回稳定的字典行。"""
+        from apps.cmdb.services.cloud_cost.query import CLOUD_COST_QUERY_TIMEOUT_SECONDS, compile_cloud_cost_query
+
+        compiled = compile_cloud_cost_query(plan)
+        query = Query(compiled.statement, timeout=CLOUD_COST_QUERY_TIMEOUT_SECONDS)
+        return [dict(record) for record in self.session.run(query, **compiled.params)]
+
+    def query_entity_by_id(self, id: int):
+        """
+        查询实体详情
+        """
+        obj = self.session.run(f"MATCH (n) WHERE id(n) = {id} RETURN n").single()
+        if not obj:
+            return {}
+        return self.entity_to_dict(obj)
+
+    def query_entity_by_ids(self, ids: list):
+        """
+        查询实体列表
+        """
+        objs = self.session.run(f"MATCH (n) WHERE id(n) IN {ids} RETURN n")
+        if not objs:
+            return []
+        return self.entity_to_list(objs)
+
+    def query_entity_by_inst_names(self, inst_names: list, model_id: str = None):
+        """
+        查询实体列表 通过实例名称
+        """
+        queries = f"AND n.model_id= '{model_id}'" if model_id else ""
+        objs = self.session.run(f"MATCH (n) WHERE n.inst_name IN {inst_names} {queries} RETURN n")
+        if not objs:
+            return []
+        return self.entity_to_list(objs)
+
+    def query_export_associations(self, model_id, inst_uuids, association_ids):
+        from apps.cmdb.graph.export_query import export_association_queries
+
+        return [
+            dict(row)
+            for statement, params in export_association_queries(model_id, inst_uuids, association_ids)
+            for row in self.session.run(statement, **params)
+        ]
+
+    def query_edge(
+        self,
+        label: str,
+        params: list,
+        param_type: str = "AND",
+        return_entity: bool = False,
+    ):
+        """
+        查询边
+        """
+        label_str = f":{label}" if label else ""
+        params_str, query_params = self.format_search_params(params, param_type)
+        params_str = f"WHERE {params_str}" if params_str else params_str
+
+        objs = self.session.run(f"MATCH p=((a)-[n{label_str}]->(b)) {params_str} RETURN p", **query_params)
+
+        return self.edge_to_list(objs, return_entity)
+
+    def query_edge_by_id(self, id: int, return_entity: bool = False):
+        """
+        查询边详情
+        """
+        objs = self.session.run(f"MATCH p=((a)-[n]->(b)) WHERE id(n) = {id} RETURN p")
+        edges = self.edge_to_list(objs, return_entity)
+        return edges[0]
+
+    def format_properties_set(self, properties: dict, alias: str = "n"):
+        """格式化properties的set数据"""
+        properties_str = ""
+        for key, value in properties.items():
+            target = f"{alias}.{key}"
+            if isinstance(value, str):
+                properties_str += f"{target}='{value}',"
+            elif value is None:
+                properties_str += f"{target}=null,"
+            else:
+                properties_str += f"{target}={value},"
+        return properties_str if properties_str == "" else properties_str[:-1]
+
+    def set_entity_properties(
+        self,
+        label: str,
+        entity_ids: list,
+        properties: dict,
+        check_attr_map: dict,
+        exist_items: list,
+        check: bool = True,
+        attrs: list = None,
+    ):
+        """
+        设置实体属性
+        """
+        from apps.cmdb.constants.constants import INSTANCE
+
+        if check:
+            # 校验唯一属性
+            self.check_unique_attr(
+                properties,
+                check_attr_map.get("is_only", {}),
+                exist_items,
+                is_update=True,
+            )
+
+            self.check_unique_rules(
+                check_attr_map.get("validation_items") or [properties],
+                check_attr_map.get("unique_rules", []),
+                exist_items,
+                check_attr_map.get("attrs_by_id", {}),
+                exclude_instance_ids=set(entity_ids),
+            )
+
+            # 校验必填项
+            self.check_required_attr(properties, check_attr_map.get("is_required", {}), is_update=True)
+
+            # 取出可编辑属性
+            properties = self.get_editable_attr(properties, check_attr_map.get("editable", {}))
+
+        if label == INSTANCE and attrs:
+            from apps.cmdb.validators import FieldValidator
+
+            validation_errors = FieldValidator.validate_instance_data(properties, attrs)
+            if validation_errors:
+                error_msg = "; ".join([f"{err['field_name']}: {err['error']}" for err in validation_errors])
+                raise BaseAppException(f"字段校验失败: {error_msg}")
+
+        nodes = self.batch_update_node_properties(label, entity_ids, properties)
+        return self.entity_to_list(nodes)
+
+    def batch_update_entity_properties(self, label: str, entity_ids: list, properties: dict, check_attr_map: dict, check: bool = True):
+        """批量更新实体属性"""
+        if check:
+            # 校验必填项
+            self.check_required_attr(properties, check_attr_map.get("is_required", {}), is_update=True)
+
+            # 取出可编辑属性
+            properties = self.get_editable_attr(properties, check_attr_map.get("editable", {}))
+            if not properties:
+                return []
+
+        nodes = self.batch_update_node_properties(label, entity_ids, properties)
+        return {"data": self.entity_to_list(nodes), "success": True, "message": ""}
+
+    def batch_update_node_properties(self, label: str, node_ids: Union[int, List[int]], properties: dict):
+        """批量更新节点属性"""
+        label_str = f":{label}" if label else ""
+        properties_str = self.format_properties_set(properties)
+        if not properties_str:
+            raise BaseAppException("properties is empty")
+        nodes = self.session.run(f"MATCH (n{label_str}) WHERE id(n) IN {node_ids} SET {properties_str} RETURN n")
+        return nodes
+
+    def batch_update_node_property_values(self, label: str, field: str, property_values: list[dict]):
+        """在一次图查询中为不同节点写入同一字段的不同值。"""
+        validated_label = CQLValidator.validate_label(label)
+        validated_field = CQLValidator.validate_field(field)
+        validated_property_values = CQLValidator.validate_property_values(property_values)
+        if not validated_property_values:
+            return []
+
+        query = (
+            f"UNWIND $property_values AS row " f"MATCH (n:{validated_label}) WHERE id(n) = row.id " f"SET n.{validated_field} = row.value RETURN n"
+        )
+        result = self.session.run(query, property_values=validated_property_values)
+        return self.entity_to_list(result)
+
+    def format_properties_remove(self, attrs: list):
+        """格式化properties的remove数据"""
+        properties_str = ""
+        for attr in attrs:
+            properties_str += f"n.{attr},"
+        return properties_str if properties_str == "" else properties_str[:-1]
+
+    def remove_entitys_properties(self, label: str, params: list, attrs: list):
+        """移除某些实体的某些属性"""
+        label_str = f":{label}" if label else ""
+        properties_str = self.format_properties_remove(attrs)
+        params_str, query_params = self.format_search_params(params)
+        params_str = f"WHERE {params_str}" if params_str else params_str
+
+        self.session.run(f"MATCH (n{label_str}) {params_str} REMOVE {properties_str} RETURN n", **query_params)
+
+    def batch_delete_entity(self, label: str, entity_ids: list):
+        """批量删除实体"""
+        label_str = f":{label}" if label else ""
+        self.session.run(f"MATCH (n{label_str}) WHERE id(n) IN {entity_ids} DETACH DELETE n")
+
+    def detach_delete_entity(self, label: str, id: int):
+        """删除实体，以及实体的关联关系"""
+        label_str = f":{label}" if label else ""
+        self.session.run(f"MATCH (n{label_str}) WHERE id(n) = {id} DETACH DELETE n")
+
+    def delete_edge(self, edge_id: int):
+        """删除边"""
+        self.session.run(f"MATCH ()-[n]->() WHERE id(n) = {edge_id} DELETE n")
+
+    def set_edge_properties(self, edge_id: int, properties: dict):
+        properties_str = self.format_properties_set(properties, alias="e")
+        if not properties_str:
+            raise BaseAppException("properties is empty")
+        edge = self.session.run(f"MATCH ()-[e]->() WHERE id(e) = {edge_id} SET {properties_str} RETURN e").single()
+        if not edge:
+            raise BaseAppException("edge not found")
+        return self.edge_to_dict(edge)
+
+    def entity_objs(self, label: str, params: list, permission_params: str = ""):
+        """实体对象查询"""
+
+        label_str = f":{label}" if label else ""
+        params_str, query_params = self.format_final_params(params, permission_params=permission_params)
+        params_str = f"WHERE {params_str}" if params_str else params_str
+
+        sql_str = f"MATCH (n{label_str}) {params_str} RETURN n"
+
+        inst_objs = self.session.run(sql_str, **query_params)
+        return inst_objs
+
+    def query_topo(self, label: str, inst_id: int):
+        """查询实例拓扑"""
+
+        label_str = f":{label}" if label else ""
+        params_str, query_params = self.format_search_params([{"field": "id", "type": "id=", "value": inst_id}])
+        if params_str:
+            params_str = f"AND {params_str}"
+        src_objs = self.session.run(f"MATCH p=(n{label_str})-[*]->(m{label_str}) WHERE NOT (m)-->() {params_str} RETURN p", **query_params)
+        dst_objs = self.session.run(f"MATCH p=(m{label_str})-[*]->(n{label_str}) WHERE NOT (m)<--() {params_str} RETURN p", **query_params)
+
+        return dict(src_result=self.format_topo(inst_id, src_objs, True), dst_result=self.format_topo(inst_id, dst_objs, False))
+
+    def query_topo_lite(self, label: str, inst_id: int, depth: int = 3, exclude_ids=None):
+        """查询实例拓扑（轻量）：限制返回层级，减少前端一次性渲染与网络传输压力"""
+        depth = max(1, int(depth))
+        probe_depth = depth + 1
+
+        label_str = f":{label}" if label else ""
+        params_str, query_params = self.format_search_params([{"field": "id", "type": "id=", "value": inst_id}])
+        where_clause = f"WHERE {params_str}" if params_str else ""
+
+        src_objs = self.session.run(f"MATCH p=(n{label_str})-[*1..{probe_depth}]->(m{label_str}) {where_clause} RETURN p", **query_params)
+        dst_objs = self.session.run(f"MATCH p=(m{label_str})-[*1..{probe_depth}]->(n{label_str}) {where_clause} RETURN p", **query_params)
+
+        return dict(
+            src_result=self.format_topo_lite(inst_id, src_objs, True, depth=depth, exclude_ids=exclude_ids),
+            dst_result=self.format_topo_lite(inst_id, dst_objs, False, depth=depth, exclude_ids=exclude_ids),
+        )
+
+    def query_network_topo(self, inst_id: int, belong_asst_id: str):
+        """网络拓扑：以设备为中心，查其接口直连的对端设备。返回扁平行列表。"""
+        connect_asst = "interface_connect_interface"
+        query = (
+            "MATCH (i)-[e1]->(dev) WHERE ID(dev) = $inst_id AND e1.model_asst_id = $belong "
+            "MATCH (i)-[e2]-(p) WHERE e2.model_asst_id = $connect "
+            "MATCH (p)-[e3]->(dev2) WHERE e3.asst_id = 'belong' AND ID(dev2) <> $inst_id "
+            "RETURN ID(dev) AS dev_id, dev.inst_name AS dev_name, dev.model_id AS dev_model, "
+            "i.inst_name AS local_if, p.inst_name AS peer_if, "
+            "ID(dev2) AS peer_id, dev2.inst_name AS peer_name, dev2.model_id AS peer_model, "
+            "ID(e2) AS rel_id"
+        )
+        objs = self.session.run(query, inst_id=int(inst_id), belong=belong_asst_id, connect=connect_asst)
+        keys = ["dev_id", "dev_name", "dev_model", "local_if", "peer_if", "peer_id", "peer_name", "peer_model", "rel_id"]
+        return [{k: record[k] for k in keys} for record in objs]
+
+    def format_topo_lite(self, start_id, objs, entity_is_src=True, depth: int = 3, exclude_ids=None):
+        if objs.peek() is None:
+            return {}
+
+        exclude_id_set = set()
+        for value in exclude_ids or []:
+            try:
+                exclude_id_set.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        exclude_id_set.discard(start_id)
+
+        edge_map = {}
+        entity_map = {}
+        for obj in objs:
+            for element in obj:
+                if not isinstance(element, Path):
+                    continue
+                nodes = element.nodes
+                relationships = element.relationships
+                for node in nodes:
+                    entity_map[node.id] = dict(_id=node.id, _label=list(node.labels)[0], **node._properties)
+                for relationship in relationships:
+                    edge_map[relationship.id] = dict(_id=relationship.id, _label=relationship.type, **relationship._properties)
+
+        edges = list(edge_map.values())
+        edges = [edge for edge in edges if edge["src_inst_id"] != edge["dst_inst_id"]]
+        if exclude_id_set:
+            for node_id in exclude_id_set:
+                entity_map.pop(node_id, None)
+            edges = [edge for edge in edges if edge["src_inst_id"] not in exclude_id_set and edge["dst_inst_id"] not in exclude_id_set]
+        entities = list(entity_map.values())
+        if start_id not in entity_map:
+            return {}
+
+        return self.create_node_lite(entity_map[start_id], edges, entities, entity_is_src, level=1, max_depth=depth)
+
+    def create_node_lite(self, entity, edges, entities, entity_is_src=True, level: int = 1, max_depth: int = 3):
+        node = {
+            "_id": entity["_id"],
+            "model_id": entity["model_id"],
+            "inst_name": entity["inst_name"],
+            "children": [],
+        }
+
+        if entity_is_src:
+            entity_key, child_entity_key = "src", "dst"
+        else:
+            entity_key, child_entity_key = "dst", "src"
+
+        if level >= max_depth:
+            # 只在达到最大层级时返回 has_more，用于前端展示“+”
+            node["has_more"] = any(edge.get(f"{entity_key}_inst_id") == entity["_id"] for edge in edges)
+            return node
+
+        for edge in edges:
+            if edge.get(f"{entity_key}_inst_id") == entity["_id"]:
+                child_entity = self.find_entity_by_id(edge.get(f"{child_entity_key}_inst_id"), entities)
+                if child_entity:
+                    child_node = self.create_node_lite(
+                        child_entity,
+                        edges,
+                        entities,
+                        entity_is_src,
+                        level=level + 1,
+                        max_depth=max_depth,
+                    )
+                    child_node["model_asst_id"] = edge.get("model_asst_id")
+                    child_node["asst_id"] = edge.get("asst_id")
+                    node["children"].append(child_node)
+        return node
+
+    @staticmethod
+    def get_topo_config() -> dict:
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            topo_config_path = os.path.join(base_dir, "cmdb_config", "instance", "../support-files/topo_config.json")
+
+            if not os.path.isfile(topo_config_path):
+                logger.warning("Topo config file not found: %s", topo_config_path)
+                return {}
+
+            with open(topo_config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                logger.warning("Topo config is not a dictionary: %s", topo_config_path)
+                return {}
+            return data
+
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Failed to load topo config: %s, error: %s", topo_config_path, e)
+            return {}
+
+    def convert_to_cypher_match(self, label_str: str, model_id: str, params_str: str, dst: bool = True) -> str:
+        """
+        根据 JSON 配置生成 Neo4j Cypher 查询语句
+
+        :param label_str: 节点标签
+        :param model_id: 当前模型 ID
+        :param params_str: WHERE 附加条件（字符串）
+        :param dst: True 查询后继路径，False 查询前驱路径
+        :return: 生成的 Cypher 查询语句
+        """
+        # 方向配置
+        edge_type = "dst" if dst else "src"
+        default_match = (
+            f"MATCH p={f'(m{label_str}) - [*]->(n{label_str})' if dst else f'(n{label_str}) - [*]->(m{label_str})'}"
+            f"WHERE NOT (m){'<--()' if dst else '-->()'} {params_str} RETURN p"
+        )
+        # 获取拓扑配置
+        topo_path = self.get_topo_config().get(model_id)
+
+        # 没有配置
+        if not topo_path:
+            return default_match
+
+        edge_list = topo_path.get(edge_type)
+        if not edge_list:
+            return default_match
+
+        cypher_parts = []
+        node_aliases = {}
+        rep_alias = ""
+
+        # 为每一个关系生成相应的MATCH部分
+        for i, relation in enumerate(edge_list):
+            self_obj = relation["self_obj"]
+            target_obj = relation["target_obj"]
+            assoc = relation["assoc"]
+
+            # 处理self_obj
+            if self_obj not in node_aliases:
+                node_aliases[self_obj] = f"v{i}"
+            self_alias = node_aliases[self_obj]
+
+            # 添加self_obj节点
+            if i == 0:
+                if edge_type == "src":
+                    rep_alias = self_alias
+                cypher_parts.append(f"({self_alias}:instance {{model_id: '{self_obj}'}})")
+
+            # 处理target_obj
+            if target_obj not in node_aliases:
+                node_aliases[target_obj] = f"v{i + 1}"
+            target_alias = node_aliases[target_obj]
+            if edge_type == "dst":
+                rep_alias = target_alias
+            # 添加关系和target_obj节点
+            cypher_parts.append(f"-[:{assoc}]->({target_alias}:instance {{model_id: '{target_obj}'}})")
+
+        # 拼接最终 MATCH
+        match_path = "".join(cypher_parts)
+        where_clause = f"WHERE 1=1 {params_str.replace('n', rep_alias)}"
+
+        return f"MATCH p={match_path}\n{where_clause}\nRETURN p"
+
+    def query_topo_test_config(self, label: str, inst_id: int, model_id: str):
+        """查询实例拓扑"""
+        label_str = f":{label}" if label else ""
+        params_str, query_params = self.format_search_params([{"field": "id", "type": "id=", "value": inst_id}])
+        if params_str:
+            params_str = f"AND {params_str}"
+
+        src_objs = self.session.run(self.convert_to_cypher_match(label_str, model_id, params_str, dst=False), **query_params)
+        dst_objs = self.session.run(self.convert_to_cypher_match(label_str, model_id, params_str, dst=True), **query_params)
+
+        return dict(src_result=self.format_topo(inst_id, src_objs, True), dst_result=self.format_topo(inst_id, dst_objs, False))
+
+    def format_topo(self, start_id, objs, entity_is_src=True):
+        """格式化拓扑数据"""
+
+        if objs.peek() is None:
+            return {}
+
+        edge_map = {}
+        entity_map = {}
+        for obj in objs:
+            for element in obj:
+                if not isinstance(element, Path):
+                    continue
+                # 分离出路径中的点和线
+                nodes = element.nodes  # 获取所有节点
+                relationships = element.relationships  # 获取所有关系
+                for node in nodes:
+                    entity_map[node.id] = dict(_id=node.id, _label=list(node.labels)[0], **node._properties)
+                for relationship in relationships:
+                    edge_map[relationship.id] = dict(_id=relationship.id, _label=relationship.type, **relationship._properties)
+
+        edges = list(edge_map.values())
+        # 去除自己指向自己的边
+        edges = [edge for edge in edges if edge["src_inst_id"] != edge["dst_inst_id"]]
+        entities = list(entity_map.values())
+
+        result = self.create_node(entity_map[start_id], edges, entities, entity_is_src, level=1)
+        return result
+
+    def create_node(
+        self,
+        entity,
+        edges,
+        entities,
+        entity_is_src=True,
+        level: int = 1,
+    ):
+        """entity作为目标"""
+        node = {
+            "_id": entity["_id"],
+            "model_id": entity["model_id"],
+            "inst_name": entity["inst_name"],
+            "children": [],
+        }
+
+        if entity_is_src:
+            entity_key, child_entity_key = "src", "dst"
+        else:
+            entity_key, child_entity_key = "dst", "src"
+
+        for edge in edges:
+            if edge[f"{entity_key}_inst_id"] == entity["_id"]:
+                child_id = edge[f"{child_entity_key}_inst_id"]
+                child_entity = self.find_entity_by_id(child_id, entities)
+                if child_entity:
+                    child_node = self.create_node(
+                        child_entity,
+                        edges,
+                        entities,
+                        entity_is_src,
+                        level=level + 1,
+                    )
+                    child_node["model_asst_id"] = edge["model_asst_id"]
+                    child_node["asst_id"] = edge["asst_id"]
+                    node["children"].append(child_node)
+        if level == 3:
+            node["has_more"] = len(node["children"]) > 0
+        return node
+
+    def find_entity_by_id(self, entity_id, entities):
+        """根据ID找实体"""
+        for entity in entities:
+            if entity["_id"] == entity_id:
+                return entity
+        return None
+
+    @staticmethod
+    def format_instance_permission_params(instance_permission_params: list, created: str = ""):
+        model_list = []
+        instance_conditions = []
+        for perm_param in instance_permission_params:
+            model_id = perm_param.get("model_id")
+            instance_names = perm_param.get("inst_names", [])
+            if model_id and instance_names:
+                # 对于有具体实例权限的模型，只统计指定的实例
+                condition = f"(n.model_id = '{model_id}' AND n.inst_name IN {instance_names})"
+                instance_conditions.append(condition)
+                model_list.append(model_id)
+
+        # 如果有模型ID但没有实例名称，则只统计该模型的所有实例
+        instance_condition_str = " OR ".join(instance_conditions) if instance_conditions else ""
+
+        # 只有在存在具体模型限制时才排除其他模型
+        if model_list and instance_conditions:
+            instance_condition_str += f" OR (NOT n.model_id IN {model_list})"
+
+        # 判断是否为全部权限：没有具体的实例限制条件
+        has_full_permission = not instance_conditions and not model_list
+
+        # 个人创建的过滤 - 只有在没有全部权限时才添加
+        if created and not has_full_permission:
+            if instance_condition_str:
+                instance_condition_str += f" OR (n._creator = '{created}')"
+            else:
+                instance_condition_str = f"n._creator = '{created}'"
+
+        return instance_condition_str
+
+    def entity_count(
+        self,
+        label: str,
+        group_by_attr: str,
+        params: list = None,
+        format_permission_dict: dict = None,
+        permission_params: str = "",
+        instance_permission_params: list = None,
+        created: str = "",
+    ):
+        params = params or []
+        format_permission_dict = format_permission_dict or {}
+        instance_permission_params = instance_permission_params or {}
+        label_str = f":{label}" if label else ""
+
+        combined_collector = ParameterCollector()
+        if format_permission_dict:
+            permission_filters = []
+            for organization_id, query_list in format_permission_dict.items():
+                organization_query = [{"field": "organization", "type": "list[]", "value": [organization_id]}]
+                base_permission_str, _ = self.format_search_params(organization_query, param_type="AND", collector=combined_collector)
+                org_permission_str, _ = self.format_search_params(query_list, param_type="OR", collector=combined_collector)
+
+                if base_permission_str and org_permission_str:
+                    permission_filters.append(f"({base_permission_str} AND {org_permission_str})")
+                elif base_permission_str:
+                    permission_filters.append(base_permission_str)
+
+            if permission_filters:
+                formatted_permission = permission_filters[0] if len(permission_filters) == 1 else f"({' OR '.join(permission_filters)})"
+                permission_params = f"{permission_params} AND {formatted_permission}" if permission_params else formatted_permission
+
+        # 首先应用基础查询参数和组织权限
+        final_params_str, _ = self.format_search_params(params, collector=combined_collector)
+        if final_params_str and permission_params:
+            final_params_str = f"{final_params_str} AND {permission_params}"
+        elif permission_params:
+            final_params_str = permission_params
+
+        # 在组织权限基础上，添加实例权限过滤
+        instance_permission_str = self.format_instance_permission_params(instance_permission_params, created)
+
+        if instance_permission_str:
+            final_params_str = f"{final_params_str} AND ({instance_permission_str})" if final_params_str else f"({instance_permission_str})"
+
+        if final_params_str:
+            final_params_str = f"WHERE {final_params_str}"
+
+        count_sql = f"MATCH (n{label_str}) {final_params_str} RETURN n.{group_by_attr} AS {group_by_attr}, COUNT(n) AS count"
+        data = self.session.run(count_sql, **combined_collector.get_params())
+
+        return {i[group_by_attr]: i["count"] for i in data}
+
+    @staticmethod
+    def _build_exclude_fields_list(exclude_fields: list) -> str:
+        if not exclude_fields:
+            return "[]"
+        validated_fields = []
+        for field in exclude_fields:
+            try:
+                validated_fields.append(f"'{CQLValidator.validate_field(field)}'")
+            except Exception as exc:
+                logger.warning("event=cmdb_neo4j_exclude_field_skipped error_type=%s", type(exc).__name__)
+                continue
+        return "[" + ", ".join(validated_fields) + "]"
+
+    def _full_text_where(
+        self,
+        *,
+        search: str,
+        permission_params: str = "",
+        inst_name_params: str = "",
+        created: str = "",
+        case_sensitive: bool = False,
+        extra_conditions: list | None = None,
+        extra_params: dict | None = None,
+        permission_params_dict: dict | None = None,
+    ) -> tuple[str, dict]:
+        query_params = dict(permission_params_dict or {})
+        if extra_params:
+            query_params.update(extra_params)
+        conditions = []
+        or_filters = [item for item in (permission_params, inst_name_params) if item]
+        if or_filters:
+            conditions.append(f"({' OR '.join(or_filters)})")
+        if created:
+            query_params["created_by"] = created
+            conditions.append("n._creator = $created_by")
+        exclude_list_str = self._build_exclude_fields_list(ExcludeFieldsCache.get_exclude_fields())
+        query_params["search_term"] = search
+        if case_sensitive:
+            search_condition = (
+                f"ANY(key IN keys(n) WHERE "
+                f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                f"n[key] IS NOT NULL AND "
+                f"toString(n[key]) = $search_term)"
+            )
+        else:
+            search_condition = (
+                f"ANY(key IN keys(n) WHERE "
+                f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                f"n[key] IS NOT NULL AND "
+                f"toLower(toString(n[key])) CONTAINS toLower($search_term))"
+            )
+        conditions.append(search_condition)
+        if extra_conditions:
+            conditions.extend(extra_conditions)
+        return " AND ".join(conditions) if conditions else "true", query_params
+
+    def full_text_stats(
+        self,
+        search: str,
+        permission_params: str = "",
+        inst_name_params: str = "",
+        created: str = "",
+        case_sensitive: bool = False,
+        permission_params_dict: dict = None,
+    ) -> dict:
+        where_clause, query_params = self._full_text_where(
+            search=search,
+            permission_params=permission_params,
+            inst_name_params=inst_name_params,
+            created=created,
+            case_sensitive=case_sensitive,
+            permission_params_dict=permission_params_dict,
+        )
+        query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN n.model_id AS model_id, COUNT(n) AS count ORDER BY count DESC"
+        rows = self.session.run(query, **query_params)
+        model_stats = []
+        total = 0
+        for row in rows:
+            count = int(row["count"] or 0)
+            model_stats.append({"model_id": row["model_id"], "count": count})
+            total += count
+        return {"total": total, "model_stats": model_stats}
+
+    def full_text_by_model(
+        self,
+        search: str,
+        model_id: str,
+        permission_params: str = "",
+        inst_name_params: str = "",
+        created: str = "",
+        page: int = 1,
+        page_size: int = 10,
+        case_sensitive: bool = False,
+        permission_params_dict: dict = None,
+    ) -> dict:
+        if not model_id:
+            raise BaseAppException("model_id is required")
+        page = int(page)
+        page_size = int(page_size)
+        if page < 1:
+            raise BaseAppException("page must be >= 1")
+        if page_size < 1 or page_size > 100:
+            raise BaseAppException("page_size must be between 1 and 100")
+        where_clause, query_params = self._full_text_where(
+            search=search,
+            permission_params=permission_params,
+            inst_name_params=inst_name_params,
+            created=created,
+            case_sensitive=case_sensitive,
+            extra_conditions=["n.model_id = $model_id"],
+            extra_params={"model_id": model_id},
+            permission_params_dict=permission_params_dict,
+        )
+        count_query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN COUNT(n) AS total"
+        count_row = self.session.run(count_query, **query_params).single()
+        total = int(count_row["total"] or 0) if count_row else 0
+        skip = (page - 1) * page_size
+        data_query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN n ORDER BY ID(n) SKIP {skip} LIMIT {page_size}"
+        data = self.entity_to_list(self.session.run(data_query, **query_params))
+        return {
+            "model_id": model_id,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "data": data,
+        }
+
+    def full_text(
+        self,
+        search: str,
+        permission_params: str = "",
+        inst_name_params: str = "",
+        created: str = "",
+        case_sensitive: bool = False,
+        permission_params_dict: dict = None,
+    ):
+        """全文检索。签名与 FalkorDB 及 InstanceManage.fulltext_search 对齐。"""
+        where_clause, query_params = self._full_text_where(
+            search=search,
+            permission_params=permission_params,
+            inst_name_params=inst_name_params,
+            created=created,
+            case_sensitive=case_sensitive,
+            permission_params_dict=permission_params_dict,
+        )
+        query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN n"
+        objs = self.session.run(query, **query_params)
+        return self.entity_to_list(objs)
+
+    def batch_save_entity(
+        self,
+        label: str,
+        properties_list: list,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+    ):
+        """批量保存实体，支持新增与更新"""
+        unique_key = check_attr_map.get(ModelConstraintKey.unique.value, {}).keys()
+        add_nodes = []
+        update_results = []
+        if unique_key:
+            properties_map = {}
+            for properties in properties_list:
+                properties_key = tuple(properties.get(k) for k in unique_key if k in properties)
+                # 对参数中的节点按唯一键进行去重
+                properties_map[properties_key] = properties
+            # 已有节点处理
+            item_map = {}
+            for item in exist_items:
+                item_key = tuple(item.get(k) for k in unique_key if k in item)
+                item_map[item_key] = item
+            for properties_key, properties in properties_map.items():
+                node = item_map.get(properties_key)
+                if node:
+                    # 节点更新
+                    try:
+                        results = self.batch_update_entity_properties(
+                            label=label, entity_ids=[node.get("_id")], properties=properties, check_attr_map=check_attr_map
+                        )
+                        results["data"] = results["data"][0]
+                        update_results.append(results)
+                    except Exception as e:
+                        logger.info(f"update entity error: {e}")
+                        update_results.append({"success": False, "data": properties, "message": "update entity error"})
+
+                else:
+                    # 暂存统一新增
+                    add_nodes.append(properties)
+        else:
+            add_nodes = properties_list
+        add_results = self.batch_create_entity(
+            label=label, properties_list=add_nodes, check_attr_map=check_attr_map, exist_items=exist_items, operator=operator
+        )
+        return add_results, update_results

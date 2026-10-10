@@ -1,0 +1,84 @@
+from django.db import models
+from django.utils.translation import gettext_lazy as _
+
+
+class ChannelChoices(models.TextChoices):
+    ENTERPRISE_WECHAT = ("enterprise_wechat", _("Enterprise WeChat"))
+    ENTERPRISE_WECHAT_BOT = ("enterprise_wechat_bot", _("Enterprise WeChat Bot"))
+    WECHAT_OFFICIAL_ACCOUNT = ("wechat_official_account", _("WeChat Official Account"))
+    DING_TALK = ("ding_talk", _("Ding Talk"))
+    WEB = ("web", _("Web"))
+    GITLAB = ("gitlab", _("GitLab"))
+
+
+class SkillChannelChoices(models.TextChoices):
+    """智能体独立发布渠道类型（与 ChatFlow 入口类型对齐，另增 platform）。"""
+
+    PLATFORM = ("platform", _("Platform"))
+    WEB_CHAT = ("web_chat", _("Web Chat"))
+    EMBEDDED_CHAT = ("embedded_chat", _("Embedded Chat"))
+    ENTERPRISE_WECHAT = ("enterprise_wechat", _("Enterprise WeChat"))
+    ENTERPRISE_WECHAT_AIBOT = ("enterprise_wechat_aibot", _("Enterprise WeChat AI Bot"))
+    DINGTALK = ("dingtalk", _("Ding Talk"))
+    FEISHU = ("feishu", _("Feishu"))
+    WECHAT_OFFICIAL = ("wechat_official", _("WeChat Official Account"))
+
+
+# 这些渠道对话时不校验 BK-Lite 组织（尚未做用户/组织同步）。
+SKILL_CHANNEL_SKIP_ORG_CHECK = frozenset(
+    {
+        SkillChannelChoices.ENTERPRISE_WECHAT,
+        SkillChannelChoices.ENTERPRISE_WECHAT_AIBOT,
+        SkillChannelChoices.DINGTALK,
+        SkillChannelChoices.FEISHU,
+        SkillChannelChoices.WECHAT_OFFICIAL,
+    }
+)
+
+
+class BotTypeChoice(models.IntegerChoices):
+    PILOT = (1, _("Pilot"))
+    LOBE = (2, _("LobeChat"))
+    CHAT_FLOW = (3, _("ChatFlow"))
+
+
+class SkillTypeChoices(models.IntegerChoices):
+    BASIC_TOOL = 1, _("Basic Tool")
+    KNOWLEDGE_TOOL = 2, _("Knowledge Tool")
+    PLAN_EXECUTE = 3, _("Plan Execute")
+    LATS = 4, _("Lats")
+
+
+class LLMModelChoices(models.TextChoices):
+    CHAT_GPT = "chat-gpt", "OpenAI"
+    ZHIPU = "zhipu", "智谱AI"
+    HUGGING_FACE = "hugging_face", "Hugging Face"
+    DEEP_SEEK = "deep-seek", "DeepSeek"
+    BAICHUAN = "Baichuan", "百川"
+
+
+class WorkFlowExecuteType(models.TextChoices):
+    """工作流执行类型枚举"""
+
+    OPENAI = "openai", _("OpenAI")
+    RESTFUL = "restful", _("RESTful")
+    CELERY = "celery", _("Celery")
+    ENTERPRISE_WECHAT = "enterprise_wechat", _("Enterprise WeChat")
+    ENTERPRISE_WECHAT_AIBOT = "enterprise_wechat_aibot", _("Enterprise WeChat AI Bot")
+    WECHAT_OFFICIAL_ACCOUNT = "wechat_official", _("WeChat Official Account")
+    DINGTALK = "dingtalk", _("Ding Talk")
+    EMBEDDED_CHAT = "embedded_chat", _("Embedded Chat")
+    WEB_CHAT = "web_chat", _("Web Chat")
+    MOBILE = "mobile", _("Mobile")
+    AGUI = "agui", _("AG-UI")
+    NATS = "nats", _("NATS")
+
+
+class WorkFlowTaskStatus(models.TextChoices):
+    """工作流任务状态枚举"""
+
+    RUNNING = "running", _("Running")
+    INTERRUPT_REQUESTED = "interrupt_requested", _("Interrupt Requested")
+    INTERRUPTED = "interrupted", _("Interrupted")
+    SUCCESS = "success", _("Success")
+    FAIL = "fail", _("Fail")

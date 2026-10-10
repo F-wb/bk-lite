@@ -1,0 +1,374 @@
+"""
+MLOps Model Mixins
+
+Shared behavioral mixin classes for mlops models.
+"""
+
+
+class ConfigSyncError(Exception):
+    """Raised when training configuration sync to MinIO fails.
+
+    This exception signals that the database changes should be rolled back
+    because the config file in MinIO is inconsistent with the database state.
+    """
+
+
+class TrainDataFileCleanupMixin:
+    """
+    Mixin for TrainData models that automatically cleans up old training data files
+    when the train_data field is updated.
+
+    Usage:
+        class MyTrainData(TrainDataFileCleanupMixin, MaintainerInfo, TimeInfo):
+            train_data = models.FileField(...)
+
+            # TrainDataFileCleanupMixin must come BEFORE other base classes
+            # to ensure its save() is called first in the MRO.
+    """
+
+    # Subclasses can override this to use a different file field name
+    _file_field_name = "train_data"
+    _loaded_file_path_missing = object()
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        file_field_name = cls._file_field_name
+        if file_field_name in field_names:
+            file_value = getattr(instance, file_field_name)
+            instance._loaded_file_path = file_value.name if file_value else None
+        return instance
+
+    def save(self, *args, **kwargs):
+        """
+        Automatically clean up old training data file when it's being replaced.
+
+        This method:
+        1. Detects if we're updating an existing record (pk exists)
+        2. Compares old and new file paths
+        3. Saves the database record while holding a row lock
+        4. Deletes the old file after the surrounding transaction commits
+        """
+        from django.db import router, transaction
+        from apps.mlops.services.train_data_file_cleanup import (
+            _assert_file_reference_available,
+            _lock_file_reference_guards,
+            _mark_file_reference_active,
+        )
+
+        file_field_name = self._file_field_name
+        file_field = self._meta.get_field(file_field_name)
+        update_fields = kwargs.get("update_fields")
+        using = kwargs.get("using") or router.db_for_write(
+            self.__class__, instance=self
+        )
+
+        # New records and partial saves that exclude the file keep normal Model.save semantics.
+        if not self.pk:
+            with transaction.atomic(using=using):
+                file_value = getattr(self, file_field_name)
+                candidate_path = self._file_reference_lock_path(
+                    file_field,
+                    file_value,
+                )
+                guards = _lock_file_reference_guards(
+                    paths=[candidate_path],
+                    using=using,
+                )
+                _assert_file_reference_available(
+                    field_file=file_value,
+                    guard=guards.get(candidate_path),
+                    using=using,
+                )
+                super().save(*args, **kwargs)
+                file_value = getattr(self, file_field_name)
+                actual_path = file_value.name if file_value else None
+                _mark_file_reference_active(
+                    path=actual_path,
+                    using=using,
+                    guards=guards,
+                )
+                self._loaded_file_path = actual_path
+            return
+        if update_fields is not None and file_field_name not in update_fields:
+            super().save(*args, **kwargs)
+            return
+
+        with transaction.atomic(using=using):
+            try:
+                old_instance = (
+                    self.__class__.objects.using(using)
+                    .select_for_update()
+                    .get(pk=self.pk)
+                )
+                old_file = getattr(old_instance, file_field_name)
+                old_path = old_file.name if old_file else None
+            except self.__class__.DoesNotExist:
+                old_file = None
+                old_path = None
+
+            new_file = getattr(self, file_field_name)
+            new_path = new_file.name if new_file else None
+            loaded_path = getattr(
+                self, "_loaded_file_path", self._loaded_file_path_missing
+            )
+
+            # A stale instance that did not change the file must not overwrite a
+            # replacement committed by another request.
+            if (
+                loaded_path is not self._loaded_file_path_missing
+                and new_path == loaded_path
+                and old_path != loaded_path
+            ):
+                setattr(self, file_field_name, old_file)
+                new_file = getattr(self, file_field_name)
+                new_path = old_path
+
+            candidate_path = self._file_reference_lock_path(
+                file_field,
+                new_file,
+            )
+            guards = _lock_file_reference_guards(
+                paths=[old_path, candidate_path],
+                using=using,
+            )
+            _assert_file_reference_available(
+                field_file=new_file,
+                guard=guards.get(candidate_path),
+                using=using,
+            )
+            super().save(*args, **kwargs)
+            new_file = getattr(self, file_field_name)
+            new_path = new_file.name if new_file else None
+            _mark_file_reference_active(
+                path=new_path,
+                using=using,
+                guards=guards,
+            )
+            self._loaded_file_path = new_path
+
+            if old_path and old_path != new_path:
+                cleanup_kwargs = {
+                    "model_label": self.__class__._meta.label,
+                    "instance_pk": self.pk,
+                    "file_field_name": file_field_name,
+                    "old_path": old_path,
+                    "using": using,
+                }
+
+                def delete_old_file():
+                    from apps.mlops.services.train_data_file_cleanup import (
+                        delete_train_data_file_with_retry,
+                    )
+
+                    delete_train_data_file_with_retry(**cleanup_kwargs)
+
+                transaction.on_commit(delete_old_file, using=using)
+
+    def _file_reference_lock_path(self, file_field, field_file):
+        if not field_file:
+            return None
+        if field_file._committed:
+            return field_file.name
+        return file_field.generate_filename(self, field_file.name)
+
+
+class TrainJobConfigSyncMixin:
+    """
+    Mixin for TrainJob models that automatically syncs hyperopt_config to MinIO
+    when the model is saved.
+
+    Usage:
+        class MyTrainJob(TrainJobConfigSyncMixin, MaintainerInfo, TimeInfo):
+            _model_prefix = "MyModel"  # e.g., "AnomalyDetection", "Classification"
+
+            algorithm = models.CharField(...)
+            hyperopt_config = models.JSONField(...)
+            config_url = models.FileField(...)
+            max_evals = models.IntegerField(...)
+
+            # TrainJobConfigSyncMixin must come BEFORE other base classes
+            # to ensure its save() is called first in the MRO.
+
+    Required model fields:
+        - algorithm: CharField
+        - hyperopt_config: JSONField
+        - config_url: FileField (MinIO storage)
+        - max_evals: IntegerField
+    """
+
+    # Subclasses MUST override this to set the model identifier prefix
+    _model_prefix: str = ""
+
+    # Fields that trigger config sync when updated
+    _config_related_fields = {
+        "hyperopt_config",
+        "config_url",
+        "algorithm",
+        "dataset_version",
+    }
+
+    def save(self, *args, **kwargs):
+        """
+        Save with automatic config sync to MinIO.
+
+        This method:
+        1. Checks if config-related fields are being updated
+        2. Saves to database first to get pk (inside transaction)
+        3. Syncs config to MinIO if needed
+        4. Updates config_url in database without triggering recursive save
+
+        Raises:
+            ConfigSyncError: If MinIO sync fails, the entire save is rolled back.
+        """
+        from django.db import router, transaction
+
+        from apps.core.logger import mlops_logger as logger
+
+        # If only updating non-config fields, skip file sync
+        update_fields = kwargs.get("update_fields")
+
+        if update_fields and not any(field in self._config_related_fields for field in update_fields):
+            super().save(*args, **kwargs)
+            return
+
+        using = kwargs.get("using") or router.db_for_write(self.__class__, instance=self)
+        old_file_name = None
+        uploaded_file_name = None
+
+        # Wrap in transaction so DB changes roll back if MinIO sync fails
+        with transaction.atomic(using=using):
+            if self.pk:
+                try:
+                    persisted = (
+                        self.__class__.objects.select_for_update()
+                        .only("config_url")
+                        .using(using)
+                        .get(pk=self.pk)
+                    )
+                except self.__class__.DoesNotExist:
+                    pass
+                else:
+                    old_file_name = persisted.config_url.name if persisted.config_url else None
+
+            # 1. Save to database first to get pk
+            super().save(*args, **kwargs)
+
+            # 2. Sync file to MinIO based on pk
+            config_updated = False
+
+            try:
+                if self.hyperopt_config:
+                    # Has config → complete and upload to MinIO
+                    # Raises ConfigSyncError on failure → transaction rolls back
+                    self._sync_config_to_minio()
+                    uploaded_file_name = self.config_url.name
+                    config_updated = True
+                elif self.config_url:
+                    # Config is empty → clear the database pointer first. The old
+                    # object is deleted only after the outermost transaction commits.
+                    self.config_url = None
+                    config_updated = True
+
+                # 3. If config_url changed, update database (use queryset.update to avoid recursive save)
+                if config_updated:
+                    updated = (
+                        self.__class__.objects.filter(pk=self.pk)
+                        .using(using)
+                        .update(config_url=self.config_url)
+                    )
+                    if updated != 1:
+                        raise ConfigSyncError(f"训练配置数据库指针更新失败: TrainJob {self.pk} 不存在")
+            except Exception:
+                if uploaded_file_name and uploaded_file_name != old_file_name:
+                    try:
+                        self._meta.get_field("config_url").storage.delete(uploaded_file_name)
+                        logger.info(f"Deleted unreferenced config upload after database failure for TrainJob {self.pk}: {uploaded_file_name}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to delete unreferenced config upload '{uploaded_file_name}': {cleanup_error}")
+                self.config_url = old_file_name
+                raise
+
+            new_file_name = self.config_url.name if self.config_url else None
+            if old_file_name and old_file_name != new_file_name:
+                self._delete_config_file_on_commit(
+                    file_name=old_file_name,
+                    using=using,
+                )
+
+    def _delete_config_file_on_commit(self, *, file_name, using):
+        """Delete an obsolete config only after the outer DB transaction commits."""
+        from django.db import transaction
+
+        from apps.core.logger import mlops_logger as logger
+
+        storage = self._meta.get_field("config_url").storage
+        train_job_pk = self.pk
+
+        def delete_old_file():
+            try:
+                storage.delete(file_name)
+                logger.info(f"Deleted old config file after commit for TrainJob {train_job_pk}: {file_name}")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to delete old config file '{file_name}': {cleanup_error}")
+
+        transaction.on_commit(delete_old_file, using=using)
+
+    def _sync_config_to_minio(self):
+        """Sync hyperopt_config to MinIO (auto-complete model and mlflow config).
+
+        Upload a new config file without deleting the previous object. The
+        caller updates the database pointer and schedules old-object deletion
+        after the outermost database transaction commits.
+
+        Raises:
+            ConfigSyncError: If the new config file cannot be uploaded.
+        """
+        import json
+        import uuid
+
+        from django.core.files.base import ContentFile
+
+        from apps.core.logger import mlops_logger as logger
+
+        # Build and upload new config file — failure MUST propagate
+        try:
+            complete_config = self._build_complete_config()
+
+            # Upload new file
+            content = json.dumps(complete_config, ensure_ascii=False, indent=2)
+            filename = f"config_{self.pk or 'new'}_{uuid.uuid4().hex[:8]}.json"
+            self.config_url.save(
+                filename,
+                ContentFile(content.encode("utf-8")),
+                save=False,  # Important: avoid recursive save()
+            )
+            logger.info(f"Synced config to MinIO for TrainJob {self.pk}: {filename}")
+        except Exception as e:
+            logger.error(f"Failed to sync config to MinIO: {e}", exc_info=True)
+            raise ConfigSyncError(f"训练配置同步到 MinIO 失败，数据库变更已回滚: {e}") from e
+
+    def _build_complete_config(self):
+        """Build complete config file (add model, mlflow, and max_evals sections)."""
+        import copy
+
+        # Base config (from frontend)
+        config = copy.deepcopy(self.hyperopt_config) if self.hyperopt_config else {}
+
+        # Generate model identifier: {prefix}_{algorithm}_{id} (pk exists at this point)
+        model_identifier = f"{self._model_prefix}_{self.algorithm}_{self.pk}"
+
+        # Ensure hyperparams exists
+        if "hyperparams" not in config:
+            config["hyperparams"] = {}
+
+        # Force sync max_evals (use dedicated field as source of truth)
+        config["hyperparams"]["max_evals"] = self.max_evals
+
+        # Add model config
+        config["model"] = {"type": self.algorithm, "name": model_identifier}
+
+        # Add mlflow config
+        config["mlflow"] = {"experiment_name": model_identifier}
+
+        return config

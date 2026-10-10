@@ -1,0 +1,76 @@
+{
+  "object": "Switch",
+  "plugin": "Switch Phoenix Contact SNMP",
+  "templates": [
+    {
+      "name": "Phoenix Contact交换机温度过高",
+      "alert_name": "交换机${resource_name} 温度过高",
+      "description": "监控 Phoenix Contact FL SWITCH 机箱温度（flWorkFWCtrlActualDeviceTemperature），当持续高于阈值时触发告警，提示机柜散热不良或环境过热，避免热保护或器件损坏。",
+      "metric_name": "device_temperature_celsius",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 70,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 60,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 50,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "Phoenix Contact交换机电源异常",
+      "alert_name": "交换机${resource_name} 电源状态异常",
+      "description": "监控 Phoenix Contact FL SWITCH 冗余电源状态（flWorkBasicPowerStat，5=两路均正常）。取值不是 5 时提示未知状态或任一路电源失电，需检查供电冗余。",
+      "metric_name": "power_status",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 5,
+          "method": "!="
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "Phoenix Contact交换机固件运行异常",
+      "alert_name": "交换机${resource_name} 固件运行状态异常",
+      "description": "监控 Phoenix Contact FL SWITCH 固件运行状态（flWorkFWInfoOperStatus，2=ok）。取值不是 2 时提示固件未处于正常运行模式。",
+      "metric_name": "firmware_oper_status",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 2,
+          "method": "!="
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "Phoenix Contact交换机告警触点动作",
+      "alert_name": "交换机${resource_name} 告警触点已打开",
+      "description": "监控 Phoenix Contact FL SWITCH 告警触点状态（flWorkFWCtrlAlarmContactStatus，2=闭合/正常，1=打开/告警）。触点打开表示已配置的告警条件被触发。",
+      "metric_name": "alarm_contact_status",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 2,
+          "method": "!="
+        }
+      ],
+      "group_algorithm": "avg"
+    }
+  ]
+}

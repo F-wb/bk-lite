@@ -1,0 +1,69 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_albentia"
+        config_type = "albentia"
+        brand = "albentia"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+# @bk_include_ifmib_table
+    # RF temperature scalar (albTemp, PEN 28087). Integer32 two implied
+    # decimals → query-side /100 to Celsius. Empty or missing scalar yields
+    # no point; do not invent CPU%/mem% from this tree.
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.28087.12.10.1.6.0"
+        name = "rf_temperature_celsius"
+    # Optional per-sector temperature (sectorTemp). Same Integer32 ÷100.
+    # INDEX is sectorColor (DisplayString). Empty table yields no rows.
+    [[inputs.snmp.table]]
+        name = "sector_temperature"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.28087.12.10.10.1.1.1"
+        name = "sectorColor"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.28087.12.10.10.1.1.5"
+        name = "celsius"
+    # Optional per-sector transmit power (radioInfoTxPow) in dBm, Integer32
+    # with no scaling. INDEX is radioInfoSectorColor. Target RSSI is a radio
+    # configuration object and is not collected as measured RSSI.
+    [[inputs.snmp.table]]
+        name = "tx"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.28087.12.10.10.5.1.1"
+        name = "sectorColor"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.28087.12.10.10.5.1.6"
+        name = "power"
+    # CPU/mem: no stable private scalar in this tree this round; do not invent.

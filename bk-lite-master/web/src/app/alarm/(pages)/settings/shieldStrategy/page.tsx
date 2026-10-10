@@ -1,0 +1,193 @@
+'use client';
+
+import React, { useMemo } from 'react';
+import dayjs from 'dayjs';
+import OperateModal from './components/operateModal';
+import CustomTable from '@/components/custom-table';
+import PermissionWrapper from '@/components/permission';
+import Introduction from '@/components/introduction';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import { AlertShieldListItem } from '@/app/alarm/types/settings';
+import { useSettingApi } from '@/app/alarm/api/settings';
+import { STATUS_TEXT } from '@/app/alarm/constants/colors';
+import { Button, Input, Switch } from 'antd';
+import { useTranslation } from '@/utils/i18n';
+import { typeLabel, weekMap } from '@/app/alarm/constants/settings';
+import { useSettingsTable } from '@/app/alarm/hooks/useSettingsTable';
+
+const ShieldStrategy: React.FC = () => {
+  const { t } = useTranslation();
+  const { getShieldList, deleteShield, patchShield } = useSettingApi();
+  const { convertToLocalizedTime } = useLocalizedTime();
+
+  const {
+    tableLoading,
+    loadingIds,
+    operateVisible,
+    setOperateVisible,
+    searchKey,
+    setSearchKey,
+    dataList,
+    currentRow,
+    pagination,
+    handleEdit,
+    handleDelete,
+    handleFilterChange,
+    handleFilterClear,
+    handleTableChange,
+    handleStatusToggle,
+    refreshList,
+  } = useSettingsTable<AlertShieldListItem>({
+    fetchList: getShieldList,
+    deleteItem: deleteShield,
+    patchItem: patchShield,
+  });
+
+  const columns = useMemo(() => [
+    {
+      title: t('settings.assignName'),
+      dataIndex: 'name',
+      key: 'name',
+      width: 150,
+    },
+    {
+      title: t('settings.assignTime'),
+      key: 'suppression_time',
+      width: 220,
+      render: (_: unknown, row: AlertShieldListItem) => {
+        const suppressionTime = row.suppression_time as Record<string, unknown>;
+        const type = suppressionTime.type as string;
+        const start_time = suppressionTime.start_time as string;
+        const end_time = suppressionTime.end_time as string;
+        const week_month = suppressionTime.week_month as number[] | undefined;
+        let label = typeLabel[type] || '';
+
+        const fmt = (time: string, pattern = 'HH:mm:ss') =>
+          dayjs(time, pattern).format(pattern);
+
+        if (type === 'one') {
+          return `${fmt(start_time, 'YYYY-MM-DD HH:mm:ss')}-${fmt(end_time, 'YYYY-MM-DD HH:mm:ss')}`;
+        } else if (type === 'week') {
+          label += ` ${(week_month || []).map((d: number) => weekMap[d]).join(',')}`;
+        } else if (type === 'month') {
+          label += ` ${(week_month || []).map((d: number) => `${d}日`).join(',')}`;
+        }
+        return `${label} ${fmt(start_time)} - ${fmt(end_time)}`;
+      },
+    },
+    {
+      title: t('settings.assignStatus'),
+      dataIndex: 'assignStatus',
+      key: 'assignStatus',
+      width: 100,
+      render: (_: unknown, row: AlertShieldListItem) => {
+        const { is_active } = row;
+        return is_active ? (
+          <span style={{ color: STATUS_TEXT.ACTIVE_GREEN }}>{t('settings.effective')}</span>
+        ) : (
+          <span style={{ color: STATUS_TEXT.INACTIVE_RED }}>
+            {t('settings.ineffective')}
+          </span>
+        );
+      },
+    },
+    {
+      title: t('settings.assignCreateTime'),
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 180,
+      render: (val: string) => {
+        return convertToLocalizedTime(val, 'YYYY-MM-DD HH:mm:ss');
+      },
+    },
+    {
+      title: t('settings.assignStartStop'),
+      dataIndex: 'is_active',
+      key: 'is_active',
+      width: 110,
+      render: (val: boolean, row: AlertShieldListItem) => (
+        <Switch
+          loading={!!loadingIds[row.id]}
+          checked={val}
+          onChange={(checked) => handleStatusToggle(row, checked)}
+        />
+      ),
+    },
+    {
+      title: t('settings.assignActions'),
+      key: 'operation',
+      width: 130,
+      render: (_: unknown, row: AlertShieldListItem) => (
+        <div className="flex gap-4">
+          <PermissionWrapper requiredPermissions={['Edit']}>
+            <Button
+              type="link"
+              size="small"
+              onClick={() => handleEdit('edit', row)}
+            >
+              {t('common.edit')}
+            </Button>
+          </PermissionWrapper>
+          <PermissionWrapper requiredPermissions={['Delete']}>
+            <Button
+              type="link"
+              size="small"
+              danger
+              onClick={() => handleDelete(row)}
+            >
+              {t('common.delete')}
+            </Button>
+          </PermissionWrapper>
+        </div>
+      ),
+    },
+  ], [t, loadingIds, handleStatusToggle, handleEdit, handleDelete, convertToLocalizedTime]);
+
+  return (
+    <div className="flex h-full min-h-0 w-full flex-1 flex-col">
+      <Introduction
+        title={t('settings.shieldStrategy')}
+        message={t('settings.shieldStrategyMessage')}
+      />
+      <div className="flex min-h-0 flex-1 flex-col rounded-lg bg-[var(--color-bg-1)] p-4 shadow">
+        <div className="nav-box mb-[20px] flex shrink-0 justify-between">
+          <div className="flex items-center">
+            <Input
+              allowClear
+              value={searchKey}
+              placeholder={t('common.search')}
+              style={{ width: 250 }}
+              onChange={(e) => setSearchKey(e.target.value)}
+              onPressEnter={handleFilterChange}
+              onClear={handleFilterClear}
+            />
+          </div>
+          <PermissionWrapper requiredPermissions={['Add']}>
+            <Button type="primary" onClick={() => handleEdit('add')}>
+              {t('common.addNew')}
+            </Button>
+          </PermissionWrapper>
+        </div>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <CustomTable
+            size="middle"
+            rowKey="id"
+            loading={tableLoading}
+            columns={columns}
+            dataSource={dataList}
+            pagination={pagination}
+            onChange={handleTableChange}
+          />
+        </div>
+        <OperateModal
+          open={operateVisible}
+          onClose={() => setOperateVisible(false)}
+          currentRow={currentRow}
+          onSuccess={() => refreshList({ current: 1 })}
+        />
+      </div>
+    </div>
+  );
+};
+
+export default ShieldStrategy;

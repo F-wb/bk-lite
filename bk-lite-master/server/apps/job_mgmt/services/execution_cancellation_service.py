@@ -1,0 +1,88 @@
+"""REST 与 NATS 共用的作业取消状态机。"""
+
+from datetime import timedelta
+
+from celery import current_app
+from django.db import transaction
+from django.utils import timezone
+
+from apps.core.logger import job_logger as logger
+from apps.job_mgmt.config import CANCEL_CONVERGE_BUFFER_SECONDS
+from apps.job_mgmt.constants import ExecutionStatus
+from apps.job_mgmt.models import JobExecution
+from apps.job_mgmt.services.completion_outbox_service import enqueue_terminal_effects
+from apps.job_mgmt.utils.i18n import job_message
+from apps.job_mgmt.utils.team_authz import is_team_authorized
+
+
+class ExecutionCancellationError(Exception):
+    pass
+
+
+class ExecutionCancellationAuthorizationError(ExecutionCancellationError):
+    pass
+
+
+def _run_cancel_fast_path(execution_id: int, celery_task_id: str, countdown: int | None) -> None:
+    if celery_task_id:
+        try:
+            current_app.control.revoke(celery_task_id)
+        except Exception as error:
+            logger.warning("[cancel] revoke 失败: execution_id=%s, error=%s", execution_id, error)
+    if countdown is not None:
+        try:
+            from apps.job_mgmt.tasks import finalize_cancelling_execution
+
+            finalize_cancelling_execution.apply_async(args=[execution_id], countdown=countdown)
+        except Exception:
+            logger.exception("[cancel] 兜底任务入队失败，等待 Beat 补偿: execution_id=%s", execution_id)
+
+
+def request_execution_cancel(
+    execution_id: int,
+    *,
+    authorized_team_ids: set[int] | None,
+) -> tuple[JobExecution, str]:
+    """锁定执行记录后重验授权并推进取消；所有外部 I/O 都在提交后执行。"""
+    with transaction.atomic():
+        execution = JobExecution.objects.select_for_update().filter(id=execution_id).first()
+        if execution is None:
+            raise JobExecution.DoesNotExist
+        if not is_team_authorized(execution.team, authorized_team_ids):
+            raise ExecutionCancellationAuthorizationError(job_message(None, "error.cancel_denied", "You are not allowed to cancel this task"))
+        if execution.status in ExecutionStatus.TERMINAL_STATES:
+            raise ExecutionCancellationError(
+                job_message(
+                    None,
+                    "error.task_terminal_not_cancellable",
+                    "Task is already in a terminal state ({status}) and cannot be cancelled",
+                    status=execution.get_status_display(),
+                )
+            )
+        if execution.status == ExecutionStatus.CANCELLING:
+            raise ExecutionCancellationError(job_message(None, "error.task_cancelling", "Task is already being cancelled; do not repeat the request"))
+
+        now = timezone.now()
+        countdown = None
+        if execution.status == ExecutionStatus.PENDING:
+            execution.status = ExecutionStatus.CANCELLED
+            execution.finished_at = now
+            execution.cancel_finalize_at = None
+            execution.converge_deadline_at = None
+            execution.save(update_fields=["status", "finished_at", "cancel_finalize_at", "converge_deadline_at", "updated_at"])
+            enqueue_terminal_effects(execution)
+            message = job_message(None, "message.cancel_done", "Execution cancelled")
+        elif execution.status == ExecutionStatus.RUNNING:
+            # execution.timeout 是从作业开始计算的执行时限，不是取消请求的等待时限。
+            # 取消后只保留独立的回调收敛窗口，避免长超时作业长期停留在 CANCELLING。
+            countdown = CANCEL_CONVERGE_BUFFER_SECONDS
+            execution.status = ExecutionStatus.CANCELLING
+            execution.cancel_finalize_at = now + timedelta(seconds=countdown)
+            execution.converge_deadline_at = None
+            execution.save(update_fields=["status", "cancel_finalize_at", "converge_deadline_at", "updated_at"])
+            message = job_message(None, "message.cancel_in_progress", "Cancelling execution")
+        else:
+            raise ExecutionCancellationError(job_message(None, "error.status_changed_retry", "Status has changed; refresh and try again"))
+
+        transaction.on_commit(lambda: _run_cancel_fast_path(execution.id, execution.celery_task_id, countdown))
+    return execution, message

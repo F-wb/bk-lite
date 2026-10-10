@@ -1,0 +1,236 @@
+from celery import shared_task
+from celery_singleton import Singleton
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from django.db.models import F
+import time
+
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.monitor.models import MonitorPolicy
+from apps.core.logger import celery_logger as logger
+from apps.monitor.tasks.services.policy_scan import MonitorPolicyScan
+from apps.monitor.tasks.utils.policy_methods import period_to_seconds
+from apps.monitor.constants.alert_policy import AlertConstants
+
+
+def _run_scan_and_record_success(policy_obj, scan_time):
+    """Run one policy scan window and advance the watermark only after success."""
+    policy_obj.last_run_time = scan_time
+    MonitorPolicyScan(policy_obj).run()
+    MonitorPolicy.objects.filter(id=policy_obj.id).update(last_run_time=scan_time)
+
+
+def _legacy_alert_center_retry_statuses(*, outbox_enabled, created_retry_enabled):
+    # active outbox 在进入 legacy 查询前已返回；其余 disabled/shadow/rollback
+    # 阶段都必须继续补偿首次告警，不能因只开启 outbox 双写而退化。
+    return ["new", "recovered", "closed"]
+
+
+@shared_task(base=Singleton, raise_on_duplicate=False)
+def scan_policy_task(policy_id):
+    """扫描监控策略
+
+    Args:
+        policy_id: 监控策略ID
+
+    Returns:
+        dict: 执行结果 {"success": bool, "duration": float, "message": str}
+    """
+    start_time = time.time()
+    logger.info(f"开始执行监控策略扫描任务，策略ID: {policy_id}")
+
+    try:
+        policy_obj = (
+            MonitorPolicy.objects.filter(id=policy_id)
+            .select_related("monitor_object")
+            .first()
+        )
+        if not policy_obj:
+            raise BaseAppException(f"未找到ID为 {policy_id} 的监控策略")
+
+        if not policy_obj.enable:
+            duration = time.time() - start_time
+            logger.info(
+                f"监控策略 [{policy_id}] 未启用，跳过执行，耗时: {duration:.2f}s"
+            )
+            return {"success": True, "duration": duration, "message": "策略未启用"}
+
+        current_time = datetime.now(timezone.utc)
+
+        if not policy_obj.last_run_time:
+            logger.info(f"监控策略 [{policy_id}] 首次执行，扫描时间点: {current_time}")
+            _run_scan_and_record_success(policy_obj, current_time)
+        else:
+            period_seconds = period_to_seconds(policy_obj.period)
+            gap_seconds = (current_time - policy_obj.last_run_time).total_seconds()
+
+            gap_seconds = min(gap_seconds, AlertConstants.MAX_BACKFILL_SECONDS)
+
+            backfill_count = int(gap_seconds // period_seconds)
+
+            if backfill_count <= 1:
+                _run_scan_and_record_success(policy_obj, current_time)
+            else:
+                backfill_count = min(backfill_count, AlertConstants.MAX_BACKFILL_COUNT)
+                planned = min(backfill_count, AlertConstants.MAX_BACKFILL_PER_TASK)
+                logger.info(
+                    "event=policy_backfill_planned policy_id=%s pending=%s planned=%s",
+                    policy_id,
+                    backfill_count,
+                    planned,
+                )
+
+                completed = 0
+                for i in range(planned):
+                    if (
+                        i > 0
+                        and time.time() - start_time
+                        >= AlertConstants.BACKFILL_SOFT_TIME_LIMIT_SECONDS
+                    ):
+                        break
+                    scan_time = policy_obj.last_run_time + timedelta(
+                        seconds=period_seconds
+                    )
+                    _run_scan_and_record_success(policy_obj, scan_time)
+                    completed += 1
+                    logger.debug(
+                        "event=policy_backfill_window_done policy_id=%s index=%s planned=%s",
+                        policy_id,
+                        completed,
+                        planned,
+                    )
+
+                remaining = backfill_count - completed
+                if remaining > 0:
+                    # 剩余窗口由下一次 Beat 调度继续；last_run_time 已单调推进，不会重扫。
+                    logger.info(
+                        "event=policy_backfill_deferred policy_id=%s completed=%s remaining=%s",
+                        policy_id,
+                        completed,
+                        remaining,
+                    )
+
+        duration = time.time() - start_time
+        logger.info(f"监控策略 [{policy_id}] 扫描完成，耗时: {duration:.2f}s")
+        return {"success": True, "duration": duration, "message": "执行成功"}
+
+    except BaseAppException as e:
+        duration = time.time() - start_time
+        logger.error(
+            f"监控策略 [{policy_id}] 执行失败（业务异常），耗时: {duration:.2f}s，错误: {str(e)}"
+        )
+        raise
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(
+            f"监控策略 [{policy_id}] 执行失败（系统异常），耗时: {duration:.2f}s，错误: {str(e)}",
+            exc_info=True,
+        )
+        raise
+
+
+@shared_task(base=Singleton, raise_on_duplicate=False)
+def retry_alert_center_lifecycle_notify_task():
+    """补偿任务：重试推送到告警中心失败的告警通知（每5分钟执行，每次最多处理200条）"""
+    from apps.monitor.services.alert_center_delivery import (
+        ALERT_CENTER_OUTBOX_DELIVERY_ENABLED,
+        ALERT_CENTER_OUTBOX_ENABLED,
+        backfill_legacy_alerts,
+        due_delivery_ids,
+    )
+
+    if ALERT_CENTER_OUTBOX_ENABLED:
+        backfilled = backfill_legacy_alerts()
+        if ALERT_CENTER_OUTBOX_DELIVERY_ENABLED:
+            delivery_ids = due_delivery_ids()
+            for delivery_id in delivery_ids:
+                deliver_alert_center_lifecycle_delivery.delay(delivery_id)
+            return {
+                "success": True,
+                "backfilled": backfilled,
+                "scheduled": len(delivery_ids),
+            }
+
+    from apps.monitor.models import MonitorAlert, MonitorPolicy
+    from apps.monitor.services.alert_lifecycle_notify import (
+        ALERT_CENTER_CREATED_RETRY_ENABLED,
+        AlertLifecycleNotifier,
+    )
+
+    retry_statuses = _legacy_alert_center_retry_statuses(
+        outbox_enabled=ALERT_CENTER_OUTBOX_ENABLED,
+        created_retry_enabled=ALERT_CENTER_CREATED_RETRY_ENABLED,
+    )
+    retry_alerts = MonitorAlert.objects.filter(
+        status__in=retry_statuses,
+        alert_center_notified=False,
+        alert_center_retry_count__lt=10,
+    )
+    if ALERT_CENTER_OUTBOX_DELIVERY_ENABLED:
+        # active 阶段不得按当前状态越过 outbox 中尚未完成的 created 代次；
+        # shadow/rollback 阶段仍由 legacy 补偿负责实际送达。
+        retry_alerts = retry_alerts.exclude(
+            alert_center_deliveries__status__in=["pending", "delivering"]
+        )
+    alerts = list(retry_alerts.order_by("id")[:200])
+    if not alerts:
+        return {"success": True, "message": "no alerts to retry"}
+
+    logger.info(f"告警中心补偿任务：发现 {len(alerts)} 条待重试告警")
+
+    new_policy_ids = {
+        alert.policy_id
+        for alert in alerts
+        if alert.status == "new" and alert.policy_id
+    }
+    policies_by_id = MonitorPolicy.objects.in_bulk(new_policy_ids)
+
+    groups = defaultdict(list)
+    for alert in alerts:
+        groups[alert.status].append(alert)
+
+    notifier = AlertLifecycleNotifier(policies_by_id=policies_by_id)
+    success_ids = []
+    fail_ids = []
+
+    for status, group_alerts in groups.items():
+        # 单组异常隔离：一组毒数据不应崩溃整个任务，否则该批次会被反复取回永久楔死
+        try:
+            action = "created" if status == "new" else status
+            results = notifier.push_to_alert_center_only(group_alerts, action=action)
+        except Exception:
+            logger.exception(f"告警中心补偿任务：status={status} 推送异常，本组按失败处理")
+            fail_ids.extend(alert.id for alert in group_alerts)
+            continue
+        for alert, pushed_ok in results:
+            if pushed_ok:
+                success_ids.append(alert.id)
+            else:
+                fail_ids.append(alert.id)
+
+    if success_ids:
+        notifier._mark_alert_center_notified(success_ids)
+
+    if fail_ids:
+        # F() 原子递增，避免与并发的即时层回写（置 0）竞态丢失更新
+        MonitorAlert.objects.filter(id__in=fail_ids).update(
+            alert_center_retry_count=F("alert_center_retry_count") + 1
+        )
+        # 即将达到重试上限（10）的告警在此处汇总告警，否则它们会静默从补偿查询中消失
+        alerts_by_id = {a.id: a for a in alerts}
+        exhausted_ids = [aid for aid in fail_ids if alerts_by_id[aid].alert_center_retry_count + 1 >= 10]
+        if exhausted_ids:
+            logger.error(
+                f"告警中心补偿任务：以下 {len(exhausted_ids)} 条告警已达最大重试次数(10)，"
+                f"将不再补偿，需人工介入：{exhausted_ids}"
+            )
+
+    logger.info(f"告警中心补偿任务完成：成功 {len(success_ids)} 条，失败 {len(fail_ids)} 条")
+    return {"success": True, "total": len(alerts), "succeeded": len(success_ids), "failed": len(fail_ids)}
+
+
+@shared_task(autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 5})
+def deliver_alert_center_lifecycle_delivery(delivery_id):
+    from apps.monitor.services.alert_center_delivery import deliver_alert_center_delivery
+
+    return deliver_alert_center_delivery(delivery_id)

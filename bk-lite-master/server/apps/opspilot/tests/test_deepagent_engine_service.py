@@ -1,0 +1,2470 @@
+"""DeepAgent 统一引擎接线单测（service 层，全程 mock，无 DB/网络/真实 LLM）。
+
+覆盖 ToolsNodes.build_deepagent_nodes 及其辅助方法如何把 BK-Lite 的
+tools/MCP、knowledge_retrieve 工具、SKILL.md 技能（MinIO backend）、人工审批
+（interrupt_on）真实接入 deepagents.create_deep_agent，以及 AG-UI 内置工具过滤。
+"""
+
+import asyncio
+import io
+import json
+import logging
+import os
+import subprocess
+import sys
+import traceback
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from langchain_core.messages import HumanMessage
+
+from apps.core.logger import SafeLogException, opspilot_logger
+from apps.opspilot.metis.llm.chain.node import (
+    MISSING_PARAMS_ABORT_LOG,
+    MISSING_PARAMS_NUDGE_LOG,
+    ToolsNodes,
+    _bounded_log_field,
+    _missing_params_log_args,
+)
+from apps.opspilot.metis.llm.middleware.tool_runtime import (
+    PLANNED_EXECUTION_HIDDEN_DEEPAGENT_TOOLS,
+    SkillExecutionGuardMiddleware,
+    ToolVisibilityMiddleware,
+    is_progressive_tools_enabled,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def _tool(name):
+    t = MagicMock()
+    t.name = name
+    return t
+
+
+_HITL_ALWAYS_ON = frozenset({"request_user_choice"})
+
+
+def _assert_visible_tool_steps(actual_calls, expected_steps):
+    """规划工具按集合包含关系断言，执行步只允许额外出现 HITL 选择卡。"""
+    assert len(actual_calls) == len(expected_steps), (actual_calls, expected_steps)
+    for actual, expected in zip(actual_calls, expected_steps):
+        actual_set, expected_set = set(actual), set(expected)
+        extra = actual_set - expected_set
+        assert expected_set <= actual_set, (actual, expected)
+        assert extra <= _HITL_ALWAYS_ON, (actual, expected)
+
+
+def _assert_registered_tool_names(tools, expected_names):
+    names = {getattr(tool, "name", "") for tool in tools}
+    expected = set(expected_names)
+    extra = names - expected
+    assert expected <= names, names
+    assert extra <= _HITL_ALWAYS_ON, names
+
+
+def _request(**overrides):
+    base = dict(
+        system_message_prompt="你是运维助手",
+        naive_rag_request=[],
+        extra_config={},
+        approval_config=None,
+        user_id="u1",
+        thread_id="thread-ut-1",
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class TestBuildInterruptOn:
+    def test_disabled_returns_none(self):
+        n = ToolsNodes()
+        req = _request(approval_config=SimpleNamespace(enabled=False, tools=[]))
+        assert n._build_interrupt_on(req, [_tool("a")]) is None
+
+    def test_no_approval_config_returns_none(self):
+        n = ToolsNodes()
+        assert n._build_interrupt_on(_request(), [_tool("a")]) is None
+
+    def test_named_tools_only(self):
+        n = ToolsNodes()
+        req = _request(approval_config=SimpleNamespace(enabled=True, tools=["danger_tool"]))
+        result = n._build_interrupt_on(req, [_tool("danger_tool"), _tool("safe_tool")])
+        assert result == {"danger_tool": True}
+
+    def test_metadata_approval_required_unions_named_tools(self):
+        n = ToolsNodes()
+        exec_tool = MagicMock()
+        exec_tool.name = "exec_in_pod"
+        exec_tool.metadata = {"approval": {"required": True}}
+        req = _request(approval_config=SimpleNamespace(enabled=True, tools=["danger_tool"]))
+        result = n._build_interrupt_on(req, [_tool("danger_tool"), exec_tool, _tool("safe_tool")])
+        assert result == {"danger_tool": True, "exec_in_pod": True}
+
+    def test_metadata_approval_required_ignored_when_approval_disabled(self):
+        n = ToolsNodes()
+        exec_tool = MagicMock()
+        exec_tool.name = "exec_in_pod"
+        exec_tool.metadata = {"approval": {"required": True}}
+        req = _request(approval_config=SimpleNamespace(enabled=False, tools=[]))
+        assert n._build_interrupt_on(req, [exec_tool]) is None
+
+    def test_empty_tools_means_all_business_tools_excluding_builtins(self):
+        n = ToolsNodes()
+        req = _request(approval_config=SimpleNamespace(enabled=True, tools=[]))
+        tools = [_tool("shell"), _tool("read_file"), _tool("write_todos"), _tool("k8s")]
+        result = n._build_interrupt_on(req, tools)
+        # deepagents 内置工具（read_file/write_todos）被排除
+        assert result == {"shell": True, "k8s": True}
+
+
+class TestCollectTools:
+    def test_uses_all_tools_and_appends_kb_tool(self):
+        n = ToolsNodes()
+        n.all_tools = [_tool("shell"), _tool("k8s")]
+        kb = _tool("knowledge_retrieve")
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=kb):
+            tools = n._collect_deepagent_tools(_request())
+        names = [t.name for t in tools]
+        assert names[:3] == ["shell", "k8s", "knowledge_retrieve"]
+        assert "request_user_choice" in names
+
+    def test_no_kb_tool_when_none(self):
+        n = ToolsNodes()
+        n.all_tools = [_tool("shell")]
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            tools = n._collect_deepagent_tools(_request())
+        names = [t.name for t in tools]
+        assert names[0] == "shell"
+        assert "request_user_choice" in names
+
+    def test_empty_catalog_does_not_inject_choice_tool(self):
+        n = ToolsNodes()
+        n.all_tools = []
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            tools = n._collect_deepagent_tools(_request())
+        assert tools == []
+        assert ToolsNodes._should_use_lightweight_direct_reply(tools, []) is True
+
+    def test_choice_tool_is_always_visible_for_planned_steps(self):
+        n = ToolsNodes()
+        n.all_tools = [_tool("monitor_list_object_instances")]
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            tools = n._collect_deepagent_tools(_request())
+        always_visible, _hidden = n._build_planned_execution_tool_visibility(
+            skill_sources=[],
+            skills_only_plan=False,
+            registered_tools=tools,
+        )
+        assert "request_user_choice" in always_visible
+
+
+class TestSkillBackendSources:
+    def test_no_packages_returns_none_empty(self):
+        n = ToolsNodes()
+        with patch.object(ToolsNodes, "_resolve_skill_packages", return_value=[]):
+            backend, sources, sandbox_dir = n._build_skill_backend_and_sources(_request())
+        assert backend is None and sources == [] and sandbox_dir is None
+
+    def test_materializes_packages_into_ephemeral_sandbox(self):
+        import os
+
+        n = ToolsNodes()
+        pkgs = [{"name": "k8s-triage"}, {"name": "log-analysis"}]
+        with (
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch("deepagents.backends.LocalShellBackend", return_value=MagicMock()) as backend_cls,
+            patch("apps.opspilot.services.skill_package.materializer.materialize_skill_package") as mat,
+            patch.object(ToolsNodes, "_ensure_skill_deps") as ensure_deps,
+        ):
+            backend, sources, sandbox_dir = n._build_skill_backend_and_sources(_request())
+        assert backend is not None
+        assert sources == ["/skills/"]
+        assert mat.call_count == 2
+        # 建沙箱只物化目录,不预装依赖(寒暄不应 pip install)
+        ensure_deps.assert_not_called()
+        # 一次性沙箱目录被创建（用完即弃，由调用方清理）
+        assert sandbox_dir and os.path.isdir(sandbox_dir)
+        # 用的是 LocalShellBackend：虚拟根 + 不继承宿主环境
+        _, kwargs = backend_cls.call_args
+        assert kwargs["virtual_mode"] is True
+        assert kwargs["inherit_env"] is False
+        n._cleanup_sandbox(sandbox_dir)
+
+    def test_skill_deps_install_only_when_skill_path_accessed(self):
+        """读 /skills/<name>/SKILL.md 才装该包依赖;未访问不装。"""
+        n = ToolsNodes()
+        pkgs = [
+            {"name": "kubernetes-specialist", "package_id": "kubernetes-specialist"},
+            {"name": "pdf", "package_id": "pdf"},
+        ]
+        with (
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch("deepagents.backends.LocalShellBackend", return_value=MagicMock()),
+            patch("apps.opspilot.services.skill_package.materializer.materialize_skill_package"),
+            patch.object(ToolsNodes, "_ensure_skill_deps") as ensure_deps,
+        ):
+            backend, _, sandbox_dir = n._build_skill_backend_and_sources(_request())
+            ensure_deps.assert_not_called()
+            backend.read("/skills/kubernetes-specialist/SKILL.md")
+            ensure_deps.assert_called_once()
+            ensured = ensure_deps.call_args[0][0]
+            assert len(ensured) == 1
+            assert ensured[0]["name"] == "kubernetes-specialist"
+            # 同一技能再次访问不重复装
+            backend.read("/skills/kubernetes-specialist/scripts/foo.py")
+            assert ensure_deps.call_count == 1
+            # 另一个技能按需再装
+            backend.execute("python3 /skills/pdf/create_pdf.py", timeout=5)
+            assert ensure_deps.call_count == 2
+            assert ensure_deps.call_args[0][0][0]["name"] == "pdf"
+        n._cleanup_sandbox(sandbox_dir)
+
+    def test_single_package_materialize_failure_is_isolated(self):
+        n = ToolsNodes()
+        pkgs = [{"name": "a"}, {"name": "b"}]
+        with (
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch("deepagents.backends.LocalShellBackend", return_value=MagicMock()),
+            patch(
+                "apps.opspilot.services.skill_package.materializer.materialize_skill_package",
+                side_effect=[RuntimeError("boom"), None],
+            ),
+        ):
+            backend, sources, sandbox_dir = n._build_skill_backend_and_sources(_request())
+        # 单包失败不影响整体返回
+        assert backend is not None and sources == ["/skills/"]
+        n._cleanup_sandbox(sandbox_dir)
+
+    def test_sandbox_env_excludes_host_secrets(self):
+        n = ToolsNodes()
+        os.environ["DB_PASSWORD"] = "should-not-leak"
+        try:
+            env = n._sandbox_env("/tmp/run-xyz")
+        finally:
+            os.environ.pop("DB_PASSWORD", None)
+        assert "DB_PASSWORD" not in env
+        allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR", "HOME", "KUBECONFIG"}
+        allowed.update(n._WINDOWS_SOCKET_ENV_KEYS)
+        assert set(env).issubset(allowed)
+        assert env["TMPDIR"] == "/tmp/run-xyz"
+        if os.name == "nt":
+            assert env.get("SystemRoot")
+            assert "SYSTEMROOT" not in env
+            assert env.get("TEMP") == "/tmp/run-xyz"
+            assert env.get("TMP") == "/tmp/run-xyz"
+            path_entries = env["PATH"].split(os.pathsep)
+            assert any(p.lower().endswith("\\system32") or p.lower().endswith("/system32") for p in path_entries)
+
+    def test_sandbox_env_can_create_socket(self):
+        """精简沙箱 env 必须能初始化套接字。Windows 缺 SystemRoot 会 WinError 10106。"""
+        n = ToolsNodes()
+        env = n._sandbox_env(os.path.abspath("/tmp/run-socket"))
+        completed = subprocess.run(
+            [sys.executable, "-c", "import socket; socket.socket().close()"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_cleanup_sandbox_removes_dir(self):
+        import tempfile
+
+        n = ToolsNodes()
+        d = tempfile.mkdtemp(prefix="run-")
+        assert os.path.isdir(d)
+        n._cleanup_sandbox(d)
+        assert not os.path.exists(d)
+        n._cleanup_sandbox(None)  # None 安全
+
+    def test_sandbox_prefers_runtime_python_when_parent_path_only_has_system_python(self):
+        n = ToolsNodes()
+
+        with patch.dict(os.environ, {"PATH": os.pathsep.join(["/usr/bin", "/bin"])}):
+            env = n._sandbox_env("/tmp/run-python-path")
+
+        path_entries = env["PATH"].split(os.pathsep)
+        assert path_entries[0] == os.path.dirname(sys.executable)
+        python_cmd = "python" if os.name == "nt" else "python3"
+        completed = subprocess.run(
+            [python_cmd, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert completed.stdout.strip() == f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+class _FakeGraphBuilder:
+    def __init__(self):
+        self.nodes = {}
+
+    def add_node(self, name, fn):
+        self.nodes[name] = fn
+
+
+def test_should_use_lightweight_direct_reply():
+    from apps.opspilot.metis.llm.chain.node import ToolsNodes
+
+    assert ToolsNodes._should_use_lightweight_direct_reply([], []) is True
+    assert ToolsNodes._should_use_lightweight_direct_reply([], None) is True
+    assert ToolsNodes._should_use_lightweight_direct_reply([_tool("request_user_choice")], []) is True
+    assert ToolsNodes._should_use_lightweight_direct_reply([_tool("shell")], []) is False
+    assert ToolsNodes._should_use_lightweight_direct_reply([_tool("shell"), _tool("request_user_choice")], []) is False
+    assert ToolsNodes._should_use_lightweight_direct_reply([], ["/skills/"]) is False
+
+
+def test_should_use_lightweight_after_empty_plan():
+    from apps.opspilot.metis.llm.agent.tool_execution_planner import ToolExecutionPlan, ToolExecutionStep
+    from apps.opspilot.metis.llm.chain.node import ToolsNodes
+
+    assert ToolsNodes._should_use_lightweight_after_empty_plan(ToolExecutionPlan(goal="hi", steps=[])) is True
+    assert (
+        ToolsNodes._should_use_lightweight_after_empty_plan(
+            ToolExecutionPlan(goal="use skill", steps=[ToolExecutionStep(objective="读技能", tools=["__use_skills__"])])
+        )
+        is False
+    )
+
+
+def test_build_lightweight_system_prompt_is_short():
+    from apps.opspilot.metis.llm.chain.node import ToolsNodes
+
+    prompt = ToolsNodes._build_lightweight_system_prompt("你是运维助手")
+    assert "你是运维助手" in prompt
+    assert "DeepAgent" not in prompt
+    assert "write_todos" not in prompt
+    assert "read_file" not in prompt
+    assert len(prompt) < 500
+    with_skills = ToolsNodes._build_lightweight_system_prompt("你是运维助手", skills_available=True)
+    assert "不需要调用工具或读取技能文件" in with_skills
+    assert "当前没有可用工具与技能" not in with_skills
+
+
+class TestBuildDeepagentNodes:
+    def _run_wrapper(
+        self,
+        node,
+        req,
+        captured,
+        *,
+        plan_payload=None,
+        plan_payloads=None,
+        failing_agent_calls=(),
+        raising_agent_calls=None,
+        direct_reply_content=None,
+        agent_reply=None,
+        agent_replies=None,
+    ):
+        gb = _FakeGraphBuilder()
+
+        async def _build():
+            return await node.build_deepagent_nodes(gb, composite_node_name="deep_agent")
+
+        # 主线程无 event loop 时 `asyncio.get_event_loop()` 抛 RuntimeError;
+        # 用 `asyncio.run()` 自管理 loop 创建/关闭。
+        name = asyncio.run(_build())
+        wrapper = gb.nodes[name]
+
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        input_messages = [HumanMessage(content="排查 pod 崩溃")]
+
+        fake_agent = MagicMock()
+
+        async def _ainvoke(payload, config=None):
+            captured.setdefault("ainvoke_messages", []).append(payload["messages"])
+            middleware_list = list(captured["create_kwargs"].get("middleware") or [])
+            visibility = next(
+                (middleware for middleware in middleware_list if isinstance(middleware, ToolVisibilityMiddleware)),
+                None,
+            )
+            if visibility is not None:
+                visible_request = visibility._filter_request(
+                    SimpleNamespace(
+                        tools=[
+                            *captured["create_kwargs"]["tools"],
+                            _tool("write_todos"),
+                            _tool("task"),
+                            _tool("execute"),
+                        ],
+                        override=lambda **changes: SimpleNamespace(**changes),
+                    )
+                )
+                captured.setdefault("visible_tool_calls", []).append([tool.name for tool in visible_request.tools])
+            else:
+                captured.setdefault("visible_tool_calls", []).append([tool.name for tool in captured["create_kwargs"]["tools"]])
+            extra = getattr(req, "extra_config", None) or {}
+            captured.setdefault("hide_during_ainvoke", []).append(bool(extra.get("opspilot_hide_planned_step_text")))
+            call_index = len(captured["visible_tool_calls"])
+            if raising_agent_calls and call_index in raising_agent_calls:
+                raise raising_agent_calls[call_index]
+            if agent_replies and call_index in agent_replies:
+                reply_text = agent_replies[call_index]
+            else:
+                reply_text = agent_reply or f"执行结果 {call_index}"
+            appended_messages = [AIMessage(content=reply_text)]
+            if call_index in failing_agent_calls:
+                from langchain_core.messages import ToolMessage
+
+                fail_spec = failing_agent_calls[call_index] if isinstance(failing_agent_calls, dict) else None
+                if isinstance(fail_spec, dict):
+                    tool_content = fail_spec.get("content", "connection refused")
+                    tool_status = fail_spec.get("status", "error")
+                    tool_name = fail_spec.get("name", "diagnose_kubernetes_pod_issues")
+                else:
+                    tool_content = "connection refused"
+                    tool_status = "error"
+                    tool_name = "diagnose_kubernetes_pod_issues"
+                appended_messages.insert(
+                    0,
+                    ToolMessage(
+                        content=tool_content,
+                        name=tool_name,
+                        tool_call_id=f"failed-{call_index}",
+                        status=tool_status,
+                    ),
+                )
+            return {
+                **payload,
+                "messages": list(payload["messages"]) + appended_messages,
+            }
+
+        fake_agent.ainvoke = _ainvoke
+
+        def _create(**kwargs):
+            captured["create_kwargs"] = kwargs
+            return fake_agent
+
+        planned_responses = iter(plan_payloads or [])
+
+        class _FakeLLM:
+            async def ainvoke(self, messages, config=None):
+                captured.setdefault("llm_calls", []).append(messages)
+                joined = "\n".join(str(getattr(message, "content", "") or "") for message in messages)
+                is_planner = "工具执行规划器" in joined or "紧凑工具目录" in joined
+                if is_planner:
+                    captured.setdefault("planner_calls", []).append(messages)
+                    payload = next(planned_responses) if plan_payloads is not None else plan_payload or {"goal": "直接回答", "steps": []}
+                    return AIMessage(
+                        content=json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                        ),
+                        usage_metadata={
+                            "input_tokens": 100,
+                            "output_tokens": 20,
+                            "total_tokens": 120,
+                        },
+                    )
+                captured.setdefault("direct_reply_calls", []).append(messages)
+                return AIMessage(
+                    content=direct_reply_content or "轻量直答",
+                    usage_metadata={
+                        "input_tokens": 80,
+                        "output_tokens": 10,
+                        "total_tokens": 90,
+                    },
+                )
+
+        with (
+            patch("apps.opspilot.metis.llm.chain.node.create_deep_agent", side_effect=_create),
+            patch.object(ToolsNodes, "get_llm_client", return_value=_FakeLLM()),
+        ):
+            config = {"configurable": {"graph_request": req}}
+            # 主线程无 event loop 时 `asyncio.get_event_loop()` 抛 RuntimeError;
+            # 用 `asyncio.run()` 自管理 loop 创建/关闭。
+            result = asyncio.run(wrapper({"messages": input_messages}, config))
+        return result
+
+    def test_lightweight_direct_reply_skips_planner_and_deepagent(self):
+        node = ToolsNodes()
+        node.all_tools = []
+        req = _request(user_message="你好", system_message_prompt="你是助手")
+        captured = {}
+
+        with (
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(None, [], None)),
+        ):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                direct_reply_content="你好！有什么可以帮你的？",
+            )
+
+        assert "create_kwargs" not in captured
+        assert captured.get("planner_calls") in (None, [])
+        assert len(captured["direct_reply_calls"]) == 1
+        system_text = str(captured["direct_reply_calls"][0][0].content)
+        assert "DeepAgent" not in system_text
+        assert "read_file" not in system_text
+        assert result["messages"][0].content == "你好！有什么可以帮你的？"
+
+    def test_empty_plan_with_skill_packages_skips_deepagent(self):
+        """已启用技能包但规划器返回空 steps（寒暄）时，不物化沙箱、不创建 DeepAgent。"""
+        node = ToolsNodes()
+        node.all_tools = []
+        req = _request(user_message="你好")
+        captured = {}
+        pkgs = [{"name": "kubernetes-specialist", "description": "K8s 排障"}]
+
+        with (
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(MagicMock(), ["/skills/"], None)) as build_skills,
+        ):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={"goal": "问候", "steps": []},
+                direct_reply_content="你好！",
+            )
+
+        assert "create_kwargs" not in captured
+        build_skills.assert_not_called()
+        assert len(captured["planner_calls"]) == 1
+        planner_text = "\n".join(str(m.content) for m in captured["planner_calls"][0])
+        assert "可用技能包" in planner_text
+        assert "kubernetes-specialist" in planner_text
+        assert len(captured["direct_reply_calls"]) == 1
+        assert "不需要调用工具或读取技能文件" in str(captured["direct_reply_calls"][0][0].content)
+        assert result["messages"][0].content == "你好！"
+
+    def test_empty_plan_with_registered_tools_lists_them(self):
+        """寒暄式空计划仍要带上已配置工具名，不能对用户说没有工具。"""
+        node = ToolsNodes()
+        node.all_tools = [_tool("get_current_time")]
+        req = _request(user_message="你当前有哪些可以调用的工具")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={"goal": "说明可用工具", "steps": []},
+                direct_reply_content="可以调用 get_current_time。",
+            )
+
+        system_text = str(captured["direct_reply_calls"][0][0].content)
+        assert "当前没有可用工具与技能" not in system_text
+        assert "当前可用工具:" in system_text
+        assert "get_current_time" in system_text
+
+    def test_use_skills_step_materializes_sandbox_and_enables_fs(self):
+        node = ToolsNodes()
+        node.all_tools = []
+        req = _request(user_message="用 kubernetes 技能排查 Pod")
+        captured = {}
+        pkgs = [{"name": "kubernetes-specialist", "description": "K8s 排障"}]
+        fake_backend = MagicMock()
+
+        with (
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(fake_backend, ["/skills/"], None)) as build_skills,
+        ):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "排查 Pod",
+                    "steps": [{"objective": "按技能执行", "tools": ["__use_skills__"]}],
+                },
+            )
+
+        build_skills.assert_called_once()
+        kwargs = captured["create_kwargs"]
+        assert kwargs["backend"] is fake_backend
+        assert kwargs["skills"] == ["/skills/"]
+        visibility = next(m for m in kwargs["middleware"] if isinstance(m, ToolVisibilityMiddleware))
+        # 纯技能步不再常驻整套 FS（避免每轮 ~7k schema），但必须把 execute
+        # 放进 always_visible（仅 discard hidden 不够，allow_unregistered=False）。
+        assert "read_file" not in visibility._always_visible_tools
+        assert "execute" not in visibility._hidden_tools
+        assert "execute" in visibility._always_visible_tools
+        skill_guard = next(m for m in kwargs["middleware"] if isinstance(m, SkillExecutionGuardMiddleware))
+        assert skill_guard.enabled is True
+
+    def test_context_overflow_skips_current_step_and_continues_remaining(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("list_kubernetes_events"),
+            _tool("get_kubernetes_pod_logs"),
+            _tool("validate_probe_configuration"),
+        ]
+        req = _request(user_message="告警：Unhealthy startup probe")
+        captured = {}
+
+        gb = _FakeGraphBuilder()
+        name = asyncio.run(node.build_deepagent_nodes(gb, composite_node_name="deep_agent"))
+        wrapper = gb.nodes[name]
+
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        class _OverflowLLM:
+            async def ainvoke(self, messages, config=None):
+                captured.setdefault("planner_calls", []).append(messages)
+                return AIMessage(
+                    content=json.dumps(
+                        {
+                            "goal": "诊断",
+                            "steps": [
+                                {"objective": "查日志与事件", "tools": ["get_kubernetes_pod_logs", "list_kubernetes_events"]},
+                                {"objective": "验证探针配置", "tools": ["validate_probe_configuration"]},
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        fake_agent = MagicMock()
+
+        async def _ainvoke(payload, config=None):
+            captured.setdefault("agent_calls", 0)
+            captured["agent_calls"] += 1
+            joined = "\n".join(str(getattr(m, "content", "") or "") for m in payload["messages"])
+            captured.setdefault("ainvoke_joined", []).append(joined)
+            if captured["agent_calls"] == 1:
+                raise Exception(
+                    "BadRequestError: Error code: 400 - "
+                    "{'error': {'message': 'request (9132 tokens) exceeds the available context size (8192 tokens)', "
+                    "'type': 'exceed_context_size_error'}}"
+                )
+            return {
+                **payload,
+                "messages": list(payload["messages"]) + [AIMessage(content=f"执行结果 {captured['agent_calls']}")],
+            }
+
+        fake_agent.ainvoke = _ainvoke
+        emitted = []
+
+        async def _capture_event(name, payload, config=None):
+            emitted.append((name, payload))
+
+        with (
+            patch("apps.opspilot.metis.llm.chain.node.create_deep_agent", return_value=fake_agent),
+            patch.object(ToolsNodes, "get_llm_client", return_value=_OverflowLLM()),
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(None, [], None)),
+            patch("apps.opspilot.metis.llm.chain.node.adispatch_custom_event", new=AsyncMock(side_effect=_capture_event)),
+        ):
+            result = asyncio.run(
+                wrapper(
+                    {"messages": [HumanMessage(content="告警：Unhealthy")]},
+                    {"configurable": {"graph_request": req}},
+                )
+            )
+
+        # 规划 1 次；第 1 步溢出后不重规划，压缩上下文后继续第 2 步，再走总结
+        assert len(captured["planner_calls"]) == 1
+        assert captured["agent_calls"] == 3
+        assert "上下文压缩" in captured["ainvoke_joined"][1]
+        assert result["messages"][-1].content == "执行结果 3"
+        overflow_ends = [
+            payload
+            for name, payload in emitted
+            if name == "planned_execution_step" and payload.get("phase") == "end" and payload.get("status") == "skipped_context_overflow"
+        ]
+        assert overflow_ends, "溢出步必须发出 skipped_context_overflow"
+        assert "outcome" not in overflow_ends[0]
+
+    def test_llm_upstream_500_skips_sandbox_whitelist_fallback(self, caplog):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("list_kubernetes_events"),
+            _tool("get_kubernetes_pod_logs"),
+        ]
+        req = _request(user_message="告警：Unhealthy startup probe")
+        captured = {}
+
+        gb = _FakeGraphBuilder()
+        name = asyncio.run(node.build_deepagent_nodes(gb, composite_node_name="deep_agent"))
+        wrapper = gb.nodes[name]
+
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        class InternalServerError(Exception):
+            pass
+
+        class _PlannerLLM:
+            async def ainvoke(self, messages, config=None):
+                captured.setdefault("planner_calls", []).append(messages)
+                joined = "\n".join(str(getattr(m, "content", "") or "") for m in messages)
+                if "上一轮工具执行失败" in joined:
+                    captured["fallback_explain"] = True
+                    raise AssertionError("must not re-invoke LLM to explain upstream 500")
+                return AIMessage(
+                    content=json.dumps(
+                        {
+                            "goal": "诊断",
+                            "steps": [
+                                {"objective": "查日志与事件", "tools": ["get_kubernetes_pod_logs", "list_kubernetes_events"]},
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        fake_agent = MagicMock()
+
+        async def _ainvoke(payload, config=None):
+            captured.setdefault("agent_calls", 0)
+            captured["agent_calls"] += 1
+            original = InternalServerError(
+                "Error code: 500 - {'error': {'message': 'upstream error: do request failed "
+                "(request id: 202609051131219225871028268d9d61rWfvQV9)', "
+                "'type': 'new_api_error', 'param': '', 'code': 'do_request_failed'}}"
+            )
+            captured["original"] = original
+            raise original
+
+        fake_agent.ainvoke = _ainvoke
+        caplog.set_level(logging.ERROR, logger="opspilot")
+        log_output = io.StringIO()
+        handler = logging.StreamHandler(log_output)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        opspilot_logger.addHandler(handler)
+        try:
+            with (
+                patch("apps.opspilot.metis.llm.chain.node.create_deep_agent", return_value=fake_agent),
+                patch.object(ToolsNodes, "get_llm_client", return_value=_PlannerLLM()),
+                patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+                patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(None, [], None)),
+            ):
+                result = asyncio.run(
+                    wrapper(
+                        {"messages": [HumanMessage(content="告警：Unhealthy")]},
+                        {"configurable": {"graph_request": req}},
+                    )
+                )
+        finally:
+            opspilot_logger.removeHandler(handler)
+
+        content = result["messages"][-1].content
+        assert "上游请求失败" in content
+        assert "202609051131219225871028268d9d61rWfvQV9" in content
+        assert "uvx" not in content
+        assert "python -m" not in content
+        assert captured["agent_calls"] == 1
+        assert len(captured["planner_calls"]) == 1
+        assert "fallback_explain" not in captured
+
+        owned = [
+            rec
+            for rec in caplog.records
+            if rec.name == "opspilot"
+            and rec.levelno == logging.ERROR
+            and rec.exc_info
+            and rec.msg == "event=deepagent_llm_upstream_failed failed_stage=%s error_type=%s request_id=%s"
+        ]
+        assert len(owned) == 1
+        rec = owned[0]
+        assert rec.args == ("planned_execution", "InternalServerError", "202609051131219225871028268d9d61rWfvQV9")
+        message = rec.getMessage()
+        assert "failed_stage=planned_execution" in message
+        assert "error_type=InternalServerError" in message
+        assert rec.exc_info[0] is SafeLogException
+        assert rec.exc_info[1] is not captured["original"]
+        assert str(rec.exc_info[1]) == "InternalServerError"
+        frame_names = [frame.name for frame in traceback.extract_tb(rec.exc_info[2])]
+        assert "_ainvoke" in frame_names
+        rendered = log_output.getvalue()
+        assert "do_request_failed" not in message
+        assert "do_request_failed" not in rendered
+        traceback_errors = [r for r in caplog.records if r.name == "opspilot" and r.levelno >= logging.ERROR and r.exc_info]
+        assert traceback_errors == owned
+
+    def test_successful_step_compacts_history_before_next_step(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("resolve_k8s_target_from_alert"),
+            _tool("diagnose_kubernetes_pod_issues"),
+        ]
+        req = _request(user_message="告警：Unhealthy startup probe")
+        captured = {}
+
+        gb = _FakeGraphBuilder()
+        name = asyncio.run(node.build_deepagent_nodes(gb, composite_node_name="deep_agent"))
+        wrapper = gb.nodes[name]
+
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        class _PlanLLM:
+            async def ainvoke(self, messages, config=None):
+                captured.setdefault("planner_calls", []).append(messages)
+                return AIMessage(
+                    content=json.dumps(
+                        {
+                            "goal": "诊断",
+                            "steps": [
+                                {"objective": "反查命名空间", "tools": ["resolve_k8s_target_from_alert"]},
+                                {"objective": "诊断 Pod", "tools": ["diagnose_kubernetes_pod_issues"]},
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        fake_agent = MagicMock()
+
+        async def _ainvoke(payload, config=None):
+            captured.setdefault("agent_calls", 0)
+            captured["agent_calls"] += 1
+            joined = "\n".join(str(getattr(m, "content", "") or "") for m in payload["messages"])
+            captured.setdefault("ainvoke_joined", []).append(joined)
+            if captured["agent_calls"] == 1:
+                return {
+                    **payload,
+                    "messages": list(payload["messages"])
+                    + [
+                        ToolMessage(content="HUGE_TOOL_RESULT_" + ("x" * 8000), tool_call_id="t1", name="resolve_k8s_target_from_alert"),
+                        AIMessage(content="已解析 namespace=bk-lite"),
+                    ],
+                }
+            return {
+                **payload,
+                "messages": list(payload["messages"]) + [AIMessage(content=f"执行结果 {captured['agent_calls']}")],
+            }
+
+        fake_agent.ainvoke = _ainvoke
+
+        with (
+            patch("apps.opspilot.metis.llm.chain.node.create_deep_agent", return_value=fake_agent),
+            patch.object(ToolsNodes, "get_llm_client", return_value=_PlanLLM()),
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(None, [], None)),
+        ):
+            asyncio.run(
+                wrapper(
+                    {"messages": [HumanMessage(content="告警：Unhealthy")]},
+                    {"configurable": {"graph_request": req}},
+                )
+            )
+
+        assert captured["agent_calls"] == 3
+        assert "步骤摘要" in captured["ainvoke_joined"][1]
+        assert "HUGE_TOOL_RESULT_" not in captured["ainvoke_joined"][1]
+        assert "步骤摘要" in captured["ainvoke_joined"][2] or "工具执行计划目标" in captured["ainvoke_joined"][2]
+
+    def test_runtime_middleware_includes_tool_result_compaction(self):
+        from apps.opspilot.metis.llm.middleware.context_window import ContextWindowMiddleware
+        from apps.opspilot.metis.llm.middleware.tool_runtime import ToolResultCompactionMiddleware
+
+        node = ToolsNodes()
+        node.all_tools = [_tool("list_kubernetes_events")]
+        req = _request(user_message="查事件")
+        captured = {}
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "查事件",
+                    "steps": [{"objective": "读事件", "tools": ["list_kubernetes_events"]}],
+                },
+            )
+        middlewares = captured["create_kwargs"]["middleware"]
+        compaction = next(item for item in middlewares if isinstance(item, ToolResultCompactionMiddleware))
+        assert compaction._max_tool_chars == 1500
+        assert compaction._max_ai_chars == 1000
+        assert any(isinstance(item, ContextWindowMiddleware) for item in middlewares)
+
+    def test_runtime_middleware_scales_tool_compaction_with_working_budget(self):
+        from apps.opspilot.metis.llm.middleware.tool_runtime import ToolResultCompactionMiddleware
+
+        node = ToolsNodes()
+        node.all_tools = [_tool("list_kubernetes_events")]
+        req = _request(
+            user_message="查事件",
+            extra_config={"input_working_tokens": 186_000},
+            message_trim_config={"max_single_message_tokens": 37_200},
+        )
+        captured = {}
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "查事件",
+                    "steps": [{"objective": "读事件", "tools": ["list_kubernetes_events"]}],
+                },
+            )
+        middlewares = captured["create_kwargs"]["middleware"]
+        compaction = next(item for item in middlewares if isinstance(item, ToolResultCompactionMiddleware))
+        assert compaction._max_tool_chars == 37_200
+        assert compaction._max_ai_chars == 27_352
+
+    def test_planned_step_prepare_passes_active_tools(self):
+        seen_tool_names = []
+
+        async def _spy(self, messages, graph_request, *, tools=None):
+            seen_tool_names.append([getattr(tool, "name", "") for tool in (tools or [])])
+            return list(messages or [])
+
+        node = ToolsNodes()
+        node.all_tools = [_tool("list_kubernetes_events")]
+        req = _request(user_message="查事件")
+        captured = {}
+        with (
+            patch.object(ToolsNodes, "_prepare_messages_for_llm", _spy),
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+        ):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "查事件",
+                    "steps": [{"objective": "读事件", "tools": ["list_kubernetes_events"]}],
+                },
+            )
+        assert any("list_kubernetes_events" in names for names in seen_tool_names)
+
+    def test_passes_tools_and_returns_only_new_messages(self):
+        node = ToolsNodes()
+        node.all_tools = [_tool("shell")]
+        req = _request()
+        captured = {}
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "排查",
+                    "steps": [{"objective": "执行命令", "tools": ["shell"]}],
+                },
+            )
+        kwargs = captured["create_kwargs"]
+        assert kwargs["model"].__class__.__name__ == "_FakeLLM"
+        _assert_registered_tool_names(kwargs["tools"], ["shell"])
+        assert "system_prompt" in kwargs
+        # 无技能/审批时不传 backend/skills/interrupt_on
+        assert "backend" not in kwargs
+        assert "skills" not in kwargs
+        assert "interrupt_on" not in kwargs
+        # 执行步正文不对外；只返回总结轮一份答案
+        assert len(result["messages"]) == 1
+        assert result["messages"][0].content == "执行结果 2"
+
+    def test_planned_execution_reuses_agent_and_replaces_tools_per_step(self):
+        node = ToolsNodes()
+        node._dynamic_mode = True
+        node.all_tools = [
+            _tool("current_time"),
+            _tool("diagnose_kubernetes_pod_issues"),
+            _tool("restart_pod"),
+        ]
+        node.active_tools = []
+        req = _request(user_message="检查 Pod 故障")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "定位 Pod 故障",
+                    "steps": [
+                        {"objective": "确认当前时间", "tools": ["current_time"]},
+                        {
+                            "objective": "诊断 Pod",
+                            "tools": ["diagnose_kubernetes_pod_issues"],
+                        },
+                    ],
+                },
+            )
+
+        kwargs = captured["create_kwargs"]
+        _assert_registered_tool_names(
+            kwargs["tools"],
+            ["current_time", "diagnose_kubernetes_pod_issues", "restart_pod"],
+        )
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["current_time"],
+                ["diagnose_kubernetes_pod_issues"],
+                [],
+            ],
+        )
+        assert len(captured["ainvoke_messages"]) == 3
+        assert len(result["messages"]) == 1
+        assert result["messages"][0].content == "执行结果 3"
+        assert all(not isinstance(message, HumanMessage) for message in result["messages"])
+
+    def test_planned_execution_hides_deepagent_builtin_tools(self):
+        from apps.opspilot.metis.llm.middleware.planned_execution_limits import PlannedExecutionLimitMiddleware
+
+        node = ToolsNodes()
+        node._dynamic_mode = True
+        node.all_tools = [_tool("list_kubernetes_events"), _tool("restart_pod")]
+        node.active_tools = []
+        req = _request(
+            user_message="告警：K8s Warning Failed on Pod/ns/pod-1",
+            extra_config={"entry_type": "nats"},
+        )
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "检查事件",
+                    "steps": [
+                        {
+                            "objective": "读取事件",
+                            "tools": ["list_kubernetes_events"],
+                        }
+                    ],
+                },
+            )
+
+        kwargs = captured["create_kwargs"]
+        visibility = next(middleware for middleware in kwargs["middleware"] if isinstance(middleware, ToolVisibilityMiddleware))
+        assert visibility._hidden_tools == PLANNED_EXECUTION_HIDDEN_DEEPAGENT_TOOLS
+        assert "write_todos" in visibility._hidden_tools
+        assert "task" in visibility._hidden_tools
+        # 无技能包时不常驻 FS 工具，避免 8K 模型被 read_file/ls schema 撑爆。
+        assert "read_file" not in visibility._always_visible_tools
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["list_kubernetes_events"],
+                [],
+            ],
+        )
+        call_limit = next(middleware for middleware in kwargs["middleware"] if isinstance(middleware, PlannedExecutionLimitMiddleware))
+        assert call_limit.run_limit == 10
+        assert call_limit.token_budget == 0
+        assert call_limit.enforce_limits is False  # 总结轮关闭硬限制
+
+    def test_tool_failure_replans_only_unfinished_steps(self):
+        # 不用 namespace 反查类工具，避免规划硬校验改写步骤顺序。
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("current_time"),
+            _tool("diagnose_kubernetes_pod_issues"),
+            _tool("validate_probe_configuration"),
+        ]
+        req = _request(user_message="定位 Pod 告警")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payloads=[
+                    {
+                        "goal": "定位 Pod 告警",
+                        "steps": [
+                            {"objective": "确认时间", "tools": ["current_time"]},
+                            {
+                                "objective": "诊断 Pod",
+                                "tools": ["diagnose_kubernetes_pod_issues"],
+                            },
+                        ],
+                    },
+                    {
+                        "goal": "改验探针配置",
+                        "steps": [
+                            {
+                                "objective": "验证探针配置",
+                                "tools": ["validate_probe_configuration"],
+                            }
+                        ],
+                    },
+                ],
+                failing_agent_calls={2},
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["current_time"],
+                ["diagnose_kubernetes_pod_issues"],
+                ["validate_probe_configuration"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 2
+        replan_prompt = "\n".join(str(message.content) for message in captured["planner_calls"][1])
+        assert "确认时间: 执行结果 1" in replan_prompt
+        assert "connection refused" in replan_prompt
+
+    def test_replan_keeps_unfinished_followup_steps(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("normalize_alert_event"),
+            _tool("diagnose_node_issues"),
+            _tool("list_kubernetes_nodes"),
+            _tool("check_pvc_capacity"),
+        ]
+        req = _request(user_message="诊断节点磁盘不可调度")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payloads=[
+                    {
+                        "goal": "诊断节点磁盘",
+                        "steps": [
+                            {"objective": "解析告警", "tools": ["normalize_alert_event"]},
+                            {"objective": "检查节点", "tools": ["diagnose_node_issues"]},
+                            {"objective": "检查 PVC", "tools": ["check_pvc_capacity"]},
+                        ],
+                    },
+                    {
+                        "goal": "先确认节点是否存在",
+                        "steps": [
+                            {"objective": "获取集群节点列表", "tools": ["list_kubernetes_nodes"]},
+                        ],
+                    },
+                ],
+                failing_agent_calls={
+                    2: {
+                        "content": '{"error": "Node不存在: k3s-worker02"}',
+                        "status": "success",
+                        "name": "diagnose_node_issues",
+                    }
+                },
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["normalize_alert_event"],
+                ["diagnose_node_issues"],
+                ["list_kubernetes_nodes"],
+                ["check_pvc_capacity"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 2
+
+    def test_json_tool_error_payload_triggers_replan(self):
+        # 不用 list_kubernetes_pods：避免规划硬校验前置反查，干扰「JSON error → replan」断言。
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("diagnose_kubernetes_pod_issues"),
+            _tool("validate_probe_configuration"),
+        ]
+        req = _request(user_message="定位 Pod 告警")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payloads=[
+                    {
+                        "goal": "定位 Pod 告警",
+                        "steps": [
+                            {
+                                "objective": "诊断 Pod",
+                                "tools": ["diagnose_kubernetes_pod_issues"],
+                            },
+                        ],
+                    },
+                    {
+                        "goal": "改验探针配置",
+                        "steps": [
+                            {
+                                "objective": "验证探针配置",
+                                "tools": ["validate_probe_configuration"],
+                            }
+                        ],
+                    },
+                ],
+                failing_agent_calls={
+                    1: {
+                        "content": '{"error": "Pod server-x 在命名空间 default 中不存在"}',
+                        "status": "success",
+                        "name": "diagnose_kubernetes_pod_issues",
+                    }
+                },
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["diagnose_kubernetes_pod_issues"],
+                ["validate_probe_configuration"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 2
+        replan_prompt = "\n".join(str(message.content) for message in captured["planner_calls"][1])
+        assert "不存在" in replan_prompt
+
+    def test_missing_params_nudges_user_choice_without_replan(self, caplog):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("monitor_query_metric_data"),
+            _tool("request_user_choice"),
+        ]
+        req = _request(user_message="fusion-collector近30天的情况")
+        captured = {}
+        sentinel = "SENTINEL_MISSING_PARAMS_BODY"
+
+        caplog.set_level(logging.DEBUG, logger="opspilot")
+        log_output = io.StringIO()
+        handler = logging.StreamHandler(log_output)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        opspilot_logger.addHandler(handler)
+        try:
+            with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+                result = self._run_wrapper(
+                    node,
+                    req,
+                    captured,
+                    plan_payload={
+                        "goal": "查看主机近30天情况",
+                        "steps": [
+                            {
+                                "objective": "查询指标",
+                                "tools": ["monitor_query_metric_data"],
+                            }
+                        ],
+                    },
+                    failing_agent_calls={
+                        1: {
+                            "content": f'{{"success": false, "error": "metric is required {sentinel}"}}',
+                            "status": "success",
+                            "name": "monitor_query_metric_data",
+                        }
+                    },
+                    agent_replies={
+                        1: "上一轮失败，可用 uvx fusion-monitor 替代排查。",
+                        2: "请选择要查看的指标",
+                    },
+                )
+        finally:
+            opspilot_logger.removeHandler(handler)
+
+        assert len(captured["planner_calls"]) == 1
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"][:2],
+            [
+                ["monitor_query_metric_data", "request_user_choice"],
+                ["monitor_query_metric_data", "request_user_choice"],
+            ],
+        )
+        nudge_text = "\n".join(str(getattr(message, "content", "") or "") for message in captured["ainvoke_messages"][1])
+        assert "request_user_choice" in nudge_text
+        assert "禁止编造 uvx" in nudge_text
+        joined = "\n".join(str(getattr(message, "content", "") or "") for message in result["messages"])
+        assert "uvx fusion-monitor" not in joined
+        assert "请选择要查看的指标" in joined
+
+        nudges = [rec for rec in caplog.records if rec.name == "opspilot" and rec.msg == MISSING_PARAMS_NUDGE_LOG]
+        assert len(nudges) == 1
+        rec = nudges[0]
+        assert rec.args == ("查询指标", "MissingToolParams", "missing_params", "thread-ut-1")
+        message = rec.getMessage()
+        assert message.startswith("event=deepagent_missing_params_nudge ")
+        assert "objective=查询指标" in message
+        assert "error_type=MissingToolParams" in message
+        assert "failed_stage=missing_params" in message
+        assert "thread_id=thread-ut-1" in message
+        assert sentinel not in message
+        assert sentinel not in rec.args
+        assert sentinel not in log_output.getvalue()
+
+    def test_missing_params_abort_logs_without_failure_body(self, caplog):
+        node = ToolsNodes()
+        node.all_tools = [_tool("monitor_query_metric_data")]
+        req = _request(user_message="fusion-collector近30天的情况")
+        captured = {}
+        sentinel = "SENTINEL_MISSING_PARAMS_ABORT_BODY"
+
+        caplog.set_level(logging.DEBUG, logger="opspilot")
+        log_output = io.StringIO()
+        handler = logging.StreamHandler(log_output)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        opspilot_logger.addHandler(handler)
+        try:
+            with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+                result = self._run_wrapper(
+                    node,
+                    req,
+                    captured,
+                    plan_payload={
+                        "goal": "查看主机近30天情况",
+                        "steps": [
+                            {
+                                "objective": "查询指标",
+                                "tools": ["monitor_query_metric_data"],
+                            }
+                        ],
+                    },
+                    failing_agent_calls={
+                        1: {
+                            "content": f'{{"success": false, "error": "metric is required {sentinel}"}}',
+                            "status": "success",
+                            "name": "monitor_query_metric_data",
+                        },
+                        2: {
+                            "content": f'{{"success": false, "error": "metric is required {sentinel}"}}',
+                            "status": "success",
+                            "name": "monitor_query_metric_data",
+                        },
+                    },
+                    agent_replies={
+                        1: f"上一轮失败，可用 uvx fusion-monitor {sentinel} 替代排查。",
+                        2: f"仍缺参数 {sentinel}",
+                    },
+                )
+        finally:
+            opspilot_logger.removeHandler(handler)
+
+        assert result["messages"]
+        assert len(captured["planner_calls"]) == 1
+
+        aborts = [rec for rec in caplog.records if rec.name == "opspilot" and rec.msg == MISSING_PARAMS_ABORT_LOG]
+        assert len(aborts) == 1
+        rec = aborts[0]
+        assert rec.args == ("查询指标", "MissingToolParams", "missing_params", "thread-ut-1")
+        message = rec.getMessage()
+        assert message.startswith("event=deepagent_missing_params_abort ")
+        assert "objective=查询指标" in message
+        assert "error_type=MissingToolParams" in message
+        assert "failed_stage=missing_params" in message
+        assert "thread_id=thread-ut-1" in message
+        assert sentinel not in message
+        assert sentinel not in rec.args
+        assert sentinel not in log_output.getvalue()
+
+    def test_missing_params_exception_path_logs_stable_template(self, caplog):
+        node = ToolsNodes()
+        node.all_tools = [_tool("monitor_query_metric_data")]
+        req = _request(user_message="fusion-collector近30天的情况")
+        captured = {}
+        sentinel = "SENTINEL_MISSING_PARAMS_EXC_BODY"
+
+        caplog.set_level(logging.DEBUG, logger="opspilot")
+        log_output = io.StringIO()
+        handler = logging.StreamHandler(log_output)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        opspilot_logger.addHandler(handler)
+        try:
+            with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+                result = self._run_wrapper(
+                    node,
+                    req,
+                    captured,
+                    plan_payload={
+                        "goal": "查看主机近30天情况",
+                        "steps": [
+                            {
+                                "objective": "查询\n指标",
+                                "tools": ["monitor_query_metric_data"],
+                            }
+                        ],
+                    },
+                    raising_agent_calls={
+                        1: ValueError(f"metric is required {sentinel}"),
+                        2: ValueError(f"metric is required {sentinel}"),
+                    },
+                )
+        finally:
+            opspilot_logger.removeHandler(handler)
+
+        assert result["messages"]
+        assert len(captured["planner_calls"]) == 1
+        ainvoke_blob = "\n".join(str(getattr(message, "content", "") or "") for messages in captured["ainvoke_messages"] for message in messages)
+        assert "缺少必要查询参数" in ainvoke_blob
+
+        nudges = [rec for rec in caplog.records if rec.name == "opspilot" and rec.msg == MISSING_PARAMS_NUDGE_LOG]
+        aborts = [rec for rec in caplog.records if rec.name == "opspilot" and rec.msg == MISSING_PARAMS_ABORT_LOG]
+        assert len(nudges) == 1
+        assert len(aborts) == 1
+        assert nudges[0].args == ("查询 指标", "MissingToolParams", "missing_params", "thread-ut-1")
+        assert aborts[0].args == ("查询 指标", "MissingToolParams", "missing_params", "thread-ut-1")
+        assert "event=deepagent_missing_params_nudge " in nudges[0].getMessage()
+        assert "event=deepagent_missing_params_abort " in aborts[0].getMessage()
+        assert "\n" not in nudges[0].getMessage()
+        assert sentinel not in nudges[0].getMessage()
+        assert sentinel not in aborts[0].getMessage()
+        assert sentinel not in log_output.getvalue()
+
+    def test_auth_tool_error_aborts_remaining_steps_without_replan(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("diagnose_kubernetes_pod_issues"),
+            _tool("validate_probe_configuration"),
+        ]
+        req = _request(user_message="定位 Pod 告警")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "定位 Pod 告警",
+                    "steps": [
+                        {
+                            "objective": "诊断 Pod",
+                            "tools": ["diagnose_kubernetes_pod_issues"],
+                        },
+                        {
+                            "objective": "验证探针配置",
+                            "tools": ["validate_probe_configuration"],
+                        },
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": '{"error": "获取Pod列表失败: (401)\\nReason: Unauthorized"}',
+                        "status": "success",
+                        "name": "diagnose_kubernetes_pod_issues",
+                    }
+                },
+                agent_reply="kubeconfig 鉴权失败，请检查 Token 或证书后重试。",
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["diagnose_kubernetes_pod_issues"],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 1
+        joined = "\n".join(str(getattr(message, "content", "") or "") for message in result["messages"])
+        assert "401" in joined or "鉴权" in joined or "Unauthorized" in joined
+
+    def test_cmdb_inventory_hit_skips_monitor_fallback_step(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("cmdb_search_instances"),
+            _tool("monitor_list_objects"),
+            _tool("monitor_list_object_instances"),
+        ]
+        req = _request(user_message="目前纳管多少台主机了")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "统计纳管主机",
+                    "steps": [
+                        {"objective": "先查CMDB", "tools": ["cmdb_search_instances"]},
+                        {
+                            "objective": "若CMDB无数据再查监控中心",
+                            "tools": ["monitor_list_objects", "monitor_list_object_instances"],
+                        },
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": '{"success": true, "data": [{"name": "fusion-collector"}]}',
+                        "status": "success",
+                        "name": "cmdb_search_instances",
+                    }
+                },
+                agent_reply="当前纳管 1 台主机。",
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["cmdb_search_instances"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 1
+
+    def test_cmdb_then_metric_query_still_runs_monitor_step(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("cmdb_search_instances"),
+            _tool("monitor_query_metric_data"),
+        ]
+        req = _request(user_message="这些主机的CPU使用率情况如何")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "查CPU",
+                    "steps": [
+                        {"objective": "查CMDB主机", "tools": ["cmdb_search_instances"]},
+                        {"objective": "查监控CPU", "tools": ["monitor_query_metric_data"]},
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": '{"success": true, "data": [{"name": "web-1", "monitor_id": "m1"}]}',
+                        "status": "success",
+                        "name": "cmdb_search_instances",
+                    }
+                },
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["cmdb_search_instances"],
+                ["monitor_query_metric_data"],
+                [],
+            ],
+        )
+
+    def test_unresolved_k8s_target_skips_namespace_required_followup_without_replan(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("resolve_k8s_target_from_alert"),
+            _tool("diagnose_kubernetes_pod_issues"),
+            _tool("generate_attachment_file"),
+        ]
+        req = _request(user_message="告警：Unhealthy server-69bf94649c-b8szc")
+        captured = {}
+        unresolved = json.dumps(
+            {
+                "cluster": "bk-lite-k3s",
+                "namespace": None,
+                "resource_type": "pod",
+                "resource_name": "server-69bf94649c-b8szc",
+                "resolved": False,
+                "lookup_exhausted": True,
+                "conclusive": True,
+                "missing_data": ["namespace"],
+                "reason": "Namespace not found for resource server-69bf94649c-b8szc via pods/events lookup",
+            },
+            ensure_ascii=False,
+        )
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "定位 Pod 告警",
+                    "steps": [
+                        {
+                            "objective": "反查命名空间",
+                            "tools": ["resolve_k8s_target_from_alert"],
+                        },
+                        {
+                            "objective": "诊断 Pod",
+                            "tools": ["diagnose_kubernetes_pod_issues"],
+                        },
+                        {
+                            "objective": "写报告",
+                            "tools": ["generate_attachment_file"],
+                        },
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": unresolved,
+                        "status": "success",
+                        "name": "resolve_k8s_target_from_alert",
+                    }
+                },
+                agent_reply="当前集群无法定位该对象。",
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["resolve_k8s_target_from_alert"],
+                ["generate_attachment_file"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 1
+
+    def test_unresolved_k8s_target_still_runs_alert_rca_summary(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("resolve_k8s_target_from_alert"),
+            _tool("diagnose_kubernetes_pod_issues"),
+            _tool("get_kubernetes_pod_logs"),
+        ]
+        req = _request(
+            user_message="告警：Unhealthy (kubernetes, bk-lite-k3s, server-fc88f89f4-j2s5z) 检测到异常",
+            system_message_prompt="你是 Kubernetes 集群 RCA 助手。\n## 告警怎么读\n## 输出格式\n# RCA 报告\n",
+        )
+        captured = {}
+        unresolved = json.dumps(
+            {
+                "cluster": "bk-lite-k3s",
+                "namespace": None,
+                "resource_type": "pod",
+                "resource_name": "server-fc88f89f4-j2s5z",
+                "resolved": False,
+                "lookup_exhausted": True,
+                "conclusive": True,
+                "missing_data": ["namespace"],
+                "reason": "Namespace not found for resource server-fc88f89f4-j2s5z via pods/events lookup",
+            },
+            ensure_ascii=False,
+        )
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "告警 RCA",
+                    "steps": [
+                        {
+                            "objective": "反查命名空间",
+                            "tools": ["resolve_k8s_target_from_alert"],
+                        },
+                        {
+                            "objective": "诊断 Pod",
+                            "tools": ["diagnose_kubernetes_pod_issues"],
+                        },
+                        {
+                            "objective": "拉日志",
+                            "tools": ["get_kubernetes_pod_logs"],
+                        },
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": unresolved,
+                        "status": "success",
+                        "name": "resolve_k8s_target_from_alert",
+                    }
+                },
+                agent_reply=("本步结果：resolve_k8s_target_from_alert 已收口。" "resolved=false，lookup_exhausted=true，无法确定 namespace。" "后续步骤应按对象不可见结束。"),
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["resolve_k8s_target_from_alert"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 1
+        summary_prompt = "\n".join(str(getattr(message, "content", "") or "") for message in captured["ainvoke_messages"][-1])
+        assert "必须以「# RCA 报告」" in summary_prompt
+        assert "对象在当前集群不可见" in summary_prompt
+
+    def test_permission_tool_error_aborts_without_replan(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("list_kubernetes_deployments"),
+            _tool("analyze_deployment_configurations"),
+        ]
+        req = _request(user_message="检查部署配置")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "检查部署配置",
+                    "steps": [
+                        {
+                            "objective": "列出 Deployment",
+                            "tools": ["list_kubernetes_deployments"],
+                        },
+                        {
+                            "objective": "分析配置",
+                            "tools": ["analyze_deployment_configurations"],
+                        },
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": '{"error": "获取Deployment列表失败: (403)\\nReason: Forbidden"}',
+                        "status": "success",
+                        "name": "list_kubernetes_deployments",
+                    }
+                },
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["list_kubernetes_deployments"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 1
+
+    def test_internal_tool_exception_aborts_without_replan(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("list_kubernetes_nodes"),
+            _tool("diagnose_kubernetes_pod_issues"),
+        ]
+        req = _request(user_message="列出节点")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "列出节点",
+                    "steps": [
+                        {"objective": "列出节点", "tools": ["list_kubernetes_nodes"]},
+                        {
+                            "objective": "诊断 Pod",
+                            "tools": ["diagnose_kubernetes_pod_issues"],
+                        },
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": "AttributeError: 'NoneType' object has no attribute 'items'",
+                        "status": "error",
+                        "name": "list_kubernetes_nodes",
+                    }
+                },
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["list_kubernetes_nodes"],
+                [],
+            ],
+        )
+        assert len(captured["planner_calls"]) == 1
+
+    def test_skill_auth_error_aborts_remaining_steps_without_replan(self):
+        node = ToolsNodes()
+        node.all_tools = []
+        req = _request(user_message="查 AD 用户")
+        captured = {}
+        pkgs = [{"name": "ad-domain-ops", "package_id": "ad-domain-ops", "description": "AD"}]
+        fake_backend = MagicMock()
+
+        with (
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(fake_backend, ["/skills/"], None)),
+        ):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "查 AD 用户",
+                    "steps": [
+                        {"objective": "查用户", "tools": ["__use_skills__"]},
+                        {"objective": "查组", "tools": ["__use_skills__"]},
+                    ],
+                },
+                failing_agent_calls={
+                    1: {
+                        "content": ('{"ok":false,"error":"invalid credentials"}\n' "[OPSPILOT_SKILL_RESULT] 脚本失败。最多修正参数后重试 1 次。"),
+                        "status": "success",
+                        "name": "execute",
+                    }
+                },
+                agent_reply="LDAP 凭据无效，请检查技能包连接配置后重试。",
+            )
+
+        _assert_visible_tool_steps(captured["visible_tool_calls"], [["execute"]])
+        assert len(captured["planner_calls"]) == 1
+        joined = "\n".join(str(getattr(message, "content", "") or "") for message in result["messages"])
+        assert "invalid credentials" in joined or "凭据" in joined
+
+    def test_wires_skills_and_approval_when_configured(self):
+        node = ToolsNodes()
+        node.all_tools = [_tool("shell")]
+        req = _request(approval_config=SimpleNamespace(enabled=True, tools=["shell"]))
+        captured = {}
+        fake_backend = MagicMock()
+        pkgs = [{"name": "kubernetes-specialist", "description": "K8s"}]
+        with (
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(fake_backend, ["/skills/"], None)),
+        ):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "按技能排查",
+                    "steps": [{"objective": "读技能并执行", "tools": ["__use_skills__", "shell"]}],
+                },
+            )
+        kwargs = captured["create_kwargs"]
+        assert kwargs["backend"] is fake_backend
+        assert kwargs["skills"] == ["/skills/"]
+        assert kwargs["interrupt_on"] == {"shell": True}
+
+    def test_build_skill_backend_and_sources_called_only_once_per_run(self):
+        """S2 回归测试:每次 deepagent 流只调一次 _build_skill_backend_and_sources。
+
+        之前 node.py 的 deep_wrapper_node 把 setup 块 copy-paste 了两遍(2664-2682 一次,
+        2684-2693 一次),导致 _build_skill_backend_and_sources 被双倍调,每次请求多 mkdtemp
+        一个沙箱,第一个永远不清理。本测试锁住"setup 只跑一次",防止回退。
+
+        改后版本里 _build_skill_backend_and_sources 应在规划需要技能运行时时恰好 1 次;
+        回退到旧版本时会变 2 次,本测试 fail 并报具体计数。
+        """
+        node = ToolsNodes()
+        # _skill_package_capabilities 是 ToolsNodes 实例属性,deep_wrapper_node 路径会读,
+        # 手动设一个空集合(测试不依赖具体 capability,只关心调用次数)
+        node._skill_package_capabilities = set()
+        node.all_tools = [_tool("shell")]
+        req = _request()
+        captured = {}
+        pkgs = [{"name": "kubernetes-specialist", "description": "K8s"}]
+
+        fake_backend = MagicMock()
+        call_counter = {"n": 0}
+
+        def _counting_side_effect(*args, **kwargs):
+            call_counter["n"] += 1
+            return (fake_backend, ["/skills/"], None)
+
+        with (
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", side_effect=_counting_side_effect),
+        ):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "按技能排查",
+                    "steps": [{"objective": "读技能", "tools": ["__use_skills__"]}],
+                },
+            )
+
+        assert call_counter["n"] == 1, (
+            f"期望 deep_wrapper_node 整个 setup 期间 _build_skill_backend_and_sources " f"只调 1 次,实际 {call_counter['n']} 次。" f"S2 修复前为 2 次(setup 块被复制粘贴)。"
+        )
+        # 同时确认 kwargs 透传正确(防御 setup 块改坏后端到端数据流)
+        kwargs = captured["create_kwargs"]
+        assert kwargs["backend"] is fake_backend
+        assert kwargs["skills"] == ["/skills/"]
+
+    def test_planned_execution_keeps_hitl_tools_always_on_until_summary(self):
+        node = ToolsNodes()
+        node.all_tools = [
+            _tool("list_kubernetes_events"),
+            _tool("request_user_choice"),
+            _tool("restart_pod"),
+        ]
+        req = _request(user_message="检查事件")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "检查事件",
+                    "steps": [
+                        {
+                            "objective": "读取事件",
+                            "tools": ["list_kubernetes_events"],
+                        }
+                    ],
+                },
+            )
+
+        _assert_visible_tool_steps(
+            captured["visible_tool_calls"],
+            [
+                ["list_kubernetes_events", "request_user_choice"],
+                [],
+            ],
+        )
+
+    def test_planned_execution_skips_summary_when_step_already_showed_table(self):
+        node = ToolsNodes()
+        node.all_tools = [_tool("execute")]
+        req = _request(user_message="查询域控前10个用户")
+        captured = {}
+        table = "已成功查询\n\n| 序号 | sAMAccountName |\n| --- | --- |\n| 1 | Administrator |"
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "查用户",
+                    "steps": [{"objective": "调用 AD 技能包", "tools": ["execute"]}],
+                },
+                agent_reply=table,
+            )
+
+        assert len(captured["ainvoke_messages"]) == 1
+        assert len(result["messages"]) == 1
+        assert result["messages"][0].content == table
+
+    def test_planned_execution_skips_summary_when_earlier_step_already_showed_table(self):
+        node = ToolsNodes()
+        node.all_tools = [_tool("list_kubernetes_pods"), _tool("list_kubernetes_events")]
+        req = _request(user_message="统计今天 pod 重启")
+        captured = {}
+        table = "| Pod | 重启次数 |\n" "| --- | --- |\n" "| calico-kube-controllers | 9 |"
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "统计重启",
+                    "steps": [
+                        {"objective": "取重启次数", "tools": ["list_kubernetes_pods"]},
+                        {"objective": "取最后重启时间", "tools": ["list_kubernetes_events"]},
+                    ],
+                },
+                agent_reply=table,
+            )
+
+        assert len(captured["ainvoke_messages"]) == 2
+        ai_messages = [message for message in result["messages"] if getattr(message, "type", "") == "ai"]
+        assert len(ai_messages) == 1
+        assert table in str(ai_messages[0].content)
+        assert captured["hide_during_ainvoke"] == [True, True]
+        assert req.extra_config.get("opspilot_hide_planned_step_text") is False
+
+    def test_planned_execution_keeps_last_table_when_step_tables_conflict(self):
+        node = ToolsNodes()
+        node.all_tools = [_tool("get_high_restart_kubernetes_pods"), _tool("get_resource_events_timeline")]
+        req = _request(user_message="统计今天 pod 重启")
+        captured = {}
+        cumulative = "| Pod | 累计重启 |\n| --- | --- |\n| calico-kube-controllers | 9 |"
+        today = "| Pod | 今天重启 |\n| --- | --- |\n| calico-kube-controllers | 0 |"
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "统计今天重启",
+                    "steps": [
+                        {"objective": "取累计重启", "tools": ["get_high_restart_kubernetes_pods"]},
+                        {"objective": "取今天事件", "tools": ["get_resource_events_timeline"]},
+                    ],
+                },
+                agent_replies={1: cumulative, 2: today},
+            )
+
+        assert len(captured["ainvoke_messages"]) == 2
+        ai_messages = [message for message in result["messages"] if getattr(message, "type", "") == "ai"]
+        assert len(ai_messages) == 1
+        assert "今天重启" in str(ai_messages[0].content)
+        assert "累计重启" not in str(ai_messages[0].content)
+        assert captured["hide_during_ainvoke"] == [True, True]
+        assert "不要输出 Markdown 表" in str(captured["ainvoke_messages"][0][-1].content)
+        assert "只保留一张表" in str(captured["ainvoke_messages"][1][-1].content)
+        assert "事件概述" in str(captured["ainvoke_messages"][1][-1].content)
+
+    def test_progressive_disabled_skips_planner_and_binds_all_tools(self, monkeypatch):
+        monkeypatch.setenv("OPSPILOT_DEEPAGENT_PROGRESSIVE_TOOLS", "0")
+        assert is_progressive_tools_enabled() is False
+
+        node = ToolsNodes()
+        node.all_tools = [_tool("shell"), _tool("k8s")]
+        req = _request(user_message="随便问问")
+        captured = {}
+
+        with patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None):
+            self._run_wrapper(node, req, captured, plan_payload={"goal": "x", "steps": []})
+
+        assert "planner_calls" not in captured
+        _assert_registered_tool_names(captured["create_kwargs"]["tools"], ["shell", "k8s"])
+        middleware = captured["create_kwargs"].get("middleware") or []
+        assert not any(isinstance(item, ToolVisibilityMiddleware) for item in middleware)
+        assert len(captured["ainvoke_messages"]) == 1
+        assert captured["ainvoke_messages"][0][0].content == "排查 pod 崩溃"
+
+
+def test_planned_step_already_answered_detects_markdown_table():
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    table = "已成功查询\n\n| 序号 | sAMAccountName |\n| --- | --- |\n| 1 | Administrator |"
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=table)]) is True
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content="执行结果 1")]) is False
+    assert ToolsNodes._planned_step_already_answered([ToolMessage(content=table, tool_call_id="t1")]) is False
+    evidence = "日志获取完成。\n\n**关键证据确认：**\n- MLflow 返回 RESOURCE_DOES_NOT_EXIST。\n" "证据链已闭环，确认为模型依赖缺失导致的启动失败。"
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=evidence)]) is False
+    dump = (
+        "## 事件描述\nPod 重启。\n\n## 涉及对象清单\n| Pod | Status | Reason | Restart Count |\n"
+        "| --- | --- | --- | --- |\n| a | Running | OOMKilled | 5 |\n\n## 链路分析\n步骤 1：OOM。\n\n## 调查结论\n堆内存不足。"
+    )
+    assert ToolsNodes._looks_like_step_investigation_dump(dump) is True
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=dump)]) is False
+    partial = (
+        "## 事件概述\n探针失败。\n\n## 异常对象清单\n| 对象 | 状态/现象 | 重启次数 | 关键事件 | 是否已定位 |\n"
+        "| --- | --- | --- | --- | --- |\n| pod/a | Ready=false | 1 | connection refused | 是 |\n\n## 根因分析\n模型缺失。"
+    )
+    assert ToolsNodes._looks_like_complete_rca_report(partial) is False
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=partial)]) is False
+    untitled = (
+        "## 事件概述\n探针失败。\n\n## 异常对象清单\n| 对象 | 状态/现象 | 重启次数 | 关键事件 | 是否已定位 |\n"
+        "| --- | --- | --- | --- | --- |\n| pod/a | Ready=false | 1 | connection refused | 是 |\n\n"
+        "## 根因分析\n模型缺失。\n\n## 修复建议\n核对模型 URI。\n\n## 待确认项\n无。"
+    )
+    assert ToolsNodes._looks_like_complete_rca_report(untitled) is False
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=untitled)]) is False
+    report = (
+        "# RCA 报告\n\n## 事件概述\n探针失败。\n\n## 异常对象清单\n| 对象 | 状态/现象 | 重启次数 | 关键事件 | 是否已定位 |\n"
+        "| --- | --- | --- | --- | --- |\n| pod/a | Ready=false | 1 | connection refused | 是 |\n\n"
+        "## 根因分析\n模型缺失。\n\n## 修复建议\n核对模型 URI。\n\n## 待确认项\n无。"
+    )
+    assert ToolsNodes._looks_like_complete_rca_report(report) is True
+    assert ToolsNodes._looks_like_evidence_note(report) is False
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=report)]) is True
+    restart = (
+        "## 时间基准\n现在 2026-09-04。\n\n## 对象与结论\nCrashLoop 仍在发生。\n\n"
+        "## 证据\nlast_state exit=1；previous_tail 含 bind() failed。\n\n"
+        "## 原因\nNginx 无法绑定 80 端口，置信度高。\n\n## 建议与待确认\n检查 hostPort/权限。"
+    )
+    assert ToolsNodes._looks_like_complete_restart_reason_report(restart) is True
+    assert ToolsNodes._looks_like_complete_rca_report(restart) is False
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=restart)]) is True
+
+
+def test_should_skip_planned_summary_for_multi_step_table():
+    from langchain_core.messages import AIMessage
+
+    table = "| Pod | 重启次数 |\n| --- | --- |\n| a | 1 |"
+    later = "以上名单累计重启均发生在 24 小时前，今天 0 次。"
+    messages = [AIMessage(content=table), AIMessage(content=later)]
+    assert ToolsNodes._planned_output_has_markdown_table(messages) is True
+    assert ToolsNodes._should_skip_planned_summary(messages, completed_step_count=3) is True
+    stubs = [AIMessage(content="执行结果 1"), AIMessage(content="执行结果 2")]
+    assert ToolsNodes._should_skip_planned_summary(stubs, completed_step_count=2) is False
+    prose = [AIMessage(content="已拿到事件时间，今天没有新的重启。")]
+    assert ToolsNodes._should_skip_planned_summary(prose, completed_step_count=2) is False
+    assert ToolsNodes._should_skip_planned_summary(prose, completed_step_count=1) is True
+    evidence = [AIMessage(content=("日志获取完成。\n\n**关键证据确认：**\n" "- 应用启动失败，端口 3000 未监听。\n" "证据链已闭环，确认为模型依赖缺失导致的启动失败。"))]
+    assert ToolsNodes._should_skip_planned_summary(evidence, completed_step_count=1) is False
+    assert ToolsNodes._should_skip_planned_summary(evidence, completed_step_count=3) is False
+    dump = [AIMessage(content=("## 事件描述\nPod 重启。\n\n## 涉及对象清单\n| Pod | Reason |\n| --- | --- |\n" "| a | OOMKilled |\n\n## 调查结论\n堆内存不足。"))]
+    assert ToolsNodes._should_skip_planned_summary(dump, completed_step_count=1) is False
+    assert ToolsNodes._should_skip_planned_summary(dump, completed_step_count=3) is False
+    restart = [AIMessage(content=("## 时间基准\n现在 2026-09-04。\n\n## 对象与结论\nCrashLoop。\n\n" "## 证据\nprevious_tail bind failed。\n\n## 原因\n端口占用。"))]
+    assert ToolsNodes._should_skip_planned_summary(restart, completed_step_count=1) is True
+    assert ToolsNodes._should_skip_planned_summary(restart, completed_step_count=2) is True
+    rca_prompt_mode = "alert_rca"
+    assert ToolsNodes._should_skip_planned_summary(prose, completed_step_count=1, report_mode=rca_prompt_mode) is False
+    assert ToolsNodes._should_skip_planned_summary(dump, completed_step_count=1, report_mode=rca_prompt_mode) is False
+    complete_rca = [
+        AIMessage(
+            content=(
+                "# RCA 报告\n\n## 事件概述\n对象不可见。\n\n## 异常对象清单\n| 对象 | 状态/现象 | 重启次数 | 关键事件 | 是否已定位 |\n"
+                "| --- | --- | --- | --- | --- |\n| pod/a | 当前集群无匹配 | 未知 | lookup_exhausted | 否 |\n\n"
+                "## 根因分析\n无法定位 namespace。\n\n## 修复建议\n核对集群。\n\n## 待确认项\n对象是否已删除。"
+            )
+        )
+    ]
+    assert ToolsNodes._should_skip_planned_summary(complete_rca, completed_step_count=1, report_mode=rca_prompt_mode) is True
+    assert ToolsNodes._should_skip_planned_summary(prose, completed_step_count=1, require_formatted_report=True) is False
+
+
+def test_should_not_skip_planned_summary_for_transitional_last_step():
+    """最后一步写成「接下来将…」过渡句时，即使前面有表也不跳过总结轮。"""
+    from langchain_core.messages import AIMessage
+
+    transitional = "工单 ALERT-2023-0824-001：nginx 返回 403。\n\n" "| 工单 | 现象 |\n| --- | --- |\n| ALERT-001 | 403 |\n\n" "已获取该工单中的集群信息。接下来将进行排查这些业务组件告警详情。"
+    assert ToolsNodes._looks_like_transitional_step_answer(transitional) is True
+    assert ToolsNodes._planned_step_already_answered([AIMessage(content=transitional)]) is False
+    assert ToolsNodes._should_skip_planned_summary([AIMessage(content=transitional)], completed_step_count=4) is False
+
+    earlier_table = "| Pod | 状态 |\n| --- | --- |\n| nginx | Ready |"
+    later_transition = "已拿到节点列表。接下来我们将验证这些业务组件的告警详情。"
+    messages = [AIMessage(content=earlier_table), AIMessage(content=later_transition)]
+    assert ToolsNodes._planned_output_has_markdown_table(messages) is True
+    assert ToolsNodes._looks_like_transitional_step_answer(later_transition) is True
+    assert ToolsNodes._should_skip_planned_summary(messages, completed_step_count=4) is False
+
+    finished = "根因是上游 upstream 超时导致 502，建议扩容并检查健康检查配置。"
+    assert ToolsNodes._looks_like_transitional_step_answer(finished) is False
+    assert ToolsNodes._should_skip_planned_summary([AIMessage(content=finished)], completed_step_count=1) is True
+
+
+def test_select_visible_planned_messages_keeps_last_table_not_cumulative():
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    cumulative = "| Pod | 累计重启 |\n| --- | --- |\n| calico | 9 |"
+    today = "| Pod | 今天重启 |\n| --- | --- |\n| calico | 0 |"
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "get_high_restart_kubernetes_pods", "args": {}}]),
+        ToolMessage(content="[{}]", tool_call_id="1"),
+        AIMessage(content=cumulative),
+        AIMessage(content="", tool_calls=[{"id": "2", "name": "get_resource_events_timeline", "args": {}}]),
+        ToolMessage(content="[]", tool_call_id="2"),
+        AIMessage(content=today),
+    ]
+    visible = ToolsNodes._select_visible_planned_messages(messages, summary_ran=False)
+    ai = [item for item in visible if getattr(item, "type", "") == "ai" and not getattr(item, "tool_calls", None)]
+    assert len(ai) == 1
+    assert "今天重启" in str(ai[0].content)
+    assert "累计重启" not in str(ai[0].content)
+    assert sum(1 for item in visible if getattr(item, "type", "") == "tool") == 2
+
+
+def test_select_visible_planned_messages_keeps_last_prose_over_earlier_table():
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    cumulative = "| Pod | 累计重启 |\n| --- | --- |\n| calico | 9 |"
+    later = "以上名单累计重启均发生在 24 小时前，今天 0 次。"
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "get_high_restart_kubernetes_pods", "args": {}}]),
+        ToolMessage(content="[{}]", tool_call_id="1"),
+        AIMessage(content=cumulative),
+        AIMessage(content="", tool_calls=[{"id": "2", "name": "get_resource_events_timeline", "args": {}}]),
+        ToolMessage(content="[]", tool_call_id="2"),
+        AIMessage(content=later),
+    ]
+    visible = ToolsNodes._select_visible_planned_messages(messages, summary_ran=False)
+    ai = [item for item in visible if getattr(item, "type", "") == "ai" and not getattr(item, "tool_calls", None)]
+    assert len(ai) == 1
+    assert str(ai[0].content) == later
+    assert "| Pod |" not in str(ai[0].content)
+    assert sum(1 for item in visible if getattr(item, "type", "") == "tool") == 2
+
+
+def test_select_visible_planned_messages_prefers_complete_rca():
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    dump = "## 事件描述\nPod 重启。\n\n| Pod | Reason |\n| --- | --- |\n| a | OOMKilled |\n\n## 调查结论\nOOM。"
+    rca = (
+        "# RCA 报告\n\n## 事件概述\nOOM 导致重启。\n\n## 异常对象清单\n| 对象 | 状态/现象 | 重启次数 | 关键事件 | 是否已定位 |\n"
+        "| --- | --- | --- | --- | --- |\n| pod/a | OOMKilled | 5 | Java heap space | 是 |\n\n"
+        "## 根因分析\nJVM 堆不足。\n\n## 修复建议\n提高堆上限。\n\n## 待确认项\n无。"
+    )
+    messages = [
+        ToolMessage(content="{}", tool_call_id="1"),
+        AIMessage(content=dump),
+        AIMessage(content=rca),
+    ]
+    visible = ToolsNodes._select_visible_planned_messages(messages, summary_ran=False)
+    ai = [item for item in visible if getattr(item, "type", "") == "ai" and not getattr(item, "tool_calls", None)]
+    assert len(ai) == 1
+    assert "事件概述" in str(ai[0].content)
+    assert "# RCA 报告" in str(ai[0].content)
+    assert "调查结论" not in str(ai[0].content)
+
+
+def test_summarize_planned_step_keeps_tool_result_not_investigation_dump():
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    dump = "## 事件描述\n重启。\n\n## 调查结论\nOOM。"
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "diagnose_kubernetes_pod", "args": {}}]),
+        ToolMessage(content='{"last_state":"OOMKilled","exit_code":137}', tool_call_id="1", name="diagnose_kubernetes_pod"),
+        AIMessage(content=dump),
+    ]
+    summary = ToolsNodes._summarize_planned_step_messages(messages)
+    assert "OOMKilled" in summary
+    assert "事件描述" not in summary
+    assert "调查结论" not in summary
+
+
+def test_summarize_planned_step_carries_instance_id_into_next_step():
+    """查全部主机时第 3 步要用第 2 步查到的 instance_id，摘要只留正文会把它丢掉。"""
+    import json
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    instances = json.dumps(
+        {
+            "success": True,
+            "data": [
+                {
+                    "id": "3f0e6d2a-1c2b-4a5d-9e8f-7a6b5c4d3e2f",
+                    "name": "bj-web-server-01",
+                    "ip": "172.16.196.222",
+                    "instance_id": "3f0e6d2a-1c2b-4a5d-9e8f-7a6b5c4d3e2f",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "monitor_list_object_instances", "args": {}}]),
+        ToolMessage(content=instances, tool_call_id="1", name="monitor_list_object_instances"),
+        AIMessage(content="已获取 1 个主机实例。"),
+    ]
+
+    summary = ToolsNodes._summarize_planned_step_messages(messages)
+
+    assert "已获取 1 个主机实例。" in summary
+    assert "3f0e6d2a-1c2b-4a5d-9e8f-7a6b5c4d3e2f" in summary
+    assert "instance_id=" in summary
+
+
+def test_summarize_planned_step_carries_monitor_metric_name():
+    import json
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    metrics = json.dumps(
+        {"success": True, "data": [{"name": "disk.used_percent", "display_name": "磁盘使用率", "unit": "%"}]},
+        ensure_ascii=False,
+    )
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "monitor_list_object_metrics", "args": {}}]),
+        ToolMessage(content=metrics, tool_call_id="1", name="monitor_list_object_metrics"),
+        AIMessage(content="已列出指标。"),
+    ]
+
+    summary = ToolsNodes._summarize_planned_step_messages(messages)
+
+    assert "metric=disk.used_percent" in summary
+
+
+def test_summarize_planned_step_does_not_treat_instance_name_as_metric():
+    """列实例结果里的 name 是主机名，不能被当成指标名带进下一步。"""
+    import json
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    instances = json.dumps(
+        {"success": True, "data": [{"id": "abc-123", "name": "bj-web-server-01", "ip": "172.16.196.222"}]},
+        ensure_ascii=False,
+    )
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "monitor_list_object_instances", "args": {}}]),
+        ToolMessage(content=instances, tool_call_id="1", name="monitor_list_object_instances"),
+        AIMessage(content="已获取 1 个主机实例。"),
+    ]
+
+    summary = ToolsNodes._summarize_planned_step_messages(messages)
+
+    assert "instance_id=abc-123" in summary
+    assert "metric=" not in summary
+
+
+def test_summarize_planned_step_skips_failed_tool_result_facts():
+    """失败结果里的 id 不能作为已取得的证据传给后续步骤。"""
+    import json
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    failed = json.dumps({"success": False, "error": "instance_ids 不能为空"}, ensure_ascii=False)
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "monitor_list_object_instances", "args": {}}]),
+        ToolMessage(content=failed, tool_call_id="1", name="monitor_list_object_instances", status="error"),
+        AIMessage(content="查询失败。"),
+    ]
+
+    summary = ToolsNodes._summarize_planned_step_messages(messages)
+
+    assert "instance_id=" not in summary
+    assert "结构化结果" not in summary
+
+
+def test_summarize_planned_step_keeps_final_report_and_ids():
+    """本步已写出终稿时，正文照旧保留，同时仍带上结构化字段。"""
+    import json
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    instances = json.dumps({"success": True, "data": [{"id": "abc-123", "name": "web-01"}]}, ensure_ascii=False)
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "monitor_list_object_instances", "args": {}}]),
+        ToolMessage(content=instances, tool_call_id="1", name="monitor_list_object_instances"),
+        AIMessage(content="当前主机共 1 台，磁盘使用率正常，未发现异常。"),
+    ]
+
+    summary = ToolsNodes._summarize_planned_step_messages(messages)
+
+    assert "磁盘使用率正常" in summary
+    assert "instance_id=abc-123" in summary
+
+
+def test_missing_params_detects_monitor_chinese_empty_param_errors():
+    from apps.opspilot.metis.llm.common.tool_failure import is_missing_tool_params_failure
+
+    assert is_missing_tool_params_failure("instance_ids 不能为空") is True
+    assert is_missing_tool_params_failure("instance_ids 必须是列表") is True
+    assert is_missing_tool_params_failure("metric is required") is True
+    assert is_missing_tool_params_failure("缺少必要参数") is True
+    # namespace 仍走 K8s 反查重规划，不算用户缺参。
+    assert is_missing_tool_params_failure("namespace 不能为空") is False
+    # 凭据/权限失败不能被误判成缺参，否则会弹无意义的补参卡。
+    assert is_missing_tool_params_failure("401 Unauthorized") is False
+    assert is_missing_tool_params_failure("403 Forbidden") is False
+
+
+def test_planned_step_already_answered_detects_tool_sentence():
+    from langchain_core.messages import AIMessage
+
+    answer = "当前时间是 **2026-08-18 17:54:29**（默认时区：Asia/Shanghai）。"
+    tool_call = AIMessage(content="", tool_calls=[{"id": "1", "name": "get_current_time", "args": {}}])
+    assert ToolsNodes._planned_step_already_answered([tool_call, AIMessage(content=answer)]) is True
+    assert ToolsNodes._planned_step_already_answered([tool_call]) is False
+
+
+def test_plan_is_skills_only_and_step_guidance():
+    from apps.opspilot.metis.llm.agent.tool_execution_planner import ToolExecutionPlan, ToolExecutionStep
+
+    skills_only = ToolExecutionPlan(
+        goal="查 AD",
+        steps=[ToolExecutionStep(objective="跑技能", tools=["__use_skills__"])],
+    )
+    mixed = ToolExecutionPlan(
+        goal="查 AD",
+        steps=[ToolExecutionStep(objective="跑技能", tools=["__use_skills__", "shell"])],
+    )
+    assert ToolsNodes._plan_is_skills_only(skills_only) is True
+    assert ToolsNodes._plan_is_skills_only(mixed) is False
+    guidance = ToolsNodes._skill_only_step_guidance([{"package_id": "ad-domain-ops"}])
+    assert "禁止 echo" in guidance or "禁止" in guidance
+    assert "/skills/ad-domain-ops/scripts/" in guidance
+    assert "一张表" in guidance
+    assert "禁止发明" in guidance
+    assert "--help" in guidance
+    assert "管道" in guidance
+    assert "不要重试" in guidance or "凭据" in guidance
+
+
+def test_planned_tool_step_guidance_is_policy_not_skill_scan():
+    guidance = ToolsNodes._planned_tool_step_guidance()
+    assert "【工具执行】" in guidance
+    assert "未计划工具" in guidance
+    assert "空列表" in guidance
+    assert "monitor_list_object_instances" in guidance
+    assert "禁止猜测" in guidance
+    assert "重规划" in guidance
+    assert "request_user_choice" in guidance
+    assert "对象类型" in guidance
+    assert "查无此实例" in guidance
+    assert "已声明" in guidance
+    assert "alerts_*" in guidance
+    assert "monitor_list_active_alerts" in guidance
+    assert "Missing parameters" in guidance
+    assert "查不到再查" in guidance
+    assert "monitor_list_object_metrics" in guidance
+    assert "cpu.util" in guidance
+    assert "空矩阵" in guidance
+    assert "instance_ids" in guidance
+    assert "禁止用 name" in guidance or "禁止用实例名" in guidance
+    assert "不要输出 Markdown 表" in guidance
+    assert "禁止降低 lines" in guidance
+    assert "execute" not in guidance
+    assert "扫技能包" not in guidance
+    last = ToolsNodes._planned_tool_step_guidance(is_last_step=True)
+    assert "只输出一份报告" in last
+    assert "不要套「# RCA 报告」" in last
+    assert "必须以「# RCA 报告」" not in last
+    assert "异常对象清单必须是 Markdown 表" not in last
+    assert "只保留一张表" in last
+    assert "不是告警 RCA" in last
+    assert "调查结论" in last
+    assert "关键证据确认" in last
+    assert "时间窗" in last
+    assert "last_restart_time" in last
+    assert "last_state" in last
+    assert "previous" in last
+    assert "不要输出 Markdown 表" not in last
+    mid = ToolsNodes._planned_tool_step_guidance()
+    assert "调查结论" in mid
+    assert "一两句话" in mid
+
+
+def test_bounded_log_field_collapses_newlines_and_truncates():
+    assert _bounded_log_field("查询\n指标\r\n") == "查询 指标"
+    assert _bounded_log_field("") == "-"
+    assert len(_bounded_log_field("x" * 200)) == 120
+    assert _missing_params_log_args("查询\n指标", "thread-1") == (
+        "查询 指标",
+        "MissingToolParams",
+        "missing_params",
+        "thread-1",
+    )
+
+
+def test_planned_tool_step_guidance_alert_rca_keeps_report_template():
+    last = ToolsNodes._planned_tool_step_guidance(
+        is_last_step=True,
+        user_message="告警：Unhealthy 检测到异常\nReadiness probe failed",
+        agent_system_prompt="你是 Kubernetes 集群 RCA 助手。\n## 告警怎么读\n## 输出格式\n# RCA 报告\n",
+    )
+    assert "必须以「# RCA 报告」" in last
+    assert "事件概述" in last
+    assert "对象在当前集群不可见" in last
+    assert "异常对象清单" in last
+    assert "根因分析" in last
+    assert "修复建议" in last
+    assert "待确认项" in last
+    assert "第一行" in last
+    summary = ToolsNodes._planned_summary_guidance(
+        user_message="告警：Unhealthy 检测到异常",
+        agent_system_prompt="你是 Kubernetes 集群 RCA 助手。\n## 告警怎么读\n",
+    )
+    assert "必须以「# RCA 报告」" in summary
+    assert "对象在当前集群不可见" in summary
+
+
+def test_planned_tool_step_guidance_restart_reason_forbids_rca_template():
+    question = "分析下pod gateway-proxy-7d4bc9778-tczng的重启原因，所属namespace：production"
+    last = ToolsNodes._planned_tool_step_guidance(
+        is_last_step=True,
+        user_message=question,
+        agent_system_prompt="你是 Kubernetes Pod 重启原因分析助手。",
+    )
+    assert "重启原因报告" in last
+    assert "时间基准" in last
+    assert "对象与结论" in last
+    assert "禁止写「# RCA 报告」" in last
+    assert "必须以「# RCA 报告」" not in last
+    assert "collect_pod_restart_evidence" in last
+    summary = ToolsNodes._planned_summary_guidance(
+        user_message=question,
+        agent_system_prompt="你是 Kubernetes Pod 重启原因分析助手。",
+    )
+    assert "重启原因报告" in summary
+    assert "禁止写「# RCA 报告」" in summary
+    assert "必须以「# RCA 报告」" not in summary
+
+
+def test_skill_only_step_guidance_lists_real_scripts(tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "ad_search.py").write_text("# search\n", encoding="utf-8")
+    (scripts / "_lib.py").write_text("# private\n", encoding="utf-8")
+    guidance = ToolsNodes._skill_only_step_guidance(
+        [{"package_id": "ad-domain-ops", "extracted_root": tmp_path}],
+    )
+    assert "python3 /skills/ad-domain-ops/scripts/ad_search.py" in guidance
+    assert "_lib.py" not in guidance
+    assert "query_users.py" not in guidance

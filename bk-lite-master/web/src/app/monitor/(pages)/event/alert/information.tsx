@@ -1,0 +1,328 @@
+'use client';
+import React, { useRef } from 'react';
+import { Button, Descriptions } from 'antd';
+import { TableDataItem, Organization } from '@/app/monitor/types';
+import { useTranslation } from '@/utils/i18n';
+import informationStyle from './index.module.scss';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import LineChart from '@/app/monitor/components/charts/lineChart';
+import { ObjectItem } from '@/app/monitor/types';
+import { showGroupName } from '@/app/monitor/utils/common';
+import { useUnitTransform } from '@/app/monitor/hooks/useUnitTransform';
+import { useCommon } from '@/app/monitor/context/common';
+import { useLevelList } from '@/app/monitor/hooks';
+import { OBJECT_DEFAULT_ICON, LEVEL_MAP } from '@/app/monitor/constants';
+import Permission from '@/components/permission';
+import { formatUserDisplayName } from '@/utils/userDisplay';
+import { getPolicySecondaryContext } from '@/app/monitor/utils/policyDisplayName';
+import { buildMonitorStrategyDetailUrl } from '@/app/monitor/utils/policyRouteUtils';
+import { buildAlertDimensionDisplayItems } from './alertDimensionUtils';
+import AlertHandlerActions from './alertHandlerActions';
+import { formatAlertHandlers } from './alertHandlerUtils';
+import type { AlertSnapshotOverlay } from './alertDetailUtils';
+
+interface InformationProps extends TableDataItem {
+  eventData?: TableDataItem[];
+  chartUnit?: string | null;
+  chartXAxisDomain?: [number, number] | null;
+  chartOverlay?: AlertSnapshotOverlay;
+}
+
+const Information: React.FC<InformationProps> = ({
+  formData,
+  chartData,
+  objects: objectsProp,
+  userList,
+  onClose,
+  trapData,
+  chartUnit,
+  chartXAxisDomain,
+  chartOverlay
+}) => {
+  const { t } = useTranslation();
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const { findUnitNameById } = useUnitTransform();
+  const LEVEL_LIST = useLevelList();
+  const commonContext = useCommon();
+  const authList = useRef(commonContext?.authOrganizations || []);
+  const organizationList: Organization[] = authList.current;
+  const objects = objectsProp ?? [];
+  const dimensionItems = buildAlertDimensionDisplayItems(
+    formData.metric?.dimensions,
+    formData.dimensions
+  );
+
+  const checkDetail = (row: TableDataItem) => {
+    const monitorItem = objects.find(
+      (item: ObjectItem) => item.id === row.policy?.monitor_object
+    );
+    const params = {
+      monitorObjId: row.policy?.monitor_object,
+      name: monitorItem?.name || '',
+      monitorObjDisplayName: monitorItem?.display_name || '',
+      icon: monitorItem?.icon || OBJECT_DEFAULT_ICON,
+      instance_id: row.monitor_instance_id,
+      instance_name: row.monitor_instance_name,
+      instance_id_values: row.instance_id_values
+    };
+    const queryString = new URLSearchParams(params).toString();
+    const url = `/monitor/view/detail?${queryString}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
+  const openPolicyEdit = (row: TableDataItem) => {
+    const monitorItem = objects.find(
+      (item: ObjectItem) => item.id === row.policy?.monitor_object
+    );
+    if (!row.policy?.id || !row.policy?.monitor_object) return;
+    const url = buildMonitorStrategyDetailUrl('edit', {
+      monitorObjId: row.policy.monitor_object,
+      monitorName: monitorItem?.name || monitorItem?.display_name || '',
+      id: row.policy.id,
+      name: row.policy.name || ''
+    });
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
+  const showNotifiers = (row: TableDataItem) => {
+    // 列表接口会补 notice_users_display；无展示名时再回退到本地 userList 映射
+    if (
+      Array.isArray(row.notice_users_display) &&
+      row.notice_users_display.length
+    ) {
+      return row.notice_users_display.join(',') || '--';
+    }
+    const users = row.notice_users || row.policy?.notice_users;
+    if (!Array.isArray(users) || !users.length) return '--';
+    return (
+      users
+        .map((item: string | number) => formatUserDisplayName(item, userList))
+        .join(',') || '--'
+    );
+  };
+
+  return (
+    <div className={informationStyle.information}>
+      <Descriptions title={t('monitor.events.information')} column={2} bordered>
+        <Descriptions.Item label={t('common.time')}>
+          {formData.updated_at
+            ? convertToLocalizedTime(formData.updated_at)
+            : '--'}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.level')}>
+          <div
+            className={informationStyle.level}
+            style={{
+              borderLeft: `4px solid ${LEVEL_MAP[formData.level]}`
+            }}
+          >
+            <span
+              style={{
+                color: LEVEL_MAP[formData.level] as string
+              }}
+            >
+              {LEVEL_LIST.find((item) => item.value === formData.level)
+                ?.label || '--'}
+            </span>
+          </div>
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.firstAlertTime')}>
+          {formData.start_event_time
+            ? convertToLocalizedTime(formData.start_event_time)
+            : '--'}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.alertName')} span={3}>
+          <div className="min-w-0 break-all whitespace-pre-wrap">
+            {formData.content || '--'}
+          </div>
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.dimension')} span={3}>
+          {dimensionItems.length ? (
+            <div className="flex min-w-0 flex-col gap-1">
+              {dimensionItems.map((item) => (
+                <div
+                  key={item.key}
+                  className="flex min-w-0 items-start gap-2"
+                >
+                  <span className="max-w-[40%] shrink-0 break-words text-[var(--color-text-3)]">
+                    {item.label}:
+                  </span>
+                  <span className="min-w-0 break-all whitespace-pre-wrap">
+                    {item.value}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            '--'
+          )}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.assetType')}>
+          {objects.find(
+            (item: ObjectItem) => item.id === formData.policy?.monitor_object
+          )?.display_name || '--'}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.asset')}>
+          <div className="flex justify-between items-center">
+            <span className="flex-1">
+              {formData.monitor_instance_name || '--'}
+            </span>
+            <a
+              href="#"
+              className="text-blue-500 ml-2"
+              onClick={() => checkDetail(formData)}
+            >
+              {t('common.more')}
+            </a>
+          </div>
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.assetGroup')}>
+          {showGroupName(
+            formData.policy?.organizations || [],
+            organizationList
+          )}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.strategyName')}>
+          {(() => {
+            const monitorObj = objects.find(
+              (item: ObjectItem) => item.id === formData.policy?.monitor_object
+            );
+            const secondary = getPolicySecondaryContext({
+              ...formData.policy,
+              monitor_object_display_name: monitorObj?.display_name || monitorObj?.name
+            });
+            return (
+              <div className="flex justify-between items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <div>{formData.policy?.name || '--'}</div>
+                  {secondary ? (
+                    <div className="mt-0.5 text-[12px] leading-4 text-[var(--color-text-3)]">
+                      {secondary}
+                    </div>
+                  ) : null}
+                </div>
+                {formData.policy?.id ? (
+                  <Permission
+                    requiredPermissions={['Edit']}
+                    permissionPath="/monitor/event/strategy"
+                    instPermissions={formData.policy_permission ?? []}
+                  >
+                    <Button
+                      type="link"
+                      className="shrink-0 ml-2 p-0 h-auto"
+                      onClick={() => openPolicyEdit(formData)}
+                    >
+                      {t('common.edit')}
+                    </Button>
+                  </Permission>
+                ) : null}
+              </div>
+            );
+          })()}
+        </Descriptions.Item>
+        {formData.status === 'closed' && (
+          <Descriptions.Item label={t('monitor.events.alertEndTime')}>
+            {formData.end_event_time
+              ? convertToLocalizedTime(formData.end_event_time)
+              : '--'}
+          </Descriptions.Item>
+        )}
+        <Descriptions.Item label={t('monitor.events.notify')}>
+          {t(
+            `monitor.events.${
+              formData.policy?.notice ? 'notified' : 'unnotified'
+            }`
+          )}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.handler')}>
+          {formatAlertHandlers(formData.handlers, formData.handlers_display, userList)}
+        </Descriptions.Item>
+        <Descriptions.Item label={t('monitor.events.notifier')}>
+          {showNotifiers(formData)}
+        </Descriptions.Item>
+      </Descriptions>
+      <div className="mt-4">
+        <AlertHandlerActions
+          record={formData}
+          closeText={t('common.close')}
+          requiredPermissions={['Operate', 'Detail']}
+          size="middle"
+          onSuccess={onClose}
+        />
+      </div>
+      <div className="mt-4">
+        {formData.policy?.query_condition?.type === 'pmq' ? (
+          <div>
+            <h3 className="font-[600] text-[16px] mb-[15px]">
+              {t('monitor.events.message')}
+            </h3>
+            <div className="leading-[24px]">
+              {/* 报文表格 */}
+              <Descriptions column={2} bordered>
+                {Object.entries<string | Array<string>>(trapData).map(
+                  ([key, value]) => {
+                    return (
+                      <Descriptions.Item label={key} key={key}>
+                        {Array.isArray(value)
+                          ? (value[0]?.[1] ?? '--')
+                          : (value ?? '--')}
+                      </Descriptions.Item>
+                    );
+                  }
+                )}
+              </Descriptions>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <h3 className="font-[600] text-[16px] mb-[15px]">
+              {t('monitor.views.indexView')}
+            </h3>
+            <div className="text-[12px]">{`${
+              formData.metric?.display_name
+            }（${findUnitNameById(chartUnit || '')}）`}</div>
+            {chartOverlay &&
+              (chartOverlay.currentValue != null ||
+                chartOverlay.baselineValue != null ||
+                chartOverlay.comparedValue != null) && (
+              <div className="text-[12px] text-[var(--color-text-3)] mt-[4px]">
+                {t('monitor.events.dryRunCurrentValue')}
+                {': '}
+                {chartOverlay.currentValue ?? '—'}
+                {chartOverlay.baselineValue != null
+                  ? ` · ${t('monitor.events.dryRunBaselineValue')}: ${chartOverlay.baselineValue}`
+                  : ''}
+                {chartOverlay.comparedValue != null
+                  ? ` · ${t('monitor.events.dryRunComparedValue')}: ${chartOverlay.comparedValue}`
+                  : ''}
+              </div>
+            )}
+            <div className="h-[250px]">
+              <LineChart
+                allowSelect={false}
+                data={chartData}
+                threshold={
+                  formData.alert_type === 'no_data'
+                    ? []
+                    : formData.policy?.threshold
+                }
+                unit={chartUnit || ''}
+                metric={formData.metric}
+                xAxisDomain={
+                  formData.alert_type === 'no_data'
+                    ? chartXAxisDomain || undefined
+                    : undefined
+                }
+                gapFit={
+                  formData.alert_type === 'no_data' ? 'plot' : 'samples'
+                }
+              />
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default Information;

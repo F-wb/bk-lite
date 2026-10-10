@@ -1,0 +1,268 @@
+import { useCallback } from 'react';
+import useApiClient from '@/utils/request';
+import React from 'react';
+import { AxiosRequestConfig } from 'axios';
+import {
+  GroupInfo,
+  InstanceParam,
+  MetricItem
+} from '@/app/monitor/types';
+import { filterVisibleMonitorObjects } from '@/app/monitor/utils/monitorObject';
+
+export interface MetricsParam {
+  monitor_object_id?: React.Key;
+  monitor_plugin_id?: string | number;
+  monitor_object_name?: string;
+  id?: React.Key;
+  id_in?: string;
+  name?: string;
+  name_in?: string;
+  keyword?: string;
+  include_ifmib?: boolean;
+  is_ifmib?: boolean;
+  page?: number;
+  page_size?: number;
+}
+
+export interface MetricCatalogPage<T> {
+  count: number;
+  items: T[];
+  metric_groups?: MetricCatalogGroup[];
+}
+
+export interface MetricCatalogGroup extends GroupInfo {
+  id: number;
+  monitor_plugin?: React.Key;
+  display_name?: string;
+  is_pre?: boolean;
+}
+
+const isMetricCatalogPage = <T,>(value: unknown): value is MetricCatalogPage<T> => (
+  typeof value === 'object'
+  && value !== null
+  && 'count' in value
+  && 'items' in value
+  && Array.isArray(value.items)
+);
+
+const useMonitorApi = () => {
+  const { get, patch, post } = useApiClient();
+
+  const getMetricCatalogPage = useCallback(async <T,>(
+    url: string,
+    params: MetricsParam,
+    config?: AxiosRequestConfig
+  ): Promise<MetricCatalogPage<T>> => {
+    const response: unknown = await get(url, {
+      ...config,
+      params: {
+        ...params,
+        page: params.page ?? 1,
+        page_size: params.page_size ?? 100
+      }
+    });
+    if (!isMetricCatalogPage<T>(response)) {
+      return { count: 0, items: [] };
+    }
+    return response;
+  }, [get]);
+
+  const getMonitorMetrics = useCallback(async (
+    params: MetricsParam = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return getMetricCatalogPage<MetricItem>(
+      `/monitor/api/metrics/`,
+      params,
+      config
+    );
+  }, [getMetricCatalogPage]);
+
+  const getMetricsGroup = useCallback(async (
+    params: MetricsParam = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return getMetricCatalogPage<MetricCatalogGroup>(
+      `/monitor/api/metrics_group/`,
+      params,
+      config
+    );
+  }, [getMetricCatalogPage]);
+
+  const getMonitorObject = useCallback(async (
+    params: {
+      name?: string;
+      add_instance_count?: boolean;
+      add_policy_count?: boolean;
+      include_invisible?: boolean;
+    } = {}
+  ) => {
+    const { include_invisible, ...queryParams } = params;
+    const result = await get('/monitor/api/monitor_object/', {
+      params: queryParams
+    });
+    if (!include_invisible && Array.isArray(result)) {
+      return filterVisibleMonitorObjects(result);
+    }
+    return result;
+  }, [get]);
+
+  const getMonitorAlert = useCallback(async (
+    params: {
+      status_in?: string[];
+      level_in?: string;
+      monitor_instance_id?: string;
+      monitor_objects?: React.Key;
+      content?: string;
+      page?: number;
+      page_size?: number;
+      created_at_after?: string;
+      created_at_before?: string;
+      my_alert?: number | string;
+    } = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return await get(`/monitor/api/monitor_alert/`, {
+      params,
+      ...config
+    });
+  }, [get]);
+
+  const getInstanceList = useCallback(async (
+    objectId?: React.Key,
+    params: InstanceParam = {},
+    config?: AxiosRequestConfig
+  ) => {
+    const { instance_id_in, ...rest } = params;
+    return await get(`/monitor/api/monitor_instance/${String(objectId)}/list/`, {
+      params: {
+        ...rest,
+        ...(instance_id_in?.length
+          ? { instance_id_in: JSON.stringify(instance_id_in) }
+          : {}),
+      },
+      ...config
+    });
+  }, [get]);
+
+  const lookupInstance = useCallback(async (
+    params: { instance_id: string },
+    config?: AxiosRequestConfig
+  ) => {
+    return await get(`/monitor/api/monitor_instance/lookup/`, {
+      params,
+      ...config
+    });
+  }, [get]);
+
+  const getEffectivePlugins = useCallback(async (
+    objectId?: React.Key,
+    params: {
+      instance_id?: string;
+    } = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return await get(`/monitor/api/monitor_instance/${String(objectId)}/effective_plugins/`, {
+      params,
+      ...config
+    });
+  }, [get]);
+
+  const getMonitorPlugin = useCallback(async (
+    params: {
+      monitor_object_id?: React.Key | null;
+      monitor_object_type?: string | null;
+      keyword?: string;
+      page?: number;
+      page_size?: number;
+    } = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return await get('/monitor/api/monitor_plugin/', {
+      params,
+      ...config
+    });
+  }, [get]);
+
+  const patchMonitorAlert = async (
+    id: React.Key,
+    data: {
+      status?: string;
+    }
+  ) => {
+    return await patch(`/monitor/api/monitor_alert/${String(id)}/`, data);
+  };
+
+  const claimMonitorAlert = async (id: React.Key) => {
+    return await post(`/monitor/api/monitor_alert/${String(id)}/claim/`);
+  };
+
+  const assignMonitorAlert = async (
+    id: React.Key,
+    handlers: Array<string | number>
+  ) => {
+    return await post(`/monitor/api/monitor_alert/${String(id)}/assign/`, {
+      handlers
+    });
+  };
+
+  const reassignMonitorAlert = async (
+    id: React.Key,
+    handlers: Array<string | number>
+  ) => {
+    return await post(`/monitor/api/monitor_alert/${String(id)}/reassign/`, {
+      handlers
+    });
+  };
+
+  const getAllUsers = async (organizationIds?: Array<string | number>) => {
+    const params =
+      organizationIds && organizationIds.length
+        ? { organization_ids: organizationIds.join(',') }
+        : undefined;
+    return await get(`/monitor/api/system_mgmt/user_all/`, { params });
+  };
+
+  const getUnitList = async () => {
+    return await get(`/monitor/api/unit/list`);
+  };
+
+  const getVmMetricNames = async (params: {
+    monitor_object_id: React.Key;
+    monitor_plugin_id: React.Key;
+    keyword?: string;
+  }) => {
+    return await get(`/monitor/api/metrics/vm-metric-names/`, { params });
+  };
+
+  const testMetricQuery = async (data: {
+    query: string;
+    monitor_object_id?: React.Key;
+    monitor_plugin_id?: React.Key;
+  }) => {
+    return await post(`/monitor/api/metrics/test_query/`, data, {
+      suppressErrorNotification: true
+    });
+  };
+
+  return {
+    getMonitorMetrics,
+    getMetricsGroup,
+    getMonitorObject,
+    getMonitorAlert,
+    getInstanceList,
+    lookupInstance,
+    getEffectivePlugins,
+    getMonitorPlugin,
+    patchMonitorAlert,
+    claimMonitorAlert,
+    assignMonitorAlert,
+    reassignMonitorAlert,
+    getAllUsers,
+    getUnitList,
+    getVmMetricNames,
+    testMetricQuery
+  };
+};
+
+export default useMonitorApi;

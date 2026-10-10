@@ -1,0 +1,586 @@
+# -*- coding: utf-8 -*-
+# @File: nats_utils.py
+# @Time: 2025/12/16
+# @Author: windyzhao
+"""
+NATS 通用工具方法
+提供简洁的 NATS 请求/发布封装，无需手动管理连接。
+
+实现说明（重要）：
+    本模块维护两条**进程级共享长连接**：低流量 control/RPC 与 metrics
+    JetStream 各自复用一条，避免指标背压和重连占用控制面连接。
+
+    为什么必须共享长连接：
+        stargazer 的每个服务进程使用一个 Sanic 事件循环。遗留同步 SDK 已在
+        插件内部包装到 asyncio 默认线程池，但事件循环抖动期间若新建 NATS
+        连接，异步 TLS 握手无法被事件循环及时驱动，NATS 服务端在握手超时
+        （默认 2s）后会直接 reset，表现为大量 ConnectionResetError，导致
+        ansible adhoc 请求发不出去、回调收不到。
+
+        改为按通道复用已建立的长连接后：
+        - 不再有“每次操作一次 TLS 握手”，握手只在启动/重连时发生一次；
+        - 连接由 nats-py 在后台维护并无限自动重连；
+        - 即使事件循环被阻塞数十秒，已建立的连接也不会像 2s 握手那样被打断。
+"""
+
+import asyncio
+import hashlib
+import json
+import os
+import time
+from collections import deque
+from collections.abc import Callable
+from contextlib import ExitStack
+from functools import partial
+from typing import Any, List, Optional, Sequence
+
+from core.infra.jetstream_publish_window import JetStreamMessage, JetStreamPublishWindow, JetStreamPublishWindowSettings, JetStreamWindowPublishError
+from core.infra.nats import NATS, NATSConfig
+from core.logger import logger, safe_log_value
+
+DEFAULT_METRICS_STREAM_NAME = "metrics"
+_METRICS_ASYNC_ERROR_TYPES = frozenset({"BadRequestError", "APIError", "NotFoundError"})
+
+# 进程级共享连接与连接锁
+_shared_nc: Optional[NATS] = None
+_metrics_nc: Optional[NATS] = None
+_connect_lock: Optional[asyncio.Lock] = None
+_metrics_connect_lock: Optional[asyncio.Lock] = None
+_metrics_js_window: Optional[JetStreamPublishWindow] = None
+_metrics_js_context = None
+_metrics_js_connection: Optional[NATS] = None
+_metrics_reconnect_total = 0
+_metrics_reconnect_started_at: float | None = None
+_metrics_reconnect_duration_seconds = 0.0
+_metrics_reconnect_durations: deque[float] = deque(maxlen=500)
+
+
+class NatsLinesPublishError(RuntimeError):
+    def __init__(
+        self,
+        subject: str,
+        attempted_count_before_failure: int,
+        delivery_detected: bool,
+        error: Exception,
+        attempted_indices: tuple[int, ...] = (),
+        confirmed_indices: tuple[int, ...] = (),
+    ):
+        self.subject = subject
+        self.attempted_count_before_failure = attempted_count_before_failure
+        self.delivery_detected = delivery_detected
+        self.error = error
+        self.timeout_stage = getattr(error, "timeout_stage", None)
+        self.timeout_phase = getattr(error, "timeout_phase", None)
+        self.attempted_indices = attempted_indices
+        self.confirmed_indices = confirmed_indices
+        super().__init__(
+            f"NATS publish lines failed [{subject}] after writing "
+            f"{attempted_count_before_failure} lines before confirmation "
+            f"(delivery_detected={delivery_detected}): {type(error).__name__}: {error}"
+        )
+        self.__cause__ = error
+
+
+class MetricsJetStreamRequiredError(RuntimeError):
+    """生产 metrics 链路禁止静默回退 Core NATS。"""
+
+
+def _get_lock(channel: str = "control") -> asyncio.Lock:
+    """惰性创建锁，确保绑定到当前运行的事件循环。"""
+    global _connect_lock, _metrics_connect_lock
+    if channel == "metrics":
+        if _metrics_connect_lock is None:
+            _metrics_connect_lock = asyncio.Lock()
+        return _metrics_connect_lock
+    if _connect_lock is None:
+        _connect_lock = asyncio.Lock()
+    return _connect_lock
+
+
+def configured_metrics_stream_name() -> str:
+    raw = str(os.getenv("NATS_JS_STREAM_NAME", DEFAULT_METRICS_STREAM_NAME) or "").strip()
+    return raw or DEFAULT_METRICS_STREAM_NAME
+
+
+def nats_error_log_fields(error: BaseException) -> tuple[str, object, object, str]:
+    """提取 NATS 异常的安全日志字段，不记录 payload 或完整异常正文。"""
+
+    error_type = type(error).__name__
+    nats_code = getattr(error, "code", None)
+    nats_err_code = getattr(error, "err_code", None)
+    description = getattr(error, "description", None)
+    if description in (None, ""):
+        description_text = "-"
+    else:
+        description_text = safe_log_value(description, max_length=120)
+    return (
+        error_type,
+        "-" if nats_code is None else nats_code,
+        "-" if nats_err_code is None else nats_err_code,
+        description_text,
+    )
+
+
+async def _on_error(channel: str, error: Exception) -> None:
+    error_type, nats_code, nats_err_code, description = nats_error_log_fields(error)
+    if channel == "metrics" and error_type in _METRICS_ASYNC_ERROR_TYPES:
+        logger.debug(
+            "event=nats_metrics_async_error error_type=%s nats_code=%s nats_err_code=%s description=%s",
+            error_type,
+            nats_code,
+            nats_err_code,
+            description,
+        )
+        return
+    logger.error(
+        "event=nats_connection_error channel=%s error_type=%s nats_code=%s nats_err_code=%s",
+        channel,
+        error_type,
+        nats_code,
+        nats_err_code,
+    )
+
+
+async def _on_disconnected(channel: str) -> None:
+    global _metrics_reconnect_started_at
+    if channel == "metrics" and _metrics_reconnect_started_at is None:
+        _metrics_reconnect_started_at = time.monotonic()
+    logger.warning("event=nats_connection_disconnected channel=%s", channel)
+
+
+async def _on_reconnected(channel: str) -> None:
+    global _metrics_reconnect_total, _metrics_reconnect_started_at, _metrics_reconnect_duration_seconds
+    if channel == "metrics":
+        _metrics_reconnect_total += 1
+        if _metrics_reconnect_started_at is not None:
+            _metrics_reconnect_duration_seconds = max(
+                0.0,
+                time.monotonic() - _metrics_reconnect_started_at,
+            )
+            _metrics_reconnect_durations.append(_metrics_reconnect_duration_seconds)
+            _metrics_reconnect_started_at = None
+    logger.info("event=nats_connection_reconnected channel=%s", channel)
+
+
+async def _on_closed(channel: str) -> None:
+    logger.warning("event=nats_connection_closed channel=%s", channel)
+
+
+async def get_shared_nats(channel: str = "control") -> NATS:
+    """获取共享的 NATS 长连接（懒加载 + 自动重连）。
+
+    若连接尚未建立或已关闭，则（重新）建立一条连接。并发调用通过锁串行化，
+    确保整个进程只维护一条连接。
+    """
+    global _shared_nc, _metrics_nc
+
+    if channel not in {"control", "metrics"}:
+        raise ValueError(f"unsupported NATS channel: {channel}")
+
+    nc = _metrics_nc if channel == "metrics" else _shared_nc
+    if nc is not None and (nc.is_connected or (not nc.is_closed and bool(getattr(nc, "is_reconnecting", False)))):
+        return nc
+
+    async with _get_lock(channel):
+        # 拿到锁后二次确认，避免并发重复建连
+        nc = _metrics_nc if channel == "metrics" else _shared_nc
+        if nc is not None and (nc.is_connected or (not nc.is_closed and bool(getattr(nc, "is_reconnecting", False)))):
+            return nc
+
+        # 清理可能存在的半死连接
+        if nc is not None and not nc.is_closed:
+            try:
+                await nc.close()
+            except Exception as close_err:
+                logger.debug(f"[NATS] error closing stale connection: {close_err}")
+        if channel == "metrics":
+            _metrics_nc = None
+        else:
+            _shared_nc = None
+
+        config = NATSConfig.from_env(service_name=f"stargazer-{channel}")
+        options = config.to_connect_options()
+        if channel == "metrics":
+            window_bytes = int(
+                os.getenv(
+                    "NATS_JS_PUBLISH_MAX_PENDING_BYTES",
+                    str(32 * 1024 * 1024),
+                )
+            )
+            configured_pending_bytes = int(
+                os.getenv(
+                    "NATS_METRICS_PENDING_SIZE_BYTES",
+                    str(window_bytes + 1024 * 1024),
+                )
+            )
+            options["pending_size"] = max(
+                window_bytes,
+                configured_pending_bytes,
+            )
+        # 长连接：无限重连，避免达到重连上限后被永久关闭
+        options["max_reconnect_attempts"] = -1
+        options["allow_reconnect"] = True
+        options.setdefault("error_cb", partial(_on_error, channel))
+        options.setdefault("disconnected_cb", partial(_on_disconnected, channel))
+        options.setdefault("reconnected_cb", partial(_on_reconnected, channel))
+        options.setdefault("closed_cb", partial(_on_closed, channel))
+
+        new_nc = NATS()
+        await new_nc.connect(**options)
+        if channel == "metrics":
+            _metrics_nc = new_nc
+        else:
+            _shared_nc = new_nc
+        logger.info(
+            "event=nats_connection_established channel=%s servers=%s tls=%s " "authentication_configured=%s pending_size_bytes=%s",
+            channel,
+            config.servers,
+            config.tls_enabled,
+            bool(config.user),
+            options.get("pending_size"),
+        )
+        return new_nc
+
+
+async def close_shared_nats() -> None:
+    """优雅关闭共享连接（供进程退出时调用，可选）。"""
+    global _shared_nc, _metrics_nc, _metrics_js_window, _metrics_js_context, _metrics_js_connection
+    clients = tuple(client for client in (_shared_nc, _metrics_nc) if client is not None)
+    _shared_nc = None
+    _metrics_nc = None
+    _metrics_js_window = None
+    _metrics_js_context = None
+    _metrics_js_connection = None
+    for nc in clients:
+        try:
+            if not nc.is_closed:
+                async with asyncio.timeout(float(os.getenv("NATS_DRAIN_TIMEOUT_SECONDS", "5"))):
+                    await nc.drain()
+        except Exception as e:
+            logger.debug(f"[NATS] error draining shared connection: {e}")
+        finally:
+            try:
+                if not nc.is_closed:
+                    await nc.close()
+            except Exception as close_error:
+                logger.debug(f"[NATS] error closing shared connection: {close_error}")
+
+
+def nats_metrics_connection_stats() -> dict[str, float | int]:
+    nc = _metrics_nc
+    pending_bytes = 0
+    if nc is not None:
+        try:
+            pending_bytes = max(0, int(getattr(nc, "pending_data_size", 0) or 0))
+        except (TypeError, ValueError):
+            pending_bytes = 0
+    ordered_durations = sorted(_metrics_reconnect_durations)
+    p99_duration = ordered_durations[int((len(ordered_durations) - 1) * 0.99)] if ordered_durations else 0.0
+    window = _metrics_js_window.snapshot() if _metrics_js_window is not None else None
+    return {
+        "nats_metrics_connected": int(bool(nc is not None and nc.is_connected)),
+        "nats_metrics_reconnecting": int(bool(nc is not None and getattr(nc, "is_reconnecting", False))),
+        "nats_metrics_reconnect_total": _metrics_reconnect_total,
+        "nats_metrics_reconnect_duration_seconds": _metrics_reconnect_duration_seconds,
+        "nats_metrics_reconnect_duration_seconds_p99": p99_duration,
+        "nats_metrics_pending_bytes": pending_bytes,
+        "nats_js_publish_pending_messages": window.pending_messages if window else 0,
+        "nats_js_publish_pending_bytes": window.pending_bytes if window else 0,
+        "nats_js_publish_waiting_messages": window.waiting_messages if window else 0,
+        "nats_js_publish_waiting_bytes": window.waiting_bytes if window else 0,
+        "nats_js_publish_pending_messages_peak": window.peak_pending_messages if window else 0,
+        "nats_js_publish_pending_bytes_peak": window.peak_pending_bytes if window else 0,
+        "nats_js_publish_waiting_messages_peak": window.peak_waiting_messages if window else 0,
+        "nats_js_publish_waiting_bytes_peak": window.peak_waiting_bytes if window else 0,
+        "nats_js_publish_confirmed_total": window.confirmed_total if window else 0,
+        "nats_js_puback_duration_seconds_p95": window.puback_duration_seconds_p95 if window else 0.0,
+        "nats_js_puback_duration_seconds_p99": window.puback_duration_seconds_p99 if window else 0.0,
+        "nats_js_deadline_expired_total": window.deadline_expired_total if window else 0,
+        "nats_js_credit_wait_timeout_total": window.credit_wait_timeout_total if window else 0,
+        "nats_js_publish_call_timeout_total": window.publish_call_timeout_total if window else 0,
+        "nats_js_puback_timeout_total": window.puback_timeout_total if window else 0,
+        "nats_js_publish_retry_total": window.retry_total if window else 0,
+        "nats_js_publish_rejected_total": window.rejected_total if window else 0,
+    }
+
+
+async def metrics_transport_ready() -> bool:
+    """验证 metrics 连接、目标 Stream 和动态指标 subject 契约。"""
+
+    if not _read_bool_env("NATS_METRICS_JETSTREAM_ENABLED", True):
+        return False
+    timeout_seconds = float(os.getenv("NATS_METRICS_READINESS_TIMEOUT", "2"))
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            nc = await get_shared_nats("metrics")
+            if not nc.is_connected:
+                return False
+            stream_name = configured_metrics_stream_name()
+            stream_info = await nc.jetstream().stream_info(stream_name)
+            subjects = tuple(getattr(stream_info.config, "subjects", ()) or ())
+            topic = str(os.getenv("NATS_METRIC_TOPIC", "metrics") or "metrics").strip(".")
+            representative_subject = f"{topic}.__stargazer_readiness__"
+            return any(_nats_subject_pattern_matches(pattern, representative_subject) for pattern in subjects)
+    except Exception:
+        return False
+
+
+def _nats_subject_pattern_matches(pattern: str, subject: str) -> bool:
+    pattern_tokens = str(pattern or "").split(".")
+    subject_tokens = str(subject or "").split(".")
+    subject_index = 0
+    for pattern_index, token in enumerate(pattern_tokens):
+        if token == ">":
+            return pattern_index == len(pattern_tokens) - 1
+        if subject_index >= len(subject_tokens):
+            return False
+        if token != "*" and token != subject_tokens[subject_index]:
+            return False
+        subject_index += 1
+    return subject_index == len(subject_tokens)
+
+
+async def nats_request(subject: str, payload: bytes, timeout: float = 30.0) -> dict:
+    """
+    通用的 NATS 请求方法（复用共享长连接）
+
+    发送请求并返回响应。连接由共享连接池管理，无需手动建连/关闭。
+
+    Args:
+        subject: NATS 主题
+        payload: 请求负载（已编码的字节数据）
+        timeout: 超时时间（秒），默认 30 秒
+
+    Returns:
+        解析后的响应数据（字典格式）
+
+    Raises:
+        ConnectionError: 连接失败
+        Exception: 请求或响应处理失败
+
+    Example:
+        >>> exec_params = {"args": [{"command": "ls"}], "kwargs": {}}
+        >>> payload = json.dumps(exec_params).encode()
+        >>> response = await nats_request("ssh.execute.node1", payload, timeout=30.0)
+    """
+    try:
+        nc = await get_shared_nats("control")
+        response_msg = await nc.request(subject, payload=payload, timeout=timeout)
+        return json.loads(response_msg.data.decode())
+    except Exception as e:
+        logger.error(f"NATS request failed [{subject}]: {type(e).__name__}: {e}")
+        raise
+
+
+async def nats_publish(subject: str, data: Any) -> None:
+    """
+    通用的 NATS 发布方法（复用共享长连接）
+
+    发布消息到指定主题（无需等待响应）。发布后会 flush，确保数据已写出。
+
+    Args:
+        subject: NATS 主题
+        data: 要发布的数据（将自动转换为 JSON）
+
+    Raises:
+        ConnectionError: 连接失败
+        Exception: 发布失败
+
+    Example:
+        >>> await nats_publish("logs.info", {"message": "Task completed"})
+    """
+    nc = await get_shared_nats("control")
+    payload = json.dumps(data).encode()
+    await nc.publish(subject, payload)
+    await nc.flush()
+
+
+async def nats_publish_lines(
+    subject: str,
+    lines: List[str],
+    *,
+    before_publish: Callable[[int], bool] | None = None,
+    message_ids: Sequence[str] | None = None,
+    deadlines: Sequence[float | None] | None = None,
+) -> int:
+    """
+    批量发布多行文本到指定主题（复用共享长连接）。
+
+    用于指标上报（InfluxDB Line Protocol，每行一条消息），逐行 publish 后统一
+    flush，避免每条指标都新建连接。
+
+    Args:
+        subject: NATS 主题
+        lines: 文本行列表（每行将单独发布一条消息）
+
+    Returns:
+        成功发布的行数
+    """
+    if not lines:
+        return 0
+
+    if message_ids is not None and len(message_ids) != len(lines):
+        raise ValueError("message_ids length must match lines length")
+    if deadlines is not None and len(deadlines) != len(lines):
+        raise ValueError("deadlines length must match lines length")
+    if _read_bool_env("NATS_METRICS_JETSTREAM_ENABLED", True):
+        return await _nats_publish_lines_jetstream(
+            subject,
+            lines,
+            before_publish=before_publish,
+            message_ids=message_ids,
+            deadlines=deadlines,
+        )
+
+    if not _read_bool_env("NATS_METRICS_CORE_FALLBACK_ENABLED", False):
+        raise MetricsJetStreamRequiredError("metrics JetStream is disabled and Core NATS fallback is not allowed")
+
+    attempted_indices: list[int] = []
+    delivery_timeout = float(os.getenv("PUBLISH_DELIVERY_TIMEOUT", os.getenv("PUBLISH_TIMEOUT", "30")))
+    phase = "publish_call"
+    try:
+        with ExitStack() as sending:
+            budget_for = getattr(before_publish, "budget_for", None)
+            budgets = {budget_for(index) for index in range(len(lines))} if callable(budget_for) else set()
+            send_deadlines = [sending.enter_context(budget.sending()) for budget in budgets if budget is not None]
+            send_deadlines.extend(deadline for deadline in (deadlines or ()) if deadline is not None)
+            if send_deadlines:
+                delivery_timeout = min(delivery_timeout, max(0.0, min(send_deadlines) - asyncio.get_running_loop().time()))
+            if delivery_timeout <= 0:
+                raise TimeoutError("Core NATS sending budget exhausted before delivery")
+            send_deadline = asyncio.get_running_loop().time() + delivery_timeout
+
+            def check_deadline():
+                if asyncio.get_running_loop().time() >= send_deadline:
+                    raise TimeoutError("Core NATS sending budget exhausted")
+
+            async with asyncio.timeout(delivery_timeout):
+                check_deadline()
+                nc = await get_shared_nats("metrics")
+                for index, line in enumerate(lines):
+                    check_deadline()
+                    if before_publish is not None and not before_publish(index):
+                        continue
+                    attempted_indices.append(index)
+                    started = getattr(before_publish, "mark_transport_started", None)
+                    if callable(started):
+                        started(index)
+                    await nc.publish(subject, line.encode("utf-8"))
+                if attempted_indices:
+                    check_deadline()
+                    phase = "core_flush"  # Core flush 不是 JetStream PubAck / CMDB 入库确认。
+                    await nc.flush(timeout=delivery_timeout)
+                    check_deadline()
+    except Exception as e:
+        if isinstance(e, TimeoutError):
+            e.timeout_phase = phase
+        raise NatsLinesPublishError(
+            subject=subject,
+            attempted_count_before_failure=len(attempted_indices),
+            delivery_detected=bool(attempted_indices),
+            error=e,
+            attempted_indices=tuple(attempted_indices),
+        ) from e
+    return len(attempted_indices)
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _jetstream_message_id(subject: str, index: int, payload: bytes) -> str:
+    digest = hashlib.sha256()
+    digest.update(subject.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(index).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+async def _get_metrics_jetstream():
+    global _metrics_js_context, _metrics_js_connection
+    nc = await get_shared_nats("metrics")
+    if _metrics_js_context is None or _metrics_js_connection is not nc:
+        _metrics_js_context = nc.jetstream(publish_async_max_pending=int(os.getenv("NATS_JS_PUBLISH_MAX_PENDING", "256")))
+        _metrics_js_connection = nc
+    return _metrics_js_context
+
+
+def _get_metrics_js_window() -> JetStreamPublishWindow:
+    global _metrics_js_window
+    if _metrics_js_window is None:
+        _metrics_js_window = JetStreamPublishWindow(
+            _get_metrics_jetstream,
+            settings=JetStreamPublishWindowSettings(
+                max_pending_messages=int(os.getenv("NATS_JS_PUBLISH_MAX_PENDING", "256")),
+                max_pending_messages_per_call=int(os.getenv("NATS_JS_PUBLISH_MAX_PENDING_PER_CALL", "64")),
+                max_pending_bytes=int(os.getenv("NATS_JS_PUBLISH_MAX_PENDING_BYTES", str(32 * 1024 * 1024))),
+                puback_timeout_seconds=float(
+                    os.getenv(
+                        "NATS_JS_PUBACK_TIMEOUT",
+                        os.getenv("PUBLISH_DELIVERY_TIMEOUT", os.getenv("PUBLISH_TIMEOUT", "30")),
+                    )
+                ),
+                max_attempts=int(os.getenv("NATS_JS_PUBLISH_MAX_ATTEMPTS", "2")),
+                expected_stream=configured_metrics_stream_name(),
+            ),
+        )
+    return _metrics_js_window
+
+
+async def _nats_publish_lines_jetstream(
+    subject: str,
+    lines: List[str],
+    *,
+    before_publish: Callable[[int], bool] | None,
+    message_ids: Sequence[str] | None,
+    deadlines: Sequence[float | None] | None,
+) -> int:
+    payloads = tuple(line.encode("utf-8") for line in lines)
+    messages = tuple(
+        JetStreamMessage(
+            payload=payload,
+            message_id=(str(message_ids[index]) if message_ids is not None else _jetstream_message_id(subject, index, payload)),
+            deadline=(deadlines[index] if deadlines is not None else None),
+            budget=(before_publish.budget_for(index) if hasattr(before_publish, "budget_for") else None),
+        )
+        for index, payload in enumerate(payloads)
+    )
+    try:
+        return await _get_metrics_js_window().publish(
+            subject,
+            messages,
+            before_publish=before_publish,
+        )
+    except JetStreamWindowPublishError as error:
+        cause = error.error if isinstance(error.error, Exception) else RuntimeError(type(error.error).__name__)
+        error_type, nats_code, nats_err_code, description = nats_error_log_fields(cause)
+        rejected_count = max(0, len(error.attempted_indices) - len(error.confirmed_indices))
+        logger.error(
+            "event=nats_metrics_publish_rejected subject=%s stream=%s rejected_count=%s "
+            "attempted_count=%s confirmed_count=%s error_type=%s nats_code=%s nats_err_code=%s "
+            "description=%s timeout_stage=%s timeout_phase=%s failed_stage=metrics_publish",
+            safe_log_value(subject),
+            safe_log_value(configured_metrics_stream_name()),
+            rejected_count,
+            len(error.attempted_indices),
+            len(error.confirmed_indices),
+            error_type,
+            nats_code,
+            nats_err_code,
+            description,
+            safe_log_value(error.timeout_stage or "-"),
+            safe_log_value(error.timeout_phase or "-"),
+        )
+        raise NatsLinesPublishError(
+            subject=subject,
+            attempted_count_before_failure=len(error.attempted_indices),
+            delivery_detected=bool(error.attempted_indices),
+            error=cause,
+            attempted_indices=error.attempted_indices,
+            confirmed_indices=error.confirmed_indices,
+        ) from error

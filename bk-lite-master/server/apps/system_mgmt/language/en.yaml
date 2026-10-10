@@ -1,0 +1,294 @@
+error:
+  network_whitelist_required: The target IP is not in the allowlist. Add it in System Management > Network Allowlist.
+  go_to_network_whitelist: Open Network Allowlist
+  detail_not_supported: Detail view is not supported
+  update_not_supported: Update is not supported
+  im_channel_in_use: This IM notification channel is still used by other business configs and cannot be deleted
+  integration_instance_in_use: This integration instance is still referenced by other configs. Delete those configs first.
+  system_token_full_update_not_supported: System tokens cannot be fully replaced
+  not_authorized: Not Authorized
+  cannot_delete_builtin_app: Cannot delete built-in application
+  is_enabled_required: Enabled status cannot be empty
+  group_not_exist: Group does not exist
+  group_ids_role_id_required: Group ID list and role ID cannot be empty
+  default_group_cannot_delete: Default group cannot be deleted.
+  group_role_ids_required: Group ID list and role ID list cannot be empty
+  invalid_time_range: Start time cannot be greater than end time
+  invalid_format: Request format error, list required
+  app_not_found: APP not found
+  role_id_required: Role ID cannot be empty
+  order_required: Order value cannot be empty
+  time_range_required: Time range is required
+  cannot_delete_admin_normal_roles: Admin and normal roles cannot be deleted
+  group_id_required: Group ID cannot be empty
+  group_has_users_remove_first: This group or sub groups has users, please remove
+    the users first!
+  update_failed: update failed
+  role_used_by_users: Role is already used by the following users!
+  parent_group_not_found: Parent group not found.
+  ids_required: Menu ID list cannot be empty
+  cannot_create_top_level_virtual_group: Cannot create top-level virtual group. Only
+    the built-in virtual group is allowed.
+  no_permission_create_group: You do not have permission to create a group under this
+    parent group.
+  token_validation_failed: token validation failed
+  login_module_domain_exists: Login module with this domain already exists.
+  no_permission_edit_group: You do not have permission to edit this group.
+  cannot_create_under_virtual_group: Cannot create a group under a virtual group.
+  no_permission_delete_group: You do not have permission to delete this group.
+  some_roles_not_exist: Role does not exist
+  login_module_name_exists: Login module with this name and source type already exists.
+  default_group_cannot_modify: Default group cannot be modified.
+  time_range_too_large: Time range cannot exceed 90 days
+  cannot_modify_builtin_menu_group: Cannot modify builtin menu group
+  cannot_delete_menu_with_children: Cannot delete menu with children
+  create_not_supported: Manual creation is not supported
+  invalid_time_format: Invalid time format, please use ISO 8601 format
+  domain_required_for_login_module: Domain is required for creating a login module.
+  module_not_found: Module not found
+  cannot_delete_menu_group_with_menus: Cannot delete menu group with menus
+  delete_failed: delete failed
+  cannot_delete_builtin_menu_group: Cannot delete builtin menu group
+  insufficient_permissions: insufficient permissions
+  some_groups_not_exist: Some groups do not exist
+  please_provide_token: please provide Token
+  delete_not_supported: Delete is not supported
+  root_menu_cannot_toggle: Root menu does not support enable/disable
+  cannot_create_under_virtual_subgroup: Cannot create a group under a virtual subgroup.
+    Virtual groups can only have two levels.
+  invalid_order: Order value must be an integer
+  invalid_role_ids: 'Invalid role IDs: {ids}'
+  invalid_group_ids: 'Invalid group IDs: {ids}'
+  group_selection_required: At least one group must be selected
+  normal_group_required: At least one normal group must be selected
+  no_permission_access_group: You do not have permission to access this group.
+  no_permission_access_user: You do not have permission to access this user.
+  system_error: System error, please contact the administrator.
+  api_not_enabled: API is not enabled
+  password_required: Password is required
+  password_too_short: Password must contain at least {min_length} characters
+  password_too_long: Password cannot contain more than {max_length} characters
+  password_missing_char_types: 'Password must contain: {types}'
+  password_invalid_characters: Password contains invalid characters. Only printable ASCII characters are allowed.
+  initial_password_generation_failed: Unable to generate an initial password that meets the password policy
+  invalid_phone: Invalid phone number format
+  email_required: Email cannot be empty
+  initial_password_not_configured: Local user initial password is not configured
+  initial_password_email_channel_unavailable: Initial password email channel does not exist or is unavailable
+  initial_password_email_channel_invalid: Initial password email channel must be an email channel
+  initial_password_email_required: An email address is required for initial password notification
+  initial_password_decrypt_failed: Unable to decrypt the initial password. Please set it again.
+  synced_groups_local_users_forbidden: Synced groups cannot have locally managed users
+  synced_group_membership_immutable: Synced group membership cannot be changed locally
+  channel_team_required: Please select the channel organization
+  custom_menu_group_display_name_exists: A menu group with the same display name already exists under app {app}
+  custom_menu_group_enabled_exists: App {app} already has an enabled menu group. Only one menu group can be enabled per app.
+  custom_menu_group_name_exists: A menu group named {display_name} already exists under app {app}
+  network_required: Network cannot be empty
+  invalid_network: 'Invalid CIDR/IP: {network}'
+  forbidden_network_supernet: Adding 0.0.0.0/0 or ::/0 is forbidden because it disables all protection
+  domain_name_required: Domain name cannot be empty
+  invalid_domain_name_characters: 'Domain name contains invalid characters: {domain}'
+  invalid_domain_name_wildcard: 'Wildcard domains must look like *.example.com: {domain}'
+  domain_name_leading_dot: Domain name cannot start with a dot
+  network_whitelist_type_immutable: Network allowlist entry type cannot be changed
+  network_or_domain_required: Exactly one of network and domain_name must be provided
+  network_or_domain_exists: Network or domain name already exists
+  app_required: App parameter is required
+  enabled_menu_group_not_found: No enabled menu group was found for app {app}
+  current_team_required: current_team parameter is required
+  invalid_current_team: current_team parameter is invalid
+  invalid_group_id: group_id parameter is invalid
+  invalid_pagination: page and page_size must be positive integers, and page_size may not exceed 100
+  group_ids_list_required: group_ids must be a required list
+  group_ids_must_be_list: group_ids must be a list
+  user_ids_list_required: user_ids must be a non-empty list
+  invalid_user_status_action: Action must be one of enable, disable, or unlock
+  invalid_user_ids: 'Invalid user IDs: {ids}'
+  import_users_empty: No users available to import
+  import_users_limit: You can import at most 500 users at a time
+  import_users_invalid_row: Invalid data format
+  import_users_missing_fields: Required fields are missing
+  import_users_username_exists: Username already exists
+  import_users_invalid_email: Invalid email format
+  import_users_create_failed: Failed to create user
+  nats_config_must_be_object: NATS config must be an object
+  nats_supports_notify_person_boolean: must be a boolean
+  nats_mode_unsupported: unsupported NATS extension mode
+  nats_subject_key_in_use: notification topic identifier is already in use
+  synced_users_delete_forbidden: Synced users cannot be deleted directly. Please delete them from the user sync source.
+  synced_group_child_creation_forbidden: Synced groups cannot have manually created child groups
+  cannot_create_under_archived_group: Cannot create a group under an archived organization
+  synced_child_group_name_immutable: Synced child group name cannot be changed
+  synced_groups_delete_forbidden: Synced groups cannot be deleted directly
+  synced_groups_archive_forbidden: Synced groups cannot be archived directly
+  group_archive_users_need_active_org: Archiving would leave some users without an active organization. Please assign them another active organization first
+  archive_operation_requires_root: Only archived roots can be restored or permanently deleted
+  group_restore_not_allowed: This archived group cannot be restored
+  group_permanent_delete_not_allowed: This archived group cannot be permanently deleted
+  group_permanent_delete_users_need_active_org: Permanent deletion would leave some users without an active organization. Please assign them another active organization first
+  otp_recommended_apps_required: At least one recommended authenticator app is required
+  otp_whitelist_must_be_user_ids: OTP allowlist must be a list of user IDs
+  otp_whitelist_duplicate_user_ids: OTP allowlist contains duplicate user IDs
+  otp_whitelist_unknown_user: OTP allowlist contains a user that does not exist
+  initial_password_mode_invalid: 'Invalid initial password mode: {mode}'
+  password_policy_invalid: Password policy configuration is invalid
+  initial_password_reset_required: Set the initial password again
+  initial_password_required: Set an initial password
+  initial_password_email_channel_required_when_enabled: An email channel is required when initial passwords are enabled for new users
+  email_channel_missing: 'Email channel {channel_id} does not exist or is not an email channel'
+  channel_not_email: 'Channel {channel_id} is not an email channel'
+  initial_password_email_channel_absent: Email channel does not exist or is not an email channel
+  no_permission_access_team: You do not have permission to access this organization's data
+  builtin_entry_immutable: 'Built-in entries cannot be modified or deleted: {label}'
+  opspilot_channel_readonly: Channels created by an OpsPilot workflow cannot be edited or deleted
+  email_channel_id_required: email_channel_id is required
+  user_email_empty: The user has no email address, so the message cannot be sent
+  email_sent: Sent
+  email_send_failed: Failed to send
+  email_recipient_missing_or_unknown: The user has no email address or does not exist
+  password_strength_insufficient: Password does not meet the strength requirements
+  user_sync_scope_unavailable: The current sync scope is no longer available. Select the department again.
+  initial_password_email_delivery_failed: Failed to send the email
+  initial_password_email_title: Your BK-Lite account is ready
+  initial_password_email_body: '<p>Hello,</p><p>An administrator has created your BK-Lite account. The account details are below:</p><p><strong>Username: </strong>{username}</p><p><strong>Initial password: </strong>{password}</p><p>Sign in with this initial password and change it immediately after your first sign-in.</p><p><strong>Security notice: </strong>Do not forward, screenshot, or keep this email. If you did not expect it, contact an administrator.</p><p>Regards<br>BK-Lite</p>'
+  current_team_archived_or_missing: The current organization is archived or does not exist
+  channel_id_not_found: No channel matches the given channel_id
+success:
+  menu_group_disabled: Menu group disabled
+  batch_create: Batch creation successful
+  menu_disabled: Menu disabled
+  menu_enabled: Menu enabled
+  sync_task_initiated: Sync task has been initiated.
+  batch_update_order: Successfully updated menu orders
+  menu_group_enabled: Menu group enabled
+  update_order: Order updated successfully
+  menu_group_copied: Menu group copied successfully
+password:
+  char_type_uppercase: uppercase letter
+  char_type_lowercase: lowercase letter
+  char_type_digit: number
+  char_type_special: special character
+  policy_must_contain: 'Must contain: {types}'
+  policy_no_special_requirement: No special requirements
+  policy_description: "Password policy:\n1. Length must be {min_length}-{max_length} characters\n2. {type_desc}\n3. Special characters include: !@#$%^&*()_+-=[]{{}};\\'\"\\|,.<>?/~`"
+login:
+  incorrect_password_with_attempts: Username or password is incorrect. {attempts}
+    attempts remaining.
+  password_expired: Your password has expired. Please change it immediately.
+  password_expired_contact_admin: Your password has expired. Please contact the administrator
+    to reset your password.
+  password_expiring_soon: Your password will expire in {days} day(s). Please change
+    it soon.
+  account_locked: Account is locked. Please try again after {minutes} minutes.
+  account_locked_too_many_attempts: Account locked due to too many failed attempts.
+    Please try again after {minutes} minutes.
+app_name:
+  monitor: Monitor Center
+  log: Log Center
+  cmdb: CMDB
+  alarm: Alert Center
+  job: Job Management
+  ops-analysis: Ops Analysis
+  ops-console: Console
+  system-manager: System Management
+  node: Node Management
+  opspilot: OpsPilot
+  mlops: MLOps
+  patch: Patch Management
+  apm: APM
+  playground: Playground
+  workflow-orchestration: Workflow Orchestration
+app:
+  ops-analysis: Integrate operation and maintenance data, analyze potential risks
+    and optimization space from multiple dimensions through dashboards and canvases,
+    provide data support for decision-making, and help improve operation and maintenance
+    quality and business continuity
+  playground: Users can experience relevant capabilities here, including AIOps model
+    testing, intelligent agent usage, and more.
+  log: For centralized collection, storage, and analysis of log data, helping users
+    achieve efficient log monitoring and troubleshooting.
+  monitor: Real-time monitoring and management platform for system operation status,
+    providing data visualization, alert notifications, performance analysis and other
+    functions to help quickly identify problems and ensure business stability
+  cmdb: Platform for centralized management of all IT assets and resources of an enterprise,
+    helping organizations effectively track asset lifecycle, optimize resource allocation
+    and ensure system security
+  alarm: Gather multiple sources of alarm events from enterprises, intelligently reduce
+    noise, explore deep fault causes, improve operation and maintenance response efficiency,
+    and help quickly locate problems.
+  mlops: AI end-to-end lifecycle management tool, integrating dataset management and
+    model task training functionalities, enhances the flexibility and efficiency of
+    machine learning.
+  opspilot: OpsPilot is an AI intelligence platform, based on cutting-edge artificial
+    intelligence technology, integrating machine learning and large model capabilities,
+    supporting diversified scenarios.
+  system-manager: Covering user and organizational role permission management, ensuring
+    resource access security through fine-grained permission control while improving
+    operational efficiency. Provides flexible configuration and management to meet
+    different business needs
+  node: Used to centrally manage nodes under various cloud regions and install various
+    probes on each node to collect monitoring data, configuration information, logs
+    and other information
+  job: Quickly create and execute jobs, unified management of script execution, file
+    distribution and scheduled tasks
+  patch: Centrally manage system patches with scanning, installation, and patch library
+    maintenance to continuously reduce security risks.
+  workflow-orchestration: Design visual workflows, automate execution, manage human
+    approvals, and track cross-system operations in one place.
+action_type:
+  create: Create
+  delete: Delete
+  execute: Execute
+  update: Update
+status:
+  success: Success
+  failed: Failed
+export:
+  login_log_sheet: User login logs
+  login_log_filename: user_login_logs
+  operation_log_sheet: User operation logs
+  operation_log_filename: user_operation_logs
+  openapi_call_log_sheet: API Call Log
+  openapi_call_log_filename: API_Call_Log
+  column_username: Username
+  column_domain: Domain
+  column_login_time: Login time
+  column_operation_time: Operation time
+  column_source_ip: Source IP
+  column_location: Location
+  column_browser: Browser
+  column_os: Operating system
+  column_login_status: Login status
+  column_failure_reason: Failure reason
+  column_app: App
+  column_action_type: Action type
+  column_summary: Summary
+email:
+  password_expiring_subject: Your password will expire soon
+  password_expiring_body: '<p>Hello {name},</p><p>Your password will expire in <b>{days}</b> day(s). Please change it soon.</p>'
+  password_expired_subject: Your password has expired
+  password_expired_body: '<p>Hello {name},</p><p>Your password has expired. Please change it now.</p>'
+channel:
+  opspilot_nats_trigger_description: NATS trigger channel created by an OpsPilot workflow
+tag:
+  # job
+  job_execution: Job Execution
+  script_management: Script Management
+  file_distribution: File Distribution
+  scheduled_task: Scheduled Task
+  # patch
+  patch_scan: Patch Scanning
+  patch_install: Patch Installation
+  patch_library: Patch Library
+  # workflow-orchestration
+  workflow_design: Workflow Design
+  workflow_execution: Workflow Execution
+  automation: Automation
+  approval: Human Approval
+# ops-analysis data-permission tabs. GroupDataRuleViewSet looks up display_name as a root key.
+"目录": Directory
+"仪表盘": Dashboard
+"拓扑图": Topology
+"架构图": Architecture
+"数据源": Data source

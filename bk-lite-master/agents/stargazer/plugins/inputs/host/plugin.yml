@@ -1,0 +1,27 @@
+name: host
+version: 2.0.0
+category: infrastructure
+metadata:
+  display_name: 主机信息
+  description: 主机信息采集插件，支持脚本方式采集
+  author: WeOps
+  tags:
+  - infrastructure
+  - host
+  cloud_protocol: false
+  model_id: host
+executors:
+  job:
+    type: job
+    execution_mode: remote
+    capacity_group: remote_job
+    scripts:
+      linux: plugins/inputs/host/host_default_discover.sh
+      windows: plugins/inputs/host/host_windows_discover.ps1
+    collector:
+      module: plugins.inputs.host.host_info
+      class: HostInfo
+    default_script: linux
+    target_policy:
+      mode: remote_channel
+default_executor: job

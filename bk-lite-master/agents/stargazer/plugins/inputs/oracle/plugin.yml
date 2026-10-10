@@ -1,0 +1,24 @@
+name: oracle
+version: 2.0.0
+category: database
+metadata:
+  display_name: Oracle 数据库
+  description: Oracle 数据库采集插件，支持协议方式采集
+  author: WeOps
+  tags:
+  - database
+  - oracle
+  cloud_protocol: false
+  model_id: oracle
+executors:
+  protocol:
+    type: protocol
+    execution_mode: async
+    capacity_group: default
+    collector:
+      module: plugins.inputs.oracle.oracle_info
+      class: OracleInfo
+    target_policy:
+      mode: tcp
+      port: 1521
+default_executor: protocol

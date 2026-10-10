@@ -1,0 +1,575 @@
+'use client';
+
+import React, {
+  useState,
+  forwardRef,
+  useImperativeHandle,
+  useRef,
+} from 'react';
+import { Tag, Button, Badge, Empty } from 'antd';
+import {
+  RightOutlined,
+  CheckCircleOutlined,
+  CloseCircleOutlined,
+  ToolOutlined,
+  ApiOutlined,
+} from '@ant-design/icons';
+import OperateDrawer from '@/components/operate-drawer';
+import CustomTable from '@/components/custom-table';
+import EditConfig from './updateConfig';
+import { useTranslation } from '@/utils/i18n';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import useIntegrationApi from '@/app/monitor/api/integration';
+import { ModalRef } from '@/app/monitor/types';
+import { ModalSuccess } from '@/app/node-manager/types';
+import {
+  PluginItem,
+  ConfigItem,
+  ShowModalParams,
+  TemplateDrawerRef,
+} from '@/app/monitor/types/integration';
+import {
+  getPluginConfigContentState,
+  getPluginConfigFetchDecision,
+  isPluginConfigurable,
+  isSameTemplatePlugin,
+} from './templateConfigDrawerLogic';
+import { comparePackVersions } from '@/app/monitor/utils/collectNeedUpdate';
+
+const TemplateConfigDrawer = forwardRef<TemplateDrawerRef, ModalSuccess>(
+  ({ onSuccess }, ref) => {
+    const { t } = useTranslation();
+    const { convertToLocalizedTime } = useLocalizedTime();
+    const { getInstanceChildConfig } = useIntegrationApi();
+    const configRef = useRef<ModalRef>(null);
+    const [visible, setVisible] = useState<boolean>(false);
+    const [loading, setLoading] = useState<boolean>(false);
+    const [selectedPlugin, setSelectedPlugin] = useState<PluginItem | null>(
+      null
+    );
+    const [plugins, setPlugins] = useState<PluginItem[]>([]);
+    const [configList, setConfigList] = useState<ConfigItem[]>([]);
+    const [instanceName, setInstanceName] = useState<string>('');
+    const [objName, setObjName] = useState<string>('');
+    const [showTemplateList, setShowTemplateList] = useState<boolean>(true);
+    const [instanceId, setInstanceId] = useState<number | string>('');
+    const [objId, setObjId] = useState<React.Key>('');
+
+    const getPackVersionText = (plugin?: PluginItem | null) => {
+      const applied = String(plugin?.applied_pack_version || '').trim();
+      if (applied) return applied;
+      if (plugin?.need_update) {
+        return t('monitor.integrations.unknownAppliedPack');
+      }
+      const latest = String(
+        plugin?.latest_pack_version || plugin?.pack_version || ''
+      ).trim();
+      return latest || t('monitor.integrations.builtinPack');
+    };
+
+    const getLatestPackVersionText = (plugin?: PluginItem | null) => {
+      const latest = String(
+        plugin?.latest_pack_version || plugin?.pack_version || ''
+      ).trim();
+      return latest || t('monitor.integrations.builtinPack');
+    };
+
+    const fetchConfigList = async (params?: {
+      plugin?: PluginItem;
+      instanceId?: number | string;
+      monitorObjectId?: React.Key;
+    }) => {
+      const targetPlugin = params?.plugin || selectedPlugin;
+      const targetInstanceId = params?.instanceId || instanceId;
+      if (!targetPlugin || !isPluginConfigurable(targetPlugin)) {
+        setConfigList([]);
+        return;
+      }
+      setLoading(true);
+      try {
+        const requestParams = {
+          monitor_plugin_id: targetPlugin.plugin_id,
+          collect_type: targetPlugin.collect_type,
+          collector: targetPlugin.collector,
+        };
+
+        const templateData = await getInstanceChildConfig({
+          ...requestParams,
+          instance_id: targetInstanceId,
+        });
+        const dataWithId = (templateData || []).map(
+          (item: any, index: number) => ({
+            ...item,
+            ...requestParams,
+            monitor_object_id: params?.monitorObjectId || objId,
+            id: index,
+          })
+        );
+        setConfigList(dataWithId);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    useImperativeHandle(ref, () => ({
+      showModal: async ({
+        instanceName,
+        instanceId,
+        monitorObjId,
+        selectedConfigId,
+        objName,
+        plugins: externalPlugins,
+        showTemplateList: shouldShowList = true,
+      }: ShowModalParams) => {
+        setVisible(true);
+        setInstanceName(instanceName);
+        setInstanceId(instanceId);
+        setObjName(objName || '');
+        setShowTemplateList(shouldShowList);
+        setPlugins(externalPlugins || []);
+        setObjId(monitorObjId || '');
+        let selectedTemp: any;
+        if (externalPlugins && externalPlugins.length > 0) {
+          if (shouldShowList) {
+            // 显示列表模式：默认选中第一个插件（按状态排序后）
+            const sortedPlugins = [...externalPlugins].sort(
+              (a: any, b: any) => {
+                // 手动接入排最后
+                if (a.collect_mode === 'manual' && b.collect_mode === 'auto')
+                  return 1;
+                if (a.collect_mode === 'auto' && b.collect_mode === 'manual')
+                  return -1;
+                // 正常状态排前面
+                if (
+                  (a.status === 'normal' || a.status === 'online') &&
+                  b.status !== 'normal' &&
+                  b.status !== 'online'
+                )
+                  return -1;
+                if (
+                  a.status !== 'normal' &&
+                  a.status !== 'online' &&
+                  (b.status === 'normal' || b.status === 'online')
+                )
+                  return 1;
+                return 0;
+              }
+            );
+            selectedTemp = sortedPlugins[0];
+          } else {
+            // 隐藏列表模式：选中指定的插件
+            if (selectedConfigId) {
+              selectedTemp = externalPlugins.find(
+                (t: any) => t.name === selectedConfigId
+              );
+            } else {
+              // 如果没有指定config_id，说明是手动模板
+              selectedTemp = externalPlugins.find(
+                (t: any) => t.collect_mode === 'manual'
+              );
+            }
+          }
+          setSelectedPlugin(selectedTemp);
+          // 使用 fetchConfigList 获取配置列表
+          await fetchConfigList({
+            plugin: selectedTemp,
+            instanceId,
+            monitorObjectId: monitorObjId,
+          });
+        }
+      },
+    }));
+
+    const handleCancel = () => {
+      setVisible(false);
+      setPlugins([]);
+      setConfigList([]);
+      setSelectedPlugin(null);
+      setInstanceName('');
+      setInstanceId('');
+      setObjId('');
+      setObjName('');
+      setShowTemplateList(true);
+    };
+
+    const handlePluginClick = async (plugin: PluginItem) => {
+      const decision = getPluginConfigFetchDecision(selectedPlugin, plugin);
+      if (!decision.shouldChangeSelection) {
+        return;
+      }
+      setSelectedPlugin(plugin);
+      setConfigList([]);
+      if (decision.shouldFetchConfig) {
+        await fetchConfigList({ plugin });
+      }
+    };
+
+    const getCollectType = (row: ConfigItem) => {
+      if (row.collect_type === 'host') {
+        return `${row.collect_type}(${row.config_type})`;
+      }
+      return row.collect_type || '--';
+    };
+
+    const handleConfigSuccess = () => {
+      fetchConfigList();
+      onSuccess?.();
+    };
+
+    const openConfigModal = (row: ConfigItem) => {
+      configRef.current?.showModal({
+        title: t('monitor.integrations.updateConfigration'),
+        type: 'edit',
+        form: {
+          ...row,
+          objName: objName,
+        },
+      });
+    };
+
+    const getStatusInfo = (status: string) => {
+      if (status === 'normal') {
+        return {
+          color: '#52c41a',
+          tagColor: 'success',
+          text: t('monitor.integrations.normal'),
+          icon: (
+            <div
+              className="w-6 h-6 rounded-lg flex items-center justify-center"
+              style={{ backgroundColor: 'rgba(82, 196, 26, 0.1)' }}
+            >
+              <CheckCircleOutlined
+                style={{
+                  color: '#52c41a',
+                  fontWeight: 'bold',
+                  fontSize: '12px',
+                }}
+              />
+            </div>
+          ),
+        };
+      } else {
+        return {
+          color: '#ff4d4f',
+          tagColor: 'error',
+          text: t('monitor.integrations.unavailable'),
+          icon: (
+            <div
+              className="w-6 h-6 rounded-lg flex items-center justify-center"
+              style={{ backgroundColor: 'rgba(255, 77, 79, 0.1)' }}
+            >
+              <CloseCircleOutlined
+                style={{
+                  color: '#ff4d4f',
+                  fontWeight: 'bold',
+                  fontSize: '12px',
+                }}
+              />
+            </div>
+          ),
+        };
+      }
+    };
+
+    const isManualAccess = (plugin: PluginItem) => {
+      return plugin.collect_mode === 'manual';
+    };
+
+    const getContentState = () =>
+      getPluginConfigContentState(selectedPlugin, configList);
+
+    const getGroupedPlugins = () => {
+      const grouped = plugins.reduce((groups, plugin) => {
+        const status = plugin.status;
+        if (!groups[status]) {
+          groups[status] = [];
+        }
+        groups[status].push(plugin);
+        return groups;
+      }, {} as Record<string, PluginItem[]>);
+
+      // Sort groups: normal/online first, then unavailable
+      return Object.entries(grouped).sort(([statusA], [statusB]) => {
+        if (statusA === 'normal' || statusA === 'online') return -1;
+        if (statusB === 'normal' || statusB === 'online') return 1;
+        return 0;
+      });
+    };
+
+    const getConfigColumns = () => {
+      return [
+        {
+          title: t('monitor.integrations.collectionMethod'),
+          dataIndex: 'collect_type',
+          key: 'collect_type',
+          width: 150,
+          render: (_: any, record: ConfigItem) => <>{getCollectType(record)}</>,
+        },
+        {
+          title: t('monitor.integrations.collectionPeriod'),
+          dataIndex: 'interval',
+          key: 'interval',
+          width: 150,
+          render: (_: any, record: ConfigItem) => {
+            const interval =
+              record?.config_content?.child?.content?.config?.interval;
+            return interval ? <Tag color="blue">{interval}</Tag> : <>--</>;
+          },
+        },
+        {
+          title: t('common.action'),
+          key: 'action',
+          dataIndex: 'action',
+          fixed: 'right' as const,
+          width: 60,
+          render: (_: any, record: ConfigItem) => (
+            <>
+              <Button
+                type="link"
+                disabled={!record.config_ids?.length}
+                onClick={() => openConfigModal(record)}
+              >
+                {t('common.edit')}
+              </Button>
+            </>
+          ),
+        },
+      ];
+    };
+
+    // 判断是否显示左侧模板列表
+    const showLeftPanel = showTemplateList && plugins.length > 1;
+
+    return (
+      <>
+        <EditConfig ref={configRef} onSuccess={handleConfigSuccess} />
+        <OperateDrawer
+          title={instanceName || '--'}
+          open={visible}
+          width={showLeftPanel ? 800 : 600}
+          destroyOnHidden
+          onClose={handleCancel}
+        >
+          <div className="flex h-full">
+            {/* 左侧：模板列表 */}
+            {showLeftPanel && (
+              <div className="w-1/3 pr-4 border-r border-[var(--color-border-1)]">
+                <div className="flex items-center mb-2">
+                  <b className="mr-2">
+                    {t('monitor.integrations.templateList')}
+                  </b>
+                  <Badge
+                    size="small"
+                    count={plugins.length}
+                    showZero
+                    color="var(--color-fill-1)"
+                    style={{
+                      backgroundColor: 'var(--color-fill-2)',
+                      color: 'var(--color-text-2)',
+                      boxShadow: 'none',
+                    }}
+                  />
+                </div>
+                <div className="space-y-2">
+                  {getGroupedPlugins().map(([status, items]) => {
+                    return (
+                      <div key={status} className="text-[12px]">
+                        <div className="space-y-2 mb-2">
+                          {items.map((plugin, idx) => {
+                            const pluginStatusInfo = getStatusInfo(
+                              plugin.status
+                            );
+                            const isSelected = isSameTemplatePlugin(
+                              selectedPlugin,
+                              plugin
+                            );
+                            return (
+                              <div
+                                key={`${plugin.name}-${idx}`}
+                                className={`p-3 rounded cursor-pointer transition-colors flex items-center justify-between border-l-4 ${
+                                  isSelected
+                                    ? 'bg-[var(--color-bg-hover)] border-blue-200'
+                                    : 'bg-[var(--color-bg-1)] border-gray-200 hover:bg-[var(--color-bg-hover)]'
+                                }`}
+                                style={{
+                                  border: '1px solid var(--color-border-1)',
+                                  borderLeft: `4px solid ${pluginStatusInfo.color}`,
+                                }}
+                                onClick={() => handlePluginClick(plugin)}
+                              >
+                                <div className="flex items-center flex-1">
+                                  <div className="mr-2">
+                                    {pluginStatusInfo.icon}
+                                  </div>
+                                  <div className="flex-1">
+                                    <div className="font-medium text-sm mb-1">
+                                      {plugin.collector
+                                        ? `${plugin.name || '--'}（${
+                                          plugin.collector
+                                        }）`
+                                        : plugin.name || '--'}
+                                    </div>
+                                    <Tag
+                                      color="blue"
+                                      icon={
+                                        isManualAccess(plugin) ? (
+                                          <ToolOutlined />
+                                        ) : (
+                                          <ApiOutlined />
+                                        )
+                                      }
+                                      className="text-xs"
+                                    >
+                                      {isManualAccess(plugin)
+                                        ? t('monitor.integrations.manualAccess')
+                                        : t('monitor.integrations.autoAccess')}
+                                    </Tag>
+                                    <Tag className="text-xs ml-[6px] m-0">
+                                      {getPackVersionText(plugin)}
+                                    </Tag>
+                                  </div>
+                                </div>
+                                <RightOutlined className="text-xs" />
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 右侧：模板详情 */}
+            <div className={showLeftPanel ? 'w-2/3 pl-4' : 'w-full'}>
+              {selectedPlugin && (
+                <div className="space-y-4">
+                  {/* 标题和标签 */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm text-[var(--color-text-2)]">
+                      {selectedPlugin.collector
+                        ? `${selectedPlugin.name || '--'}（${
+                          selectedPlugin.collector
+                        }）`
+                        : selectedPlugin.name || '--'}
+                    </span>
+                    <Tag
+                      color="blue"
+                      icon={
+                        isManualAccess(selectedPlugin) ? (
+                          <ToolOutlined />
+                        ) : (
+                          <ApiOutlined />
+                        )
+                      }
+                    >
+                      {isManualAccess(selectedPlugin)
+                        ? t('monitor.integrations.manualAccess')
+                        : t('monitor.integrations.autoAccess')}
+                    </Tag>
+                    <Tag>{getPackVersionText(selectedPlugin)}</Tag>
+                    {selectedPlugin.need_update ? (
+                      <Tag color="warning">
+                        {(() => {
+                          const version = getLatestPackVersionText(selectedPlugin);
+                          const direction = comparePackVersions(
+                            getPackVersionText(selectedPlugin) ===
+                              t('monitor.integrations.unknownAppliedPack')
+                              ? ''
+                              : getPackVersionText(selectedPlugin),
+                            String(
+                              selectedPlugin.latest_pack_version ||
+                                selectedPlugin.pack_version ||
+                                ''
+                            ).trim()
+                          );
+                          const key =
+                            direction === 'downgrade'
+                              ? 'monitor.integrations.needUpdateToVersionDowngrade'
+                              : direction === 'align'
+                                ? 'monitor.integrations.needUpdateToVersionAlign'
+                                : 'monitor.integrations.needUpdateToVersion';
+                          return t(key, '', { version });
+                        })()}
+                      </Tag>
+                    ) : null}
+                  </div>
+
+                  {/* 上报状态 */}
+                  <div className="py-3 px-4 bg-[var(--color-fill-1)] rounded">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-sm">
+                        {t('monitor.integrations.reportingStatus')}
+                      </span>
+                      <Tag
+                        color={getStatusInfo(selectedPlugin.status).tagColor}
+                      >
+                        {getStatusInfo(selectedPlugin.status).text}
+                      </Tag>
+                    </div>
+                    <div className="text-xs text-[var(--color-text-3)]">
+                      {t('monitor.integrations.lastReportTime')}：
+                      {selectedPlugin.time
+                        ? convertToLocalizedTime(selectedPlugin.time)
+                        : '--'}
+                    </div>
+                    <div className="text-xs text-[var(--color-text-3)] mt-1">
+                      {t('monitor.integrations.packVersion')}：
+                      {getPackVersionText(selectedPlugin)}
+                    </div>
+                  </div>
+
+                  {/* 配置列表 */}
+                  <div className="bg-[var(--color-fill-2)] rounded">
+                    {getContentState() === 'reportedOnly' ? (
+                      <div className="flex flex-col items-center justify-center py-8 px-4">
+                        <span className="text-4xl mb-3 text-[var(--color-text-3)]">
+                          <ToolOutlined />
+                        </span>
+                        <span className="text-[12px] text-[var(--color-text-3)]">
+                          {t('monitor.integrations.reportedOnlyConfigTip')}
+                        </span>
+                      </div>
+                    ) : getContentState() === 'missingConfig' && !loading ? (
+                      <div className="py-8 px-4">
+                        <Empty
+                          description={t(
+                            'monitor.integrations.missingConfigDataTip'
+                          )}
+                        />
+                      </div>
+                    ) : (
+                      <div>
+                        <div className="flex items-center justify-between p-[10px]">
+                          <span className="text-sm font-bold">
+                            {t('monitor.integrations.configurationList')}
+                          </span>
+                          <span className="text-xs text-[var(--color-text-3)]">
+                            {configList.length}
+                            {t('common.items')}
+                          </span>
+                        </div>
+                        <CustomTable
+                          scroll={{ x: 'max-content' }}
+                          rowKey="id"
+                          dataSource={configList}
+                          columns={getConfigColumns()}
+                          pagination={false}
+                          loading={loading}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </OperateDrawer>
+      </>
+    );
+  }
+);
+
+TemplateConfigDrawer.displayName = 'TemplateConfigDrawer';
+export default TemplateConfigDrawer;

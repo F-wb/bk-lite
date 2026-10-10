@@ -1,0 +1,150 @@
+"""
+MLOps group-scope helpers.
+
+Reusable utilities for team-based ownership filtering in the mlops app.
+Mirrors the cookie-parsing behaviour of
+``apps.core.utils.viewset_utils.GenericViewSetFun._parse_current_team_cookie``
+so that mlops-specific code does not depend on the core ViewSet class hierarchy.
+"""
+
+from types import SimpleNamespace
+
+from apps.core.logger import mlops_logger as logger
+from apps.core.utils.team_utils import get_current_team as _get_current_team_str
+from apps.mlops.utils.i18n import mlops_message
+from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
+
+
+def get_current_team(request, default=0):
+    """Parse ``current_team`` from request and return an ``int``.
+
+    Reads via ``apps.core.utils.team_utils.get_current_team`` so that
+    both browser-cookie and API-Key-injected team contexts are supported.
+
+    Args:
+        request: Django/DRF request object.
+        default: Value returned when the team is missing or non-numeric.
+
+    Returns:
+        int – the parsed team id, or *default*.
+    """
+    raw = _get_current_team_str(request, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_allowed_team_ids(request):
+    """Return the team ids a user is allowed to assign to root resources."""
+    user = getattr(request, "user", None)
+    if not user:
+        return set()
+    if getattr(user, "is_superuser", False):
+        return None
+
+    group_list = getattr(user, "group_list", None) or []
+    allowed_ids = set()
+    for item in group_list:
+        if isinstance(item, dict):
+            group_id = item.get("id")
+        else:
+            group_id = item
+        if group_id is None:
+            continue
+        try:
+            allowed_ids.add(int(group_id))
+        except (TypeError, ValueError):
+            continue
+    return allowed_ids
+
+
+def validate_requested_teams(request, team_ids, field_name="team"):
+    """Validate an explicit list of teams submitted for a root-owned resource."""
+    if not isinstance(team_ids, list) or not team_ids:
+        raise serializers.ValidationError({field_name: mlops_message(request, "error.team_selection_required")})
+
+    normalized = []
+    for team_id in team_ids:
+        try:
+            normalized.append(int(team_id))
+        except (TypeError, ValueError):
+            raise serializers.ValidationError({field_name: mlops_message(request, "error.team_id_must_be_integer")})
+
+    allowed_team_ids = get_allowed_team_ids(request)
+    if allowed_team_ids is not None and not set(normalized).issubset(allowed_team_ids):
+        raise serializers.ValidationError({field_name: mlops_message(request, "error.team_selection_not_allowed")})
+
+    return normalized
+
+
+def filter_queryset_by_parent_team(queryset, request, parent_team_lookup):
+    """Filter a queryset so that only rows whose parent's ``team`` field
+    contains the current team are returned.
+
+    This is the reusable building-block for *inherited* ownership: child
+    resources (TrainData, DatasetRelease) that do not carry their own
+    ``team`` column can be scoped by looking up the parent's team through
+    a Django ORM lookup path.
+
+    Args:
+        queryset: A Django ``QuerySet``.
+        request: Django/DRF request (used to read the ``current_team`` cookie).
+        parent_team_lookup: Dot-free Django ORM lookup prefix pointing at
+            the parent's ``team`` JSON field, e.g. ``"dataset__team"`` or
+            plain ``"team"`` for root-owned models.
+
+    Returns:
+        A filtered ``QuerySet``.
+    """
+    user = getattr(request, "user", None)
+    if getattr(user, "is_superuser", False):
+        return queryset
+
+    current_team = get_current_team(request, default=None)
+    allowed_team_ids = get_allowed_team_ids(request)
+    if not current_team or current_team not in allowed_team_ids:
+        raise PermissionDenied(mlops_message(request, "error.team_data_access_denied"))
+
+    return queryset.filter(**{f"{parent_team_lookup}__contains": current_team})
+
+
+def assert_team_ownership(team_owned_obj, current_team, field_name, request=None):
+    """Raise ``ValidationError`` when ``team_owned_obj`` is not visible to the current team."""
+    user = getattr(request, "user", None) if request is not None else None
+    if getattr(user, "is_superuser", False):
+        return
+
+    owned_teams = getattr(team_owned_obj, "team", None) or []
+    if current_team not in owned_teams:
+        raise serializers.ValidationError({field_name: mlops_message(request, "error.team_resource_not_owned")})
+
+
+def assert_parent_team_matches(team_owned_obj, parent_obj, field_name, request=None):
+    """Raise ``ValidationError`` when a root-owned object does not match its parent's team."""
+    owner_team = getattr(team_owned_obj, "team", None) or []
+    parent_team = getattr(parent_obj, "team", None) or []
+    if set(owner_team) != set(parent_team):
+        raise serializers.ValidationError({field_name: mlops_message(request, "error.team_assignment_mismatch")})
+
+
+def assert_dataset_version_scope(dataset_version, team, request, field_name="dataset_version"):
+    """Validate that a dataset release is visible to the current team and
+    matches the root resource's team binding.
+
+    This is the shared guard for TrainJob write paths and runtime dispatch.
+    """
+    if dataset_version is None:
+        return
+
+    dataset = getattr(dataset_version, "dataset", None)
+    if dataset is None:
+        raise serializers.ValidationError({field_name: mlops_message(request, "error.dataset_version_no_dataset")})
+
+    assert_team_ownership(dataset, get_current_team(request), field_name, request=request)
+
+    if team is not None:
+        assert_parent_team_matches(SimpleNamespace(team=team), dataset, field_name, request=request)

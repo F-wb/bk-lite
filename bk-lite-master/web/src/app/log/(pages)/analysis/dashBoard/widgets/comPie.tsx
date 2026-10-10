@@ -1,0 +1,293 @@
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import ReactEcharts from 'echarts-for-react';
+import ChartLegend from '../components/chartLegend';
+import { Spin } from 'antd';
+import ChartEmptyState from '@/components/chart-empty-state';
+import { ChartDataTransformer } from '@/app/log/utils/chartDataTransform';
+import useChartColors from './docker/useChartColors';
+import { createHorizontalBarGradient } from './chartStyle';
+import { useTranslation } from '@/utils/i18n';
+
+const LEGEND_WIDTH_CLASS = 'w-40';
+const LEGEND_WIDTH_PX = 160;
+const LEGEND_GAP_PX = 8;
+const CHART_MIN_WIDTH_PX = 150;
+
+interface OsPieProps {
+  rawData: any;
+  loading?: boolean;
+  config?: any;
+  onReady?: (ready: boolean) => void;
+}
+
+const OsPie: React.FC<OsPieProps> = ({
+  rawData,
+  loading = false,
+  config,
+  onReady
+}) => {
+  const [isDataReady, setIsDataReady] = useState(false);
+  const [chartInstance, setChartInstance] = useState<any>(null);
+  const [showLegend, setShowLegend] = useState(true);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const colors = useChartColors();
+  const chartColors = colors.series;
+  const { t } = useTranslation();
+  const totalLabel = t('log.analysis.total');
+
+  const containerCallbackRef = useCallback((node: HTMLDivElement | null) => {
+    // 清理旧的 observer
+    if (observerRef.current) {
+      observerRef.current.disconnect();
+      observerRef.current = null;
+    }
+    containerRef.current = node;
+    if (!node) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const containerWidth = entry.contentRect.width;
+        setShowLegend(
+          containerWidth >= CHART_MIN_WIDTH_PX + LEGEND_WIDTH_PX + LEGEND_GAP_PX
+        );
+      }
+    });
+    observer.observe(node);
+    observerRef.current = observer;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      observerRef.current?.disconnect();
+    };
+  }, []);
+
+  const onChartReady = useCallback((instance: any) => {
+    setChartInstance(instance);
+  }, []);
+
+  const transformData = (rawData: any) => {
+    // 如果有 displayMaps 配置，先将原始数据映射为 {name, value} 格式
+    const displayMaps = config?.displayMaps;
+    if (displayMaps?.key && displayMaps?.value && Array.isArray(rawData)) {
+      const mapped = rawData
+        .filter((item: any) => item[displayMaps.key] !== undefined)
+        .map((item: any) => ({
+          name: String(item[displayMaps.key]),
+          value: parseFloat(item[displayMaps.value]) || 0
+        }));
+      if (mapped.length > 0) {
+        return mapped;
+      }
+    }
+    return ChartDataTransformer.transformToPieData(rawData);
+  };
+
+  const chartData = transformData(rawData);
+  const useBarChart = chartData && chartData.length > 5;
+
+  useEffect(() => {
+    if (!loading) {
+      const hasData = chartData && chartData.length > 0;
+      setIsDataReady(hasData);
+      if (onReady) {
+        onReady(hasData);
+      }
+    }
+  }, [chartData, loading, onReady]);
+
+  // Sort data descending for bar chart display
+  const sortedBarData = useBarChart
+    ? [...chartData].sort((a: any, b: any) => a.value - b.value)
+    : [];
+
+  let barOption: any = null;
+
+  if (useBarChart) {
+    barOption = {
+      color: chartColors,
+      animation: true,
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'shadow' },
+        confine: true,
+        textStyle: { fontSize: 12 }
+      },
+      grid: {
+        left: 12,
+        right: 48,
+        top: 8,
+        bottom: 8,
+        containLabel: true
+      },
+      xAxis: {
+        type: 'value',
+        axisLabel: { fontSize: 11, color: colors.axisLabel },
+        splitLine: { lineStyle: { type: 'dashed', color: colors.splitLine } }
+      },
+      yAxis: {
+        type: 'category',
+        data: sortedBarData.map((d: any) => d.name),
+        axisLabel: {
+          fontSize: 11,
+          color: colors.axisLabel,
+          width: 100,
+          overflow: 'truncate',
+          ellipsis: '...'
+        },
+        axisTick: { show: false },
+        axisLine: { show: false }
+      },
+      series: [
+        {
+          type: 'bar',
+          data: sortedBarData.map((d: any, i: number) => ({
+            value: d.value,
+            itemStyle: {
+              color: createHorizontalBarGradient(
+                chartColors[i % chartColors.length]
+              ),
+              borderRadius: [0, 3, 3, 0]
+            }
+          })),
+          barMaxWidth: 16,
+          label: {
+            show: true,
+            position: 'right',
+            fontSize: 11,
+            color: colors.textSecondary
+          }
+        }
+      ]
+    };
+  }
+
+  const pieOption: any = {
+    color: chartColors,
+    animation: true,
+    calculable: true,
+    title: { show: false },
+    tooltip: {
+      trigger: 'item',
+      appendToBody: true,
+      enterable: true,
+      confine: false,
+      extraCssText: 'box-shadow: 0 0 3px rgba(150,150,150, 0.7);',
+      textStyle: {
+        fontSize: 12
+      },
+      formatter: function (params: any) {
+        const percent = params.percent || 0;
+        return `
+          <div style="padding: 4px 8px;">
+            <div style="margin-bottom: 4px; font-weight: bold;">${
+              params.seriesName
+            }</div>
+            <div style="display: flex; align-items: center;">
+              <span style="display: inline-block; width: 10px; height: 10px; background-color: ${
+                params.color
+              }; border-radius: 50%; margin-right: 6px;"></span>
+              <span>${params.name}: ${params.value} (${percent.toFixed(
+                1
+              )}%)</span>
+            </div>
+          </div>
+        `;
+      }
+    },
+    legend: {
+      show: false
+    },
+    series: [
+      {
+        name: '',
+        type: 'pie',
+        center: ['50%', '50%'],
+        radius: ['45%', '69%'],
+        avoidLabelOverlap: false,
+        selectedMode: 'single',
+        label: {
+          show: true,
+          position: 'center',
+          formatter: function () {
+            const total = (chartData || []).reduce(
+              (sum: number, item: any) => sum + item.value,
+              0
+            );
+            return `{title|${totalLabel}}\n{value|${total}}`;
+          },
+          rich: {
+            title: {
+              fontSize: 14,
+              lineHeight: 20
+            },
+            value: {
+              fontSize: 24,
+              fontWeight: 'bold',
+              lineHeight: 32
+            }
+          }
+        },
+        labelLine: {
+          show: false,
+          length: 10,
+          length2: 15,
+          smooth: true
+        },
+        itemStyle: {
+          borderRadius: 2,
+          borderColor: '#fff',
+          borderWidth: 1
+        },
+        emphasis: {
+          focus: 'none',
+          scaleSize: 5
+        },
+        data: chartData || []
+      }
+    ]
+  };
+
+  const option = useBarChart ? barOption : pieOption;
+
+  if (loading) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center">
+        <Spin size="small" />
+      </div>
+    );
+  }
+
+  if (!isDataReady || !chartData || chartData.length === 0) {
+    return <ChartEmptyState compact />;
+  }
+
+  return (
+    <div
+      className="h-full flex w-full overflow-hidden"
+      ref={containerCallbackRef}
+    >
+      {/* 图表区域 */}
+      <div className={useBarChart ? 'w-full' : 'flex-1 min-w-[150px]'}>
+        <ReactEcharts
+          option={option}
+          style={{ height: '100%', width: '100%' }}
+          onChartReady={onChartReady}
+        />
+      </div>
+
+      {/* 图例区域 - only for pie/donut */}
+      {!useBarChart && showLegend && chartData && chartData.length > 1 && (
+        <div className={`ml-2 ${LEGEND_WIDTH_CLASS} flex-shrink-0 h-full`}>
+           <ChartLegend
+             chart={chartInstance}
+             data={chartData.map((item: any) => ({ name: item.name }))}
+             colors={chartColors}
+           />
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default OsPie;

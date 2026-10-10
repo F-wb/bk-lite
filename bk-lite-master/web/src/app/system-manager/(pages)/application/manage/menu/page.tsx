@@ -1,0 +1,260 @@
+'use client';
+
+import React, { useEffect, useMemo, useCallback } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
+import { Button, Tag, Form } from 'antd';
+import SearchActionBar from '@/components/search-action-bar';
+import { PlusOutlined } from '@ant-design/icons';
+import { useTranslation } from '@/utils/i18n';
+import type { CustomMenu } from '@/app/system-manager/types/menu';
+import PermissionWrapper from '@/components/permission';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import type { MoreActionsDropdownItem } from '@/components/more-actions-dropdown';
+import OperateModal from '@/components/operate-modal';
+import DynamicForm from '@/components/dynamic-form';
+import CustomTable from '@/components/custom-table';
+import SystemManagerFillTable from '@/app/system-manager/components/system-manager-fill-table';
+import styles from '@/app/system-manager/styles/common.module.scss';
+import {
+  useCustomMenuList,
+  useCustomMenuActions,
+  useCustomMenuModal,
+} from '@/app/system-manager/hooks/useCustomMenuPage';
+
+const CustomMenuPage = () => {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const clientId = searchParams.get('clientId') || '';
+  const [menuForm] = Form.useForm();
+
+  const {
+    dataList,
+    loading,
+    pagination,
+    searchTerm,
+    setPagination,
+    loadMenus,
+    handleSearch,
+  } = useCustomMenuList(clientId);
+
+  const refreshList = useCallback(() => {
+    loadMenus(pagination.current, searchTerm);
+  }, [loadMenus, pagination.current, searchTerm]);
+
+  const { actionLoading, handleToggleStatus, handleCopyMenu, handleDeleteMenu } =
+    useCustomMenuActions(clientId, refreshList);
+
+  const { menuModalVisible, modalLoading, openModal, closeModal, handleAddMenuSubmit } =
+    useCustomMenuModal(clientId, refreshList, () => menuForm.resetFields());
+
+  useEffect(() => {
+    if (clientId) {
+      loadMenus(1);
+    }
+  }, [clientId]);
+
+  const getFormFields = useMemo(
+    () => [
+      {
+        name: 'display_name',
+        type: 'input',
+        label: t('system.menu.name'),
+        placeholder: `${t('common.inputMsg')}${t('system.menu.name')}`,
+        rules: [
+          { required: true, message: `${t('common.inputMsg')}${t('system.menu.name')}` },
+          { max: 100, message: t('system.menu.nameMaxLength') },
+        ],
+      },
+    ],
+    [t]
+  );
+
+  const columns = useMemo(
+    () => [
+      {
+        title: t('system.menu.name'),
+        dataIndex: 'display_name',
+        key: 'display_name',
+        render: (text: string) => <span className={styles.textEllipsis}>{text}</span>,
+      },
+      {
+        title: t('system.menu.updatedBy'),
+        dataIndex: 'updated_by',
+        key: 'updated_by',
+        render: (text: string) => <span className={styles.textEllipsis}>{text}</span>,
+      },
+      {
+        title: t('system.menu.updatedAt'),
+        dataIndex: 'updated_at',
+        key: 'updated_at',
+        render: (text: string) => {
+          if (!text) return '-';
+          try {
+            const date = new Date(text);
+            return date.toLocaleString('zh-CN');
+          } catch {
+            return text;
+          }
+        },
+      },
+      {
+        title: t('system.menu.enabled'),
+        dataIndex: 'is_enabled',
+        key: 'is_enabled',
+        render: (enabled: boolean) => (
+          <Tag color={enabled ? 'green' : 'red'}>
+            {enabled ? t('system.menu.enable') : t('system.menu.disable')}
+          </Tag>
+        ),
+      },
+      {
+        title: t('common.actions'),
+        key: 'actions',
+        render: (_: unknown, record: CustomMenu) => {
+          const operations = [
+            {
+              key: 'toggle',
+              label: record.is_enabled ? t('system.menu.disable') : t('system.menu.enable'),
+              onClick: () => handleToggleStatus(record),
+              permission: 'Edit',
+            },
+            {
+              key: 'copy',
+              label: t('common.copy'),
+              onClick: () => handleCopyMenu(record),
+              permission: 'Edit',
+            },
+            {
+              key: 'edit',
+              label: t('common.edit'),
+              onClick: () => {
+                router.push(
+                  `/system-manager/application/manage/menu/config?clientId=${clientId}&menuId=${record.id}`
+                );
+              },
+              permission: 'Edit',
+              disabled: record.is_build_in,
+            },
+            {
+              key: 'delete',
+              label: t('common.delete'),
+              onClick: () => handleDeleteMenu(record),
+              permission: 'Delete',
+              danger: true,
+              disabled: record.is_build_in,
+            },
+          ];
+
+          const directOps = operations.slice(0, 3);
+          const moreOps: MoreActionsDropdownItem[] = operations.slice(3).map((op) => ({
+            key: op.key,
+            label: op.label,
+            danger: op.danger,
+            disabled: op.disabled,
+            permission: op.permission,
+            onClick: op.onClick,
+            confirm: op.key === 'delete'
+              ? {
+                title: t('common.delConfirm'),
+                okText: t('common.confirm'),
+                cancelText: t('common.cancel'),
+              }
+              : undefined,
+          }));
+
+          return (
+            <div className="flex space-x-1">
+              {directOps.map((op) => (
+                <PermissionWrapper key={op.key} requiredPermissions={[op.permission]}>
+                  <Button
+                    type="link"
+                    onClick={op.onClick}
+                    loading={actionLoading[`${op.key}-${record.id}`]}
+                    disabled={op.disabled}
+                  >
+                    {op.label}
+                  </Button>
+                </PermissionWrapper>
+              ))}
+
+              {moreOps.length > 0 ? (
+                <MoreActionsDropdown
+                  items={moreOps}
+                  buttonType="link"
+                  buttonSize="middle"
+                />
+              ) : null}
+            </div>
+          );
+        },
+      },
+    ],
+    [t, clientId, router, actionLoading, handleToggleStatus, handleCopyMenu, handleDeleteMenu]
+  );
+
+  return (
+    <div className="flex h-full min-h-0 w-full flex-col rounded-md bg-[var(--color-bg)] p-4">
+      <SearchActionBar
+        searchProps={{
+          placeholder: t('system.menu.search'),
+          onSearch: handleSearch,
+        }}
+        actions={(
+          <PermissionWrapper requiredPermissions={['Add']}>
+            <Button type="primary" icon={<PlusOutlined />} onClick={openModal}>
+              {t('common.new')}
+            </Button>
+          </PermissionWrapper>
+        )}
+      />
+
+      <OperateModal
+        title={t('common.add')}
+        open={menuModalVisible}
+        onOk={() => {
+          menuForm
+            .validateFields()
+            .then(() => {
+              const values = menuForm.getFieldsValue(true);
+              handleAddMenuSubmit(values);
+            })
+            .catch(() => {});
+        }}
+        onCancel={closeModal}
+        okText={t('common.confirm')}
+        cancelText={t('common.cancel')}
+        okButtonProps={{ loading: modalLoading }}
+        cancelButtonProps={{ disabled: modalLoading }}
+      >
+        <DynamicForm form={menuForm} fields={getFormFields} />
+      </OperateModal>
+
+      <SystemManagerFillTable>
+        <CustomTable
+          loading={loading}
+          columns={columns}
+          dataSource={dataList}
+          rowKey="id"
+          pagination={{
+            current: pagination.current,
+            pageSize: pagination.pageSize,
+            total: pagination.total,
+            onChange: (page: number) => loadMenus(page, searchTerm),
+            showSizeChanger: true,
+            pageSizeOptions: ['10', '20', '50', '100'],
+            onShowSizeChange: (_: number, size: number) => {
+              setPagination((prev) => ({ ...prev, pageSize: size }));
+              loadMenus(1, searchTerm);
+            },
+          }}
+          locale={{
+            emptyText: t('system.menu.noData'),
+          }}
+        />
+      </SystemManagerFillTable>
+    </div>
+  );
+};
+
+export default CustomMenuPage;

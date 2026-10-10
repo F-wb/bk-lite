@@ -1,0 +1,169 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_ubiquiti"
+        config_type = "ubiquiti"
+        brand = "ubiquiti"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB, auto-walked column names) ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    # ---- 64-bit IF-MIB HC traffic counters (ifXTable, wrap-safe on high-speed ports) ----
+    # 待现网核验：ifHCInOctets 1.3.6.1.2.1.31.1.1.1.6 / ifHCOutOctets ...1.10，按 ifIndex 与上表接口行对齐。
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- Ubiquiti EdgeSwitch system memory (agentSwitchCpuProcessMemAvailable/MemFree, KB, scalars) ----
+    # 顶层 field GET 必须带实例 .0；禁止 table.field（标量 GET-NEXT 会走到空子树，指标静默为空）。
+    # total=MemAvailable …4413.1.1.1.1.4.2.0 / free=MemFree …4.1.0（KB）。利用率按 (total-free)/total（KB 相消）。绝对字节在 metrics.json 查询里 *1024。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.4413.1.1.1.1.4.2.0"
+        name = "device_memory_total"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.4413.1.1.1.1.4.1.0"
+        name = "device_memory_free"
+    # ---- Ubiquiti EdgeSwitch CPU (agentSwitchCpuProcessTotalUtilization …4413.1.1.1.1.4.9.0, 整机聚合标量, 顶层 field 带 .0) ----
+    # DisplayString，形如 "5 Secs ( 12.3%) 60 Secs ( 8.1%) 300 Secs ( 6.0%)"；下方 starlark 取最后一个百分数（300 秒窗口）→ device_cpu_usage。
+    # 不用 agentSwitchCpuProcessTable 逐进程列（无法行级过滤，不能代表整机）。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.4413.1.1.1.1.4.9.0"
+        name = "cpu_total_util_raw"
+    # ---- Ubiquiti EdgeSwitch temperature (boxServicesTempSensorTemperature, °C, per-sensor table) ----
+    # 列 OID 1.3.6.1.4.1.4413.1.1.43.1.8.1.5（°C，专用温度列）。device_temperature_celsius。
+    [[inputs.snmp.table]]
+        name = "device_temperature"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.4413.1.1.43.1.8.1.5"
+        name = "celsius"
+    # ---- Ubiquiti EdgeSwitch fan state (boxServicesFanItemState, per-fan table) ----
+    # state 列 1.3.6.1.4.1.4413.1.1.43.1.6.1.3。
+    # 原始码 1=notpresent/2=operational/3=failed/4=powering/5=nopower/6=notpowering/7=incompatible；
+    # 下方 processors.enum 归一为 1=正常(1/2/4)/2=异常(3/5/6/7)。共享盘 device_fan_state 约定 1=正常,>1=异常。
+    [[inputs.snmp.table]]
+        name = "device_fan"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.4413.1.1.43.1.6.1.3"
+        name = "state"
+    # ---- Ubiquiti EdgeSwitch PSU state (boxServicesPowSupplyItemState, per-supply table) ----
+    # state 列 1.3.6.1.4.1.4413.1.1.43.1.7.1.3（表列，禁止 .0）。
+    # 原始码同风扇；下方 processors.enum 归一为 1=正常(1/2/4)/2=异常。共享盘 device_psu_state 约定 1=正常,>1=异常。
+    [[inputs.snmp.table]]
+        name = "device_psu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.4413.1.1.43.1.7.1.3"
+        name = "state"
+
+# ---- 风扇状态归一：1=notpresent(缺位)/2=operational/4=powering→1(正常)，3=failed/5=nopower/6=notpowering/7=incompatible→2(异常)。----
+[[processors.enum]]
+    namepass = ["device_fan"]
+    [processors.enum.tagpass]
+        brand = ["ubiquiti"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "1" = 1
+            "2" = 1
+            "4" = 1
+# ---- 电源状态归一：与风扇同一套枚举，1/2/4→1(正常)，其余→2(异常)。----
+[[processors.enum]]
+    namepass = ["device_psu"]
+    [processors.enum.tagpass]
+        brand = ["ubiquiti"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "1" = 1
+            "2" = 1
+            "4" = 1
+
+# ---- CPU：从 TotalUtilization 文本中取最后一个百分数（300 秒窗口）；没有百分号时只接受纯数字；0~100 时输出 device_cpu_usage，解析不出或越界则丢弃。----
+[[processors.starlark]]
+    namepass = ["snmp"]
+    source = '''
+def to_number(value):
+    if value == "" or value.count(".") > 1 or value.startswith(".") or value.endswith("."):
+        return None
+    for c in value.elems():
+        if not (c.isdigit() or c == "."):
+            return None
+    return float(value)
+
+def last_percent(raw):
+    text = str(raw).strip()
+    pos = text.rfind("%")
+    if pos < 0:
+        return to_number(text)
+    end = pos
+    for i in range(pos):
+        if text[end - 1] == " ":
+            end = end - 1
+        else:
+            break
+    start = end
+    for i in range(end):
+        c = text[end - 1 - i]
+        if c.isdigit() or c == ".":
+            start = end - 1 - i
+        else:
+            break
+    return to_number(text[start:end])
+
+def apply(metric):
+    raw = metric.fields.pop("cpu_total_util_raw", None)
+    if raw == None:
+        return metric
+    cpu = last_percent(raw)
+    if cpu != None and cpu >= 0 and cpu <= 100:
+        metric.fields["device_cpu_usage"] = cpu
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["ubiquiti"]

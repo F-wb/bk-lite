@@ -1,0 +1,160 @@
+{
+  "client_id": "mlops",
+  "name": "MLOps",
+  "url": "/mlops/anomaly_detection",
+  "description": "app.mlops",
+  "icon": "moxingguanli1",
+  "tags": [
+    "tag.dataset_management",
+    "tag.data_labeling",
+    "tag.model_training",
+    "tag.model_release"
+  ],
+  "menus": [
+    {
+      "name": "Anomaly Detection",
+      "children": [
+        {
+          "id": "anomaly_detection",
+          "display_name": "Anomaly Detection",
+          "name": "anomaly_detection",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete",
+            "Train",
+            "Stop",
+            "Start",
+            "Remove",
+            "Predict"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Timeseries Predict",
+      "children": [
+        {
+          "id": "timeseries_predict",
+          "display_name": "Timeseries Predict",
+          "name": "timeseries_predict",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete",
+            "Train",
+            "Stop",
+            "Start",
+            "Remove",
+            "Predict"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Log Clustering",
+      "children": [
+        {
+          "id": "log_clustering",
+          "display_name": "Log Clustering",
+          "name": "log_clustering",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete",
+            "Train",
+            "Stop",
+            "Start",
+            "Remove",
+            "Predict"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Text Classification",
+      "children": [
+        {
+          "id": "classification",
+          "display_name": "Text Classification",
+          "name": "classification",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete",
+            "Train",
+            "Stop",
+            "Start",
+            "Remove",
+            "Predict"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Image Classification",
+      "children": [
+        {
+          "id": "image_classification",
+          "display_name": "Image Classification",
+          "name": "image_classification",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete",
+            "Train",
+            "Stop",
+            "Start",
+            "Remove",
+            "Predict"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Object Detection",
+      "children": [
+        {
+          "id": "object_detection",
+          "display_name": "Object Detection",
+          "name": "object_detection",
+          "operation": [
+            "View",
+            "Add",
+            "Edit",
+            "Delete",
+            "Train",
+            "Stop",
+            "Start",
+            "Remove",
+            "Predict"
+          ]
+        }
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "name": "admin",
+      "role_name": "mlops_admin",
+      "menus": []
+    },
+    {
+      "name": "normal",
+      "role_name": "mlops_normal",
+      "menus": [
+        "anomaly_detection-View", "anomaly_detection-Predict",
+        "timeseries_predict-View", "timeseries_predict-Predict",
+        "log_clustering-View", "log_clustering-Predict",
+        "classification-View", "classification-Predict",
+        "image_classification-View", "image_classification-Predict",
+        "object_detection-View", "object_detection-Predict"
+      ]
+    }
+  ]
+}

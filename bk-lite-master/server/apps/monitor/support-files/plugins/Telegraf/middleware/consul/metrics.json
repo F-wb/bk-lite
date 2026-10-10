@@ -1,0 +1,84 @@
+{
+  "plugin": "Consul",
+  "plugin_desc": "Used for real-time monitoring of Consul service health, collecting status check results, analyzing passing, warning, and critical metrics to help users promptly identify issues and ensure service availability.\n",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='consul', collect_type='middleware'}) by (instance_id)",
+  "instance_fact_bindings": [{"fact":"asset.ip","value_type":"ip","resolver":"input","options":{"field":"url"}}],
+  "instance_summary_columns": [{"fact":"asset.ip","title":"monitor.views.assetIp","order":10}],
+  "name": "Consul",
+  "icon": "mm-consul_Consul",
+  "type": "Middleware",
+  "description": "",
+  "default_metric": "any({instance_type='consul'}) by (instance_id)",
+  "instance_id_keys": ["instance_id"],
+  "supplementary_indicators": ["consul_health_checks_passing", "consul_health_checks_critical", "consul_health_checks_status"],
+  "display_fields": [{"name": "Health Checks Passing", "sort_order": 0, "metrics": [{"plugin": "Consul", "metric": "consul_health_checks_passing"}]}, {"name": "Health Checks Critical", "sort_order": 1, "metrics": [{"plugin": "Consul", "metric": "consul_health_checks_critical"}]}, {"name": "Health Checks Status", "sort_order": 2, "metrics": [{"plugin": "Consul", "metric": "consul_health_checks_status"}]}],
+  "metrics": [
+    {
+      "metric_group": "Health",
+      "name": "consul_health_checks_passing",
+      "display_name": "Health Checks Passing",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Enum",
+      "unit": "[{\"name\":\"未通过\",\"id\":0,\"color\":\"#ff4d4f\"},{\"name\":\"通过\",\"id\":1,\"color\":\"#1ac44a\"}]",
+      "dimensions": [],
+      "description": "Number of health checks in passing state on Consul node; 1 indicates check passed, 0 indicates not passed",
+      "query": "consul_health_checks_passing{__$labels__}"
+    },
+    {
+      "metric_group": "Health",
+      "name": "consul_health_checks_critical",
+      "display_name": "Health Checks Critical",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Enum",
+      "unit": "[{\"name\":\"正常\",\"id\":0,\"color\":\"#1ac44a\"},{\"name\":\"危险\",\"id\":1,\"color\":\"#ff4d4f\"}]",
+      "dimensions": [],
+      "description": "Number of health checks in critical state on Consul node; 1 indicates check is critical, 0 indicates normal",
+      "query": "consul_health_checks_critical{__$labels__}"
+    },
+    {
+      "metric_group": "Health",
+      "name": "consul_health_checks_warning",
+      "display_name": "Health Checks Warning",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Enum",
+      "unit": "[{\"name\":\"正常\",\"id\":0,\"color\":\"#1ac44a\"},{\"name\":\"警告\",\"id\":1,\"color\":\"#faad14\"}]",
+      "dimensions": [],
+      "description": "Number of health checks in warning state on Consul node; 1 indicates check is warning, 0 indicates normal",
+      "query": "consul_health_checks_warning{__$labels__}"
+    },
+    {
+      "metric_group": "Health",
+      "name": "consul_health_checks_status",
+      "display_name": "Health Checks Status",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Enum",
+      "unit": "[{\"name\":\"通过\",\"id\":0,\"color\":\"#1ac44a\"},{\"name\":\"警告\",\"id\":1,\"color\":\"#faad14\"},{\"name\":\"危险\",\"id\":2,\"color\":\"#ff4d4f\"}]",
+      "dimensions": [],
+      "description": "Current status value of health checks on Consul node, typically indicating specific status codes",
+      "query": "consul_health_checks_status{__$labels__}"
+    },
+    {
+      "metric_group": "Node",
+      "name": "consul_health_checks_check_name",
+      "display_name": "Check Name Identifier",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [],
+      "description": "Name identifier of health check, distinguishing different types (e.g., serfHealth for Serf cluster health check)",
+      "query": "consul_health_checks_check_name{__$labels__}"
+    },
+    {
+      "metric_group": "Service",
+      "name": "consul_health_checks_service_id",
+      "display_name": "Service ID Identifier",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [],
+      "description": "Service ID identifier associated with health check; 0 indicates node-level check, non-zero indicates service-specific check",
+      "query": "consul_health_checks_service_id{__$labels__}"
+    }
+  ]
+}

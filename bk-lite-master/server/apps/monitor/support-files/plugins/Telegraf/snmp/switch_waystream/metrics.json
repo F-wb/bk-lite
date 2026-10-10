@@ -1,0 +1,62 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_waystream",
+  "plugin": "Switch Waystream SNMP",
+  "plugin_desc": "SNMP monitoring template for Waystream switch. It reports uptime, temperature, fan speed, and interface traffic, for ASR and FTTH access switches (enterprise PEN 9303). CPU, memory, and power supply are not exposed by the private MIB and are not collected.",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='switch', collect_type='snmp_waystream'}) by (instance_id)",
+  "name": "Switch",
+  "icon": "mm-switch_交换机",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='switch'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "device_temperature_celsius",
+    "device_fan_speed"
+  ],
+  "metrics": [
+    {
+      "metric_group": "Temperature",
+      "name": "device_temperature_celsius",
+      "query": "max(device_temperature_celsius{instance_type='switch', __$labels__} / 100) by (instance_id)",
+      "display_name": "Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Highest chassis temperature reading from the wsTempMeasured table (one row per sensor), in degrees Celsius. The raw object is hundredths of a degree, so the query divides by 100. Abnormally high temperatures may indicate cooling failure, blocked airflow, or excessive ambient heat."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_fan_speed",
+      "query": "max(device_fan_speed{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "Fan Speed",
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Highest fan rotation speed from the wsFanRPM table (one row per fan), in revolutions per minute. Abnormally low or zero RPM indicates a stalled or failed fan and a risk of overheating; abnormally high RPM may indicate the device is compensating for high temperature."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='switch', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
+    }
+  ]
+}

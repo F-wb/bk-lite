@@ -1,0 +1,100 @@
+from rest_framework import serializers
+
+from apps.log.constants.victoriametrics import VictoriaLogsConstants
+from apps.log.utils.locale_text import serializer_text
+
+
+class QueryTimeWindowSerializer(serializers.Serializer):
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        try:
+            start_time, end_time = VictoriaLogsConstants.normalize_query_time_window(
+                attrs.get("start_time", ""),
+                attrs.get("end_time", ""),
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError({"start_time": str(exc)}) from exc
+        attrs["start_time"] = start_time
+        attrs["end_time"] = end_time
+        return attrs
+
+
+class LogFieldValuesSerializer(QueryTimeWindowSerializer):
+    filed = serializers.RegexField(
+        regex=r"^[A-Za-z_@][A-Za-z0-9_.@/-]*$",
+        max_length=200,
+        error_messages={"invalid": "filed 参数格式非法"},
+    )
+    start_time = serializers.CharField(required=False, allow_blank=True, default="")
+    end_time = serializers.CharField(required=False, allow_blank=True, default="")
+    limit = serializers.IntegerField(
+        min_value=1,
+        max_value=VictoriaLogsConstants.FIELD_VALUES_LIMIT_MAX,
+        default=100,
+    )
+
+
+class LogSearchSerializer(QueryTimeWindowSerializer):
+    query = serializers.CharField(required=True, allow_blank=False)
+    start_time = serializers.CharField(required=False, allow_blank=True, default="")
+    end_time = serializers.CharField(required=False, allow_blank=True, default="")
+    limit = serializers.IntegerField(
+        min_value=1,
+        max_value=VictoriaLogsConstants.QUERY_LIMIT_MAX,
+        default=10,
+    )
+    log_groups = serializers.ListField(
+        child=serializers.CharField(),
+        required=True,
+        allow_empty=False,
+        error_messages={"required": "缺少日志分组", "empty": "缺少日志分组"},
+    )
+
+
+class LogHitsSerializer(QueryTimeWindowSerializer):
+    query = serializers.CharField(required=True, allow_blank=False)
+    start_time = serializers.CharField(required=False, allow_blank=True, default="")
+    end_time = serializers.CharField(required=False, allow_blank=True, default="")
+    field = serializers.RegexField(
+        regex=r"^[A-Za-z_@][A-Za-z0-9_.@/-]*$",
+        max_length=200,
+        error_messages={"invalid": "field 参数格式非法"},
+    )
+    fields_limit = serializers.IntegerField(
+        min_value=1,
+        max_value=VictoriaLogsConstants.HITS_FIELDS_LIMIT_MAX,
+        default=5,
+    )
+    step = serializers.CharField(required=False, allow_blank=True, default="5m")
+    log_groups = serializers.ListField(
+        child=serializers.CharField(),
+        required=True,
+        allow_empty=False,
+        error_messages={"required": "缺少日志分组", "empty": "缺少日志分组"},
+    )
+
+
+class LogTopStatsSerializer(QueryTimeWindowSerializer):
+    NON_AGGREGATABLE_META_FIELDS = {"_stream", "_stream_id", "_time"}
+
+    query = serializers.CharField(required=False, allow_blank=True, default="*")
+    start_time = serializers.CharField(required=False, allow_blank=True, default="")
+    end_time = serializers.CharField(required=False, allow_blank=True, default="")
+    attr = serializers.RegexField(
+        regex=r"^[A-Za-z_@][A-Za-z0-9_.@/-]*$",
+        max_length=200,
+        error_messages={"invalid": "attr 参数格式非法"},
+    )
+    top_num = serializers.IntegerField(min_value=1, max_value=100, default=5)
+    log_groups = serializers.ListField(
+        child=serializers.CharField(),
+        required=True,
+        allow_empty=False,
+        error_messages={"required": "缺少日志分组", "empty": "缺少日志分组"},
+    )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if attrs["attr"] in self.NON_AGGREGATABLE_META_FIELDS:
+            raise serializers.ValidationError({"attr": serializer_text(self, "error.topn_unsupported")})
+        return attrs

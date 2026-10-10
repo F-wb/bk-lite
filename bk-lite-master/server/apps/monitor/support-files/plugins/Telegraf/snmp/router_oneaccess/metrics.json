@@ -1,0 +1,140 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_oneaccess",
+  "plugin": "Router OneAccess SNMP",
+  "plugin_desc": "SNMP monitoring template for OneAccess router. It reports uptime, CPU utilization, memory utilization, and interface traffic (enterprise PEN 13191).",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='router', collect_type='snmp_oneaccess'}) by (instance_id)",
+  "name": "Router",
+  "icon": "mm-router_路由器",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='router'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "device_cpu_usage",
+    "device_memory_usage",
+    "device_total_incoming_traffic",
+    "device_total_outgoing_traffic"
+  ],
+  "display_fields": [],
+  "metrics": [
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='router', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the OneAccess router since the last restart, derived from sysUpTime. Monitoring uptime helps administrators understand device stability and identify unexpected reboots."
+    },
+    {
+      "metric_group": "CPU",
+      "name": "device_cpu_usage",
+      "query": "snmp_device_cpu_usage{instance_type='router', __$labels__}",
+      "display_name": "CPU Utilization",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "CPU utilization of the OneAccess router (ONEACCESS-SYS-MIB oacSysCpuUsed) as a 0-100 percentage. Sustained high CPU usage can indicate forwarding or control-plane load."
+    },
+    {
+      "metric_group": "CPU",
+      "name": "device_cpu_core_usage",
+      "query": "device_cpu_core_usage{instance_type='router', __$labels__}",
+      "display_name": "Per-Core CPU Utilization",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "CPU core index"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Current per-core CPU utilization of the OneAccess router (ONEACCESS-SYS-MIB oacSysCpuUsedValue). Core 0 is equivalent to oacSysCpuUsed."
+    },
+    {
+      "metric_group": "CPU",
+      "name": "device_cpu_core_usage_1min",
+      "query": "device_cpu_core_usage_1min{instance_type='router', __$labels__}",
+      "display_name": "Per-Core CPU Utilization (1 min)",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "CPU core index"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "One-minute per-core CPU utilization of the OneAccess router (ONEACCESS-SYS-MIB oacSysCpuUsedOneMinuteValue)."
+    },
+    {
+      "metric_group": "Memory",
+      "name": "device_memory_usage",
+      "query": "snmp_device_memory_usage{instance_type='router', __$labels__}",
+      "display_name": "Memory Usage",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Memory utilization of the OneAccess router (ONEACCESS-SYS-MIB oacSysMemoryUsed) reported directly as a 0-100 percentage. High memory pressure can degrade forwarding and control-plane stability."
+    },
+    {
+      "metric_group": "Memory",
+      "name": "device_memory_total",
+      "query": "snmp_device_memory_total{instance_type='router', __$labels__}",
+      "display_name": "Total Memory",
+      "data_type": "Number",
+      "unit": "bytes",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Total system memory of the OneAccess router in bytes (ONEACCESS-SYS-MIB oacSysMemoryTotal)."
+    },
+    {
+      "metric_group": "Memory",
+      "name": "device_memory_free",
+      "query": "snmp_device_memory_free{instance_type='router', __$labels__}",
+      "display_name": "Free Memory",
+      "data_type": "Number",
+      "unit": "bytes",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Free system memory of the OneAccess router in bytes (ONEACCESS-SYS-MIB oacSysMemoryFree)."
+    },
+    {
+      "metric_group": "Memory",
+      "name": "device_memory_allocated",
+      "query": "snmp_device_memory_allocated{instance_type='router', __$labels__}",
+      "display_name": "Allocated Memory",
+      "data_type": "Number",
+      "unit": "bytes",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Allocated system memory of the OneAccess router in bytes (ONEACCESS-SYS-MIB oacSysMemoryAllocated)."
+    }
+  ]
+}

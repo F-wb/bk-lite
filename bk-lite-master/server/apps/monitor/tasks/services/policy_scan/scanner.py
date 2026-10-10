@@ -1,0 +1,311 @@
+"""监控策略扫描执行器 - 主流程编排"""
+
+from apps.monitor.constants.alert_policy import AlertConstants
+from apps.monitor.models import (
+    MonitorInstanceOrganization,
+    MonitorAlert,
+    MonitorInstance,
+    PolicyInstanceBaseline,
+)
+from apps.monitor.services.policy_baseline import PolicyBaselineService
+from apps.monitor.tasks.services.policy_scan.metric_query import MetricQueryService
+from apps.monitor.tasks.services.policy_scan.alert_detector import AlertDetector
+from apps.monitor.tasks.services.policy_scan.event_alert_manager import (
+    EventAlertManager,
+)
+from apps.monitor.tasks.services.policy_scan.snapshot_recorder import SnapshotRecorder
+from apps.monitor.utils.alert_name_variables import (
+    field_label_map,
+    load_display_variable_map,
+    resolve_resource_ip,
+)
+from apps.monitor.utils.dimension import (
+    normalize_instance_identity,
+    parse_instance_id,
+)
+from apps.core.logger import celery_logger as logger
+
+
+class MonitorPolicyScan:
+    """监控策略扫描执行器 - 负责流程编排"""
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.instances_map, self.resource_ip_map = self._build_instances_map()
+        self.parent_instances_map = self._build_parent_instances_map()
+        self.display_variable_map = load_display_variable_map(
+            self.policy.monitor_object,
+            list(self.instances_map.keys()),
+        )
+        self.display_field_label_map = field_label_map(
+            getattr(self.policy.monitor_object, "display_fields", None)
+        )
+        self.baselines_map = self._build_baselines_map()
+        self.active_alerts = self._get_active_alerts()
+
+        self.metric_query_service = MetricQueryService(policy, self.instances_map)
+        self.alert_detector = AlertDetector(
+            policy,
+            self.instances_map,
+            self.baselines_map,
+            self.active_alerts,
+            self.metric_query_service,
+            parent_instances_map=self.parent_instances_map,
+            resource_ip_map=self.resource_ip_map,
+            display_variable_map=self.display_variable_map,
+            display_field_label_map=self.display_field_label_map,
+        )
+        self.event_alert_manager = EventAlertManager(policy, self.instances_map, self.active_alerts)
+        self.snapshot_recorder = SnapshotRecorder(policy, self.instances_map, self.active_alerts, self.metric_query_service)
+
+    def _get_active_alerts(self):
+        """获取策略的活动告警"""
+        qs = MonitorAlert.objects.filter(policy_id=self.policy.id, status="new")
+        if self.policy.source:
+            qs = qs.filter(monitor_instance_id__in=self.instances_map.keys())
+        return qs
+
+    def _build_instances_map(self):
+        """构建策略适用的实例映射: {monitor_instance_id: monitor_instance_name}"""
+        if not self.policy.source:
+            return {}, {}
+
+        source_type = self.policy.source["type"]
+        source_values = self.policy.source["values"]
+
+        instance_list = self._get_instance_list_by_source(source_type, source_values)
+
+        instances = MonitorInstance.objects.filter(
+            monitor_object_id=self.policy.monitor_object_id,
+            id__in=instance_list,
+            is_deleted=False,
+        ).only("id", "name", "ip", "summary_facts")
+        instances_map = {}
+        resource_ip_map = {}
+        for instance in instances:
+            instances_map[instance.id] = instance.name
+            resource_ip_map[instance.id] = resolve_resource_ip(
+                instance.summary_facts, instance.ip
+            )
+        return instances_map, resource_ip_map
+
+    def _build_parent_instances_map(self):
+        """构建子对象所属父实例映射，供告警模板展示父对象身份。"""
+        monitor_object = self.policy.monitor_object
+        parent = getattr(monitor_object, "parent", None)
+        if not getattr(monitor_object, "parent_id", None) or parent is None:
+            return {}
+
+        parent_key_count = len(parent.instance_id_keys or [])
+        if not parent_key_count:
+            return {}
+
+        parent_ids = set()
+        for instance_id in self.instances_map:
+            instance_values = parse_instance_id(instance_id)
+            if len(instance_values) >= parent_key_count:
+                parent_ids.add(str(tuple(instance_values[:parent_key_count])))
+        return dict(
+            MonitorInstance.objects.filter(
+                monitor_object_id=monitor_object.parent_id,
+                id__in=parent_ids,
+                is_deleted=False,
+            ).values_list("id", "name")
+        )
+
+    def _build_baselines_map(self):
+        """构建基准映射: {metric_instance_id: monitor_instance_id}"""
+        if not self.policy.source:
+            return {}
+
+        baselines = PolicyInstanceBaseline.objects.filter(
+            policy_id=self.policy.id,
+            monitor_instance_id__in=self.instances_map.keys(),
+        )
+        return {b.metric_instance_id: b.monitor_instance_id for b in baselines}
+
+    @staticmethod
+    def _expand_instance_source_values(source_values):
+        """兼容逻辑 ID 与存储键，避免单维对象（如 K8s Cluster）扫不到实例。
+
+        页面/过滤器常给出 prod-cluster，库中主键却是 "('prod-cluster',)"。
+        Docker Container 这类多维对象两种写法本来一致，扩键是幂等的。
+        """
+        expanded = []
+        seen = set()
+        for value in source_values or []:
+            candidates = [str(value)]
+            try:
+                candidates.append(
+                    normalize_instance_identity(value)["storage_instance_key"]
+                )
+            except ValueError:
+                pass
+            for key in candidates:
+                if key and key not in seen:
+                    seen.add(key)
+                    expanded.append(key)
+        return expanded
+
+    def _get_instance_list_by_source(self, source_type, source_values):
+        """根据来源类型获取实例列表"""
+        if source_type == "instance":
+            return self._expand_instance_source_values(source_values)
+
+        if source_type == "organization":
+            return list(
+                MonitorInstanceOrganization.objects.filter(
+                    monitor_instance__monitor_object_id=self.policy.monitor_object_id,
+                    organization__in=source_values,
+                ).values_list("monitor_instance_id", flat=True)
+            )
+
+        return []
+
+    def _execute_step(self, step_name, func, *args, critical=False, **kwargs):
+        """执行流程步骤，统一错误处理"""
+        try:
+            result = func(*args, **kwargs)
+            logger.info(f"{step_name} completed for policy {self.policy.id}")
+            return True, result
+        except Exception as e:
+            logger.error(
+                f"Failed to {step_name.lower()} for policy {self.policy.id}: {e}",
+                exc_info=True,
+            )
+            if critical:
+                raise
+            return False, None
+
+    def _process_threshold_alerts(self):
+        """处理阈值告警"""
+        alert_events, info_events, hold_events = self.alert_detector.detect_threshold_alerts()
+        self.alert_detector.count_events(alert_events, info_events)
+        recovered_events = self.alert_detector.recover_threshold_alerts() or []
+        return alert_events, info_events, hold_events, recovered_events
+
+    def _process_no_data_alerts(self):
+        """处理无数据告警"""
+        no_data_events = self.alert_detector.detect_no_data_alerts()
+        recovered_events = self.alert_detector.recover_no_data_alerts() or []
+        return no_data_events, recovered_events
+
+    def _create_events_alerts_and_notify(self, events):
+        """创建事件、告警并发送通知"""
+        if not events:
+            return [], []
+
+        success, result = self._execute_step(
+            "Create events and alerts",
+            self.event_alert_manager.create_events_and_alerts,
+            events,
+            critical=True,
+        )
+        if not success:
+            return None, None
+
+        event_objs, new_alerts = result
+        logger.info(f"Created {len(event_objs)} events and {len(new_alerts)} new alerts")
+
+        return event_objs, new_alerts
+
+    def _record_snapshots(self, info_events, event_objs, new_alerts):
+        """记录告警生命周期快照"""
+        has_active_alerts = bool(self.active_alerts) or bool(new_alerts)
+        has_snapshot_data = bool(info_events) or bool(event_objs) or bool(new_alerts)
+
+        if has_active_alerts and has_snapshot_data:
+            self._execute_step(
+                "Create metric snapshots",
+                self.snapshot_recorder.record_snapshots_for_active_alerts,
+                info_events=info_events,
+                event_objs=event_objs,
+                new_alerts=new_alerts,
+            )
+
+    def run(self):
+        """执行监控策略扫描主流程"""
+        if not self._pre_check():
+            return
+
+        alert_events, info_events, hold_events, no_data_events, recovered_events = self._collect_events()
+
+        self._execute_step("Sync baselines", self._sync_baselines)
+
+        events = alert_events + no_data_events
+        result = self._create_events_alerts_and_notify(events)
+        if result[0] is None:
+            return
+        event_objs, new_alerts = result
+
+        self._record_snapshots(
+            info_events + hold_events + alert_events,
+            list(event_objs or []) + recovered_events,
+            new_alerts,
+        )
+
+    def _sync_baselines(self):
+        """用本轮存在性查询增量同步基准表（只增不删）。"""
+        if not self.policy.source or not self.instances_map or not self.policy.period:
+            return
+
+        existence = self.metric_query_service.query_existence_metrics(self.policy.period)
+        formatted = self.metric_query_service.format_aggregation_metrics(existence)
+        metric_instances = {}
+        for metric_instance_id in formatted:
+            if metric_instance_id in self.baselines_map:
+                continue
+            monitor_instance_id = (
+                self.metric_query_service.get_monitor_instance_id_from_metric_instance_id(
+                    metric_instance_id
+                )
+            )
+            if monitor_instance_id not in self.instances_map:
+                continue
+            metric_instances[metric_instance_id] = monitor_instance_id
+
+        if metric_instances:
+            PolicyBaselineService(self.policy).sync(metric_instances)
+
+    def _pre_check(self):
+        """前置检查"""
+        if self.policy.source and not self.instances_map:
+            logger.warning(f"Policy {self.policy.id} has source but no instances, skipping scan")
+            return False
+
+        self._execute_step(
+            "Set monitor instance key",
+            self.metric_query_service.set_monitor_obj_instance_key,
+            critical=True,
+        )
+
+        return True
+
+    def _collect_events(self):
+        """收集告警事件"""
+        alert_events, info_events, no_data_events, recovered_events = [], [], [], []
+        hold_events = []
+
+        if AlertConstants.THRESHOLD in self.policy.enable_alerts:
+            success, result = self._execute_step(
+                "Process threshold alerts",
+                self._process_threshold_alerts,
+                critical=True,
+            )
+            if success and result is not None:
+                alert_events, info_events, hold_events, threshold_recovered = result
+                recovered_events.extend(threshold_recovered)
+                logger.info(f"Threshold alerts: {len(alert_events)} alerts, {len(info_events)} info events")
+
+        if AlertConstants.NO_DATA in self.policy.enable_alerts:
+            success, result = self._execute_step(
+                "Process no-data alerts",
+                self._process_no_data_alerts,
+                critical=True,
+            )
+            if success and result is not None:
+                no_data_events, no_data_recovered = result
+                recovered_events.extend(no_data_recovered)
+                logger.info(f"No-data alerts: {len(no_data_events)} events")
+
+        return alert_events, info_events, hold_events, no_data_events, recovered_events

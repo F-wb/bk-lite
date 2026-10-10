@@ -1,0 +1,741 @@
+from datetime import datetime, timedelta
+from typing import Any, cast
+
+from django.db import transaction
+from django.db.models import Count, Q
+from django.http import HttpResponse
+from django.utils import timezone as dj_timezone
+from rest_framework import mixins
+from rest_framework.decorators import action
+from rest_framework.viewsets import GenericViewSet
+
+from apps.core.decorators.api_permission import HasPermission
+from apps.core.utils.loader import LanguageLoader
+from apps.core.utils.web_utils import WebUtils
+from apps.node_mgmt.constants.cloudregion_service import CloudRegionServiceConstants
+from apps.node_mgmt.constants.collector import CollectorConstants
+from apps.node_mgmt.constants.controller import ControllerConstants
+from apps.node_mgmt.constants.language import LanguageConstants
+from apps.node_mgmt.constants.node import NodeConstants
+from apps.node_mgmt.models.action import CollectorActionTaskNode
+from apps.node_mgmt.models.cloud_region import CloudRegion
+from apps.node_mgmt.models.installer import NodeCollectorInstallStatus
+from apps.node_mgmt.models.sidecar import Collector, Node, NodeOrganization
+from apps.node_mgmt.serializers.node import (
+    BatchBindingNodeConfigurationSerializer,
+    BatchOperateNodeCollectorSerializer,
+    BatchUpdateNodeOrganizationsSerializer,
+    ModulePushSerializer,
+    NodeSerializer,
+    TaskNodesQuerySerializer,
+)
+from apps.node_mgmt.services.module_push import ModulePushService, build_module_push_actor_scope, parse_retire_linked_flag
+from apps.node_mgmt.services.node import NodeService
+from apps.node_mgmt.services.node_export import (
+    EXPORT_LIMIT,
+    build_export_filename,
+    build_export_row,
+    build_export_workbook_bytes,
+    content_disposition,
+    export_labels,
+    load_organization_names,
+)
+from apps.node_mgmt.services.node_status_filter import (
+    ACTIVE_WINDOW_SECONDS,
+    collector_status_codes_from_filter_values,
+    hosted_collectors_for_filter,
+    node_matches_collector_filter,
+)
+from apps.node_mgmt.services.sidecar_cache import invalidate_node_configuration_etags
+from apps.node_mgmt.tasks.sidecar_config import sync_node_properties_to_sidecar, sync_nodes_organizations_to_sidecar
+from apps.node_mgmt.utils.permission import (
+    add_node_permissions,
+    authorize_mutable_collector_configuration_ids,
+    authorize_node_ids,
+    authorize_target_organizations,
+    get_authorized_node_queryset,
+    get_catalog_node_queryset,
+    get_node_permission,
+)
+from apps.node_mgmt.utils.task_result_schema import normalize_task_result_for_read, project_task_status_from_summary
+from config.drf.pagination import CustomPageNumberPagination
+
+
+class NodeFilterHandler:
+    """节点查询过滤器处理器 - 统一管理所有特殊字段的过滤逻辑"""
+
+    # 白名单：允许通过标准过滤路径查询的 Node 直接字段
+    ALLOWED_FILTER_FIELDS = frozenset(
+        {
+            "id",
+            "name",
+            "ip",
+            "operating_system",
+            "cpu_architecture",
+            "install_method",
+            "node_type",
+            "cloud_region_id",
+        }
+    )
+
+    # 白名单：允许使用的 ORM lookup 表达式（不含 bool，bool 在进入此校验前已被规范化为 exact）
+    ALLOWED_LOOKUP_EXPRS = frozenset(
+        {
+            "exact",
+            "iexact",
+            "contains",
+            "icontains",
+            "startswith",
+            "istartswith",
+            "endswith",
+            "iendswith",
+            "in",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+        }
+    )
+
+    @staticmethod
+    def normalize_bool_value(value):
+        """规范化布尔值"""
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        elif isinstance(value, bool):
+            return value
+        return bool(value) if value is not None else None
+
+    @staticmethod
+    def handle_upgradeable_filter(queryset, conditions):
+        """
+        处理 upgradeable 过滤逻辑
+
+        Args:
+            queryset: Django QuerySet
+            conditions: 过滤条件列表
+
+        Returns:
+            过滤后的 QuerySet
+        """
+        if not conditions or not isinstance(conditions, list):
+            return queryset
+
+        # 收集所有有效的布尔值
+        values = []
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+
+            value = NodeFilterHandler.normalize_bool_value(condition.get("value"))
+            if value is not None:
+                values.append(value)
+
+        # 如果没有有效值，返回原查询
+        if not values:
+            return queryset
+
+        # 检查是否存在矛盾条件（同时有 True 和 False）
+        if True in values and False in values:
+            # 矛盾条件：既要可升级又要不可升级，返回空结果
+            return queryset.none()
+
+        # 取最后一个有效值作为过滤条件
+        final_value = values[-1]
+
+        # upgradeable=True: 筛选有可升级版本的节点
+        if final_value:
+            return queryset.filter(
+                component_versions__component_type="controller",
+                component_versions__upgradeable=True,
+            ).distinct()
+
+        # upgradeable=False: 排除有可升级版本的节点
+        else:
+            upgradeable_node_ids = Node.objects.filter(
+                component_versions__component_type="controller",
+                component_versions__upgradeable=True,
+            ).values_list("id", flat=True)
+            return queryset.exclude(id__in=upgradeable_node_ids)
+
+    @staticmethod
+    def _condition_values(conditions):
+        values = []
+        if not conditions or not isinstance(conditions, list):
+            return values
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+            value = condition.get("value")
+            if value is None or value == "":
+                continue
+            if isinstance(value, (list, tuple)):
+                values.extend(value)
+            else:
+                values.append(value)
+        return values
+
+    @staticmethod
+    def handle_active_filter(queryset, conditions):
+        values = NodeFilterHandler._condition_values(conditions)
+        wanted = set()
+        for value in values:
+            normalized = NodeFilterHandler.normalize_bool_value(value)
+            if normalized is not None:
+                wanted.add(normalized)
+        if not wanted or (True in wanted and False in wanted):
+            return queryset
+        cutoff = dj_timezone.now() - timedelta(seconds=ACTIVE_WINDOW_SECONDS)
+        if True in wanted:
+            return queryset.filter(updated_at__gt=cutoff)
+        return queryset.filter(updated_at__lte=cutoff)
+
+    @staticmethod
+    def handle_collector_status_filter(queryset, conditions, collector_name_conditions=None):
+        wanted_codes = collector_status_codes_from_filter_values(NodeFilterHandler._condition_values(conditions))
+        if not wanted_codes:
+            return queryset
+        name_values = [str(item).strip() for item in NodeFilterHandler._condition_values(collector_name_conditions) if str(item).strip()]
+
+        node_rows = list(queryset.values_list("id", "status"))
+        if not node_rows:
+            return queryset.none()
+
+        node_ids = [node_id for node_id, _ in node_rows]
+        collector_name_by_id = dict(Collector.objects.values_list("id", "name"))
+        install_by_node = {}
+        for row in NodeCollectorInstallStatus.objects.filter(node_id__in=node_ids).values("node_id", "collector_id", "status"):
+            install_by_node.setdefault(row["node_id"], []).append(row)
+
+        matched_ids = []
+        for node_id, status in node_rows:
+            reported = status.get("collectors") if isinstance(status, dict) else None
+            hosted = hosted_collectors_for_filter(
+                reported,
+                install_by_node.get(node_id, []),
+                collector_name_by_id,
+            )
+            if not name_values:
+                if node_matches_collector_filter(hosted, wanted_codes):
+                    matched_ids.append(node_id)
+            elif any(node_matches_collector_filter(hosted, wanted_codes, name) for name in name_values):
+                matched_ids.append(node_id)
+        return queryset.filter(id__in=matched_ids)
+
+    @staticmethod
+    def build_standard_filters(params):
+        """
+        构建标准字段的 Q 对象过滤条件
+
+        只允许白名单中的字段名（ALLOWED_FILTER_FIELDS）和 lookup 表达式
+        （ALLOWED_LOOKUP_EXPRS）参与查询，不在白名单内的条目静默跳过，
+        防止攻击者通过任意字段名/lookup 进行 ORM 注入（#3609）。
+
+        Args:
+            params: 过滤参数字典
+
+        Returns:
+            Q 对象
+        """
+        if not params:
+            return Q()
+
+        final_q = Q()
+
+        for field_name, conditions in params.items():
+            # 字段名白名单校验
+            if field_name not in NodeFilterHandler.ALLOWED_FILTER_FIELDS:
+                continue
+
+            if not conditions or not isinstance(conditions, list):
+                continue
+
+            for condition in conditions:
+                if not isinstance(condition, dict):
+                    continue
+
+                lookup_expr = condition.get("lookup_expr", "exact")
+                value = condition.get("value")
+
+                if value is None or value == "":
+                    continue
+
+                # 规范化布尔值
+                if lookup_expr == "bool":
+                    value = NodeFilterHandler.normalize_bool_value(value)
+                    lookup_expr = "exact"
+
+                # lookup 表达式白名单校验
+                if lookup_expr not in NodeFilterHandler.ALLOWED_LOOKUP_EXPRS:
+                    continue
+
+                # 构建查询键
+                lookup_key = f"{field_name}__{lookup_expr}"
+                final_q &= Q(**{lookup_key: value})
+
+        return final_q
+
+    @classmethod
+    def apply_filters(cls, queryset, filters):
+        """
+        应用所有过滤条件到 QuerySet
+
+        Args:
+            queryset: Django QuerySet
+            filters: 过滤条件字典
+
+        Returns:
+            过滤后的 QuerySet
+        """
+        if not filters:
+            return queryset
+
+        # 特殊字段列表（需要自定义处理逻辑）
+        SPECIAL_FIELDS = {
+            "upgradeable": cls.handle_upgradeable_filter,
+            "active": cls.handle_active_filter,
+            # 未来可以在这里添加其他特殊字段处理器
+            # 'custom_field': cls.handle_custom_field_filter,
+        }
+
+        # 分离特殊字段和标准字段
+        special_filters = {}
+        standard_filters = {}
+
+        for field_name, conditions in filters.items():
+            if field_name in SPECIAL_FIELDS:
+                special_filters[field_name] = conditions
+            elif field_name in ("collector_status", "collector_name"):
+                continue
+            else:
+                standard_filters[field_name] = conditions
+
+        # 1. 先应用标准字段过滤
+        if standard_filters:
+            q_filters = cls.build_standard_filters(standard_filters)
+            if q_filters:
+                queryset = queryset.filter(q_filters).distinct()
+
+        # 2. 再依次应用特殊字段过滤
+        for field_name, conditions in special_filters.items():
+            handler = SPECIAL_FIELDS[field_name]
+            queryset = handler(queryset, conditions)
+
+        if "collector_status" in filters:
+            queryset = cls.handle_collector_status_filter(
+                queryset,
+                filters["collector_status"],
+                collector_name_conditions=filters.get("collector_name"),
+            )
+
+        return queryset
+
+
+class NodeViewSet(mixins.DestroyModelMixin, GenericViewSet):
+    queryset = Node.objects.all().prefetch_related("nodeorganization_set").order_by("-created_at")
+    pagination_class = CustomPageNumberPagination
+    serializer_class = NodeSerializer
+    search_fields = ["id", "name", "ip", "cloud_region_id", "install_method"]
+
+    def add_permission(self, permission, items):
+        add_node_permissions(permission, items)
+
+    @action(methods=["post"], detail=False, url_path=r"search")
+    def search(self, request, *args, **kwargs):
+        permission = get_node_permission(request)
+        queryset = get_catalog_node_queryset(request, permission)
+
+        # 应用自定义查询参数格式化（统一处理所有过滤条件）
+        custom_filters = request.data.get("filters")
+        if custom_filters:
+            queryset = NodeFilterHandler.apply_filters(queryset, custom_filters)
+
+        # 根据组织筛选
+        organization_ids = request.query_params.get("organization_ids") or request.data.get("organization_ids")
+        if organization_ids:
+            organization_ids = organization_ids.split(",")
+            queryset = queryset.filter(nodeorganization__organization__in=organization_ids).distinct()
+
+        # 根据云区域筛选
+        cloud_region_id = request.query_params.get("cloud_region_id") or request.data.get("cloud_region_id")
+        if cloud_region_id:
+            queryset = queryset.filter(cloud_region_id=cloud_region_id)
+
+        # 应用预加载优化，避免 N+1 查询
+        queryset = NodeSerializer.setup_eager_loading(queryset)
+
+        # 按创建时间倒序排序（最新的在前）
+        queryset = queryset.order_by("-created_at")
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = NodeSerializer(page, many=True)
+            node_data = serializer.data
+            processed_data = NodeService.process_node_data(node_data)
+
+            # 添加权限信息到每个节点
+            self.add_permission(permission, processed_data)
+
+            return self.get_paginated_response(processed_data)
+
+        serializer = NodeSerializer(queryset, many=True)
+        node_data = serializer.data
+        processed_data = NodeService.process_node_data(node_data)
+
+        # 添加权限信息到每个节点
+        self.add_permission(permission, processed_data)
+
+        return WebUtils.response_success(processed_data)
+
+    @action(methods=["post"], detail=False, url_path="export_excel")
+    def export_excel(self, request, *args, **kwargs):
+        labels = export_labels(getattr(request.user, "locale", None))
+        permission = get_node_permission(request)
+        queryset = get_catalog_node_queryset(request, permission)
+        raw_selected_ids = request.data.get("selected_ids")
+        if raw_selected_ids is None:
+            raw_selected_ids = []
+        elif not isinstance(raw_selected_ids, (list, tuple)):
+            return WebUtils.response_error(error_message="selected_ids must be a list")
+        selected_ids = [str(item).strip() for item in raw_selected_ids if str(item).strip()]
+
+        cloud_region_id = request.query_params.get("cloud_region_id") or request.data.get("cloud_region_id")
+        if not cloud_region_id:
+            return WebUtils.response_error(error_message="cloud_region_id is required")
+        queryset = queryset.filter(cloud_region_id=cloud_region_id)
+
+        if selected_ids:
+            queryset = queryset.filter(id__in=selected_ids)
+        else:
+            custom_filters = request.data.get("filters")
+            if custom_filters:
+                queryset = NodeFilterHandler.apply_filters(queryset, custom_filters)
+            organization_ids = request.query_params.get("organization_ids") or request.data.get("organization_ids")
+            if organization_ids:
+                organization_ids = organization_ids.split(",")
+                queryset = queryset.filter(nodeorganization__organization__in=organization_ids).distinct()
+
+        queryset = NodeSerializer.setup_eager_loading(queryset).order_by("-created_at")
+        total = queryset.count()
+        if total == 0:
+            return WebUtils.response_error(error_message=labels["empty"])
+        if total > EXPORT_LIMIT:
+            return WebUtils.response_error(error_message=labels["over_limit"].format(limit=EXPORT_LIMIT, count=total))
+
+        serializer = NodeSerializer(queryset, many=True)
+        processed = NodeService.process_node_data(serializer.data)
+        org_ids = []
+        for node in processed:
+            org_ids.extend(node.get("organization") or [])
+        organization_names = load_organization_names(org_ids)
+        rows = [build_export_row(node, labels, organization_names) for node in processed]
+        content = build_export_workbook_bytes(rows, labels["headers"])
+        region_name = CloudRegion.objects.filter(id=cloud_region_id).values_list("name", flat=True).first() or ""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = build_export_filename(region_name, stamp)
+        response = HttpResponse(
+            content,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = content_disposition(filename)
+        return response
+
+    @HasPermission("cloud_region_node-Delete")
+    def destroy(self, request, *args, **kwargs):
+        nodes, error_response = authorize_node_ids(request, [kwargs.get("pk")])
+        if error_response:
+            return error_response
+        instance = nodes[0]
+        # 删除节点必须清 CMDB 上悬挂的 node_id（实例保留）。
+        # retire_linked 另退役监控等已关联对象；失败都不阻断删除。
+        actor_scope = build_module_push_actor_scope(request)
+        ModulePushService.best_effort_unlink_cmdb(instance, actor_scope=actor_scope)
+        if parse_retire_linked_flag(request):
+            ModulePushService.best_effort_retire_linked(instance, actor_scope=actor_scope)
+        self.perform_destroy(instance)
+        return WebUtils.response_success()
+
+    @action(methods=["patch"], detail=True, url_path="update")
+    @HasPermission("cloud_region_node-Edit")
+    def update_node(self, request, pk=None):
+        nodes, error_response = authorize_node_ids(request, [pk])
+        if error_response:
+            return error_response
+        node = nodes[0]
+
+        name = request.data.get("name")
+        organizations = request.data.get("organizations")
+        error_response = authorize_target_organizations(request, node, organizations)
+        if error_response:
+            return error_response
+
+        name_changed = name is not None and name != node.name
+        if name is not None:
+            node.name = name
+            node.save()
+            if name_changed:
+                invalidate_node_configuration_etags([node.id])
+
+        if organizations is not None:
+            NodeOrganization.objects.filter(node=node).delete()
+            new_relations = [NodeOrganization(node=node, organization=org_id) for org_id in organizations]
+            NodeOrganization.objects.bulk_create(new_relations)
+
+        if name is not None or organizations is not None:
+            sync_node_properties_to_sidecar.delay(node_id=node.id, name=name, organizations=organizations)
+
+        return WebUtils.response_success()
+
+    @action(methods=["post"], detail=False, url_path="batch_update_organizations")
+    @HasPermission("cloud_region_node-Edit")
+    def batch_update_organizations(self, request):
+        serializer = BatchUpdateNodeOrganizationsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        node_ids = serializer.validated_data["node_ids"]
+        organizations = serializer.validated_data["organizations"]
+
+        with transaction.atomic():
+            list(Node.objects.select_for_update().filter(id__in=node_ids))
+            nodes, error_response = authorize_node_ids(request, node_ids)
+            if error_response:
+                return error_response
+
+            error_response = authorize_target_organizations(request, nodes[0], organizations)
+            if error_response:
+                return error_response
+
+            NodeOrganization.objects.filter(node_id__in=node_ids).delete()
+            NodeOrganization.objects.bulk_create(
+                [NodeOrganization(node=node, organization=organization_id) for node in nodes for organization_id in organizations]
+            )
+
+            def enqueue_sidecar_sync():
+                sync_nodes_organizations_to_sidecar.delay(
+                    node_ids=list(node_ids),
+                    organizations=list(organizations),
+                )
+
+            transaction.on_commit(
+                enqueue_sidecar_sync,
+                robust=True,
+            )
+
+        return WebUtils.response_success({"updated_count": len(nodes)})
+
+    @action(methods=["post"], detail=True, url_path="module_push")
+    @HasPermission("cloud_region_node-Edit")
+    def module_push(self, request, pk=None):
+        """详情补推/重同步：仅推送请求中列出的 targets，无级联。"""
+        nodes, error_response = authorize_node_ids(request, [pk])
+        if error_response:
+            return error_response
+        serializer = ModulePushSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        targets = serializer.validated_data["targets"]
+        actor_scope = build_module_push_actor_scope(request)
+        results = ModulePushService.best_effort_push_node(
+            nodes[0].id,
+            targets=targets,
+            actor_scope=actor_scope,
+        )
+        return WebUtils.response_success(
+            {
+                "node_id": nodes[0].id,
+                "targets": list(targets),
+                "results": {
+                    target: {
+                        "state": status.state,
+                        "error": status.error,
+                        "attempts": status.attempts,
+                    }
+                    for target, status in (results or {}).items()
+                },
+            }
+        )
+
+    @action(methods=["get"], detail=False, url_path=r"enum", filter_backends=[])
+    def enum(self, request, *args, **kwargs):
+        lan = LanguageLoader(app=LanguageConstants.APP, default_lang=request.user.locale)
+
+        # 翻译标签枚举
+        translated_tags = {}
+        for tag_key, tag_value in CollectorConstants.TAG_ENUM.items():
+            name_key = f"{LanguageConstants.COLLECTOR_TAG}.{tag_key}"
+            translated_tags[tag_key] = {
+                "is_app": tag_value["is_app"],
+                "name": lan.get(name_key) or tag_value["name"],
+            }
+
+        # 翻译控制器状态枚举
+        translated_sidecar_status = {}
+        for status_key, status_value in ControllerConstants.SIDECAR_STATUS_ENUM.items():
+            status_name_key = f"{LanguageConstants.CONTROLLER_STATUS}.{status_key}"
+            translated_sidecar_status[status_key] = lan.get(status_name_key) or status_value
+
+        # 翻译控制器安装方式枚举
+        translated_install_method = {}
+        for method_key, method_value in ControllerConstants.INSTALL_METHOD_ENUM.items():
+            method_name_key = f"{LanguageConstants.CONTROLLER_INSTALL_METHOD}.{method_key}"
+            translated_install_method[method_key] = lan.get(method_name_key) or method_value
+
+        # 翻译操作系统枚举
+        translated_os = {
+            NodeConstants.LINUX_OS: lan.get(f"{LanguageConstants.OS}.{NodeConstants.LINUX_OS}") or NodeConstants.LINUX_OS_DISPLAY,
+            NodeConstants.WINDOWS_OS: lan.get(f"{LanguageConstants.OS}.{NodeConstants.WINDOWS_OS}") or NodeConstants.WINDOWS_OS_DISPLAY,
+        }
+
+        enum_data = dict(
+            sidecar_status=translated_sidecar_status,
+            install_method=translated_install_method,
+            node_type=ControllerConstants.NODE_TYPE_ENUM,
+            tag=translated_tags,
+            os=translated_os,
+            cloud_server_status=CloudRegionServiceConstants.STATUS_ENUM,
+            manual_install_status=ControllerConstants.MANUAL_INSTALL_STATUS_ENUM,
+        )
+        return WebUtils.response_success(enum_data)
+
+    @action(detail=False, methods=["post"], url_path="batch_binding_configuration")
+    @HasPermission("cloud_region_node-EditMainConfiguration")
+    def batch_binding_node_configuration(self, request):
+        serializer = BatchBindingNodeConfigurationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        node_ids = serializer.validated_data["node_ids"]
+        collector_configuration_id = serializer.validated_data["collector_configuration_id"]
+        _, error_response = authorize_node_ids(request, node_ids)
+        if error_response:
+            return error_response
+        _, error_response = authorize_mutable_collector_configuration_ids(request, [collector_configuration_id])
+        if error_response:
+            return error_response
+        result, message = NodeService.batch_binding_node_configuration(node_ids, collector_configuration_id)
+
+        if result:
+            return WebUtils.response_success(message)
+        else:
+            return WebUtils.response_error(error_message=message)
+
+    @action(detail=False, methods=["post"], url_path="batch_operate_collector")
+    @HasPermission("cloud_region_node-OperateCollector")
+    def batch_operate_node_collector(self, request):
+        serializer = BatchOperateNodeCollectorSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        node_ids = serializer.validated_data["node_ids"]
+        collector_id = serializer.validated_data["collector_id"]
+        operation = serializer.validated_data["operation"]
+        _, error_response = authorize_node_ids(request, node_ids)
+        if error_response:
+            return error_response
+        task_id = NodeService.batch_operate_node_collector(
+            node_ids,
+            collector_id,
+            operation,
+            created_by=request.user.username,
+            domain=getattr(request.user, "domain", "domain.com"),
+            updated_by_domain=getattr(request.user, "domain", "domain.com"),
+        )
+
+        return WebUtils.response_success(dict(task_id=task_id))
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path=r"collector/action/(?P<task_id>[^/.]+)/nodes",
+    )
+    def collector_action_nodes(self, request, task_id):
+        serializer = TaskNodesQuerySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated_data = cast(dict[str, Any], serializer.validated_data)
+
+        authorized_node_ids = list(get_authorized_node_queryset(request).distinct().values_list("id", flat=True))
+        queryset = (
+            CollectorActionTaskNode.objects.filter(task_id=task_id, node_id__in=authorized_node_ids)
+            .select_related("node")
+            .prefetch_related("node__nodeorganization_set")
+        )
+        status_list = validated_data.get("status")
+        if status_list:
+            queryset = queryset.filter(status__in=status_list)
+
+        page = validated_data.get("page", 1)
+        page_size = validated_data.get("page_size", 20)
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        items = queryset.order_by("id")[start:end]
+        data = [
+            {
+                "node_id": obj.node_id,
+                "status": obj.status,
+                "result": normalize_task_result_for_read(obj.result),
+                "ip": obj.node.ip,
+                "os": obj.node.operating_system,
+                "node_name": obj.node.name,
+                "organizations": [rel.organization for rel in obj.node.nodeorganization_set.all()],
+                "install_method": obj.node.install_method,
+            }
+            for obj in items
+        ]
+
+        agg = CollectorActionTaskNode.objects.filter(task_id=task_id, node_id__in=authorized_node_ids).aggregate(
+            total=Count("id"),
+            waiting=Count("id", filter=Q(status="waiting")),
+            running=Count("id", filter=Q(status="running")),
+            success=Count("id", filter=Q(status="success")),
+            error=Count("id", filter=Q(status="error")),
+            timeout=Count("id", filter=Q(result__overall_status="timeout")),
+            cancelled=Count("id", filter=Q(result__overall_status="cancelled")),
+        )
+        summary = {
+            "total": agg["total"],
+            "waiting": agg["waiting"],
+            "running": agg["running"],
+            "success": agg["success"],
+            "error": agg["error"],
+            "timeout": agg["timeout"],
+            "cancelled": agg["cancelled"],
+        }
+
+        return WebUtils.response_success(
+            {
+                "task_id": task_id,
+                "status": project_task_status_from_summary(summary),
+                "summary": summary,
+                "items": data,
+                "count": total,
+                "page": page,
+                "page_size": page_size,
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="node_config_asso")
+    def get_node_config_asso(self, request):
+        cloud_region_id = request.data.get("cloud_region_id")
+        if not cloud_region_id:
+            return WebUtils.response_error(error_message="cloud_region_id is required")
+        nodes = get_authorized_node_queryset(request).prefetch_related("collectorconfiguration_set").filter(cloud_region_id=cloud_region_id)
+        if request.data.get("ids"):
+            nodes = nodes.filter(id__in=request.data["ids"])
+
+        result = [
+            {
+                "id": node.id,
+                "name": node.name,
+                "ip": node.ip,
+                "operating_system": node.operating_system,
+                "cloud_region_id": node.cloud_region_id,
+                "configs": [
+                    {
+                        "id": cfg.id,
+                        "name": cfg.name,
+                        "collector_id": cfg.collector_id,
+                        "is_pre": cfg.is_pre,
+                    }
+                    for cfg in node.collectorconfiguration_set.all()
+                ],
+            }
+            for node in nodes
+        ]
+
+        return WebUtils.response_success(result)

@@ -1,0 +1,564 @@
+'use client';
+
+import React, { useEffect, useRef, useState } from 'react';
+import { Spin, Alert, Drawer, Tag, Button, Modal, message, Tooltip } from 'antd';
+import { DisconnectOutlined } from '@ant-design/icons';
+import CompactEmptyState from '@/components/compact-empty-state';
+import { useTranslation } from '@/utils/i18n';
+import { useThemeMode } from '@/theme';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import { useInstanceApi } from '@/app/cmdb/api/instance';
+import usePermissions from '@/hooks/usePermissions';
+import type { RoomLayoutData, RoomRack, RackDevice } from '@/app/cmdb/types/rackRoom';
+import {
+  CELL, PAD, GAP, cellXY, roomGridSize, rackTypeColor, rackTypeName, TECH,
+} from '@/app/cmdb/utils/rackRoomLayout';
+import { resolveCmdbInstUuid } from '@/app/cmdb/utils/instUuid';
+import RackElevation from './rackElevation';
+import DeviceDetailDrawer from './deviceDetailDrawer';
+import LayoutPlaceModal, { type LayoutPlaceModalRef } from './layoutPlaceModal';
+import {
+  RACK_ROOM_ASSET_PERMISSION_PATH,
+  buildUnplacePayload,
+  canPlaceOnEmpty,
+  canUnplaceFromLayout,
+  hasInstanceOperate,
+} from './rackRoomEdit';
+
+interface Props {
+  modelId: string;
+  instUuid: string;
+  /** When set, rack click navigates via callback instead of opening the elevation Drawer. */
+  onRackSelect?: (rack: RoomRack) => void;
+  /** After returning from a rack drill-down, scroll this rack into view and pulse it. */
+  highlightRackId?: string;
+}
+
+const RoomFloorPlan: React.FC<Props> = ({
+  modelId,
+  instUuid,
+  onRackSelect,
+  highlightRackId,
+}) => {
+  const { t } = useTranslation();
+  const { mode } = useThemeMode();
+  const { getRoomLayout, saveRackRoomLayout } = useInstanceApi();
+  const { hasPermission } = usePermissions(RACK_ROOM_ASSET_PERMISSION_PATH);
+  const placeRef = useRef<LayoutPlaceModalRef>(null);
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState<RoomLayoutData | null>(null);
+  const [rack, setRack] = useState<RoomRack | null>(null);
+  const [device, setDevice] = useState<RackDevice | null>(null);
+  const [devOpen, setDevOpen] = useState(false);
+  const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const isDark = mode === 'dark';
+  const hasAdd = hasPermission(['Add']);
+  const hasEdit = hasPermission(['Edit']);
+  const canPlace = canPlaceOnEmpty({ hasAdd, hasEdit });
+
+  const reload = () => setReloadNonce((n) => n + 1);
+
+  const confirmUnplaceRack = (target: RoomRack) => {
+    if (
+      !canUnplaceFromLayout({
+        hasEdit,
+        instOperate: hasInstanceOperate(target.permission),
+      })
+    ) {
+      return;
+    }
+    Modal.confirm({
+      centered: true,
+      title: t('Model.layoutUnplaceConfirmTitle'),
+      content: t('Model.layoutUnplaceRackContent'),
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        const targetUuid = resolveCmdbInstUuid(target.inst_uuid);
+        if (!targetUuid) {
+          message.warning('实例缺少合法 inst_uuid，请先完成 UUID 存量清洗');
+          return;
+        }
+        await saveRackRoomLayout(
+          buildUnplacePayload({
+            scope: 'room',
+            containerInstUuid: instUuid,
+            instUuid: targetUuid,
+          })
+        );
+        message.success(t('successfullyDisassociated'));
+        setRack((current) => (current?.inst_uuid === target.inst_uuid ? null : current));
+        reload();
+      },
+    });
+  };
+
+  useEffect(() => {
+    if (!modelId || !instUuid) return;
+    let cancelled = false;
+    setLoading(true);
+    getRoomLayout(modelId, instUuid)
+      .then((res: RoomLayoutData) => !cancelled && setData(res))
+      .catch(() => !cancelled && setData(null))
+      .finally(() => !cancelled && setLoading(false));
+    return () => { cancelled = true; };
+     
+  }, [modelId, instUuid, reloadNonce]);
+
+  useEffect(() => {
+    if (!highlightRackId || !data || loading) return;
+    const el = document.querySelector(
+      `[data-room-rack-id="${CSS.escape(highlightRackId)}"]`
+    ) as HTMLElement | null;
+    if (!el) return;
+    setActiveHighlightId(highlightRackId);
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+    const timer = window.setTimeout(() => {
+      setActiveHighlightId((current) =>
+        (current === highlightRackId ? null : current)
+      );
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [highlightRackId, data, loading]);
+
+  if (loading) return <div className="p-[60px] text-center"><Spin spinning /></div>;
+  if (!data) return <CompactEmptyState description={t('Model.noRoomLayout')} />;
+
+  const missingLocationRacks = data.unplaced.filter(
+    (rack) => rack.unplaced_reason === 'missing_location'
+  );
+  const invalidLocationRacks = data.unplaced.filter(
+    (rack) => rack.unplaced_reason === 'invalid_location'
+  );
+  const { cols, rows } = roomGridSize(data);
+  const occupiedCells = new Set(data.racks.map((item) => `${item.row}-${item.col}`));
+  const width = PAD + cols * CELL + 16;
+  const height = PAD + rows * CELL + 16;
+  const box = CELL - GAP;
+  const roomBg = isDark
+    ? 'linear-gradient(180deg, #151922 0%, #12161d 58%, #10141a 100%)'
+    : 'linear-gradient(180deg, #ffffff 0%, #fbfdff 58%, #f7fbff 100%)';
+  const cellBg = isDark
+    ? 'linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.015))'
+    : 'linear-gradient(180deg, rgba(255,255,255,0.62), rgba(255,255,255,0.34))';
+  const rackHoverShadow = isDark
+    ? '0 1px 2px rgba(0,0,0,0.24), 0 14px 28px rgba(0,0,0,0.24)'
+    : '0 1px 2px rgba(24,39,63,0.06), 0 12px 22px rgba(31,51,82,0.07)';
+
+  return (
+    <div className="rf">
+      {data.conflicts.length > 0 && (
+        <Alert className="mb-3" type="error" showIcon
+          message={t('Model.rackCellConflict')} />
+      )}
+      {missingLocationRacks.length > 0 && (
+        <Alert className="mb-3" type="warning" showIcon
+          message={`${t('Model.rackLocationMissing')}: ${missingLocationRacks.map((rack) => rack.inst_name).join('、')}`} />
+      )}
+      {invalidLocationRacks.length > 0 && (
+        <Alert className="mb-3" type="warning" showIcon
+          message={`${t('Model.rackLocationInvalid')}: ${invalidLocationRacks.map((rack) => rack.inst_name).join('、')}`} />
+      )}
+
+      <div className="rf-legend">
+        <span className="rf-legend-t">{t('Model.legend')}</span>
+        {['1', '2', '3', '4', '5', 'other'].map((k) => (
+          <span key={k} className="rf-legend-i">
+            <i style={{ background: rackTypeColor(k) }} />
+            {rackTypeName(k)}
+          </span>
+        ))}
+      </div>
+      <div className="rf-stage">
+        <div className="rf-canvas" style={{ width, height }}>
+          {/* 列标题 A.. */}
+          {Array.from({ length: cols }, (_, i) => (
+            <span key={`c${i}`} className="rf-hdr rf-col"
+              style={{ left: PAD + i * CELL, width: CELL }}>
+              {String.fromCharCode(65 + i)}
+            </span>
+          ))}
+          {/* 行标题 1.. */}
+          {Array.from({ length: rows }, (_, i) => (
+            <span key={`r${i}`} className="rf-hdr rf-row"
+              style={{ top: PAD + i * CELL, height: CELL }}>{i + 1}</span>
+          ))}
+          {/* 空网格位 */}
+          {Array.from({ length: rows }).flatMap((_, ri) =>
+            Array.from({ length: cols }).map((__, ci) => {
+              const { x, y } = cellXY(ri + 1, ci + 1);
+              const empty = !occupiedCells.has(`${ri + 1}-${ci + 1}`);
+              const clickable = empty && canPlace;
+              return (
+                <div
+                  key={`g${ri}-${ci}`}
+                  className={`rf-cell${clickable ? ' rf-cell--empty' : ''}`}
+                  style={{ left: x + GAP / 2, top: y + GAP / 2, width: box, height: box }}
+                  onClick={clickable ? () => {
+                    placeRef.current?.show({
+                      scope: 'room',
+                      containerInstUuid: instUuid,
+                      row: ri + 1,
+                      col: ci + 1,
+                    });
+                  } : undefined}
+                />
+              );
+            })
+          )}
+          {/* 机柜 */}
+          {data.racks.map((r) => {
+            const { x, y } = cellXY(r.row, r.col);
+            const c = rackTypeColor(r.datacenter_type);
+            const canUnplace = canUnplaceFromLayout({
+              hasEdit,
+              instOperate: hasInstanceOperate(r.permission),
+            });
+            return (
+              <div
+                key={r.inst_uuid}
+                className={`rf-rack${activeHighlightId === r.inst_uuid ? ' rf-rack--highlight' : ''}`}
+                data-room-rack-id={r.inst_uuid}
+                style={{
+                  left: x + GAP / 2, top: y + GAP / 2, width: box, height: box,
+                  borderColor: isDark
+                    ? `color-mix(in srgb, ${c} 30%, rgba(148, 163, 184, 0.18))`
+                    : `color-mix(in srgb, ${c} 14%, rgba(41, 61, 93, 0.10))`,
+                  boxShadow: isDark
+                    ? '0 1px 2px rgba(0, 0, 0, 0.18), 0 10px 24px rgba(0, 0, 0, 0.12)'
+                    : '0 1px 2px rgba(24, 39, 63, 0.035), 0 6px 14px rgba(31, 51, 82, 0.025)',
+                  ['--rack-tone' as string]: c,
+                }}
+                onClick={() => {
+                  if (onRackSelect) {
+                    onRackSelect(r);
+                    return;
+                  }
+                  setRack(r);
+                }}>
+                <span className="rf-rack-led" style={{ background: c, boxShadow: `0 0 0 3px ${c}1f` }} />
+                {canUnplace && (
+                  <Tooltip title={t('Model.layoutUnplaceRackContent')}>
+                    <button
+                      type="button"
+                      className="rf-rack-unplace"
+                      aria-label={t('Model.layoutUnplace')}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        confirmUnplaceRack(r);
+                      }}
+                    >
+                      <DisconnectOutlined />
+                    </button>
+                  </Tooltip>
+                )}
+                <div className="rf-rack-name-slot">
+                  <EllipsisWithTooltip text={r.inst_name} className="rf-rack-name" />
+                </div>
+                <div className="rf-rack-type" style={{ color: c }}>
+                  {rackTypeName(r.datacenter_type)} · {r.u_count}U
+                </div>
+                <div className="rf-rack-free"
+                  title={`${t('Model.rackContiguousFree')} ${r.max_free_u}U`}>
+                  {t('Model.rackContiguousFreeShort')} <b>{r.max_free_u}</b>U
+                </div>
+                <div className="rf-bar">
+                  <i style={{ width: `${Math.min(r.usage, 100)}%`, background: c }} />
+                </div>
+                <div className="rf-rack-usage">{r.usage}%</div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 机柜抽屉：正视 U 图 */}
+      <Drawer
+        open={!!rack}
+        onClose={() => setRack(null)}
+        width={640}
+        title={null}
+        closable={false}
+        styles={{
+          body: { padding: 0, background: isDark ? '#141820' : '#f7fbff' },
+          content: { background: isDark ? '#141820' : '#f7fbff' },
+          wrapper: {
+            boxShadow: isDark
+              ? '-14px 0 42px rgba(0,0,0,0.38)'
+              : '-12px 0 34px rgba(23,54,106,0.11)',
+          },
+        }}
+      >
+        {rack && (
+          <div className="rd">
+            <div className="rd-hd" style={{
+              background: isDark
+                ? 'linear-gradient(180deg, #171c25 0%, #141820 100%)'
+                : 'linear-gradient(180deg, #ffffff 0%, #f8fbff 100%)',
+              borderBottom: `1px solid ${isDark ? 'rgba(148,163,184,0.14)' : TECH.line}`,
+            }}>
+              <span className="rd-led" style={{
+                background: rackTypeColor(rack.datacenter_type),
+                boxShadow: `0 0 0 4px ${rackTypeColor(rack.datacenter_type)}18`,
+              }} />
+              <div className="min-w-0 flex-1">
+                <EllipsisWithTooltip text={rack.inst_name} className="rd-name" />
+                <div className="rd-sub">
+                  <Tag style={{
+                    background: 'transparent', margin: 0,
+                    borderColor: rackTypeColor(rack.datacenter_type),
+                    color: rackTypeColor(rack.datacenter_type),
+                  }}>{rackTypeName(rack.datacenter_type)}</Tag>
+                  <span className="rd-meta">{rack.col_letter}{rack.row} · {rack.u_count}U · {t('Model.rackUsage')} {rack.usage}%</span>
+                </div>
+              </div>
+              {canUnplaceFromLayout({
+                hasEdit,
+                instOperate: hasInstanceOperate(rack.permission),
+              }) && (
+                <Button
+                  danger
+                  className="rd-unplace"
+                  onClick={() => confirmUnplaceRack(rack)}
+                >
+                  {t('Model.layoutUnplace')}
+                </Button>
+              )}
+            </div>
+            {(() => {
+              const rackUuid = resolveCmdbInstUuid(rack.inst_uuid);
+              if (!rackUuid) {
+                return <CompactEmptyState description="机柜缺少合法 inst_uuid，请先完成 UUID 存量清洗" />;
+              }
+              return (
+                <RackElevation
+                  key={`${rackUuid}-${reloadNonce}`}
+                  modelId="rack"
+                  instUuid={rackUuid}
+                  embedded
+                  onDeviceClick={(d) => { setDevice(d); setDevOpen(true); }}
+                />
+              );
+            })()}
+          </div>
+        )}
+      </Drawer>
+
+      <DeviceDetailDrawer
+        device={device}
+        open={devOpen}
+        onClose={() => setDevOpen(false)}
+        containerInstUuid={resolveCmdbInstUuid(rack?.inst_uuid) || undefined}
+        canUnplace={canUnplaceFromLayout({
+          hasEdit,
+          instOperate: hasInstanceOperate(device?.permission),
+        })}
+        onUnplaced={reload}
+      />
+      <LayoutPlaceModal
+        ref={placeRef}
+        hasAdd={hasAdd}
+        hasEdit={hasEdit}
+        onPlaced={reload}
+      />
+
+      <style jsx>{`
+        .rf {
+          padding: 8px 0 0;
+          color: ${isDark ? '#e5edf8' : TECH.text};
+          background: ${roomBg};
+          border-radius: 10px;
+        }
+        .rf-legend {
+          display: flex; align-items: center; flex-wrap: wrap; gap: 16px;
+          min-height: 36px;
+          padding: 5px 6px;
+          margin-bottom: 12px;
+          border-radius: 8px;
+          border: 1px solid ${isDark ? 'rgba(148,163,184,0.16)' : 'rgba(43,63,96,0.08)'};
+          background: ${isDark ? 'rgba(20,24,32,0.96)' : '#ffffff'};
+          box-shadow: ${isDark ? 'inset 0 1px 0 rgba(255,255,255,0.03)' : 'inset 0 1px 0 rgba(255,255,255,0.95)'};
+        }
+        .rf-legend-t {
+          display: inline-flex;
+          align-items: center;
+          min-height: 24px;
+          padding: 0 8px;
+          color: ${isDark ? '#8d9caf' : TECH.textDim};
+          font-size: 11px;
+          font-weight: 650;
+        }
+        .rf-legend-i {
+          display: inline-flex; align-items: center; gap: 6px;
+          min-height: 24px;
+          padding: 0 8px;
+          border: 1px solid ${isDark ? 'rgba(148,163,184,0.14)' : 'rgba(43, 63, 96, 0.075)'};
+          border-radius: 999px;
+          background: ${isDark ? 'rgba(255,255,255,0.035)' : '#ffffff'};
+          color: ${isDark ? '#b5c0cf' : '#536176'}; font-size: 11px; font-weight: 650;
+        }
+        .rf-legend-i > i {
+          width: 8px; height: 8px; border-radius: 2px; display: inline-block;
+        }
+        .rf-stage {
+          border-radius: 10px; padding: 10px; overflow: auto;
+          background: ${isDark ? 'rgba(18,22,29,0.92)' : 'rgba(255,255,255,0.96)'};
+          border: 1px solid ${isDark ? 'rgba(148,163,184,0.14)' : 'rgba(43,63,96,0.08)'};
+          box-shadow: ${isDark ? '0 16px 38px rgba(0,0,0,0.18)' : '0 10px 26px rgba(31, 47, 75, 0.035)'};
+        }
+        .rf-canvas {
+          position: relative;
+          overflow: hidden;
+          border: 1px solid ${isDark ? 'rgba(148,163,184,0.12)' : 'rgba(43, 63, 96, 0.06)'};
+          border-radius: 9px;
+          background-color: ${isDark ? '#111821' : '#fcfeff'};
+          background-image:
+            linear-gradient(${isDark ? 'rgba(140,160,190,0.10)' : 'rgba(58,83,125,0.065)'} 1px, transparent 1px),
+            linear-gradient(90deg, ${isDark ? 'rgba(140,160,190,0.10)' : 'rgba(58,83,125,0.065)'} 1px, transparent 1px);
+          background-size: ${CELL}px ${CELL}px, ${CELL}px ${CELL}px;
+          background-position: ${PAD}px ${PAD}px, ${PAD}px ${PAD}px;
+        }
+        .rf-canvas::before {
+          content: "";
+          position: absolute;
+          left: ${PAD}px;
+          right: 0;
+          top: calc(${PAD}px + ${CELL}px * 2);
+          height: ${CELL}px;
+          z-index: 0;
+          pointer-events: none;
+          opacity: ${isDark ? '.22' : '.20'};
+          background:
+            linear-gradient(90deg, transparent, ${isDark ? 'rgba(255,255,255,.08)' : 'rgba(255,255,255,.58)'}, transparent),
+            repeating-linear-gradient(135deg, ${isDark ? 'rgba(180,195,220,.08)' : 'rgba(43,63,96,.032)'} 0 1px, transparent 1px 10px);
+        }
+        .rf-hdr {
+          position: absolute; z-index: 3; color: ${isDark ? '#7aa8ff' : TECH.cyan}; opacity: .95;
+          font-family: ui-monospace, monospace; font-size: 11px;
+          font-weight: 700;
+          display: flex; align-items: center; justify-content: center;
+        }
+        .rf-col { top: 8px; height: 28px; }
+        .rf-row { left: 4px; width: 28px; }
+        .rf-cell {
+          position: absolute; z-index: 1; border-radius: 9px;
+          border: 1px solid ${isDark ? 'rgba(148,163,184,0.10)' : 'rgba(75,96,130,0.055)'};
+          background: ${cellBg};
+        }
+        .rf-cell--empty {
+          cursor: pointer;
+        }
+        .rf-cell--empty:hover {
+          border-color: ${isDark ? 'rgba(122,168,255,0.45)' : 'rgba(43,101,217,0.35)'};
+        }
+        .rf-rack-unplace {
+          position: absolute; top: 6px; left: 6px; z-index: 3;
+          width: 22px; height: 22px; border: 0; border-radius: 6px;
+          background: ${isDark ? 'rgba(0,0,0,0.35)' : 'rgba(255,255,255,0.86)'};
+          color: ${TECH.danger}; cursor: pointer; display: flex;
+          align-items: center; justify-content: center; font-size: 12px;
+          opacity: 0;
+          pointer-events: none;
+          transition: opacity .15s ease;
+        }
+        .rf-rack:hover .rf-rack-unplace,
+        .rf-rack-unplace:focus-visible {
+          opacity: 1;
+          pointer-events: auto;
+        }
+        .rf-rack {
+          position: absolute; z-index: 2; border-radius: 10px; cursor: pointer;
+          border: 1px solid; overflow: hidden;
+          background:
+            radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--rack-tone) ${isDark ? '10%' : '3%'}, transparent), transparent 38%),
+            linear-gradient(180deg, color-mix(in srgb, var(--rack-tone) ${isDark ? '7%' : '1.2%'}, ${isDark ? '#18202a' : '#ffffff'}), ${isDark ? '#151b24' : '#ffffff'});
+          transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+          padding: 11px 10px 9px;
+        }
+        .rf-rack::before {
+          content: "";
+          position: absolute;
+          inset: 6px;
+          border-radius: 7px;
+          border: 1px solid color-mix(in srgb, var(--rack-tone) ${isDark ? '18%' : '6%'}, transparent);
+          pointer-events: none;
+        }
+        .rf-rack:hover {
+          transform: translateY(-2px);
+          border-color: var(--rack-tone);
+          box-shadow: ${rackHoverShadow} !important;
+        }
+        .rf-rack--highlight {
+          border-color: var(--rack-tone) !important;
+          box-shadow: ${rackHoverShadow} !important;
+          animation: rf-rack-pulse 1.6s ease-out 1;
+        }
+        @keyframes rf-rack-pulse {
+          0% { transform: scale(1); }
+          35% { transform: scale(1.04); }
+          100% { transform: scale(1); }
+        }
+        .rf-rack-led {
+          position: absolute; top: 7px; right: 6px;
+          width: 7px; height: 7px; border-radius: 50%;
+        }
+        .rf-rack-name-slot {
+          display: flex;
+          align-items: center;
+          min-height: 27.6px;
+          padding-right: 8px;
+        }
+        :global(.rf-rack-name) {
+          display: -webkit-box;
+          -webkit-box-orient: vertical;
+          -webkit-line-clamp: 2;
+          color: var(--color-text-2); font-size: 11.5px; font-weight: 760; line-height: 1.2;
+          letter-spacing: 0;
+          white-space: normal; overflow: hidden; text-overflow: ellipsis;
+          word-break: normal; overflow-wrap: normal;
+          max-height: 27.6px;
+          width: 100%;
+          margin-top: 0;
+        }
+        .rf-rack-type {
+          font-size: 10px; margin-top: 4px; font-weight: 700;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .rf-rack-free {
+          font-size: 10px; margin-top: 5px; color: ${isDark ? '#8d9caf' : TECH.textDim};
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .rf-rack-free > b { font-weight: 600; font-family: ui-monospace, monospace; }
+        .rf-bar {
+          position: absolute; left: 10px; right: 10px; bottom: 18px; height: 4px;
+          border-radius: 999px; background: ${isDark ? 'rgba(148,163,184,0.14)' : 'rgba(23,32,51,0.07)'}; overflow: hidden;
+        }
+        .rf-bar > i { display: block; height: 100%; border-radius: 999px; }
+        .rf-rack-usage {
+          position: absolute; right: 10px; bottom: 5px;
+          font-size: 10px; color: ${isDark ? '#8d9caf' : TECH.textDim}; font-family: ui-monospace, monospace;
+        }
+        .rd { color: ${isDark ? '#e5edf8' : TECH.text}; display: flex; flex-direction: column;
+          min-height: 100%; background: ${isDark ? '#141820' : '#f7fbff'}; }
+        .rd-hd { display: flex; align-items: center; gap: 12px; padding: 18px 20px; }
+        .rd-led { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+        :global(.rd-unplace) {
+          opacity: 0;
+          transition: opacity .15s ease;
+        }
+        .rd-hd:hover :global(.rd-unplace),
+        :global(.rd-unplace:focus-visible) {
+          opacity: 1;
+        }
+        :global(.rd-name) {
+          font-size: 17px; font-weight: 600; color: ${isDark ? '#e5edf8' : TECH.text};
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .rd-sub { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+        .rd-meta { font-size: 12px; color: ${isDark ? '#8d9caf' : TECH.textDim}; font-family: ui-monospace, monospace; }
+      `}</style>
+    </div>
+  );
+};
+
+export default RoomFloorPlan;

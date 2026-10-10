@@ -1,0 +1,1028 @@
+'use client';
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  useMemo,
+  useCallback
+} from 'react';
+import {
+  Button,
+  Checkbox,
+  message,
+  Space,
+  Modal,
+  Tooltip,
+  Tag,
+  Dropdown,
+  Alert
+} from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
+import CatalogScopeSegmented from '@/components/catalog-scope-segmented';
+import { DownOutlined, ReloadOutlined } from '@ant-design/icons';
+import Icon from '@/components/icon';
+import type { MenuProps, TableProps } from 'antd';
+import nodeStyle from './index.module.scss';
+import CollectorModal from './collectorOperation/collectorModal';
+import { useTranslation } from '@/utils/i18n';
+import { ModalRef, TableDataItem, Pagination } from '@/app/node-manager/types';
+import { SearchFilters } from '@/components/search-combination/types';
+import CustomTable from '@/components/custom-table';
+import SearchCombination from '@/components/search-combination';
+import {
+  useColumns,
+  useTelegrafMap,
+  useSidecarItems,
+  useCollectorItems,
+  useFieldConfigs
+} from '@/app/node-manager/hooks/node';
+import MainLayout from '../mainlayout/layout';
+import useApiClient from '@/utils/request';
+import useNodeManagerApi from '@/app/node-manager/api';
+import useCloudId from '@/app/node-manager/hooks/useCloudRegionId';
+import ControllerInstall from './controllerInstall';
+import ControllerUninstall from './controllerUninstall';
+import CollectorOperation from './collectorOperation';
+import { useSearchParams } from 'next/navigation';
+import { useScreenAwareRouter } from '@/console-layout';
+import PermissionWrapper from '@/components/permission';
+import { cloneDeep } from 'lodash';
+import { ColumnItem } from '@/types';
+import CollectorDetailDrawer from './collectorDetail';
+import EditNode from './editNode';
+import BatchEditOrganizations from './batchEditOrganizations';
+import { useCommon } from '@/app/node-manager/context/common';
+import {
+  getCollectorOperationSelection,
+  isControllerOperationDisabled
+} from '@/app/node-manager/utils/nodeOperation';
+import {
+  nextSelectedNodeMap,
+  selectedNodesFromMap,
+  shouldClearNodeSelection
+} from '@/app/node-manager/utils/nodeListSelection';
+import {
+  buildNodeExportRequest,
+  NodeExportScope
+} from '@/app/node-manager/utils/nodeListExport';
+import {
+  listNodeHostedCollectors,
+  listNodeUpgradeableCollectors,
+  listCollectorUpdateHints,
+  parseCollectorQueryNames,
+  isSameCollectorName,
+  collectorDisplayName
+} from '@/app/node-manager/utils/collectorConfig';
+import { MODULE_OBJECT_QUERY_PARAM } from '@/app/monitor/utils/monitorObjectQuery';
+import { buildCollectNeedUpdateAssetUrl } from '@/app/monitor/utils/collectNeedUpdate';
+const { confirm } = Modal;
+
+type TableRowSelection<T extends object = object> =
+  TableProps<T>['rowSelection'];
+
+const Node = () => {
+  const { t } = useTranslation();
+  const router = useScreenAwareRouter();
+  const cloudId = useCloudId();
+  const searchParams = useSearchParams();
+  const { isLoading, del } = useApiClient();
+  const { getNodeList, delNode, exportNodeList } = useNodeManagerApi();
+  const sidecarItems = useSidecarItems();
+  const collectorItems = useCollectorItems();
+  const statusMap = useTelegrafMap();
+  const fieldConfigs = useFieldConfigs();
+  const commonContext = useCommon();
+  const nodeStateEnum = commonContext?.nodeStateEnum || {};
+  const name = searchParams.get('name') || '';
+  const notDeployed = searchParams.get('not_deployed');
+  const packCollectorNames = parseCollectorQueryNames(searchParams.get('collector'));
+  const packCollectorNamesRef = useRef(packCollectorNames);
+  packCollectorNamesRef.current = packCollectorNames;
+  const packObjectId = searchParams.get(MODULE_OBJECT_QUERY_PARAM) || '';
+  const packPluginId = searchParams.get('plugin_id') || '';
+  const packAlignAssetUrl = packObjectId
+    ? buildCollectNeedUpdateAssetUrl({
+      monitorObjectId: packObjectId,
+      pluginId: packPluginId || null,
+      needUpdate: true
+    })
+    : '';
+  const collectorRef = useRef<ModalRef>(null);
+  const controllerRef = useRef<ModalRef>(null);
+  const collectorDetailRef = useRef<any>(null);
+  const editNodeRef = useRef<ModalRef>(null);
+  const batchEditOrganizationsRef = useRef<ModalRef>(null);
+  const [nodeList, setNodeList] = useState<TableDataItem[]>();
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+  const [selectedNodeMap, setSelectedNodeMap] = useState<
+    Map<React.Key, TableDataItem>
+  >(new Map());
+  const [loading, setLoading] = useState<boolean>(false);
+  const [showNodeTable, setShowNodeTable] = useState<boolean>(true);
+  const [taskId, setTaskId] = useState<string>('');
+  const [showInstallController, setShowInstallController] =
+    useState<boolean>(false);
+  const [showCollectorOperation, setShowCollectorOperation] =
+    useState<boolean>(false);
+  const [collectorOperationType, setCollectorOperationType] =
+    useState<string>('');
+  const [collectorId, setCollectorId] = useState<string>('');
+  const [collectorName, setCollectorName] = useState<string>('');
+  const [collectorPackageId, setCollectorPackageId] = useState<
+    number | undefined
+  >();
+  const [activeColumns, setActiveColumns] = useState<ColumnItem[]>([]);
+  const [searchFilters, setSearchFilters] = useState<SearchFilters>({});
+  const [unassignedOnly, setUnassignedOnly] = useState(false);
+  const [exporting, setExporting] = useState<boolean>(false);
+  const [pagination, setPagination] = useState<Pagination>({
+    current: 1,
+    total: 0,
+    pageSize: 20
+  });
+
+  const clearNodeSelection = () => {
+    setSelectedRowKeys([]);
+    setSelectedNodeMap(new Map());
+  };
+
+  const columns = useColumns({
+    checkConfig: (row: TableDataItem) => {
+      const allCollectors = getNodeCollectors(row);
+      handleCollectorTagClick(row, allCollectors);
+    },
+    editNode: (row: TableDataItem) => {
+      editNodeRef.current?.showModal({
+        type: 'edit',
+        form: row
+      });
+    },
+    deleteNode: (row: TableDataItem) => {
+      let retireLinked = false;
+      confirm({
+        title: t('common.prompt'),
+        content: (
+          <div>
+            <div className="mb-3">
+              {t('node-manager.cloudregion.node.deleteNodeTips')}
+            </div>
+            <Checkbox
+              onChange={(e) => {
+                retireLinked = e.target.checked;
+              }}
+            >
+              {t('node-manager.cloudregion.node.retireLinkedConfirm')}
+            </Checkbox>
+          </div>
+        ),
+        okText: t('common.confirm'),
+        cancelText: t('common.cancel'),
+        centered: true,
+        onOk: async () => {
+          setLoading(true);
+          try {
+            await delNode(row.id as string, {
+              retire_linked: retireLinked
+            });
+            message.success(t('common.successfullyDeleted'));
+            getNodes(searchFilters);
+          } catch {
+            setLoading(false);
+            throw new Error('delete failed');
+          }
+        }
+      });
+    }
+  });
+
+  const cancelInstall = useCallback(() => {
+    setShowNodeTable(true);
+    setShowInstallController(false);
+    getNodes(searchFilters);
+  }, [searchFilters]);
+
+  const cancelCollectorOperation = useCallback(() => {
+    setShowNodeTable(true);
+    setShowCollectorOperation(false);
+    setCollectorOperationType('');
+    setCollectorName('');
+    getNodes(searchFilters);
+  }, [searchFilters]);
+
+  const tableColumns = useMemo(() => {
+    if (!activeColumns?.length) return columns;
+    const _columns = cloneDeep(columns);
+    const [first, ...remain] = activeColumns;
+    _columns.splice(2, 0, first);
+    _columns.splice(4, 0, ...remain);
+    return _columns;
+  }, [columns, nodeList, statusMap, activeColumns]);
+
+  const enableOperateCollecter = useMemo(() => {
+    if (!selectedRowKeys.length) return true;
+    const selectedNodes = selectedNodesFromMap(
+      selectedRowKeys,
+      selectedNodeMap
+    );
+    const operatingSystems = selectedNodes.map((node) => node.operating_system);
+    const architectures = selectedNodes.map(
+      (node) => node.cpu_architecture || ''
+    );
+    const uniqueOS = [...new Set(operatingSystems)];
+    const uniqueArchitectures = [...new Set(architectures)];
+    // 采集器：检查操作系统和 CPU 架构是否一致
+    return uniqueOS.length !== 1 || uniqueArchitectures.length !== 1;
+  }, [selectedRowKeys, selectedNodeMap]);
+
+  const enableOperateController = useMemo(() => {
+    const selectedNodes = selectedNodesFromMap(
+      selectedRowKeys,
+      selectedNodeMap
+    );
+    // 控制器：只要求所选节点为同一非 Windows 操作系统，安装方式不影响操作入口
+    return isControllerOperationDisabled(selectedNodes);
+  }, [selectedRowKeys, selectedNodeMap]);
+
+  const getFirstSelectedNodeOS = useCallback(() => {
+    const selectedNodes = selectedNodesFromMap(
+      selectedRowKeys,
+      selectedNodeMap
+    );
+    return selectedNodes[0]?.operating_system || 'linux';
+  }, [selectedNodeMap, selectedRowKeys]);
+
+  const getNodeCollectors = (record: TableDataItem) => {
+    return listNodeHostedCollectors(record);
+  };
+
+  useEffect(() => {
+    if (!isLoading) {
+      getCollectors();
+      getNodes(searchFilters);
+    }
+  }, [isLoading]);
+
+  useEffect(() => {
+    if (!isLoading) getNodes(searchFilters);
+  }, [pagination.current, pagination.pageSize, unassignedOnly]);
+
+  useEffect(() => {
+    if (shouldClearNodeSelection({ reason: 'cloudRegion' })) {
+      clearNodeSelection();
+    }
+  }, [cloudId]);
+
+  const handleSidecarMenuClick: MenuProps['onClick'] = (e) => {
+    if (e.key === 'uninstallController') {
+      const list = selectedNodesFromMap(selectedRowKeys, selectedNodeMap);
+      controllerRef.current?.showModal({
+        type: e.key,
+        form: { list }
+      });
+      return;
+    }
+    confirm({
+      title: t('common.prompt'),
+      content: t(`node-manager.cloudregion.node.${e.key}Tips`),
+      centered: true,
+      onOk() {
+        return new Promise(async (resolve) => {
+          const params = JSON.stringify(selectedRowKeys);
+          try {
+            await del(`/monitor/api/monitor_policy/${params}/`);
+            message.success(t('common.operationSuccessful'));
+            getNodes(searchFilters);
+          } finally {
+            resolve(true);
+          }
+        });
+      }
+    });
+  };
+
+  const handleCollectorMenuClick: MenuProps['onClick'] = (e) => {
+    const selectedNodes = selectedNodesFromMap(
+      selectedRowKeys,
+      selectedNodeMap
+    );
+    const selection = getCollectorOperationSelection(selectedNodes);
+
+    if (selection.disabled === true) {
+      if (selection.reason === 'unknown_architecture') {
+        message.error(
+          t(
+            'node-manager.cloudregion.node.collectorOperationUnknownArchitecture',
+            'The selected node has no CPU architecture. Please wait for node reporting or backfill the architecture before operating components.'
+          )
+        );
+      }
+      return;
+    }
+
+    collectorRef.current?.showModal({
+      type: e.key,
+      ids: selectedRowKeys as string[],
+      selectedsystem: selection.operatingSystem,
+      selectedArchitecture: selection.cpuArchitecture,
+      updateHints: listCollectorUpdateHints(
+        selectedNodes,
+        packCollectorNamesRef.current
+      ),
+      focusCollectorNames: packCollectorNamesRef.current,
+      selectedNodes
+    });
+  };
+
+  const SidecarmenuProps = {
+    items: sidecarItems,
+    onClick: handleSidecarMenuClick
+  };
+
+  const CollectormenuProps = {
+    items: collectorItems,
+    onClick: handleCollectorMenuClick
+  };
+
+  const onSelectChange = (newSelectedRowKeys: React.Key[]) => {
+    setSelectedRowKeys(newSelectedRowKeys);
+    setSelectedNodeMap((previous) =>
+      nextSelectedNodeMap({
+        previous,
+        selectedKeys: newSelectedRowKeys,
+        currentPageRows: nodeList || []
+      })
+    );
+  };
+
+  const getCheckboxProps = () => {
+    return {
+      disabled: false
+    };
+  };
+
+  const rowSelection: TableRowSelection<TableDataItem> = {
+    selectedRowKeys,
+    preserveSelectedRowKeys: true,
+    onChange: onSelectChange,
+    getCheckboxProps: getCheckboxProps
+  };
+
+  const handleSearchChange = (filters: SearchFilters) => {
+    if (shouldClearNodeSelection({ reason: 'filters' })) {
+      clearNodeSelection();
+    }
+    setSearchFilters(filters);
+    getNodes(filters);
+  };
+
+  const getNodes = async (filters?: SearchFilters) => {
+    setLoading(true);
+    try {
+      const params: any = {
+        cloud_region_id: cloudId,
+        page: pagination.current,
+        page_size: pagination.pageSize,
+        ...(unassignedOnly ? { unassigned: true } : {})
+      };
+
+      if (filters && Object.keys(filters).length > 0) {
+        params.filters = filters;
+      }
+
+      const res = await getNodeList(params);
+      const data = (res?.items || []).map((item: TableDataItem) => ({
+        ...item,
+        key: item.id
+      }));
+      setPagination((prev: Pagination) => ({
+        ...prev,
+        total: res?.count || 0
+      }));
+      setNodeList(data);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleInstallController = () => {
+    setShowNodeTable(false);
+    setShowInstallController(true);
+  };
+
+  const handleExportNodes = async (scope: NodeExportScope) => {
+    if (
+      scope !== 'selected' &&
+      scope !== 'currentPage' &&
+      scope !== 'all'
+    ) {
+      return;
+    }
+    const request = buildNodeExportRequest({
+      scope,
+      selectedIds: selectedRowKeys.map(String),
+      currentPageIds: (nodeList || []).map((row) =>
+        String(row.id || row.key || '')
+      ),
+      cloudRegionId: cloudId,
+      filters: searchFilters,
+      unassignedOnly
+    });
+    if (request.empty || !request.body) {
+      message.error(t('node-manager.cloudregion.node.exportEmpty'));
+      return;
+    }
+    setExporting(true);
+    try {
+      const { blob, filename } = await exportNodeList({
+        ...request.body,
+        ...request.query
+      } as any);
+      if (!(blob instanceof Blob)) {
+        return;
+      }
+      if (blob.type && blob.type.includes('application/json')) {
+        const payload = JSON.parse(await blob.text());
+        message.error(payload.message || t('common.exportFailed'));
+        return;
+      }
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename || 'nodes.xlsx';
+      link.click();
+      window.URL.revokeObjectURL(url);
+    } catch (error: any) {
+      const data = error?.payload || error?.response?.data;
+      if (data instanceof Blob) {
+        try {
+          const payload = JSON.parse(await data.text());
+          if (payload?.message) {
+            message.error(payload.message);
+            return;
+          }
+        } catch {
+          /* fall through */
+        }
+      }
+      if (error?.message) {
+        message.error(error.message);
+      }
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const getCollectors = async () => {
+    setActiveColumns([
+      {
+        title: t('node-manager.cloudregion.node.nodeProperties'),
+        dataIndex: 'node_properties',
+        key: 'node_properties',
+        onCell: () => ({
+          style: {
+            minWidth: 80
+          }
+        }),
+        render: (_: any, record: TableDataItem) => {
+          // 获取操作系统映射
+          const osValue = record.operating_system;
+          const osLabel = nodeStateEnum?.os?.[osValue] || osValue;
+
+          // 获取安装方式映射
+          const installMethodValue = record.install_method;
+          const installMethodLabel =
+            nodeStateEnum?.install_method?.[installMethodValue] ||
+            installMethodValue;
+          const isAutoInstall = installMethodValue === 'auto';
+          const cpuArchitectureValue = record.cpu_architecture;
+          const cpuArchitectureLabel =
+            cpuArchitectureValue === 'arm64'
+              ? 'ARM64'
+              : cpuArchitectureValue || '--';
+
+          // 获取节点类型映射
+          const nodeTypeValue = record.node_type;
+          const nodeTypeLabel =
+            nodeStateEnum?.node_type?.[nodeTypeValue] || nodeTypeValue;
+
+          // 容器节点tooltip内容
+          const nodeTypeTooltip =
+            nodeTypeValue === 'container' ? (
+              <div>
+                <div>{`${t(
+                  'node-manager.cloudregion.node.nodeType'
+                )}: ${nodeTypeLabel}`}</div>
+                <div>{t('node-manager.cloudregion.node.containerNodeTip')}</div>
+              </div>
+            ) : (
+              `${t('node-manager.cloudregion.node.nodeType')}: ${nodeTypeLabel}`
+            );
+          return (
+            <div className="flex gap-2 items-center ">
+              <Tooltip title={nodeTypeTooltip}>
+                <div className="flex items-center">
+                  <Icon
+                    type={
+                      nodeTypeValue === 'container'
+                        ? 'rongqifuwuContainerServi'
+                        : 'zhuji'
+                    }
+                    style={{ fontSize: '28px' }}
+                    className="cursor-pointer"
+                  />
+                </div>
+              </Tooltip>
+              <Tooltip
+                title={`${t(
+                  'node-manager.cloudregion.node.system'
+                )}: ${osLabel}`}
+              >
+                <div className="flex items-center">
+                  <Icon
+                    type={osValue === 'linux' ? 'Linux' : 'Window-Windows'}
+                    style={{ fontSize: '26px' }}
+                    className="cursor-pointer"
+                  />
+                </div>
+              </Tooltip>
+              <Tooltip
+                title={`${t(
+                  'node-manager.cloudregion.node.installMethod'
+                )}: ${installMethodLabel}`}
+              >
+                <div className="flex items-center">
+                  <Icon
+                    type={isAutoInstall ? 'daohang_007' : 'rengongganyu'}
+                    style={{
+                      fontSize: isAutoInstall ? '32px' : '24px',
+                      transform: isAutoInstall ? 'none' : 'translateX(2px)',
+                      cursor: 'pointer',
+                      marginRight: isAutoInstall ? '' : '8px'
+                    }}
+                  />
+                </div>
+              </Tooltip>
+              <Tooltip
+                title={`${t(
+                  'node-manager.cloudregion.node.cpuArchitecture'
+                )}: ${cpuArchitectureLabel}`}
+              >
+                <div className="flex items-center">
+                  <Icon
+                    type="cpu"
+                    style={{ fontSize: '28px' }}
+                    className="cursor-pointer"
+                  />
+                </div>
+              </Tooltip>
+            </div>
+          );
+        }
+      },
+      {
+        title: t('node-manager.controller.controller'),
+        dataIndex: 'controller',
+        key: 'controller',
+        onCell: () => ({
+          style: {
+            minWidth: 100
+          }
+        }),
+        render: (_: any, record: TableDataItem) => {
+          return (
+            <div className="flex flex-nowrap gap-1">
+              <Tooltip title={`${record.status?.message}`}>
+                <Tag
+                  color={record.active ? 'success' : 'warning'}
+                  className="py-1 px-2"
+                >
+                  Sidecar
+                </Tag>
+              </Tooltip>
+            </div>
+          );
+        }
+      },
+      {
+        title: t('node-manager.cloudregion.node.sidecarVersion'),
+        dataIndex: 'version',
+        key: 'version',
+        onCell: () => ({
+          style: {
+            minWidth: 100
+          }
+        }),
+        render: (_: any, record: TableDataItem) => {
+          const versions = record.versions || [];
+          const currentVersion = versions.find(
+            (item: TableDataItem) => item.component_type === 'controller'
+          );
+          const version = currentVersion?.version;
+          if (!version) return <span>--</span>;
+          return (
+            <div className="flex items-center gap-2">
+              <span>{version}</span>
+              {currentVersion?.upgradeable && (
+                <Tooltip
+                  title={`${t(
+                    'node-manager.cloudregion.node.controllerVersionTip'
+                  )}: ${currentVersion?.latest_version || '--'}`}
+                >
+                  <div>
+                    <Icon
+                      type="shengji"
+                      className="cursor-pointer"
+                      style={{ fontSize: '16px' }}
+                    />
+                  </div>
+                </Tooltip>
+              )}
+            </div>
+          );
+        }
+      },
+      {
+        title: t('node-manager.cloudregion.node.hostedProgram'),
+        dataIndex: 'collectors',
+        key: 'collectors',
+        onCell: () => ({
+          style: {
+            minWidth: 200
+          }
+        }),
+        render: (_: any, record: TableDataItem) => {
+          const allCollectors = getNodeCollectors(record);
+          // 按状态分组
+          const statusGroups = allCollectors.reduce(
+            (groups: any, collector: any) => {
+              const status = collector.status.toString();
+              if (!groups[status]) {
+                groups[status] = [];
+              }
+              groups[status].push(collector);
+              return groups;
+            },
+            {}
+          );
+          // 生成状态标签
+          const statusTags = Object.entries(statusGroups).map(
+            ([status, collectors]: [string, any]) => {
+              const statusInfo = statusMap[status] || {
+                tagColor: 'default',
+                text: t('node-manager.cloudregion.node.unknown')
+              };
+
+              return (
+                <Tag
+                  key={status}
+                  color={statusInfo.tagColor}
+                  className="cursor-pointer py-1 px-2"
+                  onClick={() => handleCollectorTagClick(record, allCollectors)}
+                >
+                  {statusInfo.text}: {collectors.length}
+                </Tag>
+              );
+            }
+          );
+          const upgradeableCollectors = listNodeUpgradeableCollectors(record);
+          const upgradeableIds = new Set(
+            upgradeableCollectors.map((item) => item.componentId)
+          );
+          const upgradeableTags = upgradeableCollectors.map((item) => (
+            <Tag
+              key={`up-${item.componentId}`}
+              color="processing"
+              className="cursor-pointer py-1 px-2"
+              onClick={() =>
+                handleCollectorTagClick(record, allCollectors, item.name)
+              }
+            >
+              {item.name}
+              {` · ${t('node-manager.cloudregion.node.collectorUpgradeable', '', {
+                version: item.latestVersion
+              })}`}
+            </Tag>
+          ));
+          const focusTags = packCollectorNamesRef.current
+            .map((collectorName) => {
+              const matched = allCollectors.find((collector: any) =>
+                isSameCollectorName(collector, collectorName)
+              );
+              if (!matched) return null;
+              if (upgradeableIds.has(String(matched.collector_id))) {
+                return null;
+              }
+              return (
+                <Tag
+                  key={`pack-${collectorName}`}
+                  color="processing"
+                  className="cursor-pointer py-1 px-2"
+                  onClick={() =>
+                    handleCollectorTagClick(record, allCollectors, collectorName)
+                  }
+                >
+                  {collectorDisplayName(matched) || collectorName}
+                  {` · ${t('node-manager.cloudregion.node.justImportedCollector')}`}
+                </Tag>
+              );
+            })
+            .filter(Boolean);
+          if (
+            statusTags.length === 0 &&
+            upgradeableTags.length === 0 &&
+            focusTags.length === 0
+          ) {
+            return <span>--</span>;
+          }
+          return (
+            <div className="flex flex-nowrap gap-1">
+              {upgradeableTags}
+              {focusTags}
+              {statusTags}
+            </div>
+          );
+        }
+      }
+    ]);
+  };
+
+  const handleCollectorTagClick = (
+    record: TableDataItem,
+    collectors: any[],
+    focusCollectorName?: string
+  ) => {
+    collectorDetailRef.current?.showModal({
+      collectors,
+      row: record,
+      focusCollectorName
+    });
+  };
+
+  const handleCollector = (
+    config = {
+      type: '',
+      taskId: '',
+      collectorId: '',
+      collectorPackageId: undefined as number | undefined,
+      collectorName: ''
+    }
+  ) => {
+    getNodes(searchFilters);
+    // 安装组件、启动组件、重启组件、停止组件、卸载控制器 - 进入步骤页面
+    const collectorOperationTypes = [
+      'installCollector',
+      'startCollector',
+      'restartCollector',
+      'stopCollector',
+      'uninstallController'
+    ];
+    if (collectorOperationTypes.includes(config.type)) {
+      setTaskId(config.taskId);
+      setCollectorOperationType(config.type);
+      setCollectorId(config.collectorId || '');
+      setCollectorName(config.collectorName || '');
+      setCollectorPackageId(config.collectorPackageId);
+      setShowNodeTable(false);
+      setShowCollectorOperation(true);
+      return;
+    }
+  };
+
+  const handleTableChange = (pagination: any) => {
+    setPagination(pagination);
+  };
+
+  return (
+    <MainLayout>
+      {notDeployed === '1' ? (
+        <div className="flex items-center justify-center h-full">
+          <CompactEmptyState description={t('node-manager.cloudregion.node.notDeployedTip')} />
+        </div>
+      ) : (
+        <>
+          {showNodeTable && (
+            <div className={`${nodeStyle.node} w-full h-full`}>
+              <div className="overflow-hidden">
+                {packCollectorNames.length ? (
+                  <Alert
+                    type="info"
+                    showIcon
+                    className="mb-4"
+                    message={t(
+                      'node-manager.packetManage.nodeImportCollectorHint',
+                      '',
+                      { collector: packCollectorNames.join(' / ') }
+                    )}
+                    description={t(
+                      'node-manager.packetManage.nodeImportCollectorDesc'
+                    )}
+                    action={
+                      packAlignAssetUrl ? (
+                        <Button
+                          size="small"
+                          onClick={() => router.push(packAlignAssetUrl)}
+                        >
+                          {t('node-manager.packetManage.goToStaleAssets')}
+                        </Button>
+                      ) : null
+                    }
+                  />
+                ) : null}
+                <div className="mb-4 flex items-center justify-between">
+                  <div className="mr-2 flex min-w-0 items-center gap-2">
+                    <SearchCombination
+                      fieldConfigs={fieldConfigs}
+                      onChange={handleSearchChange}
+                    />
+                  </div>
+                  <div className="flex items-center">
+                    <CatalogScopeSegmented
+                      unassignedOnly={unassignedOnly}
+                      onChange={(checked) => {
+                        setUnassignedOnly(checked);
+                        if (shouldClearNodeSelection({ reason: 'unassigned' })) {
+                          clearNodeSelection();
+                        }
+                        setPagination((prev) => ({ ...prev, current: 1 }));
+                      }}
+                      className="mr-[8px]"
+                    />
+                    <Dropdown
+                      overlayClassName="customMenu"
+                      menu={{
+                        items: [
+                          {
+                            key: 'selected',
+                            label: t(
+                              'node-manager.cloudregion.node.exportSelected'
+                            ),
+                            disabled: !selectedRowKeys.length
+                          },
+                          {
+                            key: 'currentPage',
+                            label: t(
+                              'node-manager.cloudregion.node.exportCurrentPage'
+                            )
+                          },
+                          {
+                            key: 'all',
+                            label: t(
+                              'node-manager.cloudregion.node.exportAll'
+                            )
+                          }
+                        ],
+                        onClick: ({ key }) =>
+                          handleExportNodes(key as NodeExportScope)
+                      }}
+                    >
+                      <Button className="mr-[8px]" loading={exporting}>
+                        <Space>
+                          {t('common.export')}
+                          <DownOutlined />
+                        </Space>
+                      </Button>
+                    </Dropdown>
+                    <PermissionWrapper
+                      requiredPermissions={['InstallController']}
+                    >
+                      <Button
+                        type="primary"
+                        className="mr-[8px]"
+                        onClick={handleInstallController}
+                      >
+                        {t('node-manager.cloudregion.node.installController')}
+                      </Button>
+                    </PermissionWrapper>
+                    <Dropdown
+                      className="mr-[8px]"
+                      overlayClassName="customMenu"
+                      menu={SidecarmenuProps}
+                      disabled={enableOperateController}
+                    >
+                      <Button>
+                        <Space>
+                          {t('node-manager.cloudregion.node.sidecar')}
+                          <DownOutlined />
+                        </Space>
+                      </Button>
+                    </Dropdown>
+                    <Dropdown
+                      className="mr-[8px]"
+                      overlayClassName="customMenu"
+                      menu={CollectormenuProps}
+                      disabled={enableOperateCollecter}
+                    >
+                      <Button>
+                        <Space>
+                          {t('node-manager.cloudregion.node.hostedProgram')}
+                          <DownOutlined />
+                        </Space>
+                      </Button>
+                    </Dropdown>
+                    <PermissionWrapper requiredPermissions={['Edit']}>
+                      <Button
+                        className="mr-[8px]"
+                        disabled={!selectedRowKeys.length}
+                        onClick={() => {
+                          batchEditOrganizationsRef.current?.showModal({
+                            type: 'batchEditOrganizations',
+                            ids: selectedRowKeys.map(String)
+                          });
+                        }}
+                      >
+                        {t(
+                          'node-manager.cloudregion.node.batchEdit',
+                          '批量编辑'
+                        )}
+                      </Button>
+                    </PermissionWrapper>
+                    {selectedRowKeys.length > 0 ? (
+                      <span className="mr-[8px] text-[var(--color-text-3)]">
+                        {t(
+                          'node-manager.cloudregion.node.selectedNodeCount',
+                          '',
+                          {
+                            count: selectedRowKeys.length
+                          }
+                        )}
+                      </span>
+                    ) : null}
+                    <ReloadOutlined onClick={() => getNodes(searchFilters)} />
+                  </div>
+                </div>
+                <div className={nodeStyle.table}>
+                  <CustomTable
+                    columns={tableColumns}
+                    loading={loading}
+                    dataSource={nodeList}
+                    scroll={{ y: 'calc(100vh - 380px)', x: 'max-content' }}
+                    rowSelection={rowSelection}
+                    pagination={pagination}
+                    onChange={handleTableChange}
+                  />
+                </div>
+                <CollectorModal
+                  ref={collectorRef}
+                  onSuccess={(config) => {
+                    handleCollector(config);
+                  }}
+                />
+                <ControllerUninstall
+                  ref={controllerRef}
+                  config={{
+                    os: getFirstSelectedNodeOS(),
+                    work_node: name
+                  }}
+                  onSuccess={(config) => {
+                    handleCollector(config);
+                  }}
+                />
+                <CollectorDetailDrawer
+                  ref={collectorDetailRef}
+                  nodeStateEnum={nodeStateEnum}
+                  onSuccess={() => getNodes(searchFilters)}
+                />
+                <EditNode
+                  ref={editNodeRef}
+                  onSuccess={() => getNodes(searchFilters)}
+                />
+                <BatchEditOrganizations
+                  ref={batchEditOrganizationsRef}
+                  onSuccess={() => {
+                    setSelectedRowKeys([]);
+                    getNodes(searchFilters);
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          {showInstallController && (
+            <ControllerInstall
+              config={{
+                os: getFirstSelectedNodeOS()
+              }}
+              cancel={cancelInstall}
+            />
+          )}
+          {showCollectorOperation && (
+            <CollectorOperation
+              operationType={collectorOperationType as any}
+              taskId={taskId}
+              collectorId={collectorId}
+              collectorName={collectorName}
+              collectorPackageId={collectorPackageId}
+              alignAssetUrl={
+                collectorOperationType === 'installCollector'
+                  ? packAlignAssetUrl || undefined
+                  : undefined
+              }
+              cancel={cancelCollectorOperation}
+            />
+          )}
+        </>
+      )}
+    </MainLayout>
+  );
+};
+
+export default Node;

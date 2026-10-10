@@ -1,0 +1,165 @@
+cloud_region:
+  default:
+    description: The Direct Connection Zone is used to connect and manage nodes that
+      communicate directly with the platform’s main control node.
+    name: Direct Connection Zone
+os:
+  linux: Linux
+  windows: Windows
+collector:
+  jmx_activemq_linux:
+    description: The ActiveMQ JMX (Linux) collector acquires various monitoring metrics
+      from ActiveMQ using Java Management Extensions (JMX) technology.
+    name: ActiveMQ JMX
+  telegraf_linux:
+    name: Telegraf
+    description: Telegraf (Linux) is a lightweight and highly efficient metrics collector
+      with native monitoring capabilities for diverse objects. It also serves as a
+      data hub that stores information collected by other monitoring and CMDB collectors
+      into the platform.
+  otelcollector_linux:
+    name: OTel Collector
+    description: OTel Collector (Linux) is the regional OpenTelemetry collector managed by the container-node Sidecar. It receives traces from language probes and publishes them to apm.traces.<cloud_region>.
+  jmx_weblogic_linux:
+    description: The WebLogic JMX (Linux) collector gathers various monitoring metrics
+      from WebLogic servers based on the Java Management Extensions (JMX) technology.
+    name: WebLogic JMX
+  exporter_elasticsearch_linux:
+    name: None
+    description: None
+  natsexecutor_linux:
+    description: None
+    name: Nats Executor
+  exporter_apache_linux:
+    description: None
+    name: None
+  exporter_postgres_linux:
+    name: None
+    description: None
+  exporter_nginx_linux:
+    name: None
+    description: None
+  exporter_mysql_linux:
+    name: None
+    description: None
+  exporter_oracle_linux:
+    name: Oracle Exporter
+    description: The Oracle Exporter (Linux) collector connects to the database to
+      collect various monitoring metrics from Oracle.
+  jmx_jetty_linux:
+    name: Jetty JMX
+    description: The Jetty JMX (Linux) collector acquires various monitoring metrics
+      from the Jetty server using Java Management Extensions (JMX) technology.
+  Vector_linux:
+    description: Vector (Linux) is a lightweight and efficient log collector that
+      natively supports the collection of various types of log data. It also serves
+      as a data transfer hub, storing data collected by other log collectors onto
+      the platform.
+    name: Vector
+  Vector_windows:
+    description: Vector (Windows) is a lightweight and efficient log collector that
+      natively supports the collection of various types of log data. It also serves
+      as a data transfer hub, storing data collected by other log collectors onto
+      the platform.
+    name: Vector
+  Auditbeat_linux:
+    name: Auditbeat
+    description: Auditbeat (Linux) is a lightweight audit data collector capable of
+      reliably collecting system-level audit and security event logs from servers.
+  exporter_kafka_linux:
+    description: The Kafka Exporter (Linux) collector connects to Kafka to gather
+      various monitoring metrics.
+    name: Kafka Exporter
+  exporter_kafka_linux_arm64:
+    description: The Kafka Exporter (Linux ARM64) collector connects to Kafka to
+      gather various monitoring metrics.
+    name: Kafka Exporter
+  telegraf_windows:
+    name: Telegraf
+    description: Telegraf (Windows) is a lightweight and highly efficient metrics
+      collector with native capabilities for monitoring various objects. It also functions
+      as a data transfer node, storing information collected by other monitoring and
+      CMDB collectors into the platform.
+  jmx_tomcat_linux:
+    name: None
+    description: None
+  jmx_jvm_linux:
+    name: JVM JMX
+    description: The JVM JMX (Linux) collector retrieves various monitoring metrics
+      from the Java Virtual Machine using Java Management Extensions (JMX) technology.
+  Packetbeat_linux:
+    description: 'Packetbeat(Linux) is a lightweight network packet collector that
+      can capture and analyze network traffic between servers in real-time. '
+    name: Packetbeat
+  Packetbeat_windows:
+    description: 'Packetbeat (Windows) is a lightweight network packet collector that
+      can capture and analyze network traffic between servers in real-time. '
+    name: Packetbeat
+  exporter_mongodb_linux:
+    description: None
+    name: None
+  exporter_mssql_linux:
+    description: None
+    name: None
+  Filebeat_linux:
+    name: Filebeat
+    description: 'Filebeat (Linux) is a lightweight file log collector capable of
+      reliably collecting log files from specified paths. '
+  Filebeat_windows:
+    name: Filebeat
+    description: 'Filebeat (Windows) is a lightweight file log collector capable of
+      reliably collecting log files from specified paths. '
+  jmx_jboss_linux:
+    description: None
+    name: None
+  exporter_rabbitmq_linux:
+    description: None
+    name: None
+  jmx_tongweb6_linux:
+    description: None
+    name: None
+  jmx_tongweb7_linux:
+    description: None
+    name: None
+  natsexecutor_windows:
+    description: None
+    name: Nats Executor
+  exporter_zookeeper_linux:
+    name: None
+    description: None
+  Metricbeat_linux:
+    name: Metricbeat
+    description: Metricbeat (Linux) is a lightweight metrics collector capable of
+      reliably collecting system-level and service-level performance metrics from
+      servers and various services.
+collector_tag:
+  exporter: Exporter
+  log: Log
+  beat: Beat
+  monitor: Monitor
+  apm: APM
+  jmx: JMX
+  cmdb: CMDB
+  executor: Executor
+  windows: Windows
+  linux: Linux
+controller_status:
+  abnormal: Abnormal
+  not_installed: Not Installed
+  normal: Normal
+controller:
+  linux:
+    name: Linux Controller
+    description: Linux Controller is the Sidecar used to manage Linux nodes and hosted
+      components, enabling automated deployment, resource coordination, and task execution.
+      NATS-Executor and Ansible-Executor are managed separately as hosted components.
+  windows:
+    description: Windows Controller is the Sidecar used to manage Windows nodes and
+      hosted components, enabling automated deployment, resource coordination, and
+      task execution. NATS-Executor is managed separately as a hosted component.
+    name: Windows Controller
+controller_install_method:
+  manual: Manual Installation
+  auto: Remote installation
+package:
+  unsupported_type: Unsupported package type

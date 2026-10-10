@@ -1,0 +1,76 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_sixnet",
+  "plugin": "Switch Sixnet SNMP",
+  "plugin_desc": "SNMP monitoring template for Sixnet switch. It reports uptime and interface traffic, for SLX/SL SlimLine (enterprise PEN 20540).",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='switch', collect_type='snmp_sixnet'}) by (instance_id)",
+  "name": "Switch",
+  "icon": "mm-switch_交换机",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='switch'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "psu1_status",
+    "psu2_status",
+    "ok_relay_status"
+  ],
+  "metrics": [
+    {
+      "metric_group": "Hardware Status",
+      "name": "psu1_status",
+      "query": "max(psu1_status{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "PSU1 Status",
+      "data_type": "Enum",
+      "unit": "[{\"name\":\"正常\",\"id\":1,\"color\":\"#1ac44a\"},{\"name\":\"异常\",\"id\":2,\"color\":\"#ff4d4f\"},{\"name\":\"未知\",\"id\":3,\"color\":\"#8c8c8c\"}]",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Operational state of Sixnet P1 power input, normalised so on=1 (normal), off=2 (abnormal), unknown=3 (gray, no alert)."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "psu2_status",
+      "query": "max(psu2_status{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "PSU2 Status",
+      "data_type": "Enum",
+      "unit": "[{\"name\":\"正常\",\"id\":1,\"color\":\"#1ac44a\"},{\"name\":\"异常\",\"id\":2,\"color\":\"#ff4d4f\"},{\"name\":\"未知\",\"id\":3,\"color\":\"#8c8c8c\"}]",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Operational state of Sixnet P2 power input, normalised so on=1 (normal), off=2 (abnormal), unknown=3 (gray, no alert)."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "ok_relay_status",
+      "query": "max(ok_relay_status{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "OK Relay Status",
+      "data_type": "Enum",
+      "unit": "[{\"name\":\"off\",\"id\":0,\"color\":\"#ff4d4f\"},{\"name\":\"on\",\"id\":1,\"color\":\"#1ac44a\"},{\"name\":\"unknown\",\"id\":2,\"color\":\"#8c8c8c\"}]",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Operational state of the Sixnet OK alarm relay. Native codes are off (0), on (1), and unknown (2). on means the relay is on the OK side; off or unknown means an alarm condition or an undetermined relay state."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='switch', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
+    }
+  ]
+}

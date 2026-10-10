@@ -1,0 +1,319 @@
+export interface AssignmentNotificationTarget {
+    type: 'user' | 'organization';
+    usernames?: string[];
+    organization_ids?: number[];
+    include_children?: boolean;
+}
+
+export interface AssignmentEscalationLayer {
+    personnel: string[];
+    notification_target?: AssignmentNotificationTarget;
+    wait_minutes: number;
+    notify_channels: ChannelItem[];
+}
+
+export interface AlertAssignListItem {
+    id: number;
+    priority: number;
+    created_at: string;
+    updated_at: string;
+    created_by: string;
+    updated_by: string;
+    name: string;
+    match_type: string;
+    match_rules: Record<string, any>;
+    personnel: string[];
+    notify_channels: ChannelItem[];
+    notification_scenario: string[];
+    config: {
+        type: string;
+        end_time: string;
+        start_time: string;
+        week_month: string;
+        notification_target?: AssignmentNotificationTarget;
+        escalation?: {
+            enabled: boolean;
+            mode?: 'append' | 'replace';
+            layers?: AssignmentEscalationLayer[];
+        };
+    };
+    notification_frequency: Record<
+        string,
+        { max_count: number; interval_minutes: number }
+    >;
+    is_active: boolean;
+}
+
+export interface AlertShieldListItem {
+    id: number;
+    created_at: string;
+    updated_at: string;
+    created_by: string;
+    updated_by: string;
+    name: string;
+    match_type: string;
+    match_rules: Array<Array<{
+        key: string;
+        value: string | number | (string | number)[];
+        operator: string;
+    }>>;
+    suppression_time: {
+        type: string;
+        end_time: string;
+        start_time: string;
+        week_month: string[];
+    };
+    is_active: boolean;
+}
+
+export interface AggregationRule {
+    id: number;
+    created_at: string;
+    updated_at: string;
+    created_by: string;
+    updated_by: string;
+    rule_id: string;
+    name: string;
+    description: { en: string; zh: string };
+    image: string;
+    [key: string]: any;
+}
+
+export interface FilterRule {
+    key: string;
+    operator: string;
+    value: string | number | (string | number)[];
+}
+
+export interface AlarmStrategyParams {
+    policy?: 'service' | 'location' | 'resource_name' | 'other';
+    group_by?: Array<'service' | 'location' | 'resource_name' | 'item'>;
+    window_size?: number;
+    time_out?: boolean;
+    time_minutes?: number;
+}
+
+export interface HeartbeatAlertTemplate {
+    title: string;
+    level: string;
+    description: string;
+}
+
+export interface HeartbeatParams {
+    check_mode: 'cron';
+    cron_expr: string;
+    grace_period: number;
+    activation_mode: 'first_heartbeat' | 'immediate';
+    auto_recovery: boolean;
+    heartbeat_status?: 'waiting' | 'monitoring' | 'alerting';
+    last_heartbeat_time?: string | null;
+    last_heartbeat_context?: Record<string, string | null> | null;
+    alert_template: HeartbeatAlertTemplate;
+}
+
+export interface InstantAlertTemplate {
+    title: string;
+    description: string;
+}
+
+export interface InstantParams {
+    alert_template: InstantAlertTemplate;
+}
+
+export interface CorrelationRule {
+    id: number;
+    created_at: string;
+    updated_at: string;
+    created_by: string;
+    updated_by: string;
+    name: string;
+    strategy_type?: 'smart_denoise' | 'missing_detection' | 'instant';
+    team?: string[];
+    dispatch_team?: string[];
+    match_rules?: FilterRule[][];
+    params?: AlarmStrategyParams | HeartbeatParams | InstantParams;
+    auto_close?: boolean;
+    close_minutes?: number;
+    last_execute_time?: string;
+}
+
+
+
+export interface Config {
+  notify_every: number;
+  notify_people: string[];
+  notify_channel: string[];
+}
+
+export interface GlobalConfig {
+  id: string | number;
+  key: string;
+  value: Config;
+  description: string;
+  is_activate: boolean;
+  is_build: boolean;
+}
+
+
+export interface ChannelItem {
+  id: number;
+  name: string;
+  channel_type: string;
+  team?: Array<number | string>;
+  notification_templates?: Record<string, number | null>;
+}
+
+export interface NotificationTemplateContent {
+  id?: number;
+  channel_type: string;
+  subject_template: string;
+  body_template: string;
+}
+
+export interface NotificationTemplateItem {
+  id: number;
+  name: string;
+  description: string;
+  team: number[];
+  scope: 'single_alert' | 'unassigned_summary' | 'alert_operation';
+  is_global: boolean;
+  builtin_key: string;
+  is_builtin: boolean;
+  channel_id: number | null;
+  assignment_count: number;
+  revision: number;
+  contents: NotificationTemplateContent[];
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  updated_by: string;
+}
+
+export interface NotificationTemplatePreview {
+  subject: string;
+  body: string;
+  missing_fields: string[];
+}
+
+export interface NotificationTemplatePayload {
+  name: string;
+  description?: string;
+  team?: number[];
+  scope: NotificationTemplateItem['scope'];
+  channel_id?: number | null;
+  revision?: number;
+  contents: NotificationTemplateContent[];
+}
+
+export interface NotificationTemplateListParams {
+  page?: number;
+  page_size?: number;
+  name?: string;
+  channel_type?: string;
+  scope?: NotificationTemplateItem['scope'];
+}
+
+export interface NotificationTemplatePreviewRequest {
+  channel_type: string;
+  scope: NotificationTemplateItem['scope'];
+  subject_template: string;
+  body_template: string;
+  sample?: Record<string, unknown>;
+}
+
+export interface NotificationTemplateTestSendRequest {
+  channel_id: number;
+  alert_id?: number;
+  receivers?: string[];
+  sample?: Record<string, unknown>;
+}
+
+export interface NotificationTemplateDraftTestSendRequest {
+  template_id?: number;
+  channel_id: number;
+  alert_id: number;
+  receivers: string[];
+  scope: NotificationTemplateItem['scope'];
+  channel_type: string;
+  subject_template: string;
+  body_template: string;
+}
+
+export interface NotifyOption {
+  label: string;
+  value: string;
+}
+
+export interface EnrichmentProjectionItem {
+  source: string;
+  as?: string;
+}
+
+export interface EnrichmentRuleListItem {
+  id: number;
+  name: string;
+  is_active: boolean;
+  match_rules: any[];
+  provider_type: string;
+  input_binding: Record<string, string>;
+  provider_config: Record<string, any>;
+  output_projection: EnrichmentProjectionItem[];
+  on_multiple: 'first' | 'merge' | 'list';
+  namespace: string;
+  preset_key: string;
+  is_builtin: boolean;
+  created_at: string;
+}
+
+export interface LevelFormItem {
+  id?: number;
+  level_id: number;
+  level_display_name: string;
+  color: string;
+  icon: string;
+  level_type: string;
+  built_in?: boolean;
+}
+
+export interface TargetBinding {
+  source: 'node_mgmt';
+  match_by?: 'ip' | 'name';
+  // 主机来源模式：
+  //   'from_alert'(默认) — 用 host_field 从告警 payload 里解析主机 IP
+  //   'fixed'           — 不读 alert，直接用 ip 字段写死的 IP
+  mode?: 'from_alert' | 'fixed';
+  host_field?: string;
+  ip?: string;
+}
+export interface ActionConfig {
+  script_id?: number;
+  target_binding: TargetBinding;
+  param_bindings: Array<{ name: string; from: 'field' | 'const'; value: string; allow_adjust?: boolean }>;
+  timeout?: number;
+}
+export interface ActionRuleListItem {
+  id: number;
+  name: string;
+  is_active: boolean;
+  auto_execute?: boolean;
+  team: number[];
+  trigger_events: string[];
+  match_rules: Array<Array<{ key: string; operator: string; value: string | number | (string | number)[] }>>;
+  action_type: 'job' | 'itsm' | 'webhook';
+  action_config: ActionConfig;
+  updated_at: string;
+}
+export interface ActionExecutionItem {
+  id: number;
+  rule: number | null;
+  rule_name: string | null;
+  alert_title: string | null;
+  trigger_event: string;
+  trigger_type: 'auto' | 'manual';
+  status: 'pending' | 'running' | 'success' | 'failed' | 'skipped' | 'config_error';
+  job_task_id: number | null;
+  job_detail_url: string | null;
+  result: Record<string, any>;
+  operator: string | null;
+  created_at: string;
+}

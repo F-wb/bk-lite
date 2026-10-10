@@ -1,0 +1,907 @@
+"""Kubernetes基础资源查询工具"""
+
+import json
+import re
+
+import yaml
+from kubernetes import client
+from kubernetes.client import ApiException
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+
+from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.metis.llm.tools.kubernetes.instance_scope import prepare_point_instance, run_scan_tool
+from apps.opspilot.metis.llm.tools.kubernetes.utils import coerce_bool, coerce_int, prepare_context
+
+_DEFAULT_LOG_HOURS = 24
+_MAX_LOG_HOURS = 168
+_DEFAULT_POD_LOG_LINES = 80
+_MAX_POD_LOG_LINES = 80
+_POD_LOG_RCA_MAX_CHARS = 3500
+_POD_LOG_RCA_TAIL_LINES = 40
+_POD_LOG_NO_RETRY = "这是有效证据，禁止降低 lines 再次调用本工具。"
+_POD_LOG_NO_LINES_RETRY = "禁止降低 lines 再次调用本工具。"
+_POD_LOG_HEAD_TRUNCATION_SUFFIX = "\n...(truncated)"
+_POD_LOG_COMPACT_PREFIX = "【日志已按 RCA 压缩，禁止为获取更多行再次调用本工具。】"
+_POD_LOG_ERROR_RE = re.compile(
+    r"error|exception|traceback|panic|fatal|oomkilled|\boom\b|failed|denied|refused|timeout|crash|resource_does_not_exist",
+    re.I,
+)
+
+
+def _pod_log_since_seconds(hours, *, default=_DEFAULT_LOG_HOURS):
+    """hours -> kubelet sinceSeconds（相对当前时间的滚动窗口）。
+
+    default=None 表示省略 hours 时不限窗，不传 since_seconds。
+    """
+    if default is None and (hours is None or hours == ""):
+        return None
+    fallback = _DEFAULT_LOG_HOURS if default is None else default
+    return coerce_int(hours, fallback, lo=1, hi=_MAX_LOG_HOURS) * 3600
+
+
+def _coerce_pod_log_lines(lines) -> int:
+    return coerce_int(lines, _DEFAULT_POD_LOG_LINES, lo=1, hi=_MAX_POD_LOG_LINES)
+
+
+def _empty_pod_log_message(pod_name, container, *, previous: bool) -> str:
+    if previous:
+        return f"Pod {pod_name} 容器 {container} 没有上一次实例的日志输出。{_POD_LOG_NO_RETRY}"
+    return f"Pod {pod_name} 容器 {container} 没有日志输出。{_POD_LOG_NO_RETRY}"
+
+
+def _unavailable_previous_log_message(pod_name, container) -> str:
+    return f"Pod {pod_name} 容器 {container} 没有可用的 previous 日志。{_POD_LOG_NO_RETRY}"
+
+
+def _cap_pod_logs_head(logs: str, *, max_chars: int = _POD_LOG_RCA_MAX_CHARS) -> str:
+    """tail=false：只做长度上限的头截断，不套「最近日志」式 RCA 尾摘录。"""
+    if not logs or len(logs) <= max_chars:
+        return logs
+    keep = max(0, max_chars - len(_POD_LOG_HEAD_TRUNCATION_SUFFIX))
+    return logs[:keep] + _POD_LOG_HEAD_TRUNCATION_SUFFIX
+
+
+def excerpt_pod_logs_for_rca(logs: str, *, max_chars: int = _POD_LOG_RCA_MAX_CHARS, tail_lines: int = _POD_LOG_RCA_TAIL_LINES) -> str:
+    """把超长容器日志压成 RCA 可用摘录：保住错误行和尾部，避免模型降 lines 重拉。"""
+    if not logs:
+        return logs
+    if len(logs) <= max_chars:
+        return logs
+    lines = logs.split("\n")
+    error_hits = [line for line in lines if _POD_LOG_ERROR_RE.search(line)]
+    if len(error_hits) > 40:
+        error_hits = error_hits[:8] + ["..."] + error_hits[-32:]
+    parts = [_POD_LOG_COMPACT_PREFIX]
+    if error_hits:
+        parts.append("【错误相关行】")
+        parts.extend(error_hits)
+    parts.append("【最近日志】")
+    parts.extend(lines[-tail_lines:])
+    text = "\n".join(parts)
+    if len(text) <= max_chars:
+        return text
+    omitted = "...(earlier logs omitted)\n"
+    keep = max_chars - len(_POD_LOG_COMPACT_PREFIX) - 1 - len(omitted)
+    if keep <= 0:
+        return logs[-max_chars:]
+    return _POD_LOG_COMPACT_PREFIX + "\n" + omitted + text[-keep:]
+
+
+def _finalize_pod_logs(logs, *, pod_name, container, previous: bool, tail: bool, lines: int) -> str:
+    if not tail and logs:
+        log_lines = logs.split("\n")
+        logs = "\n".join(log_lines[:lines])
+    if not logs:
+        return _empty_pod_log_message(pod_name, container, previous=previous)
+    if not tail:
+        return _cap_pod_logs_head(logs)
+    return excerpt_pod_logs_for_rca(logs)
+
+
+@tool()
+def get_kubernetes_namespaces(config: RunnableConfig):
+    """
+    列出集群中的所有命名空间
+
+    **何时使用此工具：**
+    - 用户问"有哪些命名空间"、"项目空间列表"
+    - 需要了解集群的租户/项目划分
+    - 作为其他查询的前置步骤（先选择namespace）
+    - 检查命名空间是否存在或状态异常
+
+    **工具能力：**
+    - 列出所有命名空间及其状态
+    - 显示标签和注解（用于分类和管理）
+    - 识别Terminating状态的命名空间（删除中）
+    - 提供创建时间
+
+    Args:
+        config (RunnableConfig): 工具配置（自动传递）
+
+    Returns:
+        JSON格式，包含命名空间列表：
+        - name: 命名空间名称
+        - status: 状态（Active/Terminating）
+        - creation_time: 创建时间
+        - labels: 标签
+        - annotations: 注解
+
+    **配合其他工具使用：**
+    - 获取namespace后 → 使用 list_kubernetes_pods 查看该空间的Pod
+    - 检查资源配额 → 使用 check_kubernetes_resource_quotas
+    """
+    prepare_context(config)
+
+    try:
+        core_v1 = client.CoreV1Api()
+        namespaces = core_v1.list_namespace()
+        result = []
+        for ns in namespaces.items:
+            result.append(
+                {
+                    "name": ns.metadata.name,
+                    "status": ns.status.phase,
+                    "creation_time": ns.metadata.creation_timestamp.isoformat() if ns.metadata.creation_timestamp else None,
+                    "labels": ns.metadata.labels if ns.metadata.labels else {},
+                    "annotations": ns.metadata.annotations if ns.metadata.annotations else {},
+                }
+            )
+        return json.dumps(result)
+    except Exception as e:
+        logger.exception(e)
+        return json.dumps({"error": f"获取命名空间列表失败: {str(e)}"})
+
+
+@tool()
+def list_kubernetes_pods(namespace=None, instance_name=None, config: RunnableConfig = None):
+    """
+    查看Pod列表和基本状态
+
+    **何时使用此工具：**
+    - 用户问"有哪些Pod"、"查看运行的应用"
+    - 获取特定命名空间的所有Pod概览
+    - 查看Pod分布在哪些节点
+    - 作为问题诊断的起点（先列表再深入）
+
+    **工具能力：**
+    - 列出指定命名空间或所有命名空间的Pod
+    - 显示Pod状态、IP、所在节点
+    - 展示容器列表和就绪状态
+    - 提供标签和重启策略信息
+
+    **与其他工具的区别：**
+    - 本工具：基础列表，显示概览信息
+    - get_failed_pods：只看失败的Pod
+    - diagnose_pod_issues：深度诊断单个Pod
+
+    Args:
+        namespace (str, optional): 命名空间，None=所有命名空间
+            - None: 查看整个集群的Pod
+            - "default": 只看default命名空间
+            - "prod": 只看生产环境
+        instance_name (str, optional): 多实例时指定集群；省略则扫描全部已配置实例
+        config (RunnableConfig): 工具配置（自动传递）
+
+    Returns:
+        JSON格式，包含Pod列表：
+        - name: Pod名称
+        - namespace: 命名空间
+        - phase: 状态（Running/Pending/Failed/Succeeded/Unknown）
+        - ip: Pod IP地址
+        - node: 所在节点
+        - containers[]: 容器列表
+          - name: 容器名
+          - ready: 是否就绪
+          - restart_count: 重启次数
+          - image: 镜像
+        - creation_time: 创建时间
+        - labels: 标签
+
+    **配合其他工具使用：**
+    - 发现异常Pod → 使用 diagnose_kubernetes_pod_issues 诊断
+    - 查看Pod日志 → 使用 get_kubernetes_pod_logs
+    - 检查资源使用 → 使用 get_kubernetes_node_capacity
+    """
+
+    def _run(bound_config):
+        return _list_kubernetes_pods_on_instance(namespace, bound_config)
+
+    return run_scan_tool(config, instance_name, _run)
+
+
+def _list_kubernetes_pods_on_instance(namespace, config: RunnableConfig = None):
+    prepare_context(config)
+    core_v1 = client.CoreV1Api()
+    try:
+        if namespace:
+            pods = core_v1.list_namespaced_pod(namespace)
+        else:
+            pods = core_v1.list_pod_for_all_namespaces()
+
+        result = []
+        for pod in pods.items:
+            containers = []
+            if pod.status.container_statuses:
+                for container in pod.status.container_statuses:
+                    containers.append(
+                        {
+                            "name": container.name,
+                            "ready": container.ready,
+                            "restart_count": container.restart_count,
+                            "image": container.image,
+                            "state": str(container.state),
+                        }
+                    )
+
+            result.append(
+                {
+                    "name": pod.metadata.name,
+                    "namespace": pod.metadata.namespace,
+                    "phase": pod.status.phase,
+                    "ip": pod.status.pod_ip,
+                    "node": pod.spec.node_name,
+                    "containers": containers,
+                    "creation_time": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else None,
+                    "labels": pod.metadata.labels if pod.metadata.labels else {},
+                    "restart_policy": pod.spec.restart_policy,
+                }
+            )
+        return json.dumps(result)
+    except ApiException as e:
+        return json.dumps({"error": f"获取Pod列表失败: {str(e)}"})
+
+
+@tool()
+def list_kubernetes_nodes(config: RunnableConfig):
+    """List all nodes and their status"""
+    try:
+        prepare_context(config)
+        core_v1 = client.CoreV1Api()
+        nodes = core_v1.list_node()
+        result = []
+        for node in nodes.items:
+            conditions = []
+            if node.status.conditions:
+                for condition in node.status.conditions:
+                    conditions.append({"type": condition.type, "status": condition.status, "reason": condition.reason, "message": condition.message})
+
+            allocatable = {}
+            if node.status.allocatable:
+                allocatable = {
+                    "cpu": node.status.allocatable.get("cpu", ""),
+                    "memory": node.status.allocatable.get("memory", ""),
+                    "pods": node.status.allocatable.get("pods", ""),
+                }
+
+            result.append(
+                {
+                    "name": node.metadata.name,
+                    "status": "Ready" if any(c.type == "Ready" and c.status == "True" for c in node.status.conditions) else "NotReady",
+                    "roles": list(node.metadata.labels.keys()) if node.metadata.labels else [],
+                    "age": node.metadata.creation_timestamp.isoformat() if node.metadata.creation_timestamp else None,
+                    "version": node.status.node_info.kubelet_version if node.status.node_info else "",
+                    "conditions": conditions,
+                    "allocatable": allocatable,
+                    "addresses": [{"type": addr.type, "address": addr.address} for addr in (node.status.addresses or [])],
+                }
+            )
+        return json.dumps(result)
+    except ApiException as e:
+        return json.dumps({"error": f"获取节点列表失败: {str(e)}"})
+
+
+@tool()
+def list_kubernetes_deployments(namespace=None, limit: int = 30, offset: int = 0, instance_name=None, config: RunnableConfig = None):
+    """
+    List deployments with optional namespace filter and pagination.
+
+    Args:
+        namespace (str, optional): Namespace to filter. If None, returns all namespaces.
+        limit (int, optional): Maximum number of deployments to return (default 30, max 50).
+        offset (int, optional): Number of deployments to skip for pagination (default 0).
+        instance_name (str, optional): 多实例时指定集群；省略则扫描全部已配置实例
+        config (RunnableConfig): Configuration for the tool.
+
+    Returns:
+        JSON with fields: items (list), total (int), returned (int), offset (int), has_more (bool).
+    """
+    limit = coerce_int(limit, 30, lo=1, hi=50)
+    offset = coerce_int(offset, 0, lo=0, hi=1_000_000)
+
+    def _run(bound_config):
+        return _list_kubernetes_deployments_on_instance(namespace, limit, offset, bound_config)
+
+    return run_scan_tool(config, instance_name, _run)
+
+
+def _list_kubernetes_deployments_on_instance(namespace, limit, offset, config: RunnableConfig = None):
+    prepare_context(config)
+
+    apps_v1 = client.AppsV1Api()
+    try:
+        if namespace:
+            deployments = apps_v1.list_namespaced_deployment(namespace)
+        else:
+            deployments = apps_v1.list_deployment_for_all_namespaces()
+
+        all_items = deployments.items
+        total_count = len(all_items)
+        paged_items = all_items[offset : offset + limit]
+
+        result = []
+        for deployment in paged_items:
+            result.append(
+                {
+                    "name": deployment.metadata.name,
+                    "namespace": deployment.metadata.namespace,
+                    "replicas": deployment.spec.replicas,
+                    "ready_replicas": deployment.status.ready_replicas or 0,
+                    "available_replicas": deployment.status.available_replicas or 0,
+                    "updated_replicas": deployment.status.updated_replicas or 0,
+                    "creation_time": deployment.metadata.creation_timestamp.isoformat() if deployment.metadata.creation_timestamp else None,
+                    "labels": deployment.metadata.labels if deployment.metadata.labels else {},
+                    "selector": deployment.spec.selector.match_labels if deployment.spec.selector else {},
+                }
+            )
+        payload = {
+            "items": result,
+            "total": total_count,
+            "returned": len(result),
+            "offset": offset,
+            "has_more": (offset + len(result)) < total_count,
+        }
+        if total_count > 1:
+            scope_hint = f"namespace={namespace}" if namespace else "不传 namespace（覆盖全部命名空间）"
+            payload["_next_step_hint"] = (
+                f"当前范围内共 {total_count} 个 Deployment；列表结果不含 limits/探针等配置。"
+                f"配置检查请调用 analyze_deployment_configurations（{scope_hint}），"
+                "【禁止】仅传 name 抽样单个对象，也禁止擅自改用用户未提及的命名空间（如 kube-system）。"
+                "用户说全部/所有工作负载时，必须分析约定范围内的全部对象。"
+            )
+        return json.dumps(payload, ensure_ascii=False)
+    except ApiException as e:
+        return json.dumps({"error": f"获取Deployment列表失败: {str(e)}"})
+
+
+@tool()
+def list_kubernetes_services(namespace=None, config: RunnableConfig = None):
+    """
+    List services with optional namespace filter
+
+    Args:
+        namespace (str, optional): The namespace to filter services by.
+            If None, services from all namespaces will be returned. Defaults to None.
+        config (RunnableConfig): Configuration for the tool.
+
+    Returns:
+        str: JSON string containing an array of service objects with fields:
+            - name (str): Name of the service
+            - namespace (str): Namespace where the service is running
+            - type (str): Type of the service (ClusterIP, NodePort, LoadBalancer)
+            - cluster_ip (str): The cluster IP address assigned to the service
+            - external_ip (str): External IP address, if available
+            - ports (list): List of ports exposed by the service
+            - selector (dict): Label selector used by the service
+            - creation_time (str): Timestamp when service was created
+    """
+    prepare_context(config)
+    try:
+        core_v1 = client.CoreV1Api()
+        if namespace:
+            services = core_v1.list_namespaced_service(namespace)
+        else:
+            services = core_v1.list_service_for_all_namespaces()
+
+        result = []
+        for service in services.items:
+            ports = []
+            if service.spec.ports:
+                for port in service.spec.ports:
+                    ports.append(
+                        {
+                            "name": port.name,
+                            "port": port.port,
+                            "target_port": str(port.target_port) if port.target_port else None,
+                            "protocol": port.protocol,
+                            "node_port": port.node_port if hasattr(port, "node_port") else None,
+                        }
+                    )
+
+            external_ips = []
+            if service.status.load_balancer and service.status.load_balancer.ingress:
+                for ingress in service.status.load_balancer.ingress:
+                    if ingress.ip:
+                        external_ips.append(ingress.ip)
+                    elif ingress.hostname:
+                        external_ips.append(ingress.hostname)
+
+            result.append(
+                {
+                    "name": service.metadata.name,
+                    "namespace": service.metadata.namespace,
+                    "type": service.spec.type,
+                    "cluster_ip": service.spec.cluster_ip,
+                    "external_ips": external_ips,
+                    "ports": ports,
+                    "selector": service.spec.selector if service.spec.selector else {},
+                    "creation_time": service.metadata.creation_timestamp.isoformat() if service.metadata.creation_timestamp else None,
+                }
+            )
+        return json.dumps(result)
+    except ApiException as e:
+        return json.dumps({"error": f"获取Service列表失败: {str(e)}"})
+
+
+@tool()
+def list_kubernetes_events(namespace=None, instance_name=None, config: RunnableConfig = None):
+    """
+    List events with optional namespace filter
+
+    Args:
+        namespace (str, optional): The namespace to filter events by.
+            If None, events from all namespaces will be returned. Defaults to None.
+        instance_name (str, optional): 多实例时指定集群；省略则扫描全部已配置实例
+        config (RunnableConfig): Configuration for the tool.
+
+    Returns:
+        str: JSON string containing an array of event objects with fields:
+            - type (str): Type of event (Normal, Warning)
+            - reason (str): Short reason for the event
+            - message (str): Detailed message about the event
+            - object (str): Object involved in the event
+            - namespace (str): Namespace where the event occurred
+            - count (int): Number of times this event has occurred
+            - first_time (str): Timestamp when event first occurred
+            - last_time (str): Timestamp when event last occurred
+    """
+
+    def _run(bound_config):
+        return _list_kubernetes_events_on_instance(namespace, bound_config)
+
+    return run_scan_tool(config, instance_name, _run)
+
+
+def _list_kubernetes_events_on_instance(namespace, config: RunnableConfig = None):
+    prepare_context(config)
+    try:
+        core_v1 = client.CoreV1Api()
+        if namespace:
+            events = core_v1.list_namespaced_event(namespace)
+        else:
+            events = core_v1.list_event_for_all_namespaces()
+
+        result = []
+        for event in events.items:
+            result.append(
+                {
+                    "type": event.type,
+                    "reason": event.reason,
+                    "message": event.message,
+                    "object": f"{event.involved_object.kind}/{event.involved_object.name}",
+                    "namespace": getattr(event, "namespace", "") or getattr(event.metadata, "namespace", ""),
+                    "count": event.count,
+                    "first_time": event.first_timestamp.isoformat() if event.first_timestamp else None,
+                    "last_time": event.last_timestamp.isoformat() if event.last_timestamp else None,
+                }
+            )
+        return json.dumps(result)
+    except ApiException as e:
+        return json.dumps({"error": f"获取事件列表失败: {str(e)}"})
+
+
+@tool()
+def get_kubernetes_resource_yaml(namespace, resource_type, resource_name, instance_name=None, config: RunnableConfig = None):
+    """
+    Retrieves the YAML configuration for a specified Kubernetes resource.
+
+    Fetches the complete configuration of a resource, which can be useful for
+    debugging, documentation, or backup purposes.
+
+    Args:
+        namespace (str): The Kubernetes namespace containing the resource.
+        resource_type (str): The type of resource to retrieve.
+            Supported types: 'pod', 'deployment', 'service', 'configmap',
+            'secret', 'job'
+        resource_name (str): The name of the specific resource to retrieve.
+        instance_name (str, optional): 多实例时必须指定集群
+        config (RunnableConfig): Configuration for the tool.
+
+    Returns:
+        str: YAML string representation of the resource configuration.
+
+    Raises:
+        ApiException: If there is an error communicating with the Kubernetes API
+        ValueError: If an unsupported resource type is specified
+    """
+    config, instance_error = prepare_point_instance(config, instance_name)
+    if instance_error:
+        return instance_error
+    prepare_context(config)
+    try:
+        core_v1 = client.CoreV1Api()
+        apps_v1 = client.AppsV1Api()
+        batch_v1 = client.BatchV1Api()
+
+        resource_data = None
+
+        if resource_type == "pod":
+            resource_data = core_v1.read_namespaced_pod(resource_name, namespace)
+        elif resource_type == "deployment":
+            resource_data = apps_v1.read_namespaced_deployment(resource_name, namespace)
+        elif resource_type == "service":
+            resource_data = core_v1.read_namespaced_service(resource_name, namespace)
+        elif resource_type == "configmap":
+            resource_data = core_v1.read_namespaced_config_map(resource_name, namespace)
+        elif resource_type == "secret":
+            resource_data = core_v1.read_namespaced_secret(resource_name, namespace)
+        elif resource_type == "job":
+            resource_data = batch_v1.read_namespaced_job(resource_name, namespace)
+        else:
+            return f"不支持的资源类型: {resource_type}。支持的类型: pod, deployment, service, configmap, secret, job"
+
+        # Convert to dict and then to YAML
+        resource_dict = client.ApiClient().sanitize_for_serialization(resource_data)
+
+        # 过滤冗余字段以减少 token 消耗和 Content Filter 触发风险
+        if "metadata" in resource_dict:
+            resource_dict["metadata"].pop("managedFields", None)
+            annotations = resource_dict["metadata"].get("annotations")
+            if isinstance(annotations, dict):
+                annotations.pop("kubectl.kubernetes.io/last-applied-configuration", None)
+        resource_dict.pop("status", None)
+
+        yaml_str = yaml.dump(resource_dict, default_flow_style=False)
+
+        return yaml_str
+    except ApiException as e:
+        return f"获取资源YAML失败: {str(e)}"
+
+
+@tool()
+def get_kubernetes_pod_logs(
+    namespace,
+    pod_name,
+    container=None,
+    lines: int = 80,
+    tail: bool = True,
+    hours: int = 24,
+    instance_name=None,
+    config: RunnableConfig = None,
+):
+    """
+    获取Pod容器日志 - 定位应用程序错误
+
+    **何时使用此工具：**
+    - 用户说"查看日志"、"看看报什么错"
+    - Pod启动失败需要查看启动日志
+    - 应用程序行为异常需要查看运行日志
+    - 从 diagnose_pod_issues 发现问题后查看详细错误
+    - 分析应用崩溃、异常退出的具体原因
+
+    **工具能力：**
+    - 获取容器的标准输出日志（stdout/stderr）
+    - 支持多容器Pod（可指定容器名）
+    - 可获取最近N行或开头N行
+    - 自动处理单容器Pod（无需指定容器名）
+
+    **日志分析场景：**
+    - CrashLoopBackOff → 查看最近日志，找panic/error
+    - ImagePullBackOff → 日志为空，检查镜像地址
+    - OOMKilled → 查看崩溃前日志，分析内存占用
+    - 应用错误 → 搜索Exception、Error、Failed关键词
+
+    **重要提示：**
+    - 本工具只能获取当前运行容器的日志
+    - 容器已重启时，上一轮日志用 get_kubernetes_previous_pod_logs
+    - 默认只取近 24 小时（滚动窗口），再按 lines 截取；频繁重启先看当天即可
+    - 超长日志会压缩为错误行+尾部；空日志是有效证据，禁止降 lines 重试
+
+    Args:
+        namespace (str): Pod所在命名空间（必填）
+        pod_name (str): Pod名称（必填）
+        container (str, optional): 容器名称，多容器Pod必须指定
+            - None: 自动选择第一个容器（仅适用于单容器Pod）
+            - "app": 指定名为app的容器
+        lines (int, optional): 日志行数，默认80，最大80。超长日志由工具压缩，禁止降 lines 重试。
+        tail (bool, optional): True=最后N行，False=开头N行，默认True
+            - True: 查看最新日志（推荐）
+            - False: 查看启动初期日志
+        hours (int, optional): 近 N 小时（滚动窗口），默认24；最大168
+        config (RunnableConfig): 工具配置（自动传递）
+
+    Returns:
+        日志文本内容，或错误信息：
+        - 成功: 容器的实际日志输出
+        - 失败: 错误原因（Pod不存在、容器不存在、容器创建中等）
+
+    **配合其他工具使用：**
+    - 发现Pod问题 → 使用 diagnose_kubernetes_pod_issues 确定需要查看哪个Pod
+    - 日志显示OOM → 使用 check_oom_events 分析内存配置
+    - 日志显示网络错误 → 使用 trace_service_chain 检查服务链路
+    - 需要重启恢复 → 使用 restart_pod
+    """
+    config, instance_error = prepare_point_instance(config, instance_name)
+    if instance_error:
+        return instance_error
+    prepare_context(config)
+    lines = _coerce_pod_log_lines(lines)
+    tail = coerce_bool(tail, True)
+    since_seconds = _pod_log_since_seconds(hours)
+    try:
+        core_v1 = client.CoreV1Api()
+
+        # 先检查 Pod 是否存在，并获取容器信息
+        try:
+            pod = core_v1.read_namespaced_pod(pod_name, namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return f"Pod {pod_name} 在命名空间 {namespace} 中不存在"
+            raise
+
+        # 如果未指定容器名称且 Pod 有多个容器，获取容器列表
+        if not container and pod.spec.containers and len(pod.spec.containers) > 1:
+            container_names = [c.name for c in pod.spec.containers]
+            return f"Pod {pod_name} 包含多个容器: {container_names}。请指定容器名称。"
+
+        # 如果未指定容器且只有一个容器，使用该容器
+        if not container and pod.spec.containers and len(pod.spec.containers) == 1:
+            container = pod.spec.containers[0].name
+
+        # 获取日志
+        logs = core_v1.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=namespace,
+            container=container,
+            since_seconds=since_seconds,
+            tail_lines=lines if tail else None,
+            limit_bytes=None if lines else 1024 * 1024,  # 1MB limit if no line limit
+        )
+        return _finalize_pod_logs(logs, pod_name=pod_name, container=container, previous=False, tail=tail, lines=lines)
+
+    except ApiException as e:
+        error_message = str(e)
+        if "ContainerCreating" in error_message:
+            return f"容器 {container} 正在创建中，日志暂不可用"
+        elif "ContainerNotFound" in error_message:
+            return f"在 Pod {pod_name} 中找不到容器 {container}"
+        else:
+            return f"获取Pod日志失败: {error_message}"
+    except Exception as e:
+        return f"获取Pod日志时发生未知错误: {str(e)}"
+
+
+@tool()
+def get_kubernetes_previous_pod_logs(
+    namespace,
+    pod_name,
+    container=None,
+    lines: int = 80,
+    tail: bool = True,
+    hours=None,
+    instance_name=None,
+    config: RunnableConfig = None,
+):
+    """
+    获取Pod容器上一次实例的日志，用于重启类故障采集。
+
+    **何时使用此工具：**
+    - 已知具体 Pod，分析频繁重启的上一轮死因
+    - diagnose 已给出 last_state，需要对照崩溃现场日志
+    - 当前轮日志干净，但 restart_count > 0
+
+    **重要提示：**
+    - kubelet 只保留最近一次 previous 日志，不能还原全部历史重启
+    - 不要用本工具扫全集群；必须带 namespace 和 pod_name
+
+    Args:
+        namespace (str): Pod所在命名空间
+        pod_name (str): Pod名称
+        container (str, optional): 容器名称，多容器Pod必须指定
+        lines (int, optional): 日志行数，默认80，最大80。超长由工具压缩；没有 previous 是有效证据，禁止降 lines 重试
+        tail (bool, optional): True=最后N行，False=开头N行
+        hours (int, optional): 近 N 小时（滚动窗口）；默认不限窗。仅显式传入时才按 sinceSeconds 过滤
+        instance_name (str, optional): 多实例时必须指定集群
+        config (RunnableConfig): 工具配置
+
+    Returns:
+        str: previous 容器日志文本，或错误信息
+    """
+    config, instance_error = prepare_point_instance(config, instance_name)
+    if instance_error:
+        return instance_error
+    prepare_context(config)
+    lines = _coerce_pod_log_lines(lines)
+    tail = coerce_bool(tail, True)
+    since_seconds = _pod_log_since_seconds(hours, default=None)
+    try:
+        core_v1 = client.CoreV1Api()
+
+        try:
+            pod = core_v1.read_namespaced_pod(pod_name, namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return f"Pod {pod_name} 在命名空间 {namespace} 中不存在"
+            raise
+
+        if not container and pod.spec.containers and len(pod.spec.containers) > 1:
+            container_names = [c.name for c in pod.spec.containers]
+            return f"Pod {pod_name} 包含多个容器: {container_names}。请指定容器名称。"
+
+        if not container and pod.spec.containers and len(pod.spec.containers) == 1:
+            container = pod.spec.containers[0].name
+
+        log_kwargs = {
+            "name": pod_name,
+            "namespace": namespace,
+            "container": container,
+            "previous": True,
+            "tail_lines": lines if tail else None,
+            "limit_bytes": None if lines else 1024 * 1024,
+        }
+        if since_seconds is not None:
+            log_kwargs["since_seconds"] = since_seconds
+        logs = core_v1.read_namespaced_pod_log(**log_kwargs)
+
+        if not logs:
+            if since_seconds is not None:
+                window_hours = since_seconds // 3600
+                return (
+                    f"Pod {pod_name} 容器 {container} 在近 {window_hours} 小时滚动窗口内没有 previous 日志。"
+                    f"这不等于没有 previous 容器；可加大 hours 或不传 hours（不限窗）再查。"
+                    f"{_POD_LOG_NO_LINES_RETRY}"
+                )
+            return _empty_pod_log_message(pod_name, container, previous=True)
+
+        return _finalize_pod_logs(logs, pod_name=pod_name, container=container, previous=True, tail=tail, lines=lines)
+
+    except ApiException as e:
+        error_message = str(e)
+        if "previous terminated container" in error_message or "not found" in error_message.lower():
+            return _unavailable_previous_log_message(pod_name, container)
+        elif "ContainerNotFound" in error_message:
+            return f"在 Pod {pod_name} 中找不到容器 {container}"
+        else:
+            return f"获取 previous Pod 日志失败: {error_message}"
+    except Exception as e:
+        return f"获取 previous Pod 日志时发生未知错误: {str(e)}"
+
+
+@tool()
+def search_workload_across_namespaces(workload_name: str, config: RunnableConfig = None):
+    """
+    在所有已配置的集群和命名空间中搜索指定名称的工作负载（Deployment/StatefulSet/DaemonSet）。
+
+    **何时使用此工具：**
+    - 用户指定了工作负载名称但没有指定集群或命名空间
+    - 需要知道某个应用部署在哪些集群和命名空间中
+    - 判断某个应用是否全局唯一（只存在于一个集群的一个命名空间）
+    - **替代逐个空间调用 list_kubernetes_deployments 的方式，一次完成搜索**
+
+    **工具能力：**
+    - 自动遍历所有已配置的 Kubernetes 集群
+    - 在每个集群的所有命名空间中搜索
+    - 同时搜索 Deployment、StatefulSet、DaemonSet 三种工作负载类型
+    - 返回找到的位置列表（含集群名）和是否唯一的标志
+
+    **典型使用场景：**
+    1. 用户说"检查 scheduler 的配置" → 搜索发现只在 minikube/production 有 → 直接检查，不问用户
+    2. 用户说"检查 order-api 的配置" → 搜索发现在多个集群/空间 → 让用户选择
+
+    Args:
+        workload_name (str): 工作负载名称（必填），如 "order-api"、"scheduler"
+        config (RunnableConfig): 工具配置（自动传递）
+
+    Returns:
+        JSON格式，包含：
+        - workload_name: 搜索的工作负载名称
+        - found: 是否找到
+        - unique: 是否全局唯一（只在一个集群的一个命名空间中存在）
+        - locations: 找到的位置列表，每项包含 cluster、namespace、kind、replicas、ready_replicas
+        - total_count: 找到的总数
+    """
+    from apps.opspilot.metis.llm.tools.kubernetes.connection import get_kubernetes_instances_from_configurable
+
+    configurable = config.get("configurable", {}) if config else {}
+    instances = get_kubernetes_instances_from_configurable(configurable)
+
+    locations = []
+
+    def _search_current_cluster(cluster_name):
+        """Search for the workload in the currently loaded cluster context."""
+        try:
+            apps_v1 = client.AppsV1Api()
+
+            for dep in apps_v1.list_deployment_for_all_namespaces().items:
+                if dep.metadata.name == workload_name:
+                    locations.append(
+                        {
+                            "cluster": cluster_name,
+                            "namespace": dep.metadata.namespace,
+                            "kind": "Deployment",
+                            "replicas": dep.spec.replicas,
+                            "ready_replicas": dep.status.ready_replicas or 0,
+                        }
+                    )
+
+            for sts in apps_v1.list_stateful_set_for_all_namespaces().items:
+                if sts.metadata.name == workload_name:
+                    locations.append(
+                        {
+                            "cluster": cluster_name,
+                            "namespace": sts.metadata.namespace,
+                            "kind": "StatefulSet",
+                            "replicas": sts.spec.replicas,
+                            "ready_replicas": sts.status.ready_replicas or 0,
+                        }
+                    )
+
+            for ds in apps_v1.list_daemon_set_for_all_namespaces().items:
+                if ds.metadata.name == workload_name:
+                    locations.append(
+                        {
+                            "cluster": cluster_name,
+                            "namespace": ds.metadata.namespace,
+                            "kind": "DaemonSet",
+                            "replicas": ds.status.desired_number_scheduled or 0,
+                            "ready_replicas": ds.status.number_ready or 0,
+                        }
+                    )
+        except ApiException as e:
+            logger.warning("搜索集群 %s 中的工作负载失败: %s", cluster_name, str(e))
+
+    if instances and len(instances) > 0:
+        # Multi-instance: iterate through all configured clusters
+        for instance in instances:
+            cluster_name = instance.get("name", "unknown")
+            try:
+                kubeconfig_data = instance.get("kubeconfig_data", "")
+                if kubeconfig_data:
+                    import io as _io
+
+                    from kubernetes import config as kube_config
+
+                    from apps.opspilot.metis.llm.tools.kubernetes.utils import _preprocess_kubeconfig
+
+                    if isinstance(kubeconfig_data, str):
+                        kubeconfig_data = kubeconfig_data.replace("\\n", "\n")
+                    kubeconfig_data = _preprocess_kubeconfig(kubeconfig_data)
+                    kubeconfig_io = _io.StringIO(kubeconfig_data)
+                    kube_config.load_kube_config(config_file=kubeconfig_io)
+                    _search_current_cluster(cluster_name)
+            except Exception as e:
+                logger.warning("加载集群 %s 配置失败: %s", cluster_name, str(e))
+    else:
+        # Single instance or default kubeconfig
+        prepare_context(config)
+        _search_current_cluster("default")
+
+    is_unique = len(locations) == 1
+    result = {
+        "workload_name": workload_name,
+        "found": len(locations) > 0,
+        "unique": is_unique,
+        "locations": locations,
+        "total_count": len(locations),
+    }
+
+    if len(locations) > 1:
+        # 多个匹配：强制要求 LLM 向用户询问
+        choices_desc = ", ".join(f"{loc['cluster']} / {loc['namespace']} / {loc['kind']}" for loc in locations)
+        result["_next_step_hint"] = (
+            f"找到多个名为 {workload_name} 的工作负载：{choices_desc}。"
+            "你【必须】立即调用 request_user_choice 工具，让用户选择要检查哪一个。"
+            "选项格式为：'集群名 / 命名空间 / 类型'。"
+            "在用户做出选择之前，禁止调用 analyze_deployment_configurations 或其他分析工具。"
+        )
+    elif len(locations) == 1:
+        loc = locations[0]
+        result["_next_step_hint"] = (
+            f"全局唯一，直接对 {loc['cluster']} / {loc['namespace']} 中的 {workload_name} 执行后续操作，"
+            f"调用 analyze_deployment_configurations 时传入 instance_name=\"{loc['cluster']}\"、"
+            f"namespace=\"{loc['namespace']}\"、name=\"{workload_name}\"。"
+        )
+    else:
+        result["_next_step_hint"] = f"未找到名为 {workload_name} 的工作负载。请告知用户未找到该工作负载，确认名称是否正确。"
+
+    return json.dumps(result)

@@ -1,0 +1,136 @@
+'use client';
+
+import React from 'react';
+import { useSimpleDashboardData } from '../common/simple-dashboard-core';
+import {
+  DashboardShell,
+  DetailPanelCard,
+  FlexiblePanelSection,
+  KpiSection,
+  useFilteredChartPanels,
+  useFilteredDetailPanels,
+  useFilteredRingPanels,
+  useFilteredSummaryCards, DashboardSectionLabel } from '../common/dashboard-components';
+import { RingChartPanel, TrendChartPanel } from '../../shared/widgets';
+import { APACHE_DASHBOARD_CONFIG } from './config';
+import styles from './index.module.scss';
+
+const SUMMARY_TITLES = ['运行时长', '请求处理速率', '数据传输速率', 'Worker 饱和度', '请求变化速率'];
+const CHART_TITLES = ['请求速率趋势', '传输速率趋势', 'Worker 状态趋势', 'Scoreboard 状态趋势', '系统负载趋势'];
+const RING_TITLES = ['Worker 使用分布'];
+const DETAIL_TITLES = ['运行细节'];
+
+export default function ApacheDashboardPage() {
+  const dashboard = useSimpleDashboardData(APACHE_DASHBOARD_CONFIG);
+  const summaryCards = useFilteredSummaryCards(dashboard.summaryCards, SUMMARY_TITLES);
+  const charts = useFilteredChartPanels(dashboard.chartPanels, CHART_TITLES);
+  const rings = useFilteredRingPanels(dashboard.ringPanels, RING_TITLES);
+  const details = useFilteredDetailPanels(dashboard.detailPanels, DETAIL_TITLES);
+
+  const [reqRateChart, byteRateChart, workerChart, scoreboardChart, loadChart] = charts;
+  const [workerRing] = rings;
+  const [runtimeDetail] = details;
+
+  return (
+    <DashboardShell
+      dashboard={dashboard}
+      styles={styles}
+      dashboardContent={
+        <>
+          <DashboardSectionLabel styles={styles}>健康概览</DashboardSectionLabel>
+          <KpiSection dashboard={dashboard} summaryCards={summaryCards} kpiCols={6} styles={styles} />
+
+          {/* Row 1: 请求速率 + 传输速率；Worker 状态 */}
+          <DashboardSectionLabel styles={styles}>性能趋势</DashboardSectionLabel>
+          <FlexiblePanelSection styles={styles}>
+            {[reqRateChart, byteRateChart, workerChart].map((chart) =>
+              chart ? (
+                <TrendChartPanel
+                  key={chart.chart.title}
+                  title={chart.chart.title}
+                  subtitle={chart.chart.subtitle}
+                  guide={chart.chart.guide}
+                  legends={chart.legends}
+                  data={chart.data}
+                  metric={chart.metric}
+                  unit={chart.unit}
+                  loading={dashboard.loading}
+                  seriesStyles={chart.seriesStyles}
+                  onXRangeChange={dashboard.onXRangeChange}
+                  className={`${styles.span4} ${styles.compactTrend}`}
+                  styles={styles}
+                />
+              ) : null
+            )}
+          </FlexiblePanelSection>
+
+          {/* Row 2: Worker 使用环 span4 + 系统负载趋势 span8 = 12 —— 环图配折线消除中部留白 */}
+          <DashboardSectionLabel styles={styles}>分布与负载</DashboardSectionLabel>
+          <FlexiblePanelSection styles={styles}>
+            {workerRing ? (
+              <RingChartPanel
+                key={workerRing.panel.title}
+                title={workerRing.panel.title}
+                subtitle={workerRing.panel.subtitle}
+                guide={workerRing.panel.guide}
+                data={workerRing.data}
+                centerValue={workerRing.centerValue}
+                centerCaption={workerRing.panel.centerCaption}
+                isEmpty={workerRing.isEmpty}
+                className={styles.span4}
+                styles={styles}
+              />
+            ) : null}
+            {loadChart ? (
+              <TrendChartPanel
+                key={loadChart.chart.title}
+                title={loadChart.chart.title}
+                subtitle={loadChart.chart.subtitle}
+                guide={loadChart.chart.guide}
+                legends={loadChart.legends}
+                data={loadChart.data}
+                metric={loadChart.metric}
+                unit={loadChart.unit}
+                loading={dashboard.loading}
+                seriesStyles={loadChart.seriesStyles}
+                onXRangeChange={dashboard.onXRangeChange}
+                className={`${styles.span8} ${styles.compactTrend}`}
+                styles={styles}
+              />
+            ) : null}
+          </FlexiblePanelSection>
+
+          {/* Row 3: Scoreboard 趋势 span6 + 运行细节详情 span6 = 12 —— 详情配折线 */}
+          <DashboardSectionLabel styles={styles}>连接与详情</DashboardSectionLabel>
+          <FlexiblePanelSection styles={styles}>
+            {scoreboardChart ? (
+              <TrendChartPanel
+                key={scoreboardChart.chart.title}
+                title={scoreboardChart.chart.title}
+                subtitle={scoreboardChart.chart.subtitle}
+                guide={scoreboardChart.chart.guide}
+                legends={scoreboardChart.legends}
+                data={scoreboardChart.data}
+                metric={scoreboardChart.metric}
+                unit={scoreboardChart.unit}
+                loading={dashboard.loading}
+                seriesStyles={scoreboardChart.seriesStyles}
+                onXRangeChange={dashboard.onXRangeChange}
+                className={`${styles.span6} ${styles.compactTrend}`}
+                styles={styles}
+              />
+            ) : null}
+            {runtimeDetail ? (
+              <DetailPanelCard
+                key={runtimeDetail.panel.title}
+                detailPanel={runtimeDetail}
+                className={styles.span6}
+                styles={styles}
+              />
+            ) : null}
+          </FlexiblePanelSection>
+        </>
+      }
+    />
+  );
+}

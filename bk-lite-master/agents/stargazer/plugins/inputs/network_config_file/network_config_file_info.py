@@ -1,0 +1,226 @@
+import base64
+import re
+import time
+import uuid
+
+from core.logger import logger
+from plugins.inputs.network_config_file.constants import (
+    COMMAND_ERROR_PATTERNS,
+    DANGEROUS_COMMAND_PREFIXES,
+    DANGEROUS_EXACT_COMMANDS,
+    DEVICE_TYPE_DISABLE_PAGING,
+    SCRAPLI_PLATFORM_BY_DEVICE_TYPE,
+    SUPPORTED_DEVICE_TYPES,
+)
+from scrapli import AsyncScrapli
+from scrapli.driver.generic.async_driver import AsyncGenericDriver
+
+HTTP_HEADER_COMMANDS_PREFIX = "b64:"
+SSH_TRANSPORT = "asyncssh"
+TELNET_TRANSPORT = "asynctelnet"
+SSH_DEFAULT_PORT = 22
+TELNET_DEFAULT_PORT = 23
+TELNET_ALIASES = {"telnet", "asynctelnet"}
+SSH_ALIASES = {"ssh", "asyncssh"}
+
+
+def resolve_cli_transport(params: dict | None) -> tuple[str, str, int]:
+    """解析 CLI 传输：返回 (ssh|telnet, scrapli transport, 默认端口)。
+
+    正式字段为 ``transport_protocol``。``protocol`` 仅在值为 ssh/telnet 别名时生效，
+    避免 ``protocol_version`` 等其它 protocol 键误改传输。未知或缺失回退 SSH/22。
+    """
+    source = params or {}
+    protocol = "ssh"
+    for key in ("transport_protocol", "protocol"):
+        raw = str(source.get(key) or "").strip().lower()
+        if raw in TELNET_ALIASES:
+            protocol = "telnet"
+            break
+        if raw in SSH_ALIASES:
+            protocol = "ssh"
+            break
+    if protocol == "telnet":
+        return "telnet", TELNET_TRANSPORT, TELNET_DEFAULT_PORT
+    return "ssh", SSH_TRANSPORT, SSH_DEFAULT_PORT
+
+
+def decode_http_header_commands(raw_commands) -> str:
+    text = str(raw_commands or "")
+    if not text.startswith(HTTP_HEADER_COMMANDS_PREFIX):
+        return text
+    payload = text[len(HTTP_HEADER_COMMANDS_PREFIX) :]
+    try:
+        return base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as err:
+        raise ValueError("采集命令头编码无效") from err
+
+
+def validate_safe_command(command: str) -> str:
+    normalized = " ".join(str(command or "").strip().split())
+    lowered = normalized.lower()
+    if not lowered:
+        raise ValueError("采集命令不能为空")
+    if lowered in DANGEROUS_EXACT_COMMANDS:
+        raise ValueError(f"采集命令存在高危操作: {normalized}")
+    first_word = re.split(r"\s+", lowered, maxsplit=1)[0]
+    if first_word in DANGEROUS_COMMAND_PREFIXES:
+        raise ValueError(f"采集命令存在高危操作: {normalized}")
+    return normalized
+
+
+class NetworkConfigFileInfo:
+    def __init__(self, params):
+        self.params = params or {}
+
+    @staticmethod
+    def merge_command_outputs(results: list[dict]) -> str:
+        sections = []
+        for item in results:
+            sections.append(f"===== command: {item.get('command', '')} =====\n{item.get('output', '')}")
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _has_command_error(output: str) -> bool:
+        lowered = str(output or "").lower()
+        return any(pattern in lowered for pattern in COMMAND_ERROR_PATTERNS)
+
+    def _commands(self) -> list[str]:
+        raw = decode_http_header_commands(self.params.get("commands"))
+        return [validate_safe_command(line) for line in raw.splitlines() if line.strip()]
+
+    def _connect_params(self) -> dict:
+        device_type = str(self.params.get("device_type") or "").strip()
+        if device_type not in SUPPORTED_DEVICE_TYPES:
+            raise ValueError(f"不支持的异步网络驱动: {device_type}")
+        _, scrapli_transport, default_port = resolve_cli_transport(self.params)
+        return {
+            "platform": SCRAPLI_PLATFORM_BY_DEVICE_TYPE[device_type],
+            "host": self.params.get("host") or self.params.get("connect_ip"),
+            "auth_username": self.params.get("username"),
+            "auth_password": self.params.get("password"),
+            "auth_secondary": self.params.get("enable_password") or "",
+            "port": int(self.params.get("port") or default_port),
+            # 目标管理 IP 已随采集任务落在 CMDB；任务下发即授权该地址，不再用 known_hosts 拒绝。
+            "auth_strict_key": False,
+            "transport": scrapli_transport,
+            "timeout_socket": 30.0,  # 建连超时硬编码
+            "timeout_transport": 30.0,
+            "timeout_ops": 60.0,  # 单命令超时硬编码；表单 timeout 由框架作单对象预算
+        }
+
+    @staticmethod
+    def _create_connection(connect_params: dict):
+        if connect_params["platform"] != "f5_tmsh":
+            return AsyncScrapli(**connect_params)
+        generic_params = dict(connect_params)
+        generic_params.pop("platform", None)
+        generic_params.pop("auth_secondary", None)
+        return AsyncGenericDriver(**generic_params)
+
+    def _success_payload(self, merged_output: str) -> dict:
+        if str(self.params.get("protocol_version") or "") != "2":
+            raise ValueError("unsupported config collection protocol version")
+        target_instance_uuid = str(self.params.get("target_instance_uuid") or "").strip()
+        try:
+            parsed_uuid = uuid.UUID(target_instance_uuid)
+        except (TypeError, ValueError, AttributeError) as err:
+            raise ValueError("target_instance_uuid must be a valid UUIDv4") from err
+        if parsed_uuid.version != 4 or str(parsed_uuid) != target_instance_uuid.lower():
+            raise ValueError("target_instance_uuid must be a canonical UUIDv4")
+
+        encoded = base64.b64encode(merged_output.encode()).decode()
+        config_name = str(self.params.get("config_name") or "").strip()
+        return {
+            "collect_task_id": self.params.get("collect_task_id"),
+            "protocol_version": "2",
+            "instance_uuid": target_instance_uuid,
+            "instance_name": self.params.get("instance_name") or self.params.get("host") or "",
+            "model_id": self.params.get("target_model_id"),
+            "file_path": f"network://{config_name}",
+            "file_name": config_name,
+            "version": str(int(time.time() * 1000)),
+            "status": "success",
+            "size": len(merged_output.encode()),
+            "error": "",
+            "content_base64": encoded,
+        }
+
+    async def list_all_resources(self, need_raw=False):
+        del need_raw
+        command_results = []
+        failures = []
+        connection = None
+        try:
+            commands = self._commands()
+            connect_params = self._connect_params()
+            connection = self._create_connection(connect_params)
+            await connection.open()
+            if self.params.get("enable_password"):
+                await connection.acquire_priv("privilege_exec")
+            device_type = str(self.params.get("device_type") or "")
+            paging_command = DEVICE_TYPE_DISABLE_PAGING.get(device_type)
+            if paging_command:
+                await connection.send_command(paging_command)
+
+            for command in commands:
+                started = time.monotonic()
+                try:
+                    response = await connection.send_command(command)
+                    output = str(response.result or "")
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    if bool(response.failed) or self._has_command_error(output):
+                        failures.append(f"{command}: {output[:200]}")
+                        command_results.append(
+                            {
+                                "command": command,
+                                "status": "error",
+                                "error": output[:200],
+                                "duration_ms": duration_ms,
+                            }
+                        )
+                        continue
+                    command_results.append(
+                        {
+                            "command": command,
+                            "status": "success",
+                            "output": output,
+                            "duration_ms": duration_ms,
+                        }
+                    )
+                except Exception as err:
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    failures.append(f"{command}: {type(err).__name__}")
+                    command_results.append(
+                        {
+                            "command": command,
+                            "status": "error",
+                            "error": type(err).__name__,
+                            "duration_ms": duration_ms,
+                        }
+                    )
+
+            if failures:
+                return {
+                    "success": False,
+                    "result": {"cmdb_collect_error": "; ".join(failures)[:2000]},
+                }
+            return {
+                "success": True,
+                "result": self._success_payload(self.merge_command_outputs(command_results)),
+            }
+        except Exception as err:
+            return {
+                "success": False,
+                "result": {"cmdb_collect_error": type(err).__name__},
+            }
+        finally:
+            if connection is not None:
+                try:
+                    await connection.close()
+                except Exception as close_error:  # 关闭失败不得覆盖主采集结果
+                    logger.warning(
+                        "event=network_config_close_failed target=%s error_type=%s",
+                        self.params.get("host") or self.params.get("connect_ip") or "-",
+                        type(close_error).__name__,
+                    )

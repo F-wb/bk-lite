@@ -1,0 +1,75 @@
+# ====================================
+# Docker 日志源（含字段映射）
+# ====================================
+{% set _endpoint = endpoint | default('unix:///var/run/docker.sock') %}
+{% set _enable_container_filter = enable_container_filter | default(false) %}
+{% set _container_name_contains = container_name_contains | default('') %}
+{% set _container_name_exclude = container_name_exclude | default('vector,logspout') %}
+{% set _enable_multiline = enable_multiline | default(false) %}
+
+[sources.docker_{{ instance_id }}]
+type = "docker_logs"
+docker_host = "{{ _endpoint }}"
+auto_partial_merge = true
+{% if _enable_container_filter %}
+{% if _container_name_contains %}
+include_containers = [{{ _container_name_contains | split(',') | map('trim') | reject('equalto', '') | map('tojson') | join(', ') }}]
+{% endif %}
+{% if _container_name_exclude %}
+exclude_containers = [{{ _container_name_exclude | split(',') | map('trim') | reject('equalto', '') | map('tojson') | join(', ') }}]
+{% endif %}
+{% endif %}
+
+
+{% if _enable_multiline %}
+# ====================================
+# 多行日志处理
+# ====================================
+multiline.condition_pattern = '{{ multiline_pattern | default("^[\\s]+") }}'
+multiline.mode = "{{ multiline_mode | default('continue_through') }}"
+multiline.start_pattern = '{{ multiline_start_pattern | default("^[^\\s]") }}'
+multiline.timeout_ms = {{ multiline_timeout_ms | default(1000) }}
+{% endif %}
+
+# ====================================
+# enrich（字段补全）
+# ====================================
+[transforms.docker_enrich_{{ instance_id }}]
+type = "remap"
+inputs = ["docker_{{ instance_id }}"]
+source = '''
+.collector = "Vector"
+.collect_type = "docker"
+.instance_id = "{{ instance_id }}"
+# bk-lite:vector-host-metadata:v1 begin
+.host_name = decode_base64!("${node.name_b64}")
+.host_ip = decode_base64!("${node.ip_b64}")
+# bk-lite:vector-host-metadata:v1 end
+'''
+
+# ====================================
+# sinks
+# ====================================
+[sinks.vmlogs_{{ instance_id }}]
+type = "nats"
+inputs = ["docker_enrich_{{ instance_id }}"]
+subject = "vector"
+url = "${NATS_PROTOCOL}://${NATS_SERVERS}"
+
+[sinks.vmlogs_{{ instance_id }}.auth]
+strategy = "user_password"
+
+[sinks.vmlogs_{{ instance_id }}.auth.user_password]
+user = "${NATS_USERNAME}"
+password = "${NATS_PASSWORD}"
+
+{% if NATS_PROTOCOL == "tls" %}
+# TLS 配置
+[sinks.vmlogs_{{ instance_id }}.tls]
+enabled = true
+verify_certificate = true
+ca_file = "${NATS_TLS_CA_FILE}"
+{% endif %}
+
+[sinks.vmlogs_{{ instance_id }}.encoding]
+codec = "json"

@@ -1,0 +1,193 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_mikrotik"
+        config_type = "mikrotik"
+        brand = "mikrotik"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB, auto-walked column names) ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    # ---- 64-bit IF-MIB HC traffic counters (ifXTable, wrap-safe on high-speed ports) ----
+    # 待现网核验：ifHCInOctets 1.3.6.1.2.1.31.1.1.1.6 / ifHCOutOctets ...1.10，按 ifIndex 与上表接口行对齐。
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- MikroTik CPU utilization (HOST-RESOURCES-MIB hrProcessorLoad, per-core %) ----
+    # 待现网核验：1.3.6.1.2.1.25.3.3.1.2（per-core 0-100%，多核走表自动按 index 区分；仪表盘 avg by instance）。
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.25.3.3.1.2"
+        name = "usage"
+    # ---- MikroTik system memory (HOST-RESOURCES-MIB hrStorageTable, walked by column) ----
+    # hrStorageType 1.3.6.1.2.1.25.2.3.1.2 / hrStorageAllocationUnits .4 / hrStorageSize .5 / hrStorageUsed .6；
+    # starlark 只保留 hrStorageType=hrStorageRam（RouterOS 主内存行），size/used × allocation units → 字节。
+    [[inputs.snmp.table]]
+        name = "device_memory"
+        inherit_tags = ["source"]
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.25.2.3.1.2"
+        name = "storage_type"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.25.2.3.1.4"
+        name = "alloc_units"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.25.2.3.1.5"
+        name = "total"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.25.2.3.1.6"
+        name = "used"
+    # ---- MikroTik health (MIKROTIK-MIB mtxrHealth 1.3.6.1.4.1.14988.1.1.3)：标量，顶层 field 带 .0 → measurement snmp，查询用 snmp_ 前缀 ----
+    # mtxrHlTemperature .10.0 / mtxrHlProcessorTemperature .11.0：Temperature（DISPLAY-HINT d-1，0.1 ℃）→ ÷10。
+    # mtxrHlVoltage .8.0：Voltage（DISPLAY-HINT d-1，0.1 V）→ ÷10。型号不支持的传感器不返回，对应字段缺省。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.14988.1.1.3.10.0"
+        name = "board_temperature_raw"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.14988.1.1.3.11.0"
+        name = "cpu_temperature_raw"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.14988.1.1.3.8.0"
+        name = "voltage_raw"
+    # mtxrHlPowerSupplyState .15.0 / mtxrHlBackupPowerSupplyState .16.0：BoolValue false(0)/true(1) → device_psu（psu=primary/backup）。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.14988.1.1.3.15.0"
+        name = "psu_primary_raw"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.14988.1.1.3.16.0"
+        name = "psu_backup_raw"
+    # mtxrHlFanSpeed1 .17.0 / mtxrHlFanSpeed2 .18.0：RPM → device_fan（fan=1/2）；新版 MIB 为 Gauge32，2015 版 MIB 为 DisplayString，非数字时不输出。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.14988.1.1.3.17.0"
+        name = "fan1_rpm_raw"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.14988.1.1.3.18.0"
+        name = "fan2_rpm_raw"
+
+# ---- 内存：只保留 RAM 行并换算为字节；其它 hrStorage 行（磁盘等）丢弃。----
+[[processors.starlark]]
+    namepass = ["device_memory"]
+    source = '''
+def to_num(v):
+    # 只接受整数/浮点或纯数字字符串；空串、非数字一律返回 None，不抛异常
+    t = type(v)
+    if t == "int" or t == "float":
+        return v
+    if t != "string":
+        return None
+    s = v.strip()
+    body = s[1:] if s.startswith("-") else s
+    if body == "" or body.count(".") > 1 or not body.replace(".", "").isdigit() or body.startswith(".") or body.endswith("."):
+        return None
+    if "." in body:
+        return float(s)
+    return int(s)
+
+def apply(metric):
+    storage_type = str(metric.fields.pop("storage_type", ""))
+    units = to_num(metric.fields.pop("alloc_units", None))
+    if not (storage_type.endswith("1.3.6.1.2.1.25.2.1.2") or storage_type.endswith("hrStorageRam")):
+        return None
+    total = to_num(metric.fields.get("total"))
+    used = to_num(metric.fields.get("used"))
+    if units == None or units <= 0 or total == None or used == None or total <= 0 or used < 0 or used > total:
+        return None
+    metric.fields["total"] = int(total) * int(units)
+    metric.fields["used"] = int(used) * int(units)
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["mikrotik"]
+
+# ---- 健康标量：温度/电压 ÷10；电源 true(1)→1 正常、false(0)→2 异常；风扇 RPM 拆为带 fan 维度的 device_fan。----
+[[processors.starlark]]
+    namepass = ["snmp"]
+    source = '''
+def child(metric, name, tag_key, tag_value, field, value):
+    m = Metric(name)
+    for k, v in metric.tags.items():
+        m.tags[k] = v
+    m.tags[tag_key] = tag_value
+    m.fields[field] = value
+    m.time = metric.time
+    return m
+
+def to_num(v):
+    # 只接受整数/浮点或纯数字字符串；空串、非数字一律返回 None，不抛异常
+    t = type(v)
+    if t == "int" or t == "float":
+        return v
+    if t != "string":
+        return None
+    s = v.strip()
+    body = s[1:] if s.startswith("-") else s
+    if body == "" or body.count(".") > 1 or not body.replace(".", "").isdigit() or body.startswith(".") or body.endswith("."):
+        return None
+    if "." in body:
+        return float(s)
+    return int(s)
+
+def apply(metric):
+    out = [metric]
+    for raw_key, key in [("board_temperature_raw", "device_temperature_celsius"), ("cpu_temperature_raw", "device_cpu_temperature_celsius"), ("voltage_raw", "device_voltage_volts")]:
+        raw = to_num(metric.fields.pop(raw_key, None))
+        if raw != None:
+            metric.fields[key] = raw / 10.0
+    for raw_key, psu in [("psu_primary_raw", "primary"), ("psu_backup_raw", "backup")]:
+        raw = to_num(metric.fields.pop(raw_key, None))
+        if raw == 1:
+            out.append(child(metric, "device_psu", "psu", psu, "state", 1))
+        elif raw == 0:
+            out.append(child(metric, "device_psu", "psu", psu, "state", 2))
+    for raw_key, fan in [("fan1_rpm_raw", "1"), ("fan2_rpm_raw", "2")]:
+        # mtxrHlFanSpeed1/2 为 DisplayString，旧版 RouterOS 可能返回空串或非数字，只在是数字时输出
+        raw = to_num(metric.fields.pop(raw_key, None))
+        if raw != None and raw >= 0:
+            out.append(child(metric, "device_fan", "fan", fan, "speed", int(raw)))
+    return out
+'''
+    [processors.starlark.tagpass]
+        brand = ["mikrotik"]

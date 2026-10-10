@@ -1,0 +1,11 @@
+[[inputs.sqlserver]]
+    startup_error_behavior = "retry"
+    servers = ["sqlserver://{{ username | urlencode }}:${PASSWORD__{{ config_id }}}@{{ host }}:{{ port }}?database={{ database | default('master') | urlencode }}&app+name=telegraf&encrypt=disable"]
+    database_type = "SQLServer"
+    exclude_query = ["SQLServerAvailabilityReplicaStates", "SQLServerDatabaseReplicaStates"]
+    interval = "{{ interval }}s"
+    [inputs.sqlserver.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "database"
+        config_type = "mssql"

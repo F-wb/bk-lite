@@ -1,0 +1,190 @@
+import time
+
+from apps.core.exceptions.base_app_exception import BaseAppException, ValidationAppException
+from apps.core.logger import node_logger as logger
+from apps.core.utils.crypto.aes_crypto import AESCryptor
+from apps.node_mgmt.constants.installer import InstallerConstants
+from apps.node_mgmt.constants.node import NodeConstants
+from apps.node_mgmt.models import SidecarEnv
+from apps.node_mgmt.services.installer_credentials import (
+    INVALID_INSTALLER_CREDENTIALS_MODE_MESSAGE,
+    normalize_installer_credentials_mode,
+)
+from apps.node_mgmt.services.install_token import InstallTokenService
+from apps.node_mgmt.services.package import PackageService
+from apps.node_mgmt.utils.architecture import normalize_cpu_architecture
+from apps.node_mgmt.utils.token_auth import generate_node_token
+from config.components.nats import NATS_NAMESPACE
+
+
+class InstallerSessionService:
+    @staticmethod
+    def windows_bootstrap_artifact(cpu_architecture: str = "") -> dict:
+        normalized_arch = normalize_cpu_architecture(cpu_architecture) or NodeConstants.X86_64_ARCH
+        return {
+            "filename": InstallerConstants.WINDOWS_BOOTSTRAP_FILENAME,
+            "object_key": InstallerConstants.build_latest_bootstrap_path(
+                NodeConstants.WINDOWS_OS,
+                normalized_arch,
+            ),
+            "architecture": normalized_arch,
+        }
+
+    @staticmethod
+    def installer_artifact(os_name: str, cpu_architecture: str = "") -> dict:
+        normalized_arch = normalize_cpu_architecture(cpu_architecture) or "generic"
+        if os_name == NodeConstants.WINDOWS_OS:
+            return {
+                "filename": InstallerConstants.WINDOWS_INSTALLER_FILENAME,
+                "object_key": InstallerConstants.build_latest_alias_path(NodeConstants.WINDOWS_OS, normalized_arch),
+                "download_url": f"/api/proxy/node_mgmt/api/installer/windows/download/?arch={normalized_arch}",
+                "alias_object_key": InstallerConstants.build_latest_alias_path(NodeConstants.WINDOWS_OS, normalized_arch),
+                "version": InstallerConstants.DEFAULT_INSTALLER_VERSION,
+                "architecture": normalized_arch,
+            }
+        if os_name == NodeConstants.LINUX_OS:
+            return {
+                "filename": InstallerConstants.LINUX_INSTALLER_FILENAME,
+                "object_key": InstallerConstants.build_latest_alias_path(NodeConstants.LINUX_OS, normalized_arch),
+                "download_url": f"/api/proxy/node_mgmt/api/installer/linux/download/?arch={normalized_arch}",
+                "alias_object_key": InstallerConstants.build_latest_alias_path(NodeConstants.LINUX_OS, normalized_arch),
+                "version": InstallerConstants.DEFAULT_INSTALLER_VERSION,
+                "architecture": normalized_arch,
+            }
+        raise BaseAppException(f"Unsupported operating system: {os_name}")
+
+    @staticmethod
+    def _get_cloud_region_env(cloud_region_id):
+        envs = SidecarEnv.objects.filter(cloud_region=cloud_region_id)
+        aes_obj = AESCryptor()
+        result = {}
+        for env in envs:
+            if env.type == "secret":
+                result[env.key] = aes_obj.decode(env.value)
+            else:
+                result[env.key] = env.value
+        return result
+
+    @staticmethod
+    def build_session_config(token: str, cpu_architecture: str = "", token_data: dict | None = None):
+        token_data = token_data or InstallTokenService.validate_and_get_token_data(token)
+
+        resolved_arch = normalize_cpu_architecture(cpu_architecture or token_data.get("cpu_architecture", ""))
+
+        package_obj = PackageService.resolve_package_by_architecture(
+            token_data["package_id"],
+            resolved_arch,
+        )
+        if not package_obj:
+            raise BaseAppException("Package not found")
+
+        envs = InstallerSessionService._get_cloud_region_env(token_data["cloud_region_id"])
+        server_url = envs.get(NodeConstants.SERVER_URL_KEY)
+        if not server_url:
+            raise BaseAppException(f"Missing NODE_SERVER_URL in cloud region {token_data['cloud_region_id']}")
+
+        nats_servers = envs.get(NodeConstants.NATS_SERVERS_KEY)
+
+        # 优先使用安装专用凭据；存量区域默认保留管理员凭据回退，迁移完成后可按区域切到 strict。
+        nats_username = envs.get(NodeConstants.NATS_INSTALLER_USERNAME_KEY)
+        nats_password = envs.get(NodeConstants.NATS_INSTALLER_PASSWORD_KEY)
+        has_installer_username = bool(str(nats_username or "").strip())
+        has_installer_password = bool(str(nats_password or "").strip())
+        credentials_mode_key = NodeConstants.NATS_INSTALLER_CREDENTIALS_MODE_KEY
+        try:
+            installer_credentials_mode = normalize_installer_credentials_mode(
+                envs.get(credentials_mode_key),
+                allow_missing=credentials_mode_key not in envs,
+            )
+        except ValueError:
+            raise BaseAppException(INVALID_INSTALLER_CREDENTIALS_MODE_MESSAGE)
+        is_windows_remote = (
+            token_data["os"] == NodeConstants.WINDOWS_OS
+            and token_data.get("install_mode") == "auto"
+        )
+
+        if not has_installer_username or not has_installer_password:
+            if (
+                is_windows_remote
+                or installer_credentials_mode == NodeConstants.NATS_INSTALLER_CREDENTIALS_MODE_STRICT
+            ):
+                install_context = "Windows remote installation" if is_windows_remote else "Installer session in strict mode"
+                raise ValidationAppException(
+                    f"{install_context} requires dedicated NATS_INSTALLER_USERNAME/PASSWORD credentials"
+                )
+            # Fallback to admin credentials (legacy deployments)
+            logger.warning(
+                "NATS_INSTALLER_USERNAME/PASSWORD not configured for cloud region %s, "
+                "falling back to NATS_ADMIN credentials. Consider configuring dedicated "
+                "installer credentials with minimal permissions.",
+                token_data["cloud_region_id"],
+            )
+            nats_username = envs.get("NATS_ADMIN_USERNAME")
+            nats_password = envs.get(NodeConstants.NATS_ADMIN_PASSWORD_KEY)
+
+        installer_bucket = NATS_NAMESPACE
+        if not nats_servers or not nats_username or not nats_password:
+            raise BaseAppException("Missing NATS direct download configuration")
+
+        sidecar_token = generate_node_token(token_data["node_id"], token_data["ip"], token_data["user"])
+        groups = ",".join([str(org_id) for org_id in token_data.get("organizations", [])])
+
+        nats_tls_ca = envs.get("NATS_TLS_CA") or ""
+        nats_protocol = (envs.get("NATS_PROTOCOL") or "nats").strip().lower()
+        if is_windows_remote:
+            if nats_protocol != "tls":
+                raise BaseAppException("Windows remote installation requires NATS_PROTOCOL=tls")
+            configured_servers = [item.strip() for item in nats_servers.split(",") if item.strip()]
+            if any("://" in item and not item.lower().startswith("tls://") for item in configured_servers):
+                raise BaseAppException("Windows remote installation requires TLS NATS server URLs")
+
+        install_dir = (
+            InstallerConstants.WINDOWS_INSTALL_DEFAULT_DIR
+            if token_data["os"] == NodeConstants.WINDOWS_OS
+            else InstallerConstants.LINUX_INSTALL_DEFAULT_DIR
+        )
+        package_file_key = PackageService.resolve_existing_file_path(package_obj)
+
+        config = {
+            "api_token": sidecar_token,
+            "group_id": groups,
+            "install_dir": install_dir,
+            "node_id": token_data["node_id"],
+            "node_name": token_data["node_name"],
+            "os": token_data["os"],
+            "cpu_architecture": resolved_arch,
+            "remaining_usage": token_data["remaining_usage"],
+            "server_url": f"{server_url.rstrip('/')}/api/v1/node_mgmt/open_api/node",
+            "storage": {
+                "bucket": installer_bucket,
+                "file_key": package_file_key,
+                "file_name": package_obj.name,
+                "nats_password": nats_password,
+                "nats_protocol": nats_protocol,
+                "nats_servers": nats_servers,
+                "nats_tls_ca": nats_tls_ca,
+                "nats_username": nats_username,
+            },
+            "zone_id": str(token_data["cloud_region_id"]),
+        }
+        config["package"] = {
+            "id": package_obj.id,
+            "os": package_obj.os,
+            "cpu_architecture": getattr(package_obj, "cpu_architecture", "") or resolved_arch or "generic",
+            "object": package_obj.object,
+            "version": package_obj.version,
+            "name": package_obj.name,
+            "file_key": package_file_key,
+        }
+        config["installer"] = InstallerSessionService.installer_artifact(
+            token_data["os"],
+            resolved_arch,
+        )
+        max_clock_skew_seconds = InstallerConstants.CONTROLLER_INSTALL_MAX_CLOCK_SKEW_SECONDS
+        if max_clock_skew_seconds <= 0:
+            raise BaseAppException("CONTROLLER_INSTALL_MAX_CLOCK_SKEW_SECONDS must be a positive integer")
+        config["clock_validation"] = {
+            "server_time_unix_ms": time.time_ns() // 1_000_000,
+            "max_skew_seconds": max_clock_skew_seconds,
+        }
+        return config

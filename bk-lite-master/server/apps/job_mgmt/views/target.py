@@ -1,0 +1,543 @@
+"""目标管理视图"""
+
+import time
+import uuid
+
+from rest_framework import status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from apps.core.decorators.api_permission import HasPermission
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.logger import job_logger as logger
+from apps.core.utils.team_utils import get_current_team
+from apps.core.utils.viewset_utils import AuthViewSet
+from apps.job_mgmt.constants import OSType, SSHCredentialType, WinRMTransport
+from apps.job_mgmt.filters.target import TargetFilter
+from apps.job_mgmt.models import Target, TargetTeamConcurrentUpdateError
+from apps.job_mgmt.serializers.target import TargetBatchDeleteSerializer, TargetSerializer, TargetTestConnectionSerializer
+from apps.job_mgmt.services.error_response import exception_to_response
+from apps.job_mgmt.services.execution_base_service import ExecutionTaskBaseService
+from apps.job_mgmt.utils.i18n import job_message
+from apps.job_mgmt.views.mixins import BatchDeleteMixin
+from apps.node_mgmt.models import CloudRegion
+from apps.rpc.ansible import AnsibleExecutor
+from apps.rpc.executor import Executor
+from apps.rpc.node_mgmt import NodeMgmt
+from apps.rpc.system_mgmt import SystemMgmt
+from apps.system_mgmt.utils.operation_log_utils import log_operation
+
+
+def _get_executor_node(cloud_region_id: int) -> str:
+    """
+    根据云区域ID获取执行节点
+
+    Args:
+        cloud_region_id: 云区域ID
+
+    Returns:
+        节点ID
+
+    Raises:
+        ValueError: 未找到可用的执行节点
+    """
+    node_mgmt = NodeMgmt()
+    result = node_mgmt.node_list(
+        {
+            "cloud_region_id": cloud_region_id,
+            "is_container": True,
+            "page": 1,
+            "page_size": 1,
+            "skip_permission": True,
+            "legacy_callsite": "job_mgmt.connection_test",
+        }
+    )
+    if not isinstance(result, dict):
+        raise ValueError(f"云区域 {cloud_region_id} 下未找到可用的执行节点")
+    nodes = result.get("nodes", [])
+    if not nodes:
+        raise ValueError(f"云区域 {cloud_region_id} 下未找到可用的执行节点")
+    return nodes[0]["id"]
+
+
+def _parse_ssh_test_result(result) -> tuple[bool, str, str, dict]:
+    """解析 SSH 测试连接返回结果，兼容字符串与字典两种格式"""
+    if isinstance(result, str):
+        return ("success" in result, result, "", {})
+
+    if isinstance(result, dict):
+        success = result.get("success", False)
+        stdout = result.get("result", "")
+        error = result.get("error", "")
+        return success, str(stdout), str(error), result
+
+    return False, str(result), f"未知返回类型: {type(result).__name__}", {}
+
+
+def _build_ssh_test_failure_message(result: dict, fallback_error: str, fallback_stdout: str) -> str:
+    """根据执行器返回的阶段与分类构造更友好的测试连接失败文案"""
+    merged_result = dict(result or {})
+    if fallback_error and not merged_result.get("error"):
+        merged_result["error"] = fallback_error
+    if fallback_stdout and not merged_result.get("result"):
+        merged_result["result"] = fallback_stdout
+    return ExecutionTaskBaseService.normalize_executor_error(merged_result, "连接测试失败")
+
+
+def _build_actor_context(request):
+    current_team = get_current_team(request)
+    if current_team in (None, ""):
+        raise BaseAppException("缺少 current_team 参数")
+
+    try:
+        current_team = int(current_team)
+    except (TypeError, ValueError):
+        raise BaseAppException("current_team 参数非法")
+
+    return {
+        "username": request.user.username,
+        "domain": request.user.domain,
+        "current_team": current_team,
+        "include_children": request.COOKIES.get("include_children", "0") == "1",
+        "is_superuser": request.user.is_superuser,
+    }
+
+
+class TargetViewSet(BatchDeleteMixin, AuthViewSet):
+    """目标管理视图集"""
+
+    queryset = Target.objects.all()
+    serializer_class = TargetSerializer
+    filterset_class = TargetFilter
+    search_fields = ["name", "ip"]
+    ORGANIZATION_FIELD = "team"
+    permission_key = "job"
+
+    batch_delete_serializer_class = TargetBatchDeleteSerializer
+    batch_delete_log_label = "目标"
+
+    def get_serializer_class(self):
+        if self.action == "batch_delete":
+            return TargetBatchDeleteSerializer
+        elif self.action == "test_connection":
+            return TargetTestConnectionSerializer
+        return TargetSerializer
+
+    def update(self, request, *args, **kwargs):
+        try:
+            return super().update(request, *args, **kwargs)
+        except TargetTeamConcurrentUpdateError as error:
+            return exception_to_response(error, context="[target.update]", request=request)
+
+    @HasPermission("target-View")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @HasPermission("target-View")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @HasPermission("target-Add")
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        if response.status_code == status.HTTP_201_CREATED:
+            target_name = response.data.get("name") if isinstance(response.data, dict) else request.data.get("name", "")
+            log_operation(request, "create", "job", f"新增目标: {target_name}")
+        return response
+
+    @action(detail=False, methods=["get"])
+    @HasPermission("target-View")
+    def query_nodes(self, request):
+        """
+        从节点管理查询节点列表
+
+        直接查询 node_mgmt 的节点数据，不做同步存储，支持筛选和分页。
+        返回格式与手动添加目标保持一致，方便前端统一处理。
+
+        查询参数:
+            cloud_region_id: 云区域ID (可选)
+            keyword: 节点名称或IP，模糊匹配 (可选)
+            name: 节点名称，模糊匹配 (可选)
+            ip: IP地址，模糊匹配 (可选)
+            os: 操作系统 linux/windows (可选)
+            page: 页码，默认1
+            page_size: 每页数量，默认20
+
+        返回:
+        {
+            "result": true,
+            "data": {
+                "count": 100,
+                "items": [
+                    {
+                        "id": "node-1",
+                        "name": "节点1",
+                        "ip": "192.168.1.100",
+                        "os_type": "linux",
+                        "cloud_region_id": 1,
+                        "cloud_region_name": "默认区域",
+                        "source": "node_mgmt"
+                    }
+                ]
+            }
+        }
+        """
+        # 构建查询参数
+        query_data = {
+            "page": int(request.query_params.get("page", 1)),
+            "page_size": int(request.query_params.get("page_size", 20)),
+        }
+
+        # 可选筛选条件
+        cloud_region_id = request.query_params.get("cloud_region_id")
+        if cloud_region_id:
+            query_data["cloud_region_id"] = int(cloud_region_id)
+
+        keyword = request.query_params.get("keyword")
+        if keyword:
+            query_data["keyword"] = keyword
+
+        name = request.query_params.get("name")
+        if name:
+            query_data["name"] = name
+
+        ip = request.query_params.get("ip")
+        if ip:
+            query_data["ip"] = ip
+
+        os_type = request.query_params.get("os")
+        if os_type:
+            query_data["os"] = os_type
+
+        try:
+            actor_context = _build_actor_context(request)
+            include_children = actor_context["include_children"]
+            scope_result = SystemMgmt().get_authorized_groups_scoped(actor_context, include_children=include_children)
+            query_data["organization_ids"] = scope_result.get("data", [])
+
+            if not request.user.is_superuser:
+                query_data["permission_data"] = {
+                    "username": request.user.username,
+                    "domain": request.user.domain,
+                    "current_team": actor_context["current_team"],
+                    "include_children": include_children,
+                }
+
+            node_mgmt = NodeMgmt()
+            result = node_mgmt.node_list(query_data)
+
+            # 获取云区域名称映射
+
+            cloud_regions = CloudRegion.objects.all().values("id", "name")
+            cloud_region_map = {cr["id"]: cr["name"] for cr in cloud_regions}
+
+            # 转换字段名，统一格式
+            unified_items = []
+            for node in result.get("nodes", []):
+                cloud_region_id = node.get("cloud_region")
+                unified_items.append(
+                    {
+                        "id": node.get("id"),
+                        "name": node.get("name"),
+                        "ip": node.get("ip"),
+                        "os_type": node.get("operating_system", "linux"),
+                        "cloud_region_id": cloud_region_id,
+                        "cloud_region_name": cloud_region_map.get(cloud_region_id, ""),
+                        "source": "node_mgmt",
+                    }
+                )
+
+            return Response(
+                {
+                    "result": True,
+                    "data": {
+                        "count": result.get("count", 0),
+                        "items": unified_items,
+                    },
+                }
+            )
+        except Exception as e:
+            return exception_to_response(
+                e,
+                context="[query_nodes]",
+                default_message=job_message(request, "error.query_nodes_failed", "Failed to query nodes"),
+                request=request,
+            )
+
+    @action(detail=False, methods=["get"])
+    @HasPermission("target-View")
+    def cloud_regions(self, request):
+        """
+        获取云区域列表
+
+        返回:
+        {
+            "result": true,
+            "data": [
+                {"id": 1, "name": "默认区域"},
+                ...
+            ]
+        }
+        """
+        try:
+            node_mgmt = NodeMgmt()
+            result = node_mgmt.cloud_region_list()
+            return Response({"result": True, "data": result})
+        except Exception as e:
+            return exception_to_response(
+                e,
+                context="[cloud_regions]",
+                default_message=job_message(request, "error.query_cloud_regions_failed", "Failed to query cloud regions"),
+                request=request,
+            )
+
+    @action(detail=False, methods=["post"])
+    @HasPermission("target-Delete")
+    def batch_delete(self, request):
+        """批量删除目标"""
+        return self.perform_batch_delete(request)
+
+    @action(detail=False, methods=["post"])
+    @HasPermission("target-View")
+    def test_connection(self, request):
+        """
+        测试连接（仅支持 Linux SSH）
+
+        通过 nats-executor 执行 echo success 命令测试 SSH 连接。
+
+        请求体:
+        {
+            "ip": "192.168.1.100",
+            "os_type": "linux",  // 目前仅支持 linux
+            "cloud_region_id": 1,
+            "ssh_port": 22,
+            "ssh_user": "root",
+            "ssh_credential_type": "password",  // password 或 key
+            "ssh_password": "xxx",  // 密码方式必填
+            "ssh_key_file": <file>  // 密钥方式必填
+        }
+
+        返回:
+        {
+            "success": true,
+            "message": "连接成功"
+        }
+        """
+        serializer = TargetTestConnectionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return self._perform_connection_test(serializer.validated_data)
+
+    @action(detail=True, methods=["post"], url_path="test_connection")
+    @HasPermission("target-View")
+    def test_saved_connection(self, request, pk=None):
+        """使用已保存凭据测试编辑中的目标，表单中的非敏感连接参数可覆盖原值。"""
+        target = self.get_object()
+        serializer = TargetTestConnectionSerializer(
+            data=request.data,
+            context={"saved_target": target},
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        return self._perform_connection_test(serializer.validated_data, saved_target=target)
+
+    @staticmethod
+    def _perform_connection_test(validated_data, saved_target=None):
+        """执行连接测试；详情接口缺少明文凭据时，仅在进程内解密已保存值。"""
+
+        ip = validated_data.get("ip")
+        os_type = validated_data.get("os_type", OSType.LINUX)
+        cloud_region_id = validated_data.get("cloud_region_id")
+
+        if os_type == OSType.WINDOWS:
+            return TargetViewSet._perform_windows_connection_test(
+                validated_data,
+                saved_target=saved_target,
+            )
+
+        # 获取执行节点
+        try:
+            node_id = _get_executor_node(cloud_region_id)
+        except ValueError as e:
+            logger.warning(f"[test_connection] 获取执行节点失败: {e}")
+            return Response({"success": False, "message": str(e)})
+
+        # 构建 SSH 凭据
+        ssh_user = validated_data.get("ssh_user", "")
+        ssh_port = validated_data.get("ssh_port", 22)
+        ssh_credential_type = validated_data.get("ssh_credential_type", SSHCredentialType.PASSWORD)
+
+        stored_credential = {}
+        if saved_target is not None:
+            credentials = ExecutionTaskBaseService._build_host_credentials([saved_target])
+            if not credentials:
+                return Response(
+                    {
+                        "success": False,
+                        "message": job_message(None, "error.target_credentials_missing", "Target has no usable credentials"),
+                    }
+                )
+            stored_credential = credentials[0]
+
+        password = None
+        private_key = None
+
+        if ssh_credential_type == SSHCredentialType.PASSWORD:
+            password = validated_data.get("ssh_password") or stored_credential.get("password")
+        else:
+            # 密钥方式：读取上传的文件内容
+            ssh_key_file = validated_data.get("ssh_key_file")
+            if ssh_key_file:
+                private_key = ssh_key_file.read().decode("utf-8")
+            else:
+                private_key = stored_credential.get("private_key_content")
+
+        # 执行测试命令
+        try:
+            logger.info(f"[test_connection] Testing SSH: {ssh_user}@{ip}:{ssh_port} via node {node_id}")
+            executor = Executor(node_id)
+            result = executor.execute_ssh(
+                command="echo success",
+                host=str(ip),
+                username=ssh_user,
+                password=password,
+                private_key=private_key,
+                timeout=30,
+                port=ssh_port,
+                connection_test=True,
+            )
+            # 解析结果（兼容字符串与字典）
+            success, stdout, error, result_detail = _parse_ssh_test_result(result)
+
+            if success and "success" in stdout:
+                logger.info(f"[test_connection] SSH connection test passed: {ssh_user}@{ip}:{ssh_port}")
+                return Response(
+                    {
+                        "success": True,
+                        "message": job_message(None, "message.connection_test_success", "Connection test succeeded"),
+                    }
+                )
+            else:
+                error_msg = _build_ssh_test_failure_message(result_detail, error, stdout)
+                logger.warning(f"[test_connection] SSH connection test failed: {ssh_user}@{ip}:{ssh_port}, error: {error_msg}")
+                return Response(
+                    {
+                        "success": False,
+                        "message": job_message(
+                            None,
+                            "message.connection_test_failed",
+                            "Connection test failed: {detail}",
+                            detail=error_msg,
+                        ),
+                    }
+                )
+
+        except Exception as e:
+            logger.exception(f"[test_connection] SSH connection test error: {ssh_user}@{ip}:{ssh_port}, error: {e}")
+            return Response(
+                {
+                    "success": False,
+                    "message": job_message(
+                        None,
+                        "error.connection_test_exception",
+                        "Connection test failed unexpectedly; check backend logs",
+                    ),
+                }
+            )
+
+    @staticmethod
+    def _perform_windows_connection_test(validated_data, saved_target=None):
+        """通过区域内 Ansible Executor 执行一次有边界的 WinRM win_ping。"""
+        cloud_region_id = validated_data.get("cloud_region_id")
+        try:
+            node_id = ExecutionTaskBaseService._get_ansible_node(cloud_region_id)
+        except ValueError as e:
+            return Response({"success": False, "message": str(e)})
+
+        if saved_target is not None:
+            credentials = ExecutionTaskBaseService._build_host_credentials([saved_target])
+            if not credentials:
+                return Response(
+                    {
+                        "success": False,
+                        "message": job_message(None, "error.target_credentials_missing", "Target has no usable credentials"),
+                    }
+                )
+            credential = credentials[0]
+        else:
+            credential = {
+                "connection": "winrm",
+                "password": validated_data.get("winrm_password"),
+            }
+
+        credential.update(
+            {
+                "host": str(validated_data.get("ip")),
+                "port": validated_data.get("winrm_port", 5986),
+                "user": validated_data.get("winrm_user", ""),
+                "connection": "winrm",
+                "winrm_scheme": validated_data.get("winrm_scheme", "https"),
+                "winrm_transport": validated_data.get("winrm_transport", WinRMTransport.NTLM),
+                "winrm_cert_validation": validated_data.get("winrm_cert_validation", True),
+            }
+        )
+        if validated_data.get("winrm_password"):
+            credential["password"] = validated_data["winrm_password"]
+
+        task_id = f"target-connectivity-{uuid.uuid4().hex}"
+        executor = AnsibleExecutor(node_id)
+        try:
+            accepted = executor.adhoc(
+                host_credentials=[credential],
+                module="ansible.windows.win_ping",
+                task_id=task_id,
+                timeout=30,
+            )
+            accepted_task_id = (accepted.get("task_id") if isinstance(accepted, dict) else None) or task_id
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                query_result = executor.task_query(accepted_task_id, timeout=5)
+                if not isinstance(query_result, dict):
+                    return Response(
+                        {
+                            "success": False,
+                            "message": job_message(None, "error.winrm_result_invalid", "Unexpected WinRM test result format"),
+                        }
+                    )
+                task_status = query_result.get("status")
+                if task_status == "success":
+                    return Response(
+                        {
+                            "success": True,
+                            "message": job_message(None, "message.winrm_connection_test_success", "WinRM connection test succeeded"),
+                        }
+                    )
+                if task_status in {"failed", "callback_failed"}:
+                    return Response(
+                        {
+                            "success": False,
+                            "message": job_message(
+                                None,
+                                "error.winrm_connection_test_failed",
+                                "WinRM connection test failed; check executor logs",
+                            ),
+                        }
+                    )
+                time.sleep(0.2)
+            return Response(
+                {
+                    "success": False,
+                    "message": job_message(None, "error.winrm_connection_test_timeout", "WinRM connection test timed out"),
+                }
+            )
+        except Exception as e:
+            logger.exception("[test_connection] WinRM connection test error: target=%s, error=%s", credential["host"], e)
+            return Response(
+                {
+                    "success": False,
+                    "message": job_message(
+                        None,
+                        "error.winrm_connection_test_exception",
+                        "WinRM connection test failed unexpectedly; check backend logs",
+                    ),
+                }
+            )

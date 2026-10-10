@@ -1,0 +1,31 @@
+{
+  "object": "Switch",
+  "plugin": "Switch Westermo SNMP",
+  "templates": [
+    {
+      "name": "Westermo交换机CPU负载过高",
+      "alert_name": "交换机${resource_name} CPU 负载过高",
+      "description": "监控 Westermo WeOS 工业交换机的 1 分钟 CPU 负载（loadAvg1）。设备以负载×100 上报，查询已除以 100，得到与主机 load average 同量纲的值。持续高于阈值提示控制平面过载、环网协议震荡或异常流量，避免管理响应变慢或转发受影响。",
+      "metric_name": "device_cpu_load",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 4,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 2,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 1,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    }
+  ]
+}

@@ -1,0 +1,282 @@
+'use client';
+
+import React, {useState} from 'react';
+import type {UploadFile as AntdUploadFile} from 'antd';
+import {Button, Drawer, Form, message} from 'antd';
+import {DeleteOutlined} from '@ant-design/icons';
+import {Node} from '@xyflow/react';
+import {useTranslation} from '@/utils/i18n';
+import {useSearchParams} from 'next/navigation';
+import {normalizeEnterpriseWechatAibotConfig} from '@/app/opspilot/constants/chatflow';
+import {useNodeConfigData} from './hooks/useNodeConfigData';
+import {useKeyValueRows} from './hooks/useKeyValueRows';
+import {NodeConfigForm} from './NodeConfigForm';
+
+interface UploadFile extends AntdUploadFile {
+  content?: string;
+}
+
+interface ChatflowNodeData {
+  label: string;
+  type: string;
+  config?: any;
+}
+
+interface ChatflowNode extends Omit<Node, 'data'> {
+  data: ChatflowNodeData;
+}
+
+interface NodeConfigDrawerProps {
+  visible: boolean;
+  node: ChatflowNode | null;
+  nodes?: ChatflowNode[];
+  onClose: () => void;
+  onSave: (nodeId: string, config: any) => void;
+  onDelete: (nodeId: string) => void;
+}
+
+const NodeConfigDrawer: React.FC<NodeConfigDrawerProps> = ({
+  visible,
+  node,
+  nodes = [],
+  onClose,
+  onSave,
+  onDelete
+}) => {
+  const { t } = useTranslation();
+  const [form] = Form.useForm();
+  const searchParams = useSearchParams();
+  const botId = searchParams?.get('id') || '1';
+
+  // 状态管理
+  const [frequency, setFrequency] = useState('daily');
+  const [uploadedFiles, setUploadedFiles] = useState<UploadFile[]>([]);
+  const [notificationType, setNotificationType] = useState<string>('email');
+
+  // 使用自定义 Hooks
+  const {
+    skills,
+    loadingSkills,
+    loadSkills,
+    llmModels,
+    loadingLlmModels,
+    loadLlmModels,
+    notificationChannels,
+    loadingChannels,
+    loadChannels,
+    allUsers,
+    loadingUsers,
+    loadUsers,
+    memorySpaces,
+    loadingMemorySpaces,
+    loadMemorySpaces,
+  } = useNodeConfigData();
+
+  const paramRows = useKeyValueRows([{ key: '', value: '' }]);
+  const headerRows = useKeyValueRows([{ key: '', value: '' }]);
+
+  // 初始化表单数据
+  React.useEffect(() => {
+    if (node && node.data.config && visible) {
+      const config = node.data.config || {};
+      const formValues: any = { name: node.data.label, ...config };
+
+      if (node.data.type === 'celery') {
+        const freq = config.frequency === 'crontab' ? 'cron' : (config.frequency || 'daily');
+        formValues.frequency = freq;
+
+        formValues.times = Array.isArray(config.time) ? config.time : (config.time ? [config.time] : ['09:00']);
+        formValues.weekdays = Array.isArray(config.weekdays) ? config.weekdays : [];
+
+        if (config.days && Array.isArray(config.days) && config.days.length > 0) {
+          formValues.monthDay = config.days[0];
+        } else if (freq === 'monthly') {
+          formValues.monthDay = 1;
+        }
+
+        formValues.cron = config.crontab_expression || (freq === 'cron' ? '* * * * *' : '');
+      }
+
+      // NATS 节点：snake_case → camelCase 字段映射，使 Switch 显示当前值
+      if (node.data.type === 'nats') {
+        if ('expose_as_web_chat' in config) {
+          formValues.exposeAsWebChat = Boolean(config.expose_as_web_chat);
+          delete formValues.expose_as_web_chat;
+        } else {
+          formValues.exposeAsWebChat = false;
+        }
+      }
+
+      form.setFieldsValue(formValues);
+      const freq = config.frequency === 'crontab' ? 'cron' : (config.frequency || 'daily');
+      setFrequency(freq);
+
+      // 初始化参数和头部
+      const needsParamsAndHeaders = ['http', 'restful', 'openai'];
+      if (needsParamsAndHeaders.includes(node.data.type)) {
+        paramRows.resetRows(config.params?.length ? config.params : [{ key: '', value: '' }]);
+        headerRows.resetRows(config.headers?.length ? config.headers : [{ key: '', value: '' }]);
+      }
+
+      // 初始化上传文件
+      if (node.data.type === 'agents') {
+        if (config.uploadedFiles?.length) {
+          const files = config.uploadedFiles.map((file: any, index: number) => ({
+            uid: file.uid || `file-${index}`,
+            name: file.name,
+            status: 'done' as const,
+            content: file.content,
+            response: { fileId: file.uid || `file-${index}`, fileName: file.name, content: file.content }
+          }));
+          setUploadedFiles(files);
+        }
+        loadSkills();
+      }
+
+      // 加载模型列表（意图分类节点、记忆写入节点、通知节点邮件优化）
+      if (node.data.type === 'intent_classification' || node.data.type === 'memory_write' || node.data.type === 'notification') {
+        loadLlmModels();
+      }
+
+      // 加载通知渠道和用户
+      if (node.data.type === 'notification') {
+        const type = config.notificationType || 'email';
+        setNotificationType(type);
+        loadChannels(type);
+        loadUsers();
+      }
+
+      // 加载记忆空间列表（记忆读取/写入节点）
+      if (node.data.type === 'memory_read' || node.data.type === 'memory_write') {
+        loadMemorySpaces();
+      }
+    } else {
+      form.resetFields();
+      paramRows.resetRows([]);
+      headerRows.resetRows([]);
+      setFrequency('daily');
+      setUploadedFiles([]);
+    }
+  }, [node, visible]);
+
+  const handleSave = () => {
+    if (!node) return;
+
+    form.validateFields().then((values) => {
+      let configData: any = {
+        ...values,
+        params: paramRows.rows.filter(row => row.key && row.value),
+        headers: headerRows.rows.filter(row => row.key && row.value)
+      };
+
+      if (node.data.type === 'agents') {
+        configData.uploadedFiles = uploadedFiles.map(file => ({
+          name: file.name,
+          content: file.response?.content || file.content || ''
+        }));
+      }
+
+      if (node.data.type === 'notification') {
+        configData.notificationChannels = notificationChannels;
+      }
+
+      if (node.data.type === 'enterprise_wechat_aibot') {
+        configData = normalizeEnterpriseWechatAibotConfig(configData);
+      }
+
+      if (node.data.type === 'nats') {
+        // form key 是 camelCase exposeAsWebChat；后端 / ChatApplication.node_config.data.config.expose_as_web_chat 用 snake_case
+        if ('exposeAsWebChat' in configData) {
+          configData.expose_as_web_chat = Boolean(configData.exposeAsWebChat);
+          delete configData.exposeAsWebChat;
+        }
+      }
+
+      if (node.data.type === 'celery') {
+        configData.time = values.times || [];
+        delete configData.times;
+
+        if (values.frequency === 'monthly') {
+          configData.days = values.monthDay ? [values.monthDay] : [];
+          delete configData.monthDay;
+        }
+
+        if (values.frequency === 'cron') {
+          configData.frequency = 'crontab';
+          configData.crontab_expression = values.cron || '';
+          delete configData.cron;
+        }
+      }
+
+      onSave(node.id, configData);
+      message.success(t('chatflow.messages.nodeConfigured'));
+    }).catch(() => {});
+  };
+
+  const handleDelete = () => {
+    if (!node) return;
+    onDelete(node.id);
+    onClose();
+  };
+
+  const handleFrequencyChange = (value: string) => {
+    setFrequency(value);
+    form.setFieldsValue({ 
+      times: ['09:00'], 
+      weekdays: [], 
+      monthDay: value === 'monthly' ? 1 : undefined, 
+      cron: value === 'cron' ? '* * * * *' : '' 
+    });
+  };
+
+  return (
+    <Drawer
+      title={String(node?.data.label || '')}
+      open={visible}
+      onClose={onClose}
+      width={480}
+      placement="right"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button danger icon={<DeleteOutlined />} onClick={handleDelete}>
+            {t('common.delete')}
+          </Button>
+          <Button onClick={onClose}>{t('common.cancel')}</Button>
+          <Button type="primary" onClick={handleSave}>{t('common.confirm')}</Button>
+        </div>
+      }
+    >
+      <Form form={form} layout="vertical">
+        {node && (
+          <NodeConfigForm
+            node={node}
+            nodes={nodes}
+            botId={botId}
+            frequency={frequency}
+            onFrequencyChange={handleFrequencyChange}
+            paramRows={paramRows}
+            headerRows={headerRows}
+            uploadedFiles={uploadedFiles}
+            setUploadedFiles={setUploadedFiles}
+            skills={skills}
+            loadingSkills={loadingSkills}
+            llmModels={llmModels}
+            loadingLlmModels={loadingLlmModels}
+            notificationChannels={notificationChannels}
+            loadingChannels={loadingChannels}
+            notificationType={notificationType}
+            setNotificationType={setNotificationType}
+            loadChannels={loadChannels}
+            allUsers={allUsers}
+            loadingUsers={loadingUsers}
+            memorySpaces={memorySpaces}
+            loadingMemorySpaces={loadingMemorySpaces}
+            form={form}
+          />
+        )}
+      </Form>
+    </Drawer>
+  );
+};
+
+export default NodeConfigDrawer;

@@ -1,0 +1,465 @@
+.markdownBody {
+  font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+  font-size: 14px;
+  color: var(--color-text-1);
+
+  h1, h2, h3, h4, h5, h6 {
+    margin-top: 1.2em;
+    margin-bottom: 0.6em;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  h1 {
+    font-size: 1.6em;
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid var(--color-border-1);
+  }
+
+  h2 {
+    font-size: 1.4em;
+    padding-bottom: 0.2em;
+    border-bottom: 1px solid var(--color-border-1);
+  }
+
+  h3 {
+    font-size: 1.2em;
+  }
+
+  h4 {
+    font-size: 1.1em;
+  }
+
+  p {
+    margin: 0.6em 0;
+  }
+
+  strong {
+    font-weight: 600;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--color-border-1);
+    margin: 1.2em 0;
+  }
+
+  ul, ol {
+    padding-left: 1.5em;
+    margin: 0.5em 0;
+  }
+
+  li {
+    margin: 0.25em 0;
+  }
+
+  blockquote {
+    margin: 0.8em 0;
+    padding: 0.4em 1em;
+    border-left: 3px solid var(--color-primary);
+    background: var(--color-fill-1);
+    border-radius: 0 4px 4px 0;
+    color: var(--color-text-2);
+  }
+
+  code {
+    padding: 2px 5px;
+    font-size: 85%;
+    background: var(--color-fill-2);
+    border-radius: 3px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  }
+
+  pre {
+    background: var(--color-fill-1);
+    padding: 12px 16px;
+    border-radius: 6px;
+    margin: 0.8em 0;
+    overflow: auto;
+    border: 1px solid var(--color-border-1);
+
+    code {
+      padding: 0;
+      background: transparent;
+      border-radius: 0;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.8em 0;
+    font-size: 13px;
+    border: 1px solid var(--color-border-1);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  thead {
+    background: var(--color-fill-2);
+  }
+
+  th {
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--color-text-2);
+    border-bottom: 1px solid var(--color-border-1);
+  }
+
+  td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--color-fill-2);
+  }
+
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  tbody tr:hover {
+    background: var(--color-fill-1);
+  }
+
+  a {
+    color: var(--color-primary);
+    text-decoration: none;
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+
+  img {
+    max-width: 100%;
+    border-radius: 4px;
+    cursor: zoom-in;
+  }
+
+  // Tool call styles
+  :global(.tool-call-group-header) {
+    cursor: pointer;
+    &:hover {
+      background: var(--color-fill-1);
+    }
+  }
+
+  :global(.tool-call-expand-icon),
+  :global(.tool-call-item-expand-icon) {
+    transition: transform 0.2s ease;
+  }
+
+  :global(.tool-call-item-header) {
+    cursor: pointer;
+    border-radius: 4px;
+    &:hover {
+      background: var(--color-fill-1);
+    }
+  }
+}
+
+.chatContainer {
+  background: var(--color-bg);
+
+  // 对话正文比通用 markdownBody 收一档，贴近 Storybook 会话稿的 13px / 1.55
+  .markdownBody {
+    font-size: 13px;
+    line-height: 1.55;
+  }
+
+  // 引导语(默认欢迎语)与助手正文同级，不加重、不套框
+  .guideText {
+    color: var(--color-text-2);
+    // markdownBody 默认 h1-h6 + strong 都是 600 (semibold),引导语不加重
+    h1, h2, h3, h4, h5, h6, strong, b {
+      font-weight: 400;
+    }
+  }
+
+  .sender {
+    background-color: var(--color-bg);
+  }
+
+  .bubbleWrapper {
+    width: 100%;
+    cursor: pointer;
+    &:hover {
+      .operationContainer {
+        opacity: 1;
+      }
+    }
+    .operationContainer {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      background: var(--color-fill-2);
+      padding: 3px 0;
+      border-radius: 5px;
+      opacity: 0;
+      .icon {
+        font-size: 12px;
+        display: inline-block;
+        border: none;
+        color: var(--color-text-3);
+        background: transparent;
+        border-radius: 3px;
+        padding: 2px 5px;
+        cursor: pointer;
+        &:hover {
+          color: var(--color-text-2);
+          background: var(--color-fill-3);
+        }
+      }
+    }
+  }
+}
+
+// Assistant: plain text on the working surface, no bubble chrome (Storybook After)
+.chatContainer .assistantBubble :global(.ant-bubble-content-wrapper) {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.chatContainer .assistantBubble :global(.ant-bubble-content) {
+  width: 100%;
+  max-width: 100%;
+  padding: 0;
+  background-color: transparent;
+  color: var(--color-text-1);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+// User: compact right-aligned bubble. Keep the chat-tail shape; don't let markdown <p> inflate a one-liner.
+.userMessageBubble {
+  max-width: 85%;
+  padding: 8px 12px;
+  border-radius: 16px 16px 4px 16px;
+  background-color: color-mix(in srgb, var(--color-fill-1) 70%, transparent);
+  color: var(--color-text-1);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+  word-break: break-word;
+
+  .markdownBody {
+    font-size: inherit;
+    line-height: inherit;
+
+    p {
+      margin: 0;
+
+      & + p {
+        margin-top: 0.4em;
+      }
+    }
+
+    ul,
+    ol {
+      margin: 0.35em 0;
+    }
+  }
+}
+
+.chatContainer .userBubble :global(.ant-bubble-content-wrapper) {
+  max-width: 85%;
+}
+
+.chatContainer .userBubble :global(.ant-bubble-content) {
+  padding: 8px 12px;
+  border-radius: 16px 16px 4px 16px;
+  background-color: color-mix(in srgb, var(--color-fill-1) 70%, transparent);
+  color: var(--color-text-1);
+  font-size: 13px;
+  line-height: 1.45;
+  border: 0;
+  box-shadow: none;
+
+  :global(.markdownBody) {
+    font-size: inherit;
+    line-height: inherit;
+
+    p {
+      margin: 0;
+
+      & + p {
+        margin-top: 0.4em;
+      }
+    }
+  }
+}
+
+.chatContainer :global(.ant-bubble-footer) {
+  margin-top: 4px;
+}
+
+.chatContainer .userBubble :global(.ant-bubble-footer) {
+  display: flex;
+  justify-content: flex-end;
+}
+
+// Thought block: minimal inline stream style
+.thinkingPanel {
+  margin-bottom: 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.thinkingPanelActive,
+.thinkingPanelDone {
+  background: transparent;
+}
+
+.thinkingToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  margin-left: -4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-3);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: color 0.15s ease, background 0.15s ease;
+
+  &:hover {
+    color: var(--color-text-2);
+    background: var(--color-fill-1);
+  }
+}
+
+.thinkingArrow {
+  font-size: 9px;
+  color: var(--color-text-4);
+  transition: transform 0.2s ease;
+  line-height: 1;
+}
+
+.thinkingArrowExpanded {
+  transform: rotate(90deg);
+}
+
+.thinkingMeta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.thinkingBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.2;
+  color: var(--color-text-3);
+}
+
+.thinkingBadgeActive {
+  color: var(--color-text-2);
+}
+
+.thinkingBadgeDone {
+  color: var(--color-text-3);
+}
+
+.thinkingAside {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+}
+
+.thinkingDots {
+  display: inline-flex;
+  gap: 3px;
+
+  span {
+    width: 4px;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--color-primary);
+    animation: thinking-dot 1.4s infinite ease-in-out both;
+  }
+
+  span:nth-child(1) {
+    animation-delay: -0.32s;
+  }
+
+  span:nth-child(2) {
+    animation-delay: -0.16s;
+  }
+}
+
+.thinkingBody {
+  margin-top: 4px;
+  margin-left: 2px;
+  border-left: 2px solid var(--color-fill-3);
+  padding: 2px 0 2px 12px;
+}
+
+.thinkingText {
+  white-space: pre-wrap;
+  line-height: 1.6;
+  font-size: 12px;
+  color: var(--color-text-3);
+}
+
+.thinkingPlaceholder {
+  color: var(--color-text-4);
+  font-size: 12px;
+}
+
+@keyframes thinking-dot {
+  0%, 80%, 100% {
+    transform: scale(0.65);
+    opacity: 0.45;
+  }
+
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.fullscreen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 9999;
+  overflow: auto;
+  padding: 10px;
+  background-color: var(--color-bg);
+}
+.knowledgeItem {
+  background-color: var(--color-fill-2);
+  .title,
+  .references {
+    color: var(--color-primary);
+  }
+}
+.highlightIcon {
+  color: var(--color-primary) !important;
+}
+.knowledgeTitle {
+  color: var(--color-text-3);
+  background: var(--color-bg-1);
+  padding: 5px 10px;
+  border-radius: 5px;
+  &:hover {
+    color: var(--color-primary);
+  }
+}

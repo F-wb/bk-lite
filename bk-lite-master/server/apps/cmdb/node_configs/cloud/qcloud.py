@@ -1,0 +1,62 @@
+# -- coding: utf-8 --
+# @File: qcloud.py
+# @Time: 2025/11/13 14:29
+# @Author: windyzhao
+from apps.cmdb.node_configs.base import BaseNodeParams
+
+
+class QCloudNodeParams(BaseNodeParams):
+    supported_model_id = "qcloud"
+    plugin_name = "qcloud_info"
+    interval = 300  # 腾讯云采集间隔：300秒
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.PLUGIN_MAP.update({self.model_id: "qcloud_info"})
+        self.host_field = "endpoint"
+
+    def set_credential(self, *args, **kwargs):
+        """
+        生成 Tencent Cloud 的凭据
+        """
+        _secret_id = f"PASSWORD_secret_id_{self._instance_id}"
+        _secret_key = f"PASSWORD_secret_key_{self._instance_id}"
+        credential = {
+            "secret_id": "${" + _secret_id + "}",
+            "secret_key": "${" + _secret_key + "}",
+        }
+        regions = self.credential.get("regions") or {}
+        if isinstance(regions, dict) and regions.get("resource_id"):
+            credential["region_id"] = regions["resource_id"]
+        return credential
+
+    def env_config(self, *args, **kwargs):
+        secret_id = self.credential.get("accessKey") or self.credential.get("access_key", "")
+        secret_value = self.credential.get("accessSecret") or self.credential.get("access_secret", "")
+        env_config = {
+            f"PASSWORD_secret_id_{self._instance_id}": secret_id,
+            f"PASSWORD_secret_key_{self._instance_id}": secret_value,
+        }
+        return env_config
+
+    @classmethod
+    def build_region_credential(cls, raw_credential):
+        """
+        {"model_id":"qcloud",
+        "cloud_id":1,
+        "access_key":"AKID5SmwvhSinodHixv4BF",
+        "access_secret":"5762zpOSM5dz84vsla"}
+
+        """
+        raw_credential = cls.primary_credential(raw_credential)
+        access_key = raw_credential.get("access_key") or raw_credential.get("accessKey") or raw_credential.get("secret_id") or ""
+        access_secret = raw_credential.get("access_secret") or raw_credential.get("accessSecret") or raw_credential.get("secret_key")
+        return {
+            "secret_id": access_key,
+            "secret_key": access_secret,
+        }
+
+    @property
+    def password(self):
+        # 返回腾讯云的密码数据
+        return self.build_region_credential(self.credential)

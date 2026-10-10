@@ -1,0 +1,83 @@
+VoiceGateway Mitel SNMP:
+  name: Mitel (Telegraf)
+  desc: "SNMP monitoring template for Mitel voice gateway. It reports uptime, CPU utilization, memory utilization, and interface traffic, for MiVoice 5000 (enterprise PEN 2021)."
+monitor_object:
+  VoiceGateway: VoiceGateway
+monitor_object_type:
+  Network Device: Network Equipment
+monitor_object_metric:
+  VoiceGateway:
+    snmp_uptime:
+      name: System Uptime
+      desc: This metric indicates the uptime of the device since the last restart,
+        derived from sysUpTime. Monitoring uptime helps administrators understand
+        device stability and identify unexpected reboots or failures.
+    interface_ifHCInOctets:
+      name: Interface Incoming Traffic Rate
+      desc: This metric indicates the average rate of bytes received over the past
+        5 minutes, measured in bytes per second, from the 64-bit IF-MIB ifHCInOctets
+        counter (ifXTable). The 64-bit counter avoids the rapid wrap of the 32-bit
+        ifInOctets on high-speed ports, keeping the rate accurate.
+    interface_ifHCOutOctets:
+      name: Interface Outgoing Traffic Rate
+      desc: This metric calculates the average rate of bytes sent over the past 5
+        minutes, measured in bytes per second, from the 64-bit IF-MIB ifHCOutOctets
+        counter (ifXTable). The 64-bit counter avoids the rapid wrap of the 32-bit
+        ifOutOctets on high-speed ports, keeping the rate accurate.
+    device_total_incoming_traffic:
+      name: Device Total Incoming Traffic Rate
+      desc: This metric indicates the average rate of total bytes received by the
+        entire device over the past 5 minutes, measured in bytes per second, summed
+        across all interfaces from the 64-bit ifHCInOctets counter. It helps administrators
+        obtain an overview of incoming traffic for overall monitoring and capacity
+        planning.
+    device_total_outgoing_traffic:
+      name: Device Total Outgoing Traffic Rate
+      desc: This metric represents the average rate of total bytes sent by the entire
+        device over the past 5 minutes, measured in bytes per second, summed across
+        all interfaces from the 64-bit ifHCOutOctets counter. It helps administrators
+        assess sending performance for traffic management and optimization.
+    device_temperature_celsius:
+      name: Device Temperature
+      desc: Voice gateway device temperature in degrees Celsius, used to detect cooling
+        problems, blocked airflow, or overheating risk.
+    device_psu_state:
+      name: PSU State
+      desc: Voice gateway power-source state normalized so 1 means healthy and 2 means
+        fault.
+    cpu_usage_percent:
+      name: CPU Usage
+      desc: Overall CPU utilization of the Mitel MiVoice 5000 from UCD-SNMP ssCpuIdle
+        (100 minus idle), falling back to ssCpuUser plus ssCpuSystem when idle is
+        absent. Sustained high usage can indicate call-processing or control-plane
+        load.
+    memory_total:
+      name: Total Memory
+      desc: Total real memory of the Mitel MiVoice 5000 (UCD-SNMP memTotalReal,
+        reported in kB and converted to bytes).
+    memory_free:
+      name: Free Memory
+      desc: Available real memory of the Mitel MiVoice 5000 (UCD-SNMP memAvailReal,
+        reported in kB and converted to bytes). A persistently low value indicates memory
+        pressure.
+    memory_used:
+      name: Used Memory
+      desc: Used real memory of the Mitel MiVoice 5000, derived as memTotalReal minus
+        memAvailReal and converted from kB to bytes.
+    memory_usage_percent:
+      name: Memory Usage
+      desc: Real memory utilization of the Mitel MiVoice 5000, derived as (memTotalReal
+        - memAvailReal) / memTotalReal * 100. Sustained high usage may indicate resource
+        pressure.
+    memory_total_free:
+      name: Total Free Memory
+      desc: Optional total free memory of the Mitel MiVoice 5000 (UCD-SNMP memTotalFree,
+        reported in kB and converted to bytes). Collected when the scalar is present.
+monitor_object_metric_group:
+  VoiceGateway:
+    Base: Base
+    Traffic: Traffic
+    Temperature: Temperature
+    Hardware Status: Hardware Status
+    CPU: CPU
+    Memory: Memory

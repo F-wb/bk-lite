@@ -1,0 +1,112 @@
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": false,
+    "noEmit": true,
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "strictFunctionTypes": false,
+    "strictPropertyInitialization": false,
+    "noImplicitThis": false,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "types": [
+      "vitest/globals"
+    ],
+    "jsx": "react-jsx",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@/app/monitor/(enterprise)/*": [
+        "./src/app/monitor/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/system-manager/(enterprise)/*": [
+        "./src/app/system-manager/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/system-manager/api/license_mgmt": [
+        "./src/app/system-manager/(enterprise)/api/license_mgmt"
+      ],
+      "@/app/system-manager/api/sensitive_info": [
+        "./src/app/system-manager/(enterprise)/api/sensitive_info"
+      ],
+      "@/app/alarm/(enterprise)/*": [
+        "./src/app/alarm/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/cmdb/(enterprise)/*": [
+        "./src/app/cmdb/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/job/(enterprise)/*": [
+        "./src/app/job/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/log/(enterprise)/*": [
+        "./src/app/log/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/mlops/(enterprise)/*": [
+        "./src/app/mlops/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/node-manager/(enterprise)/*": [
+        "./src/app/node-manager/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/ops-analysis/(enterprise)/*": [
+        "./src/app/ops-analysis/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/ops-console/(enterprise)/*": [
+        "./src/app/ops-console/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/opspilot/(enterprise)/*": [
+        "./src/app/opspilot/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/patch-manager/(enterprise)/*": [
+        "./src/app/patch-manager/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ],
+      "@/app/apm/(enterprise)/*": [
+        "./src/app/apm/(enterprise)/*",
+        "./src/lib/enterpriseStub.ts"
+      ]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    "next.config.mjs",
+    "src/utils/dynamicsMerged.mjs",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "scripts",
+    "src/app/*/node_modules",
+    "src/app/*/package.json"
+  ]
+}

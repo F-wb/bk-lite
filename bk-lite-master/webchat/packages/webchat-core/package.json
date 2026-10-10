@@ -1,0 +1,40 @@
+{
+  "name": "@webchat/core",
+  "version": "1.0.0",
+  "description": "WebChat core library with session management, state machine, and SSE support",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["src", "dist"],
+  "scripts": {
+    "build": "npm run clean && tsc --emitDeclarationOnly && esbuild src/index.ts --bundle --platform=browser --format=esm --target=es2020 --sourcemap --outfile=dist/index.js && esbuild src/index.ts --bundle --platform=browser --format=cjs --target=es2020 --sourcemap --outfile=dist/index.cjs",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublish": "npm run build"
+  },
+  "keywords": [
+    "webchat",
+    "chat",
+    "session",
+    "sse",
+    "state-machine"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  }
+}

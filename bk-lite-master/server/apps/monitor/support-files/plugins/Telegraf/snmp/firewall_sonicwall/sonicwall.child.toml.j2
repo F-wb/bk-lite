@@ -1,0 +1,83 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_sonicwall"
+        config_type = "sonicwall"
+        brand = "sonicwall"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+# @bk_include_ifmib_table
+    # 识别门：sysObjectID 前缀 1.3.6.1.4.1.8741（sonicwall）。
+    # 标量：顶层 field GET 必须带实例 .0；禁止 table.field 采标量（walk 空或误当表列）。
+    # ---- CPU%：sonicCurrentCPUUtil，Gauge 0-100 ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.1.3.0"
+        name = "device_cpu_usage"
+    # ---- 分路 CPU%：管理面 / 转发与检测 ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.1.6.0"
+        name = "device_cpu_usage_management"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.1.7.0"
+        name = "device_cpu_usage_fwd_inspect"
+    # ---- 内存%：sonicCurrentRAMUtil，Gauge 0-100 ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.1.4.0"
+        name = "device_memory_usage"
+    # ---- 会话：sonicCurrentConnCacheEntries → firewall_active_sessions ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.1.2.0"
+        name = "firewall_active_sessions"
+    # ---- 会话上限：sonicMaxConnCacheEntries ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.1.1.0"
+        name = "firewall_max_connections"
+    # ---- NAT：sonicNatTranslationCount ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.1.5.0"
+        name = "firewall_nat_translations"
+    # ---- 硬件传感器表：sonicwallSensorsTable；table.field 禁止 .0 ----
+    # 按 Device/Unit 在查询侧过滤温度/风扇/电源行，不发明状态枚举。
+    [[inputs.snmp.table]]
+        oid = "1.3.6.1.4.1.8741.1.3.3.3.1"
+        name = "device_sensor"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.3.3.1.3"
+        name = "device"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.3.3.1.4"
+        name = "value"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.8741.1.3.3.3.1.5"
+        name = "unit"
+        is_tag = true
+# ---- 不采集 VPN SA 表与私有接口吞吐表；接口走内置 IF-MIB。----

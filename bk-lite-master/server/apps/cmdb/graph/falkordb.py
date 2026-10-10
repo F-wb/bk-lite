@@ -1,0 +1,2299 @@
+# -- coding: utf-8 --
+# @File: falkordb.py
+# @Time: 2025/8/29 14:48
+# @Author: windyzhao
+import json
+import os
+import threading
+import time
+from typing import List, Union
+
+from dotenv import load_dotenv
+from falkordb import falkordb
+
+from apps.cmdb.constants.constants import INSTANCE, INSTANCE_ASSOCIATION, ModelConstraintKey
+from apps.cmdb.constants.field_constraints import (
+    DEFAULT_NUMBER_CONSTRAINT,
+    DEFAULT_STRING_CONSTRAINT,
+    DEFAULT_TIME_CONSTRAINT,
+    DEFAULT_USER_PROMPT,
+    USER_PROMPT,
+)
+from apps.cmdb.display_field import ExcludeFieldsCache
+from apps.cmdb.graph.falkordb_format import FormatDBResult
+from apps.cmdb.graph.format_type import FORMAT_TYPE, FORMAT_TYPE_PARAMS, ParameterCollector, attr_values_equal, coerce_cloud_id_properties
+from apps.cmdb.graph.validators import CQLValidator
+from apps.cmdb.services.instance_identity import (
+    EDGE_DST_UUID_FIELD,
+    EDGE_SRC_UUID_FIELD,
+    ensure_graph_instance_identity,
+    normalize_inst_uuid,
+    prepare_edge_endpoint_properties,
+)
+from apps.cmdb.services.unique_rule import raise_unique_rule_conflict_if_needed
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.logger import cmdb_logger as logger
+
+load_dotenv()
+
+
+class FalkorDBConnectionPool:
+    """FalkorDB连接池，避免重复初始化"""
+
+    _instance = None
+    _client = None
+    _graph = None
+    _initialized = False
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(FalkorDBConnectionPool, cls).__new__(cls)
+        return cls._instance
+
+    def get_connection(self):
+        """获取连接，如果未初始化则初始化"""
+        if not self._initialized or self._client is None or self._graph is None:
+            self._initialize()
+        return self._client, self._graph
+
+    def _initialize(self):
+        """初始化连接（双检锁保护，防止多线程并发重复创建连接）"""
+        if self._initialized and self._client is not None and self._graph is not None:
+            return
+
+        with self.__class__._lock:
+            if self._initialized and self._client is not None and self._graph is not None:
+                return
+
+            try:
+                password = os.getenv("FALKORDB_REQUIREPASS", "") or None
+                host = os.getenv("FALKORDB_HOST", "127.0.0.1")
+                port = int(os.getenv("FALKORDB_PORT", "6379"))
+                database = os.getenv("FALKORDB_DATABASE", "cmdb_graph")
+
+                self._client = falkordb.FalkorDB(host=host, port=port, password=password)
+                self._graph = self._client.select_graph(database)
+                self._initialized = True
+                logger.info(f"已连接到 FalkorDB，选择Graph: {database}")
+            except Exception:
+                import traceback
+
+                logger.error(f"连接失败: {traceback.format_exc()}")
+                raise
+
+    def invalidate(self):
+        """标记当前连接已失效，下一次 get_connection 会重新初始化。"""
+        with self.__class__._lock:
+            self._client = None
+            self._graph = None
+            self._initialized = False
+
+    def close(self):
+        """关闭连接池中的连接并重置初始化状态。"""
+        client = self._client
+        self.invalidate()
+        close = getattr(client, "close", None)
+        if close:
+            try:
+                close()
+            except Exception as e:
+                logger.warning(f"关闭 FalkorDB 连接失败: {e}")
+
+
+class FalkorDBClient:
+    # 参数化查询开关（可通过环境变量控制）
+    ENABLE_PARAMETERIZATION = True
+
+    def __init__(self):
+        self._pool = FalkorDBConnectionPool()
+        self._client = None
+        self._graph = None
+        # 初始化参数收集器
+        self._param_collector = ParameterCollector()
+
+    def connect(self):
+        """建立连接并选择Graph"""
+        try:
+            self._client, self._graph = self._pool.get_connection()
+            return True
+        except Exception:  # noqa
+            import traceback
+
+            logger.error(f"连接失败: {traceback.format_exc()}")
+            return False
+
+    def close(self):
+        """关闭连接"""
+        self._pool.close()
+        self._client = None
+        self._graph = None
+
+    def __enter__(self):
+        """上下文管理器入口"""
+        self.connect()
+        # print("连接了FalkorDB")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """上下文管理器退出"""
+        # self.close()
+        pass
+
+    # 析构函数（备用）
+    def __del__(self):
+        """对象销毁时自动关闭连接"""
+        # self.close()
+        pass
+
+    def _execute_query(self, query: str, params: dict = None, timeout: int | None = None):
+        """
+        统一的查询执行方法，支持参数化查询
+
+        Args:
+            query: CQL查询语句
+            params: 查询参数字典（可选）
+
+        Returns:
+            查询结果
+        """
+        start_time = time.time()
+
+        # 记录查询日志
+        logger.debug(f"[CQL Query] {query}")
+        if params:
+            # 脱敏参数日志
+            safe_params = {k: "***" if "password" in k.lower() else v for k, v in params.items()}
+            logger.debug(f"[CQL Params] {safe_params}")
+
+        try:
+            if self._graph is None and not self.connect():
+                raise RuntimeError("FalkorDB connection is not available")
+
+            # 根据是否有参数选择调用方式
+            query_kwargs = {"params": params} if params else {}
+            if timeout is not None:
+                query_kwargs["timeout"] = timeout
+            result = self._graph.query(query, **query_kwargs)
+
+            execution_time = (time.time() - start_time) * 1000  # 转换为毫秒
+            logger.debug(f"[CQL Result] 查询成功，耗时: {execution_time:.2f}ms")
+            return result
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            self._pool.invalidate()
+            self._client = None
+            self._graph = None
+            logger.error(f"[CQL Error] 查询失败，耗时: {execution_time:.2f}ms，错误: {str(e)}")
+            raise
+
+    def entity_to_list(self, data):
+        """将使用fetchall查询的结果转换成列表类型"""
+        _format = FormatDBResult(data)
+        result = _format.to_list_of_lists()
+        result_list = [self.entity_to_dict(i, _format=False) for i in result]
+
+        if result_list and result_list[0].get("model_id") and result_list[0].get("_labels") == INSTANCE:
+            try:
+                model_id = str(result_list[0].get("model_id"))
+
+                from apps.cmdb.display_field.cache import ExcludeFieldsCache
+
+                attrs = ExcludeFieldsCache.get_model_attrs(model_id)
+
+                if attrs:
+                    result_list = self._deserialize_table_fields_in_result_list(result_list, attrs)
+            except Exception as e:
+                logger.warning(f"[entity_to_list] 表格字段反序列化失败: {e}")
+
+        return result_list
+
+    @staticmethod
+    def entity_to_dict(data: dict, _format=True):
+        """将使用single查询的结果转换成字典类型，过滤以_display结尾的字段"""
+        if _format:
+            _format = FormatDBResult(data)
+            result = _format.to_list_of_dicts()
+            data = result[0] if result else {}
+        return data
+
+    @staticmethod
+    def edge_to_list(data, return_entity: bool):
+        """将使用fetchall查询的结果转换成列表类型"""
+        _format = FormatDBResult(data)
+        result = _format.format_edge_to_list()
+        return result if return_entity else [i["edge"] for i in result]
+
+    def edge_to_dict(self, data):
+        """将使用single查询的结果转换成字典类型"""
+        _data = self.entity_to_dict(data=data)
+        return _data
+
+    @staticmethod
+    def escape_cql_string(value: str) -> str:
+        """转义CQL字符串中的特殊字符"""
+        if not isinstance(value, str):
+            return value
+        # 转义反斜杠和单引号
+        return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    @staticmethod
+    def format_properties(properties: dict):
+        """将属性格式化为CQL中的字符串格式，正确处理字符串转义"""
+        properties_str = "{"
+        for key, value in properties.items():
+            validated_key = CQLValidator.validate_field(key)
+            if isinstance(value, str):
+                escaped_value = FalkorDBClient.escape_cql_string(value)
+                properties_str += f"{validated_key}:'{escaped_value}',"
+            else:
+                properties_str += f"{validated_key}:{value},"
+        properties_str = properties_str[:-1]
+        properties_str += "}"
+        return properties_str
+
+    @staticmethod
+    def _build_exclude_fields_list(exclude_fields: list) -> str:
+        """Defense-in-depth: Validate exclude_fields from cache before query interpolation."""
+        if not exclude_fields:
+            return "[]"
+
+        validated_fields = []
+        for field in exclude_fields:
+            try:
+                validated_field = CQLValidator.validate_field(field)
+                validated_fields.append(f"'{validated_field}'")
+            except Exception as e:
+                logger.warning(f"[全文检索] 排除字段验证失败，跳过: {field}, 原因: {e}")
+                continue
+
+        return "[" + ", ".join(validated_fields) + "]"
+
+    def format_properties_params(self, properties: dict):
+        """
+        将属性字典转换为参数化查询的参数
+
+        FalkorDB 支持使用 Map 参数: CREATE (n:Label $props)
+        参考: https://docs.falkordb.com/cypher_support.html#parameters
+
+        Args:
+            properties: 属性字典
+
+        Returns:
+            dict: 参数字典,格式为 {'props': properties}
+        """
+        if not properties:
+            return {}
+
+        # 验证所有字段名是否合法
+        validated_props = {}
+        for key, value in properties.items():
+            validated_field = CQLValidator.validate_field(key)
+            if validated_field:
+                validated_props[validated_field] = value
+
+        return {"props": validated_props} if validated_props else {}
+
+    def create_entity(
+        self,
+        label: str,
+        properties: dict,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+        attrs: list = None,
+    ):
+        """
+        快速创建一个实体
+        """
+        result = self._create_entity(label, properties, check_attr_map, exist_items, operator, attrs)
+        return result
+
+    @staticmethod
+    def check_unique_attr(item, check_attr_map, exist_items, is_update=False):
+        """校验唯一属性"""
+        not_only_attr = set()
+
+        check_attrs = [i for i in check_attr_map.keys() if i in item] if is_update else check_attr_map.keys()
+
+        for exist_item in exist_items:
+            for attr in check_attrs:
+                exist_item_attr = exist_item.get(attr)
+                item_attr = item.get(attr)
+                if exist_item_attr and item_attr and attr_values_equal(attr, exist_item_attr, item_attr):
+                    not_only_attr.add(attr)
+
+        if not not_only_attr:
+            return
+
+        message = ""
+        for attr in not_only_attr:
+            message += f"{check_attr_map[attr]} exist；"
+
+        raise BaseAppException(message)
+
+    @staticmethod
+    def check_unique_rules(
+        items,
+        unique_rules,
+        exist_items,
+        attrs_by_id,
+        exclude_instance_ids=None,
+    ):
+        raise_unique_rule_conflict_if_needed(
+            unique_rules=unique_rules,
+            items=items,
+            exist_items=exist_items,
+            attrs_by_id=attrs_by_id,
+            exclude_instance_ids=exclude_instance_ids,
+        )
+
+    def check_required_attr(self, item, check_attr_map, is_update=False):
+        """校验必填属性"""
+        not_required_attr = set()
+
+        check_attrs = [i for i in check_attr_map.keys() if i in item] if is_update else check_attr_map.keys()
+
+        for attr in check_attrs:
+            if not item.get(attr):
+                not_required_attr.add(attr)
+
+        if not not_required_attr:
+            return
+
+        message = ""
+        for attr in not_required_attr:
+            # 记录必填项目为空
+            message += f"{check_attr_map[attr]} is empty；"
+
+        raise BaseAppException(message)
+
+    def get_editable_attr(self, item, check_attr_map):
+        """取可编辑属性"""
+        return {k: v for k, v in item.items() if k in check_attr_map}
+
+    def _serialize_table_fields(self, label: str, properties: dict, attrs: list = None):
+        """
+        序列化表格字段为 JSON 字符串
+
+        Args:
+            label: 实体标签
+            properties: 实体属性字典
+            attrs: 属性定义列表
+
+        Returns:
+            dict: 序列化后的属性字典
+        """
+        # 仅对 instance 类型实体进行表格字段序列化
+        if label != "instance" or not attrs:
+            return properties
+
+        # 识别 table 类型字段
+        table_field_ids = {attr.get("attr_id") for attr in attrs if attr.get("attr_type") == "table"}
+
+        if not table_field_ids:
+            return properties
+
+        # 序列化表格字段
+        serialized_properties = properties.copy()
+        for field_id in table_field_ids:
+            if field_id in serialized_properties and isinstance(serialized_properties[field_id], list):
+                try:
+                    serialized_properties[field_id] = json.dumps(serialized_properties[field_id], ensure_ascii=False)
+                    logger.debug(f"[_serialize_table_fields] 序列化表格字段: {field_id}, 原始类型: list, 序列化后类型: str")
+                except Exception as e:
+                    logger.warning(f"[_serialize_table_fields] 表格字段序列化失败: {field_id}, 错误: {e}")
+                    # 序列化失败时保持原值,让后续处理决定如何处理
+
+        return serialized_properties
+
+    def _deserialize_table_fields_in_result_list(self, result_list: list, attrs: list = None):
+        """反序列化结果列表中的表格字段"""
+        if not result_list or not attrs:
+            return result_list
+
+        table_field_ids = {attr.get("attr_id") for attr in attrs if attr.get("attr_type") == "table"}
+
+        if not table_field_ids:
+            return result_list
+
+        for item in result_list:
+            for field_id in table_field_ids:
+                if field_id in item and isinstance(item[field_id], str):
+                    try:
+                        item[field_id] = json.loads(item[field_id])
+                        logger.debug(f"[_deserialize_table_fields] 反序列化字段: {field_id}, 原始类型: str, 反序列化后类型: list")
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(f"[_deserialize_table_fields] 反序列化失败: {field_id}, 错误: {e}, 使用空列表")
+                        item[field_id] = []
+
+        return result_list
+
+    def _create_entity(
+        self,
+        label: str,
+        properties: dict,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+        attrs: list = None,
+    ):
+        properties = ensure_graph_instance_identity(label, properties)
+
+        # 验证标签（不能参数化）
+        validated_label = CQLValidator.validate_label(label)
+        if not validated_label:
+            raise BaseAppException("label is empty")
+
+        # 字段类型约束校验
+        if attrs:
+            from apps.cmdb.validators import FieldValidator
+
+            validation_errors = FieldValidator.validate_instance_data(properties, attrs)
+            if validation_errors:
+                error_msg = "; ".join([f"{err['field_name']}: {err['error']}" for err in validation_errors])
+                raise BaseAppException(f"字段校验失败: {error_msg}")
+
+        # 校验唯一属性
+        self.check_unique_attr(properties, check_attr_map.get("is_only", {}), exist_items)
+
+        self.check_unique_rules(
+            [properties],
+            check_attr_map.get("unique_rules", []),
+            exist_items,
+            check_attr_map.get("attrs_by_id", {}),
+        )
+
+        # 校验必填项
+        self.check_required_attr(properties, check_attr_map.get("is_required", {}))
+
+        # 补充创建人
+        if operator:
+            properties = {**properties, "_creator": operator}
+
+        # 序列化表格字段为 JSON 字符串
+        properties = self._serialize_table_fields(label, properties, attrs)
+
+        # 创建实体
+        if self.ENABLE_PARAMETERIZATION:
+            # 参数化: CREATE + SET += 以支持 list 类型属性
+            # inline map (CREATE (n $props)) 不支持 list 类型,必须用运行时赋值
+            props_params = self.format_properties_params(properties)
+            query = f"CREATE (n:{validated_label}) SET n += $props RETURN n"
+            entity = self._execute_query(query, params=props_params)
+        else:
+            # 旧逻辑
+            properties_str = self.format_properties(properties)
+            query = f"CREATE (n:{validated_label} {properties_str}) RETURN n"
+            entity = self._execute_query(query)
+
+        return self.entity_to_dict(entity)
+
+    def create_edge(
+        self,
+        label: str,
+        a_id: int,
+        a_label: str,
+        b_id: int,
+        b_label: str,
+        properties: dict,
+        check_asst_key: str,
+    ):
+        """
+        快速创建一条边
+        """
+        result = self._create_edge(label, a_id, a_label, b_id, b_label, properties, check_asst_key)
+        return result
+
+    def _resolve_edge_endpoint_uuids(self, properties: dict, a_id: int, b_id: int) -> dict:
+        """仅实例关联边：写入前确保 UUID 端点；缺失时从图节点补齐。"""
+        props = dict(properties or {})
+        src_uuid = props.get(EDGE_SRC_UUID_FIELD)
+        dst_uuid = props.get(EDGE_DST_UUID_FIELD)
+        if not src_uuid:
+            src_uuid = self.query_entity_by_id(a_id).get("inst_uuid")
+        if not dst_uuid:
+            dst_uuid = self.query_entity_by_id(b_id).get("inst_uuid")
+        return prepare_edge_endpoint_properties(
+            props,
+            src_inst_uuid=src_uuid,
+            dst_inst_uuid=dst_uuid,
+        )
+
+    def _create_edge(
+        self,
+        label: str,
+        a_id: int,
+        a_label: str,
+        b_id: int,
+        b_label: str,
+        properties: dict,
+        check_asst_key: str = "model_asst_id",
+    ):
+        # 验证标签和关系类型
+        validated_label = CQLValidator.validate_relation(label)
+        validated_a_label = CQLValidator.validate_label(a_label)
+        validated_b_label = CQLValidator.validate_label(b_label)
+        validated_check_key = CQLValidator.validate_field(check_asst_key)
+
+        if not validated_label:
+            raise BaseAppException("label is empty")
+
+        # 验证ID
+        validated_a_id = CQLValidator.validate_id(a_id)
+        validated_b_id = CQLValidator.validate_id(b_id)
+
+        # 校验边是否已经存在
+        check_asst_val = properties.get(check_asst_key)
+
+        if self.ENABLE_PARAMETERIZATION:
+            # 参数化查询检查边是否存在
+            check_query = (
+                f"MATCH (a:{validated_a_label})-[e]-(b:{validated_b_label}) "
+                f"WHERE ID(a) = $a_id AND ID(b) = $b_id AND e.{validated_check_key} = $check_val "
+                f"RETURN COUNT(e) AS count"
+            )
+            check_params = {
+                "a_id": validated_a_id,
+                "b_id": validated_b_id,
+                "check_val": check_asst_val,
+            }
+            result = self._execute_query(check_query, params=check_params)
+        else:
+            # 旧逻辑
+            result = self._execute_query(
+                f"MATCH (a:{validated_a_label})-[e]-(b:{validated_b_label}) "
+                f"WHERE ID(a) = {validated_a_id} AND ID(b) = {validated_b_id} "
+                f"AND e.{validated_check_key} = '{check_asst_val}' "
+                "RETURN COUNT(e) AS count"
+            )
+
+        result = FormatDBResult(result).to_list_of_lists()
+        edge_count = result[0] if result else 0
+        if edge_count > 0:
+            raise BaseAppException("edge already exists")
+
+        # model_association / 分类边等非实例关联不写入 src/dst_inst_uuid
+        if validated_label == INSTANCE_ASSOCIATION:
+            properties = self._resolve_edge_endpoint_uuids(properties, validated_a_id, validated_b_id)
+
+        # 创建边
+        if self.ENABLE_PARAMETERIZATION:
+            # 参数化: CREATE + SET += 以支持 list 类型属性
+            # inline map (CREATE (a)-[e $props]->(b)) 不支持 list 类型,必须用运行时赋值
+            props_params = self.format_properties_params(properties)
+            # 合并所有参数
+            all_params = {
+                "a_id": validated_a_id,
+                "b_id": validated_b_id,
+                **props_params,
+            }
+            create_query = (
+                f"MATCH (a:{validated_a_label}) WHERE ID(a) = $a_id "
+                f"WITH a MATCH (b:{validated_b_label}) WHERE ID(b) = $b_id "
+                f"CREATE (a)-[e:{validated_label}]->(b) SET e += $props RETURN e"
+            )
+            edge = self._execute_query(create_query, params=all_params)
+        else:
+            # 旧逻辑
+            properties_str = self.format_properties(properties)
+            edge = self._execute_query(
+                f"MATCH (a:{validated_a_label}) WHERE ID(a) = {validated_a_id} "
+                f"WITH a MATCH (b:{validated_b_label}) WHERE ID(b) = {validated_b_id} "
+                f"CREATE (a)-[e:{validated_label} {properties_str}]->(b) RETURN e"
+            )
+
+        return self.edge_to_dict(edge)
+
+    def batch_create_entity(
+        self,
+        label: str,
+        properties_list: list,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+        attrs: list = None,
+    ):
+        """批量创建实体"""
+        results = []
+        for index, properties in enumerate(properties_list):
+            result = {}
+            try:
+                entity = self._create_entity(label, properties, check_attr_map, exist_items, operator, attrs)
+                result.update(data=entity, success=True, message="")
+                exist_items.append(entity)
+            except Exception as e:
+                message = f"article {index + 1} data, {e}"
+                result.update(message=message, success=False, data=properties)
+            results.append(result)
+        return results
+
+    def batch_create_edge(
+        self,
+        label: str,
+        a_label: str,
+        b_label: str,
+        edge_list: list,
+        check_asst_key: str,
+    ):
+        """批量创建边"""
+        results = []
+        for index, edge_info in enumerate(edge_list):
+            result = {}
+            try:
+                a_id = edge_info["src_id"]
+                b_id = edge_info["dst_id"]
+                edge = self._create_edge(label, a_id, a_label, b_id, b_label, edge_info, check_asst_key)
+                result.update(data=edge, success=True)
+            except Exception as e:
+                message = f"article {index + 1} data, {e}"
+                result.update(message=message, success=False)
+            results.append(result)
+        return results
+
+    def format_search_params(
+        self,
+        params: list,
+        param_type: str = "AND",
+        param_collector: ParameterCollector = None,
+        case_sensitive: bool = True,
+    ):
+        """
+        查询参数格式化（参数化版本）
+
+        Args:
+            params: 参数列表
+            param_type: 连接类型（AND/OR）
+            param_collector: 可选的参数收集器。如果提供则使用它（累积参数），否则使用实例收集器（独立查询）
+            case_sensitive: 是否区分大小写（仅对 str* 类型生效）
+
+        Returns:
+            str: 条件字符串（参数存入 collector）
+        """
+        # 使用传入的 collector 或实例 collector
+        collector = param_collector if param_collector is not None else self._param_collector
+
+        # 如果使用实例 collector 且没有传入外部 collector，重置它（独立查询）
+        if collector is self._param_collector and param_collector is None and self.ENABLE_PARAMETERIZATION:
+            collector.reset()
+
+        params_conditions = []
+        for param in params:
+            param_format_type = param.get("type")
+            if not param_format_type:
+                continue
+
+            if self.ENABLE_PARAMETERIZATION:
+                method = FORMAT_TYPE_PARAMS.get(param_format_type)
+                if method:
+                    param_with_context = {**param, "case_sensitive": case_sensitive}
+                    condition = method(param_with_context, collector)
+                    if condition:
+                        params_conditions.append(condition)
+            else:
+                method = FORMAT_TYPE.get(param_format_type)
+                if method:
+                    condition = method(param)
+                    if condition:
+                        params_conditions.append(condition)
+
+        if not params_conditions:
+            return "", {}
+
+        params_str = f" {param_type} ".join(params_conditions)
+        final_str = f"({params_str})" if params_str else ""
+
+        return final_str, collector.get_params() if self.ENABLE_PARAMETERIZATION else {}
+
+    def format_final_params(self, search_params: list, search_param_type: str = "AND", permission_params=""):
+        """格式化最终参数"""
+        search_params_str, _ = self.format_search_params(search_params, search_param_type)
+
+        if not search_params_str:
+            return permission_params
+
+        if not permission_params:
+            return search_params_str
+
+        return f"{search_params_str} AND {permission_params}"
+
+    def query_entity(
+        self,
+        label: str,
+        params: list,
+        format_permission_dict: dict = {},
+        page: dict = None,
+        order: str = None,
+        order_type: str = "ASC",
+        param_type="AND",
+        organization_field: str = "organization",
+        case_sensitive: bool = True,
+        include_count: bool = True,
+        fields: list[str] | None = None,
+    ):
+        """
+        查询实体（参数化版本）
+        params: 查询参数列表 固定
+        format_permission_dict：组织权限查询参数 dict
+        """
+        # 验证标签和排序类型
+        validated_label = CQLValidator.validate_label(label) if label else ""
+        validated_order_type = CQLValidator.validate_order_type(order_type)
+
+        label_str = f":{validated_label}" if validated_label else ""
+
+        # 创建统一的参数收集器,避免多次调用时参数覆盖
+        param_collector = ParameterCollector() if self.ENABLE_PARAMETERIZATION else None
+
+        # 使用参数化的format_search_params（传入统一的收集器）
+        base_params_str, _ = self.format_search_params(
+            params,
+            param_type=param_type,
+            param_collector=param_collector,
+            case_sensitive=case_sensitive,
+        )
+
+        # 构建权限参数（参数化，使用同一个收集器）
+        permission_filters = []
+        for organization_id, query_list in format_permission_dict.items():
+            # 组织查询参数化
+            organization_query = [
+                {
+                    "field": organization_field,
+                    "type": "list[]",
+                    "value": [organization_id],
+                }
+            ]
+            org_base_permission_str, _ = self.format_search_params(
+                organization_query,
+                param_type="AND",
+                param_collector=param_collector,
+                case_sensitive=case_sensitive,
+            )
+
+            org_permission_str, _ = self.format_search_params(
+                query_list,
+                param_type="OR",
+                param_collector=param_collector,
+                case_sensitive=case_sensitive,
+            )
+
+            # 调试日志
+            logger.debug(f"[query_entity] org_id={organization_id}, query_list={query_list}")
+            logger.debug(f"[query_entity] org_base={org_base_permission_str}, org_perm={org_permission_str}")
+
+            # 组合组织条件（避免多余括号）
+            org_filters = []
+            if org_base_permission_str:
+                org_filters.append(org_base_permission_str)
+            if org_permission_str:
+                # org_permission_str 已经包含括号(如 (cond1 OR cond2))，直接使用
+                org_filters.append(org_permission_str)
+
+            if org_filters:
+                # 单个条件不需要额外括号
+                if len(org_filters) == 1:
+                    permission_filters.append(org_filters[0])
+                else:
+                    # 多个条件用 AND 连接时需要括号保证优先级
+                    combined_filter = f"({' AND '.join(org_filters)})"
+                    permission_filters.append(combined_filter)
+
+        # 从统一的收集器获取所有参数
+        query_params = param_collector.get_params() if param_collector else {}
+
+        # 组合最终查询条件
+        final_conditions = []
+        if permission_filters:
+            # 单个权限条件不需要额外括号
+            if len(permission_filters) == 1:
+                final_conditions.append(permission_filters[0])
+            else:
+                # 多个权限条件用 OR 连接时需要括号
+                permission_str = " OR ".join(permission_filters)
+                final_conditions.append(f"({permission_str})")
+        if base_params_str:
+            final_conditions.append(base_params_str)
+
+        final_params_str = " AND ".join(final_conditions) if final_conditions else ""
+        params_str = f"WHERE {final_params_str}" if final_params_str else ""
+
+        from apps.cmdb.graph.export_query import entity_projection
+
+        projection = "n" if fields is None else entity_projection(fields)
+        sql_str = f"MATCH (n{label_str}) {params_str} RETURN {projection}"
+
+        # 调试日志：打印 query_entity 的查询
+        logger.debug(f"[query_entity] SQL: {sql_str}")
+        logger.debug(f"[query_entity] Params: {query_params}")
+        logger.debug(f"[query_entity] format_permission_dict: {format_permission_dict}")
+
+        # 排序
+        if order:
+            validated_order = CQLValidator.validate_field(order)
+            sql_str += f" ORDER BY n.{validated_order} {validated_order_type}"
+        else:
+            sql_str += f" ORDER BY ID(n) {validated_order_type}"
+
+        # 分页
+        count = None
+        if page and include_count:
+            count_str = f"MATCH (n{label_str}) {params_str} RETURN COUNT(n) AS count"
+            _result = self._execute_query(count_str, params=query_params if self.ENABLE_PARAMETERIZATION else None)
+            result = FormatDBResult(_result).to_list_of_lists()
+            count = result[0] if result else 0
+        if page:
+            sql_str += f" SKIP {page['skip']} LIMIT {page['limit']}"
+
+        objs = self._execute_query(sql_str, params=query_params if self.ENABLE_PARAMETERIZATION else None)
+        if fields is not None:
+            return [coerce_cloud_id_properties(row) for row in FormatDBResult(objs).to_list_of_lists()], count
+        return self.entity_to_list(objs), count
+
+    def query_cloud_cost(self, plan):
+        """执行云成本只读查询计划并返回稳定的字典行。"""
+        from apps.cmdb.services.cloud_cost.query import CLOUD_COST_QUERY_TIMEOUT_SECONDS, compile_cloud_cost_query
+
+        compiled = compile_cloud_cost_query(plan)
+        result = self._execute_query(
+            compiled.statement,
+            params=compiled.params,
+            timeout=CLOUD_COST_QUERY_TIMEOUT_SECONDS * 1000,
+        )
+        formatted = FormatDBResult(result)
+        headers = [header[1] if isinstance(header, (list, tuple)) and len(header) > 1 else header for header in result.header]
+        return [dict(zip(headers, record, strict=True)) for record in formatted.records]
+
+    def query_entity_by_id(self, id: int):
+        """
+        查询实体详情（参数化版本）
+        """
+        validated_id = CQLValidator.validate_id(id)
+
+        if self.ENABLE_PARAMETERIZATION:
+            query = "MATCH (n) WHERE ID(n) = $id RETURN n"
+            params = {"id": validated_id}
+            obj = self._execute_query(query, params=params)
+        else:
+            query = f"MATCH (n) WHERE ID(n) = {validated_id} RETURN n"
+            obj = self._execute_query(query)
+
+        if not obj:
+            return {}
+        return self.entity_to_dict(obj)
+
+    def query_entity_by_ids(self, ids: list):
+        """
+        查询实体列表（参数化版本）
+        """
+        validated_ids = CQLValidator.validate_ids(ids)
+
+        if self.ENABLE_PARAMETERIZATION:
+            query = "MATCH (n) WHERE ID(n) IN $ids RETURN n"
+            params = {"ids": validated_ids}
+            objs = self._execute_query(query, params=params)
+        else:
+            query = f"MATCH (n) WHERE ID(n) IN {validated_ids} RETURN n"
+            objs = self._execute_query(query)
+
+        if not objs:
+            return []
+        return self.entity_to_list(objs)
+
+    def query_entity_by_inst_names(self, inst_names: list, model_id: str = None):
+        """
+        查询实体列表 通过实例名称（参数化版本）
+        """
+        if self.ENABLE_PARAMETERIZATION:
+            params = {"inst_names": inst_names}
+            queries = ""
+            if model_id:
+                params["model_id"] = model_id
+                queries = "AND n.model_id = $model_id"
+
+            query = f"MATCH (n) WHERE n.inst_name IN $inst_names {queries} RETURN n"
+            objs = self._execute_query(query, params=params)
+        else:
+            queries = f"AND n.model_id= '{model_id}'" if model_id else ""
+            objs = self._execute_query(f"MATCH (n) WHERE n.inst_name IN {inst_names} {queries} RETURN n")
+
+        if not objs:
+            return []
+        return self.entity_to_list(objs)
+
+    def query_entity_by_inst_uuid(self, inst_uuid: str):
+        """按不可变业务 UUID 查询单个实例节点。"""
+        normalized = normalize_inst_uuid(inst_uuid)
+        if self.ENABLE_PARAMETERIZATION:
+            query = "MATCH (n) WHERE n.inst_uuid = $inst_uuid RETURN n"
+            objs = self._execute_query(query, params={"inst_uuid": normalized})
+        else:
+            objs = self._execute_query(f"MATCH (n) WHERE n.inst_uuid = '{normalized}' RETURN n")
+
+        entities = self.entity_to_list(objs) if objs else []
+        if len(entities) > 1:
+            raise BaseAppException("inst_uuid 查询结果不唯一")
+        return entities[0] if entities else {}
+
+    def query_entity_by_inst_uuids(self, inst_uuids: list):
+        """按不可变业务 UUID 批量查询实例节点；保持输入顺序。"""
+        if not inst_uuids:
+            return []
+        normalized = [normalize_inst_uuid(value) for value in inst_uuids]
+        if len(set(normalized)) != len(normalized):
+            raise BaseAppException("inst_uuid 不允许重复")
+
+        if self.ENABLE_PARAMETERIZATION:
+            query = "MATCH (n) WHERE n.inst_uuid IN $inst_uuids RETURN n"
+            objs = self._execute_query(query, params={"inst_uuids": normalized})
+        else:
+            uuids_literal = "[" + ", ".join(f"'{value}'" for value in normalized) + "]"
+            objs = self._execute_query(f"MATCH (n) WHERE n.inst_uuid IN {uuids_literal} RETURN n")
+
+        entities = self.entity_to_list(objs) if objs else []
+        by_uuid = {}
+        for item in entities:
+            key = item.get("inst_uuid")
+            if key in by_uuid:
+                raise BaseAppException("inst_uuid 查询结果不唯一")
+            by_uuid[key] = item
+        return [by_uuid[value] for value in normalized if value in by_uuid]
+
+    def query_export_associations(self, model_id, inst_uuids, association_ids):
+        from apps.cmdb.graph.export_query import EXPORT_ASSOCIATION_FIELDS, export_association_queries
+
+        rows = []
+        for statement, params in export_association_queries(model_id, inst_uuids, association_ids):
+            result = self._execute_query(statement, params=params)
+            rows.extend(dict(zip(EXPORT_ASSOCIATION_FIELDS, row, strict=True)) for row in result.result_set)
+        return rows
+
+    def query_edge(
+        self,
+        label: str,
+        params: list,
+        param_type: str = "AND",
+        return_entity: bool = False,
+    ):
+        """
+        查询边（参数化版本）
+        """
+        validated_label = CQLValidator.validate_label(label) if label else ""
+        label_str = f":{validated_label}" if validated_label else ""
+
+        params_str, query_params = self.format_search_params(params, param_type)
+        params_str = f"WHERE {params_str}" if params_str else params_str
+
+        query = f"MATCH p=(a)-[n{label_str}]->(b) {params_str} RETURN p"
+        objs = self._execute_query(query, params=query_params if self.ENABLE_PARAMETERIZATION else None)
+
+        return self.edge_to_list(objs, return_entity)
+
+    def query_edge_by_id(self, id: int, return_entity: bool = False):
+        """
+        查询边详情（参数化版本）
+        """
+        validated_id = CQLValidator.validate_id(id)
+
+        if self.ENABLE_PARAMETERIZATION:
+            query = "MATCH p=(a)-[n]->(b) WHERE ID(n) = $id RETURN p"
+            params = {"id": validated_id}
+            objs = self._execute_query(query, params=params)
+        else:
+            objs = self._execute_query(f"MATCH p=(a)-[n]->(b) WHERE ID(n) = {validated_id} RETURN p")
+
+        edges = self.edge_to_list(objs, return_entity)
+        return edges[0]
+
+    def format_properties_set(self, properties: dict):
+        """格式化properties的set数据，正确处理字符串转义"""
+        properties_str = ""
+        for key, value in properties.items():
+            validated_key = CQLValidator.validate_field(key)
+            if isinstance(value, str):
+                escaped_value = self.escape_cql_string(value)
+                properties_str += f"n.{validated_key}='{escaped_value}',"
+            else:
+                properties_str += f"n.{validated_key}={value},"
+        return properties_str if properties_str == "" else properties_str[:-1]
+
+    def set_entity_properties(
+        self,
+        label: str,
+        entity_ids: list,
+        properties: dict,
+        check_attr_map: dict,
+        exist_items: list,
+        check: bool = True,
+        attrs: list = None,
+    ):
+        """
+        设置实体属性
+
+        根据 label 类型执行不同的逻辑:
+        - label == "instance": 校验实例数据是否符合模型字段约束
+        - label == "model": 确保模型字段定义包含必要的默认值
+        """
+        from apps.cmdb.constants.constants import INSTANCE, MODEL
+
+        if check:
+            # 校验唯一属性
+            self.check_unique_attr(
+                properties,
+                check_attr_map.get("is_only", {}),
+                exist_items,
+                is_update=True,
+            )
+
+            self.check_unique_rules(
+                check_attr_map.get("validation_items") or [properties],
+                check_attr_map.get("unique_rules", []),
+                exist_items,
+                check_attr_map.get("attrs_by_id", {}),
+                exclude_instance_ids=set(entity_ids),
+            )
+
+            # 校验必填项
+            self.check_required_attr(properties, check_attr_map.get("is_required", {}), is_update=True)
+
+            # 取出可编辑属性
+            properties = self.get_editable_attr(properties, check_attr_map.get("editable", {}))
+
+        # 根据 label 类型执行不同的校验逻辑
+        if label == INSTANCE and attrs:
+            # 实例：字段类型约束校验
+            from apps.cmdb.validators import FieldValidator
+
+            validation_errors = FieldValidator.validate_instance_data(properties, attrs)
+            if validation_errors:
+                error_msg = "; ".join([f"{err['field_name']}: {err['error']}" for err in validation_errors])
+                raise BaseAppException(f"字段校验失败: {error_msg}")
+
+        elif label == MODEL and "attrs" in properties:
+            # 模型：确保字段定义包含必要的默认值
+            try:
+                attrs_list = json.loads(properties["attrs"]) if isinstance(properties["attrs"], str) else properties["attrs"]
+
+                # 为每个字段补充默认值
+                for attr in attrs_list:
+                    if not isinstance(attr, dict):
+                        logger.warning(f"处理模型字段默认值时跳过非法字段定义，类型: {type(attr).__name__}")
+                        continue
+
+                    # 1. 确保有 user_prompt 字段
+                    if USER_PROMPT not in attr:
+                        attr.update(DEFAULT_USER_PROMPT)
+
+                    # 2. 确保 option 字段存在
+                    if "option" not in attr:
+                        attr["option"] = {}
+
+                    option = attr["option"]
+                    attr_type = attr.get("attr_type")
+
+                    # 历史字段类型可能发生漂移，兜底修正 option 结构，避免启动初始化因脏数据中断。
+                    if attr_type in ["str", "int", "float", "time"] and not isinstance(option, dict):
+                        default_option = {}
+                        if attr_type == "str":
+                            default_option = DEFAULT_STRING_CONSTRAINT.copy()
+                        elif attr_type in ["int", "float"]:
+                            default_option = DEFAULT_NUMBER_CONSTRAINT.copy()
+                        elif attr_type == "time":
+                            default_option = DEFAULT_TIME_CONSTRAINT.copy()
+                        logger.warning(
+                            "模型字段 option 类型异常，已重置为默认约束: attr_id=%s, attr_type=%s, option_type=%s",
+                            attr.get("attr_id"),
+                            attr_type,
+                            type(option).__name__,
+                        )
+                        option = default_option
+                        attr["option"] = option
+
+                    # 3. 根据字段类型补充默认约束
+                    if attr_type == "str" and option:
+                        if "validation_type" not in option:
+                            option.update(DEFAULT_STRING_CONSTRAINT.copy())
+                    elif attr_type in ["int", "float"] and option:
+                        if "min_value" not in option or "max_value" not in option:
+                            option.update(DEFAULT_NUMBER_CONSTRAINT.copy())
+                    elif attr_type == "time" and option:
+                        if "display_format" not in option:
+                            option.update(DEFAULT_TIME_CONSTRAINT.copy())
+
+                # 更新回 properties
+                properties["attrs"] = json.dumps(attrs_list, ensure_ascii=False)
+
+            except (json.JSONDecodeError, TypeError, KeyError) as e:
+                logger.warning(f"处理模型字段默认值时出错: {e}")
+
+        # 序列化表格字段为 JSON 字符串
+        properties = self._serialize_table_fields(label, properties, attrs)
+
+        nodes = self.batch_update_node_properties(label, entity_ids, properties)
+        return self.entity_to_list(nodes)
+
+    def batch_update_entity_properties(
+        self,
+        label: str,
+        entity_ids: list,
+        properties: dict,
+        check_attr_map: dict,
+        check: bool = True,
+        attrs: list = None,
+    ):
+        """批量更新实体属性"""
+        if check:
+            # 字段类型约束校验
+            if attrs:
+                from apps.cmdb.validators import FieldValidator
+
+                validation_errors = FieldValidator.validate_instance_data(properties, attrs)
+                if validation_errors:
+                    error_msg = "; ".join([f"{err['field_name']}: {err['error']}" for err in validation_errors])
+                    raise BaseAppException(f"字段校验失败: {error_msg}")
+
+            # 校验必填项
+            self.check_required_attr(properties, check_attr_map.get("is_required", {}), is_update=True)
+
+            # 取出可编辑属性
+            properties = self.get_editable_attr(properties, check_attr_map.get("editable", {}))
+            if not properties:
+                return []
+
+        # 序列化表格字段为 JSON 字符串
+        properties = self._serialize_table_fields(label, properties, attrs)
+
+        nodes = self.batch_update_node_properties(label, entity_ids, properties)
+        return {"data": self.entity_to_list(nodes), "success": True, "message": ""}
+
+    def batch_update_node_properties(self, label: str, node_ids: Union[int, List[int]], properties: dict):
+        """批量更新节点属性（参数化版本）"""
+        validated_label = CQLValidator.validate_label(label) if label else ""
+        validated_ids = CQLValidator.validate_ids(node_ids) if isinstance(node_ids, list) else [CQLValidator.validate_id(node_ids)]
+
+        if not properties:
+            raise BaseAppException("properties is empty")
+
+        if self.ENABLE_PARAMETERIZATION:
+            # 构建SET子句
+            set_parts = []
+            params = {"ids": validated_ids}
+
+            for i, (key, value) in enumerate(properties.items()):
+                validated_field = CQLValidator.validate_field(key)
+                param_name = f"val{i}"
+                set_parts.append(f"n.{validated_field} = ${param_name}")
+                params[param_name] = value
+
+            label_str = f":{validated_label}" if validated_label else ""
+            set_clause = ", ".join(set_parts)
+            query = f"MATCH (n{label_str}) WHERE ID(n) IN $ids SET {set_clause} RETURN n"
+
+            nodes = self._execute_query(query, params=params)
+        else:
+            # 旧逻辑
+            label_str = f":{validated_label}" if validated_label else ""
+            properties_str = self.format_properties_set(properties)
+            nodes = self._execute_query(f"MATCH (n{label_str}) WHERE ID(n) IN {validated_ids} SET {properties_str} RETURN n")
+
+        return nodes
+
+    def batch_update_node_property_values(self, label: str, field: str, property_values: list[dict]):
+        """在一次图查询中为不同节点写入同一字段的不同值。"""
+        validated_label = CQLValidator.validate_label(label)
+        validated_field = CQLValidator.validate_field(field)
+        validated_property_values = CQLValidator.validate_property_values(property_values)
+        if not validated_property_values:
+            return []
+
+        query = (
+            f"UNWIND $property_values AS row " f"MATCH (n:{validated_label}) WHERE ID(n) = row.id " f"SET n.{validated_field} = row.value RETURN n"
+        )
+        result = self._execute_query(
+            query,
+            params={"property_values": validated_property_values},
+        )
+        return self.entity_to_list(result)
+
+    def ensure_node_property_index(self, label: str, field: str):
+        """创建节点属性索引。
+
+        唯一性由索引加速 + 应用层保证；图引擎若不支持强唯一约束，不得宣称 DB 唯一。
+        重复执行时接受“已存在”类错误。
+        """
+        validated_label = CQLValidator.validate_label(label)
+        validated_field = CQLValidator.validate_field(field)
+        query = f"CREATE INDEX FOR (n:{validated_label}) ON (n.{validated_field})"
+        try:
+            if self._graph is None and not self.connect():
+                raise RuntimeError("FalkorDB connection is not available")
+            return self._graph.query(query)
+        except Exception as exc:
+            message = str(exc).lower()
+            if "index" in message and ("already exists" in message or "already indexed" in message):
+                return None
+            raise
+
+    def format_properties_remove(self, attrs: list):
+        """格式化properties的remove数据，验证字段名防止注入"""
+        properties_str = ""
+        for attr in attrs:
+            # 验证字段名，防止注入攻击
+            validated_attr = CQLValidator.validate_field(attr)
+            properties_str += f"n.`{validated_attr}`,"
+        return properties_str if properties_str == "" else properties_str[:-1]
+
+    def remove_entitys_properties(self, label: str, params: list, attrs: list):
+        """移除某些实体的某些属性（参数化版本）"""
+
+        # 验证标签和属性
+        if self.ENABLE_PARAMETERIZATION:
+            if label:
+                CQLValidator.validate_label(label)
+            for attr in attrs:
+                CQLValidator.validate_field(attr)
+
+        label_str = f":{label}" if label else ""
+        properties_str = self.format_properties_remove(attrs)
+
+        if self.ENABLE_PARAMETERIZATION:
+            param_collector = ParameterCollector()
+            params_str, query_params = self.format_search_params(params, param_collector=param_collector)
+            params_str = f"WHERE {params_str}" if params_str else ""
+            self._execute_query(
+                f"MATCH (n{label_str}) {params_str} REMOVE {properties_str} RETURN n",
+                params=query_params if query_params else None,
+            )
+        else:
+            params_str, _ = self.format_search_params(params)
+            params_str = f"WHERE {params_str}" if params_str else ""
+            self._execute_query(f"MATCH (n{label_str}) {params_str} REMOVE {properties_str} RETURN n")
+
+    def batch_delete_entity(self, label: str, entity_ids: list):
+        """批量删除实体（参数化版本）"""
+        validated_label = CQLValidator.validate_label(label) if label else ""
+        validated_ids = CQLValidator.validate_ids(entity_ids)
+
+        label_str = f":{validated_label}" if validated_label else ""
+
+        if self.ENABLE_PARAMETERIZATION:
+            query = f"MATCH (n{label_str}) WHERE ID(n) IN $ids DETACH DELETE n"
+            params = {"ids": validated_ids}
+            self._execute_query(query, params=params)
+        else:
+            self._execute_query(f"MATCH (n{label_str}) WHERE ID(n) IN {validated_ids} DETACH DELETE n")
+
+    def detach_delete_entity(self, label: str, id: int):
+        """删除实体，以及实体的关联关系（参数化版本）"""
+        validated_label = CQLValidator.validate_label(label) if label else ""
+        validated_id = CQLValidator.validate_id(id)
+
+        label_str = f":{validated_label}" if validated_label else ""
+
+        if self.ENABLE_PARAMETERIZATION:
+            query = f"MATCH (n{label_str}) WHERE ID(n) = $id DETACH DELETE n"
+            params = {"id": validated_id}
+            self._execute_query(query, params=params)
+        else:
+            self._execute_query(f"MATCH (n{label_str}) WHERE ID(n) = {validated_id} DETACH DELETE n")
+
+    def delete_edge(self, edge_id: int):
+        """删除边（参数化版本）"""
+        validated_id = CQLValidator.validate_id(edge_id)
+
+        if self.ENABLE_PARAMETERIZATION:
+            query = "MATCH ()-[n]->() WHERE ID(n) = $id DELETE n"
+            params = {"id": validated_id}
+            self._execute_query(query, params=params)
+        else:
+            self._execute_query(f"MATCH ()-[n]->() WHERE ID(n) = {validated_id} DELETE n")
+
+    def remove_edge_properties(self, edge_ids: list[int], attrs: list[str]):
+        """批量删除关系属性；关系 ID 仅作为本次图内维护定位符。"""
+        if not edge_ids or not attrs:
+            return
+        validated_ids = CQLValidator.validate_ids(edge_ids)
+        validated_attrs = [CQLValidator.validate_field(attr) for attr in attrs]
+        remove_clause = ", ".join(f"e.`{attr}`" for attr in validated_attrs)
+        if self.ENABLE_PARAMETERIZATION:
+            self._execute_query(
+                f"MATCH ()-[e]->() WHERE ID(e) IN $edge_ids REMOVE {remove_clause}",
+                params={"edge_ids": validated_ids},
+            )
+        else:
+            self._execute_query(f"MATCH ()-[e]->() WHERE ID(e) IN {validated_ids} REMOVE {remove_clause}")
+
+    def set_edge_properties(self, edge_id: int, properties: dict):
+        validated_id = CQLValidator.validate_id(edge_id)
+        if not properties:
+            raise BaseAppException("properties is empty")
+
+        if self.ENABLE_PARAMETERIZATION:
+            set_parts = []
+            params = {"id": validated_id}
+
+            for i, (key, value) in enumerate(properties.items()):
+                validated_field = CQLValidator.validate_field(key)
+                param_name = f"val{i}"
+                set_parts.append(f"e.{validated_field} = ${param_name}")
+                params[param_name] = value
+
+            query = f"MATCH ()-[e]->() WHERE ID(e) = $id SET {', '.join(set_parts)} RETURN e"
+            edge = self._execute_query(query, params=params)
+        else:
+            properties_str = self.format_properties_set(properties).replace("n.", "e.")
+            edge = self._execute_query(f"MATCH ()-[e]->() WHERE ID(e) = {validated_id} SET {properties_str} RETURN e")
+
+        result = self.edge_to_dict(edge)
+        if not result:
+            raise BaseAppException("edge not found")
+        return result
+
+    def entity_objs(self, label: str, params: list, permission_params: str = ""):
+        validated_label = CQLValidator.validate_label(label) if label else ""
+        label_str = f":{validated_label}" if validated_label else ""
+
+        if self.ENABLE_PARAMETERIZATION:
+            param_collector = ParameterCollector()
+            params_str, query_params = self.format_search_params(params, param_collector=param_collector)
+
+            conditions = []
+            if params_str:
+                conditions.append(params_str)
+            if permission_params:
+                conditions.append(permission_params)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            sql_str = f"MATCH (n{label_str}) {where_clause} RETURN n"
+            inst_objs = self._execute_query(sql_str, params=query_params if query_params else None)
+        else:
+            params_str = self.format_final_params(params, permission_params=permission_params)
+            params_str = f"WHERE {params_str}" if params_str else params_str
+            sql_str = f"MATCH (n{label_str}) {params_str} RETURN n"
+            inst_objs = self._execute_query(sql_str)
+
+        return inst_objs
+
+    def query_topo(self, label: str, inst_id: int):
+        """查询实例拓扑（参数化版本）"""
+
+        # 验证参数
+        if self.ENABLE_PARAMETERIZATION:
+            if label:
+                CQLValidator.validate_label(label)
+            CQLValidator.validate_id(inst_id)
+
+        label_str = f":{label}" if label else ""
+
+        # 修复 FalkorDB 兼容性问题
+        # 查询从指定节点出发的所有路径（作为源节点）
+        if self.ENABLE_PARAMETERIZATION:
+            src_query = f"MATCH p=(n{label_str})-[*]->(m{label_str}) WHERE ID(n) = $inst_id RETURN p"
+            dst_query = f"MATCH p=(m{label_str})-[*]->(n{label_str}) WHERE ID(n) = $inst_id RETURN p"
+            query_params = {"inst_id": inst_id}
+        else:
+            src_query = f"MATCH p=(n{label_str})-[*]->(m{label_str}) WHERE ID(n) = {inst_id} RETURN p"
+            dst_query = f"MATCH p=(m{label_str})-[*]->(n{label_str}) WHERE ID(n) = {inst_id} RETURN p"
+            query_params = None
+
+        try:
+            src_objs = self._execute_query(src_query, params=query_params)
+            dst_objs = self._execute_query(dst_query, params=query_params)
+        except Exception as e:
+            logger.error(f"Query topo failed: {e}")
+            # 如果复杂查询失败，使用简单的直接关系查询
+            return {}
+
+        return dict(
+            src_result=self.format_topo(inst_id, src_objs, True),
+            dst_result=self.format_topo(inst_id, dst_objs, False),
+        )
+
+    @staticmethod
+    def get_topo_config() -> dict:
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            topo_config_path = os.path.join(base_dir, "support-files", "topo_config.json")
+
+            if not os.path.isfile(topo_config_path):
+                logger.warning("Topo config file not found: %s", topo_config_path)
+                return {}
+
+            with open(topo_config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                logger.warning("Topo config is not a dictionary: %s", topo_config_path)
+                return {}
+            return data
+
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Failed to load topo config: %s, error: %s", topo_config_path, e)
+            return {}
+
+    def convert_to_cypher_match(self, label_str: str, model_id: str, params_str: str, dst: bool = True) -> str:
+        edge_type = "dst" if dst else "src"
+        default_match = (
+            f"MATCH p={f'(m{label_str})-[*]->(n{label_str})' if dst else f'(n{label_str})-[*]->(m{label_str})'} WHERE 1=1 {params_str} RETURN p"
+        )
+
+        topo_path = self.get_topo_config().get(model_id)
+
+        if not topo_path:
+            return default_match
+
+        edge_list = topo_path.get(edge_type)
+        if not edge_list:
+            return default_match
+
+        cypher_parts = []
+        node_aliases = {}
+        rep_alias = ""
+
+        for i, relation in enumerate(edge_list):
+            self_obj = relation["self_obj"]
+            target_obj = relation["target_obj"]
+            assoc = relation["assoc"]
+
+            # 验证配置文件中的值，防止配置被篡改导致注入
+            validated_self_obj = CQLValidator.validate_field(self_obj)
+            validated_target_obj = CQLValidator.validate_field(target_obj)
+            validated_assoc = CQLValidator.validate_relation(assoc)
+
+            if self_obj not in node_aliases:
+                node_aliases[self_obj] = f"v{i}"
+            self_alias = node_aliases[self_obj]
+
+            if i == 0:
+                if edge_type == "src":
+                    rep_alias = self_alias
+                cypher_parts.append(f"({self_alias}:instance {{model_id: '{validated_self_obj}'}})")
+
+            if target_obj not in node_aliases:
+                node_aliases[target_obj] = f"v{i + 1}"
+            target_alias = node_aliases[target_obj]
+            if edge_type == "dst":
+                rep_alias = target_alias
+            cypher_parts.append(f"-[:{validated_assoc}]->({target_alias}:instance {{model_id: '{validated_target_obj}'}})")
+
+        match_path = "".join(cypher_parts)
+        where_clause = f"WHERE 1=1 {params_str.replace('n', rep_alias)}"
+
+        return f"MATCH p={match_path}\n{where_clause}\nRETURN p"
+
+    def query_topo_test_config(self, label: str, inst_id: int, model_id: str):
+        """查询实例拓扑（参数化版本）"""
+
+        # 验证参数
+        if self.ENABLE_PARAMETERIZATION:
+            if label:
+                CQLValidator.validate_label(label)
+            CQLValidator.validate_id(inst_id)
+            CQLValidator.validate_field(model_id)  # 验证 model_id 格式
+
+        label_str = f":{label}" if label else ""
+
+        # 构建参数化查询
+        if self.ENABLE_PARAMETERIZATION:
+            query_params = {"inst_id": inst_id}
+            params_str = "AND ID(n) = $inst_id"
+        else:
+            params_str, _ = self.format_search_params([{"field": "id", "type": "id=", "value": inst_id}])
+            if params_str:
+                params_str = f"AND {params_str}"
+            query_params = None
+
+        src_query = self.convert_to_cypher_match(label_str, model_id, params_str, dst=False)
+        dst_query = self.convert_to_cypher_match(label_str, model_id, params_str, dst=True)
+
+        src_objs = self._execute_query(src_query, params=query_params)
+        dst_objs = self._execute_query(dst_query, params=query_params)
+
+        return dict(
+            src_result=self.format_topo(inst_id, src_objs, True),
+            dst_result=self.format_topo(inst_id, dst_objs, False),
+        )
+
+    def query_topo_lite(self, label: str, inst_id: int, depth: int = 3, exclude_ids=None):
+        """查询实例拓扑：限制返回层级，减少前端一次性渲染与网络传输压力"""
+
+        depth = max(1, int(depth))
+        probe_depth = depth + 1
+
+        if self.ENABLE_PARAMETERIZATION:
+            if label:
+                CQLValidator.validate_label(label)
+            CQLValidator.validate_id(inst_id)
+
+        label_str = f":{label}" if label else ""
+
+        if self.ENABLE_PARAMETERIZATION:
+            query_params = {"inst_id": inst_id}
+            src_query = f"MATCH p=(n{label_str})-[*1..{probe_depth}]->(m{label_str}) WHERE ID(n) = $inst_id RETURN p"
+            dst_query = f"MATCH p=(m{label_str})-[*1..{probe_depth}]->(n{label_str}) WHERE ID(n) = $inst_id RETURN p"
+        else:
+            query_params = None
+            src_query = f"MATCH p=(n{label_str})-[*1..{probe_depth}]->(m{label_str}) WHERE ID(n) = {inst_id} RETURN p"
+            dst_query = f"MATCH p=(m{label_str})-[*1..{probe_depth}]->(n{label_str}) WHERE ID(n) = {inst_id} RETURN p"
+
+        src_objs = self._execute_query(src_query, params=query_params)
+        dst_objs = self._execute_query(dst_query, params=query_params)
+
+        return dict(
+            src_result=self.format_topo_lite(inst_id, src_objs, True, depth=depth, exclude_ids=exclude_ids),
+            dst_result=self.format_topo_lite(inst_id, dst_objs, False, depth=depth, exclude_ids=exclude_ids),
+        )
+
+    def query_network_topo(self, inst_id: int, belong_asst_id: str):
+        """网络拓扑：以设备为中心，查其接口直连的对端设备。返回扁平行列表。
+
+        仅按边属性过滤（实例关联边关系类型统一），跨 FalkorDB/Neo4j 用标量 RETURN 规避对象解析差异。
+        """
+        connect_asst = "interface_connect_interface"
+        # 与 query_topo_lite 一致：分支前统一校验，避免非参数化分支吞掉非法 inst_id
+        CQLValidator.validate_id(inst_id)
+        inst_id = int(inst_id)
+        ret = (
+            "RETURN ID(dev) AS dev_id, dev.inst_name AS dev_name, dev.model_id AS dev_model, "
+            "i.inst_name AS local_if, i.inst_uuid AS local_if_uuid, "
+            "p.inst_name AS peer_if, p.inst_uuid AS peer_if_uuid, "
+            "ID(dev2) AS peer_id, dev2.inst_name AS peer_name, dev2.model_id AS peer_model, "
+            "ID(e2) AS rel_id"
+        )
+        if self.ENABLE_PARAMETERIZATION:
+            match = (
+                "MATCH (i)-[e1]->(dev) WHERE ID(dev) = $inst_id AND e1.model_asst_id = $belong "
+                "MATCH (i)-[e2]-(p) WHERE e2.model_asst_id = $connect "
+                "MATCH (p)-[e3]->(dev2) WHERE e3.asst_id = 'belong' AND ID(dev2) <> $inst_id "
+            )
+            params = {"inst_id": inst_id, "belong": belong_asst_id, "connect": connect_asst}
+            objs = self._execute_query(match + ret, params=params)
+        else:
+            safe_belong = self.escape_cql_string(belong_asst_id)
+            safe_connect = self.escape_cql_string(connect_asst)
+            match = (
+                f"MATCH (i)-[e1]->(dev) WHERE ID(dev) = {int(inst_id)} AND e1.model_asst_id = '{safe_belong}' "
+                f"MATCH (i)-[e2]-(p) WHERE e2.model_asst_id = '{safe_connect}' "
+                f"MATCH (p)-[e3]->(dev2) WHERE e3.asst_id = 'belong' AND ID(dev2) <> {int(inst_id)} "
+            )
+            objs = self._execute_query(match + ret)
+
+        keys = [
+            "dev_id",
+            "dev_name",
+            "dev_model",
+            "local_if",
+            "local_if_uuid",
+            "peer_if",
+            "peer_if_uuid",
+            "peer_id",
+            "peer_name",
+            "peer_model",
+            "rel_id",
+        ]
+        rows = []
+        for row in getattr(objs, "result_set", []) or []:
+            rows.append({k: row[idx] for idx, k in enumerate(keys)})
+        return rows
+
+    @staticmethod
+    def _relationship_endpoint_id(endpoint):
+        """兼容 FalkorDB 不同驱动版本返回的关系端点类型。"""
+        return endpoint.id if hasattr(endpoint, "id") else endpoint
+
+    def format_topo(self, start_id, objs, entity_is_src=True):
+        """格式化拓扑数据；导航优先使用图连接端点，边属性 UUID 供序列化/过滤。"""
+
+        # 修复 FalkorDB QueryResult 对象检查方式
+        all_results = objs.result_set
+
+        edge_map = {}
+        entity_map = {}
+
+        for obj in all_results:
+            for element in obj:
+                # 分离出路径中的点和线
+                nodes = getattr(element, "_nodes", [])  # 获取所有节点
+                relationships = getattr(element, "_edges", [])  # 获取所有节点
+                for node in nodes:
+                    props = {k: v for k, v in node.properties.items() if k != "_id"}
+                    entity_map[node.id] = dict(_id=node.id, _label=node.labels[0], **props)
+                for relationship in relationships:
+                    props = {k: v for k, v in relationship.properties.items() if k != "_id"}
+                    edge_map[relationship.id] = dict(
+                        _id=relationship.id,
+                        _label=relationship.relation,
+                        **props,
+                    )
+                    # 内部建树仍用图 ID；由连接端点合成，不依赖边属性上的数字端点
+                    edge_map[relationship.id].update(
+                        src_inst_id=self._relationship_endpoint_id(relationship.src_node),
+                        dst_inst_id=self._relationship_endpoint_id(relationship.dest_node),
+                    )
+
+        edges = list(edge_map.values())
+        # 去除自己指向自己的边
+        edges = [edge for edge in edges if edge["src_inst_id"] != edge["dst_inst_id"]]
+        entities = list(entity_map.values())
+
+        # 检查起始实体是否存在
+        if start_id not in entity_map:
+            return {}
+
+        result = self.create_node(entity_map[start_id], edges, entities, entity_is_src)
+        return result
+
+    def create_node(self, entity, edges, entities, entity_is_src=True):
+        """entity作为目标"""
+        node = {
+            "_id": entity["_id"],
+            "inst_uuid": entity.get("inst_uuid"),
+            "model_id": entity.get("model_id"),
+            "inst_name": entity.get("inst_name"),
+            "children": [],
+        }
+
+        if entity_is_src:
+            entity_key, child_entity_key = "src", "dst"
+        else:
+            entity_key, child_entity_key = "dst", "src"
+
+        for edge in edges:
+            if edge[f"{entity_key}_inst_id"] == entity["_id"]:
+                child_entity = self.find_entity_by_id(edge[f"{child_entity_key}_inst_id"], entities)
+                if child_entity:
+                    child_node = self.create_node(child_entity, edges, entities, entity_is_src)
+                    self._attach_association_fields(child_node, edge)
+                    node["children"].append(child_node)
+        return node
+
+    def format_topo_lite(self, start_id, objs, entity_is_src=True, depth: int = 3, exclude_ids=None):
+        """格式化拓扑数据：限制层级并支持排除父节点集合"""
+
+        all_results = objs.result_set
+
+        exclude_id_set = set()
+        for value in exclude_ids or []:
+            try:
+                exclude_id_set.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        exclude_id_set.discard(start_id)
+
+        edge_map = {}
+        entity_map = {}
+
+        for obj in all_results:
+            for element in obj:
+                nodes = getattr(element, "_nodes", [])
+                relationships = getattr(element, "_edges", [])
+                for node in nodes:
+                    props = {k: v for k, v in node.properties.items() if k != "_id"}
+                    entity_map[node.id] = dict(_id=node.id, _label=node.labels[0], **props)
+                for relationship in relationships:
+                    props = {k: v for k, v in relationship.properties.items() if k != "_id"}
+                    edge_map[relationship.id] = dict(
+                        _id=relationship.id,
+                        _label=relationship.relation,
+                        **props,
+                    )
+                    edge_map[relationship.id].update(
+                        src_inst_id=self._relationship_endpoint_id(relationship.src_node),
+                        dst_inst_id=self._relationship_endpoint_id(relationship.dest_node),
+                    )
+
+        edges = list(edge_map.values())
+        edges = [edge for edge in edges if edge.get("src_inst_id") != edge.get("dst_inst_id")]
+
+        if exclude_id_set:
+            for node_id in exclude_id_set:
+                entity_map.pop(node_id, None)
+            edges = [edge for edge in edges if edge.get("src_inst_id") not in exclude_id_set and edge.get("dst_inst_id") not in exclude_id_set]
+
+        entities = list(entity_map.values())
+        if start_id not in entity_map:
+            return {}
+
+        return self.create_node_lite(
+            entity_map[start_id],
+            edges,
+            entities,
+            entity_is_src,
+            level=1,
+            max_depth=max(1, int(depth)),
+        )
+
+    def create_node_lite(
+        self,
+        entity,
+        edges,
+        entities,
+        entity_is_src=True,
+        level: int = 1,
+        max_depth: int = 3,
+    ):
+        node = {
+            "_id": entity.get("_id"),
+            "inst_uuid": entity.get("inst_uuid"),
+            "model_id": entity.get("model_id"),
+            "inst_name": entity.get("inst_name") or entity.get("ip_addr") or str(entity.get("_id")),
+            "children": [],
+        }
+
+        if entity_is_src:
+            entity_key, child_entity_key = "src", "dst"
+        else:
+            entity_key, child_entity_key = "dst", "src"
+
+        if level >= max_depth:
+            node["has_more"] = any(edge.get(f"{entity_key}_inst_id") == entity.get("_id") for edge in edges)
+            return node
+
+        for edge in edges:
+            if edge.get(f"{entity_key}_inst_id") == entity.get("_id"):
+                child_entity = self.find_entity_by_id(edge.get(f"{child_entity_key}_inst_id"), entities)
+                if child_entity:
+                    child_node = self.create_node_lite(
+                        child_entity,
+                        edges,
+                        entities,
+                        entity_is_src,
+                        level=level + 1,
+                        max_depth=max_depth,
+                    )
+                    self._attach_association_fields(child_node, edge)
+                    node["children"].append(child_node)
+        return node
+
+    @staticmethod
+    def _attach_association_fields(child_node, edge):
+        child_node["model_asst_id"] = edge.get("model_asst_id")
+        child_node["asst_id"] = edge.get("asst_id")
+        asst_name = edge.get("asst_name")
+        if asst_name not in (None, ""):
+            child_node["asst_name"] = asst_name
+
+    def find_entity_by_id(self, entity_id, entities):
+        """根据ID找实体"""
+        for entity in entities:
+            if entity["_id"] == entity_id:
+                return entity
+        return None
+
+    def entity_count(self, label: str, group_by_attr: str, params: list = None, format_permission_dict: dict = None):
+        """
+        按指定字段分组统计实体数量（参数化版本）
+
+        Args:
+            label: 实体标签
+            group_by_attr: 分组字段
+            params: 基础过滤参数列表
+            format_permission_dict: 权限过滤字典 {organization_id: query_list}
+
+        Returns:
+            {group_value: count} 统计字典
+        """
+        # 验证标签和字段名
+        if self.ENABLE_PARAMETERIZATION and label:
+            CQLValidator.validate_label(label)
+        if self.ENABLE_PARAMETERIZATION:
+            CQLValidator.validate_field(group_by_attr)
+
+        params = params or []
+        format_permission_dict = format_permission_dict or {}
+        label_str = f":{label}" if label else ""
+
+        # 参数收集器
+        param_collector = ParameterCollector() if self.ENABLE_PARAMETERIZATION else None
+
+        base_params_str, _ = self.format_search_params(
+            params,
+            param_type="AND",
+            param_collector=param_collector,
+        )
+
+        # 构建权限参数 这里的参数是在基础参数基础上做AND 查询的 每个for的数据之间的关系是OR的关系
+        permission_filters = []
+        for organization_id, query_list in format_permission_dict.items():
+            organization_query = [{"field": "organization", "type": "list[]", "value": [organization_id]}]
+
+            if self.ENABLE_PARAMETERIZATION:
+                base_permission_str, base_params = self.format_search_params(
+                    organization_query,
+                    param_type="AND",
+                    param_collector=param_collector,
+                )
+                org_permission_str, org_params = self.format_search_params(query_list, param_type="OR", param_collector=param_collector)
+            else:
+                base_permission_str, _ = self.format_search_params(organization_query, param_type="AND")
+                org_permission_str, _ = self.format_search_params(query_list, param_type="OR")
+
+            if base_permission_str and org_permission_str:
+                # org_permission_str 已经有括号，只需要外层括号保证 AND 优先级
+                combined_filter = f"({base_permission_str} AND {org_permission_str})"
+                permission_filters.append(combined_filter)
+            elif base_permission_str:
+                # 只有组织条件，直接使用（format_search_params 返回的已有括号）
+                permission_filters.append(base_permission_str)
+
+        # 组合最终查询条件：基础参数 AND (权限条件1 OR 权限条件2 OR ...)
+        final_conditions = []
+        if base_params_str:
+            final_conditions.append(base_params_str)
+        if permission_filters:
+            # 多个组织的权限条件用 OR 连接
+            if len(permission_filters) == 1:
+                final_conditions.append(permission_filters[0])
+            else:
+                permission_str = " OR ".join(permission_filters)
+                final_conditions.append(f"({permission_str})")
+
+        filter_str = " AND ".join(final_conditions) if final_conditions else ""
+        if filter_str:
+            filter_str = f"WHERE {filter_str}"
+
+        count_sql = f"MATCH (n{label_str}) {filter_str} RETURN n.{group_by_attr} AS {group_by_attr}, COUNT(n) AS count"
+
+        query_params = param_collector.get_params() if self.ENABLE_PARAMETERIZATION and param_collector else None
+
+        # 调试日志：打印 entity_count 的查询
+        logger.debug(f"[entity_count] SQL: {count_sql}")
+        logger.debug(f"[entity_count] Params: {query_params}")
+        logger.debug(f"[entity_count] base params: {params}")
+        logger.debug(f"[entity_count] format_permission_dict: {format_permission_dict}")
+
+        data = self._execute_query(count_sql, params=query_params)
+        result = FormatDBResult(data).to_result_of_count()
+        return result
+
+    def full_text_stats(
+        self,
+        search: str,
+        permission_params: str = "",
+        inst_name_params: str = "",
+        created: str = "",
+        case_sensitive: bool = False,
+        permission_params_dict: dict = None,
+    ) -> dict:
+        """
+        全文检索 - 模型统计接口（参数化版本）
+        返回搜索结果中每个模型的总数统计
+
+        Args:
+            search: 搜索关键词
+            permission_params: 权限过滤参数（与现有全文检索保持一致）
+            inst_name_params: 实例名称过滤参数
+            created: 创建者过滤
+            case_sensitive: 是否精确匹配（True=精确匹配，False=不区分大小写模糊匹配，默认False）
+            permission_params_dict: 权限参数字典（参数化模式下使用）
+
+        Returns:
+            {
+                "total": 156,  # 所有匹配实例总数
+                "model_stats": [
+                    {"model_id": "Center", "count": 45},
+                    {"model_id": "阿里云", "count": 23}
+                ]
+            }
+        """
+        logger.info(f"[全文检索统计] 开始查询，关键词: {search}, 区分大小写: {case_sensitive}")
+
+        # 获取排除字段
+        exclude_fields = ExcludeFieldsCache.get_exclude_fields()
+
+        # 参数化查询参数（合并权限参数）
+        query_params = permission_params_dict.copy() if permission_params_dict else {}
+        conditions = []
+
+        # 权限和实例名称过滤（保持原逻辑）
+        or_filters = []
+        if permission_params:
+            or_filters.append(permission_params)
+        if inst_name_params:
+            or_filters.append(inst_name_params)
+        if or_filters:
+            or_condition = " OR ".join(or_filters)
+            conditions.append(f"({or_condition})")
+
+        # 创建者过滤
+        if created:
+            if self.ENABLE_PARAMETERIZATION:
+                param_name = "created_by"
+                query_params[param_name] = created
+                conditions.append(f"n._creator = ${param_name}")
+            else:
+                validated_created = self.escape_cql_string(created)
+                conditions.append(f"n._creator = '{validated_created}'")
+
+        # 全文检索条件
+        exclude_list_str = self._build_exclude_fields_list(exclude_fields)
+
+        if self.ENABLE_PARAMETERIZATION:
+            query_params["search_term"] = search
+
+            if case_sensitive:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toString(n[key]) = $search_term)"
+                )
+            else:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toLower(toString(n[key])) CONTAINS toLower($search_term))"
+                )
+        else:
+            escaped_search = self.escape_cql_string(search)
+
+            if case_sensitive:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toString(n[key]) = '{escaped_search}')"
+                )
+            else:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toLower(toString(n[key])) CONTAINS toLower('{escaped_search}'))"
+                )
+
+        conditions.append(search_condition)
+
+        where_clause = " AND ".join(conditions) if conditions else "true"
+
+        # 执行统计查询
+        query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN n.model_id AS model_id, COUNT(n) AS count ORDER BY count DESC"
+
+        result = self._execute_query(query, params=query_params if self.ENABLE_PARAMETERIZATION else None)
+        formatted_result = FormatDBResult(result).to_result_of_count()
+
+        # 构建返回结果
+        model_stats = []
+        total = 0
+        for model_id, count in formatted_result.items():
+            model_stats.append({"model_id": model_id, "count": count})
+            total += count
+
+        logger.info(f"[全文检索统计] 查询成功，总数: {total}, 模型数: {len(model_stats)}")
+
+        return {"total": total, "model_stats": model_stats}
+
+    def full_text_by_model(
+        self,
+        search: str,
+        model_id: str,
+        permission_params: str = "",
+        inst_name_params: str = "",
+        created: str = "",
+        page: int = 1,
+        page_size: int = 10,
+        case_sensitive: bool = False,
+        permission_params_dict: dict = None,
+    ) -> dict:
+        """
+        全文检索 - 模型数据查询接口
+        返回指定模型的分页数据
+
+        Args:
+            search: 搜索关键词
+            model_id: 目标模型ID（必填）
+            permission_params: 权限过滤参数（与现有全文检索保持一致）
+            inst_name_params: 实例名称过滤参数
+            created: 创建者过滤
+            page: 页码（从1开始）
+            page_size: 每页大小（默认10）
+            case_sensitive: 是否区分大小写（True=精准匹配，False=模糊匹配，默认False）
+            permission_params_dict: 权限参数字典（参数化模式下使用）
+
+        Returns:
+            {
+                "model_id": "Center",
+                "total": 45,  # 该模型匹配的总数
+                "page": 1,
+                "page_size": 10,
+                "data": [{...}, {...}]  # 分页数据
+            }
+        """
+        logger.info(f"[全文检索数据] 开始查询，关键词: {search}, 模型: {model_id}, 页码: {page}, 每页: {page_size}, 区分大小写: {case_sensitive}")
+
+        # 参数校验
+        if not model_id:
+            raise BaseAppException("model_id is required")
+
+        if page < 1:
+            raise BaseAppException("page must be >= 1")
+
+        if page_size < 1 or page_size > 100:
+            raise BaseAppException("page_size must be between 1 and 100")
+
+        # 获取排除字段
+        exclude_fields = ExcludeFieldsCache.get_exclude_fields()
+
+        # 参数化查询参数（合并权限参数）
+        query_params = permission_params_dict.copy() if permission_params_dict else {}
+        conditions = []
+
+        # 权限和实例名称过滤
+        or_filters = []
+        if permission_params:
+            or_filters.append(permission_params)
+        if inst_name_params:
+            or_filters.append(inst_name_params)
+        if or_filters:
+            or_condition = " OR ".join(or_filters)
+            conditions.append(f"({or_condition})")
+
+        # 创建者过滤
+        if created:
+            if self.ENABLE_PARAMETERIZATION:
+                query_params["created_by"] = created
+                conditions.append("n._creator = $created_by")
+            else:
+                validated_created = self.escape_cql_string(created)
+                conditions.append(f"n._creator = '{validated_created}'")
+
+        # 模型ID过滤
+        if self.ENABLE_PARAMETERIZATION:
+            CQLValidator.validate_field(model_id)  # 验证模型ID格式
+            query_params["model_id"] = model_id
+            conditions.append("n.model_id = $model_id")
+        else:
+            escaped_model_id = self.escape_cql_string(model_id)
+            conditions.append(f"n.model_id = '{escaped_model_id}'")
+
+        # 全文检索条件
+        exclude_list_str = self._build_exclude_fields_list(exclude_fields)
+
+        if self.ENABLE_PARAMETERIZATION:
+            query_params["search_term"] = search
+
+            if case_sensitive:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toString(n[key]) = $search_term)"
+                )
+            else:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toLower(toString(n[key])) CONTAINS toLower($search_term))"
+                )
+        else:
+            escaped_search = self.escape_cql_string(search)
+
+            if case_sensitive:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toString(n[key]) = '{escaped_search}')"
+                )
+            else:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toLower(toString(n[key])) CONTAINS toLower('{escaped_search}'))"
+                )
+
+        conditions.append(search_condition)
+        where_clause = " AND ".join(conditions) if conditions else "true"
+
+        # 第一步：查询该模型的总数
+        count_query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN COUNT(n) AS total"
+
+        count_result = self._execute_query(count_query, params=query_params if self.ENABLE_PARAMETERIZATION else None)
+        count_data = FormatDBResult(count_result).to_list_of_lists()
+        total = count_data[0] if count_data else 0
+
+        logger.debug(f"[全文检索数据] 模型 {model_id} 总数: {total}")
+
+        # 第二步：查询分页数据
+        skip = (page - 1) * page_size
+        data_query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN n ORDER BY ID(n) SKIP {skip} LIMIT {page_size}"
+
+        data_result = self._execute_query(data_query, params=query_params if self.ENABLE_PARAMETERIZATION else None)
+        data = self.entity_to_list(data_result)
+
+        logger.info(f"[全文检索数据] 查询成功，模型: {model_id}, 总数: {total}, 返回: {len(data)} 条数据")
+
+        return {
+            "model_id": model_id,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "data": data,
+        }
+
+    def full_text(
+        self,
+        search: str,
+        permission_params: str = "",
+        inst_name_params: str = "",
+        created: str = "",
+        case_sensitive: bool = False,
+        permission_params_dict: dict = None,
+    ):
+        """
+        全文检索（兼容旧接口，参数化版本）
+        推荐使用 full_text_stats 和 full_text_by_model 替代
+
+        Args:
+            search: 搜索关键词
+            permission_params: 权限过滤参数
+            inst_name_params: 实例名称过滤参数
+            created: 创建者过滤
+            case_sensitive: 是否区分大小写（默认False，模糊匹配）
+
+        Returns:
+            匹配的实例列表
+        """
+        logger.info(f"[全文检索] 开始查询（旧接口），关键词: {search}")
+
+        # 获取排除字段
+        exclude_fields = ExcludeFieldsCache.get_exclude_fields()
+
+        query_params = dict(permission_params_dict or {})
+        conditions = []
+
+        # 权限和实例名称过滤
+        or_filters = []
+        if permission_params:
+            or_filters.append(permission_params)
+        if inst_name_params:
+            or_filters.append(inst_name_params)
+        if or_filters:
+            or_condition = " OR ".join(or_filters)
+            conditions.append(f"({or_condition})")
+
+        # 创建者过滤
+        if created:
+            if self.ENABLE_PARAMETERIZATION:
+                query_params["created_by"] = created
+                conditions.append("n._creator = $created_by")
+            else:
+                validated_created = self.escape_cql_string(created)
+                conditions.append(f"n._creator = '{validated_created}'")
+
+        # 全文检索条件
+        exclude_list_str = self._build_exclude_fields_list(exclude_fields)
+
+        if self.ENABLE_PARAMETERIZATION:
+            query_params["search_term"] = search
+
+            if case_sensitive:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toString(n[key]) CONTAINS $search_term)"
+                )
+            else:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toLower(toString(n[key])) CONTAINS toLower($search_term))"
+                )
+        else:
+            escaped_search = self.escape_cql_string(search)
+
+            if case_sensitive:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toString(n[key]) CONTAINS '{escaped_search}')"
+                )
+            else:
+                search_condition = (
+                    f"ANY(key IN keys(n) WHERE "
+                    f"none(excluded IN {exclude_list_str} WHERE excluded = key) AND "
+                    f"n[key] IS NOT NULL AND "
+                    f"toLower(toString(n[key])) CONTAINS toLower('{escaped_search}'))"
+                )
+
+        conditions.append(search_condition)
+        where_clause = " AND ".join(conditions) if conditions else "true"
+
+        query = f"MATCH (n:{INSTANCE}) WHERE {where_clause} RETURN n"
+
+        objs = self._execute_query(query, params=query_params if self.ENABLE_PARAMETERIZATION else None)
+        result = self.entity_to_list(objs)
+
+        logger.info(f"[全文检索] 查询成功，返回: {len(result)} 条数据")
+        return result
+
+    def batch_save_entity(
+        self,
+        label: str,
+        properties_list: list,
+        check_attr_map: dict,
+        exist_items: list,
+        operator: str = None,
+        attrs: list = None,
+    ):
+        """批量保存实体，支持新增与更新"""
+        unique_key = check_attr_map.get(ModelConstraintKey.unique.value, {}).keys()
+        add_nodes = []
+        update_results = []
+        if unique_key:
+            properties_map = {}
+            for properties in properties_list:
+                properties_key = tuple(properties.get(k) for k in unique_key if k in properties)
+                # 对参数中的节点按唯一键进行去重
+                properties_map[properties_key] = properties
+            # 已有节点处理
+            item_map = {}
+            for item in exist_items:
+                item_key = tuple(item.get(k) for k in unique_key if k in item)
+                item_map[item_key] = item
+            for properties_key, properties in properties_map.items():
+                node = item_map.get(properties_key)
+                if node:
+                    # 节点更新
+                    try:
+                        results = self.batch_update_entity_properties(
+                            label=label,
+                            entity_ids=[node.get("_id")],
+                            properties=properties,
+                            check_attr_map=check_attr_map,
+                            attrs=attrs,
+                        )
+                        results["data"] = results["data"][0]
+                        update_results.append(results)
+                    except Exception as e:
+                        logger.info(f"update entity error: {e}")
+                        update_results.append(
+                            {
+                                "success": False,
+                                "data": properties,
+                                "message": "update entity error",
+                            }
+                        )
+
+                else:
+                    # 暂存统一新增
+                    add_nodes.append(properties)
+        else:
+            add_nodes = properties_list
+        add_results = self.batch_create_entity(
+            label=label,
+            properties_list=add_nodes,
+            check_attr_map=check_attr_map,
+            exist_items=exist_items,
+            operator=operator,
+            attrs=attrs,
+        )
+        return add_results, update_results

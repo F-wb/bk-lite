@@ -1,0 +1,1300 @@
+import ipaddress
+
+from django.db import IntegrityError, models, transaction
+
+from apps.core.exceptions.base_app_exception import BaseAppException, UnauthorizedException
+from apps.core.logger import monitor_logger as logger
+from apps.core.models.maintainer_info import maintainer_kwargs
+from apps.core.utils.current_team_scope import scope_permission_queryset
+from apps.core.utils.database import bulk_create_with_primary_keys
+from apps.core.utils.permission_utils import get_permission_rules
+from apps.monitor.constants.database import DatabaseConstants
+from apps.monitor.constants.permission import PermissionConstants
+from apps.monitor.models import (
+    CollectConfig,
+    Metric,
+    MonitorInstance,
+    MonitorInstanceOrganization,
+    MonitorObject,
+    MonitorObjectOrganizationRule,
+    MonitorPlugin,
+)
+from apps.monitor.services.child_instance_discovery import enqueue_child_instance_discovery, normalize_collect_interval, parent_has_child_objects
+from apps.monitor.services.host_deployment import HostDeploymentStatus
+from apps.monitor.services.instance_facts import InstanceFactResolver
+from apps.monitor.services.website_config import validate_rendered_website_config
+from apps.monitor.utils.config_format import ConfigFormat
+from apps.monitor.utils.dimension import build_safe_instance_id, normalize_instance_identity, parse_instance_id
+from apps.monitor.utils.node_selector import normalize_node_selector
+from apps.monitor.utils.plugin_controller import Controller
+from apps.node_mgmt.constants.controller import ControllerConstants
+from apps.rpc.node_mgmt import NodeMgmt
+from apps.system_mgmt.models import User
+
+_REDACTED_CONFIG_KEYS = {"community"}
+_REDACTED_CONFIG_PLACEHOLDER = "***"
+
+
+def _redact_config_secrets(value):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if str(key).lower() in _REDACTED_CONFIG_KEYS and item not in (None, ""):
+                redacted[key] = _REDACTED_CONFIG_PLACEHOLDER
+            else:
+                redacted[key] = _redact_config_secrets(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_config_secrets(item) for item in value]
+    return value
+
+
+def _restore_config_secrets(new_value, old_value):
+    if isinstance(new_value, dict):
+        old_map = old_value if isinstance(old_value, dict) else {}
+        restored = {}
+        for key, item in new_value.items():
+            if str(key).lower() in _REDACTED_CONFIG_KEYS and item in ("", _REDACTED_CONFIG_PLACEHOLDER):
+                restored[key] = old_map.get(key, item)
+            else:
+                restored[key] = _restore_config_secrets(item, old_map.get(key))
+        return restored
+    if isinstance(new_value, list):
+        old_items = old_value if isinstance(old_value, list) else []
+        return [_restore_config_secrets(item, old_items[index] if index < len(old_items) else None) for index, item in enumerate(new_value)]
+    return new_value
+
+
+class InstanceConfigService:
+    DEFAULT_GROUPING_METRIC_BY_OBJECT = {
+        "Pod": "pod_status_phase",
+        "Node": "node_status_condition",
+    }
+    _HOST_MONITOR_OBJECT_NAME = "Host"
+    _PROCESS_MONITOR_OBJECT_NAME = "Process"
+    _NETWORK_DEVICE_MONITOR_OBJECT_NAMES = {"Switch", "Router", "Firewall", "Loadbalance", "Wanopt"}
+
+    @staticmethod
+    def _build_permission_data(actor_context):
+        return {
+            "username": actor_context["username"],
+            "domain": actor_context["domain"],
+            "current_team": actor_context["current_team"],
+            "include_children": actor_context.get("include_children", False),
+        }
+
+    @staticmethod
+    def _build_actor_user(actor_context):
+        return User(username=actor_context["username"], domain=actor_context["domain"])
+
+    @staticmethod
+    def _get_data_scope(actor_context):
+        from apps.core.utils.current_team_scope import hydrate_actor_context_data_scope
+
+        scope = hydrate_actor_context_data_scope(actor_context)
+        if scope is None or not scope.data_team_ids:
+            raise UnauthorizedException("当前组织无可用权限范围")
+        return scope
+
+    @staticmethod
+    def _get_actor_scope_groups(actor_context):
+        return set(InstanceConfigService._get_data_scope(actor_context).data_team_ids)
+
+    @classmethod
+    def _get_authorized_monitor_instances(cls, actor_context, monitor_object_id, require_operate=False):
+        scope = cls._get_data_scope(actor_context)
+        if actor_context.get("is_superuser"):
+            permission = {"team": list(scope.data_team_ids), "instance": []}
+        else:
+            permission = get_permission_rules(
+                cls._build_actor_user(actor_context),
+                actor_context["current_team"],
+                "monitor",
+                f"{PermissionConstants.INSTANCE_MODULE}.{monitor_object_id}",
+                include_children=actor_context.get("include_children", False),
+            )
+            if require_operate:
+                permission = {
+                    **permission,
+                    "team": permission.get("team", []),
+                    "instance": [
+                        item for item in permission.get("instance", []) if isinstance(item, dict) and "Operate" in item.get("permission", [])
+                    ],
+                }
+
+        return scope_permission_queryset(
+            MonitorInstance,
+            permission,
+            scope,
+            team_key="monitorinstanceorganization__organization__in",
+            id_key="id__in",
+        ).filter(monitor_object_id=monitor_object_id)
+
+    @classmethod
+    def _get_authorized_collect_configs(cls, ids, actor_context=None, require_operate=False):
+        config_ids = list({str(config_id) for config_id in ids if config_id not in (None, "")})
+        if not config_ids:
+            return []
+
+        config_objs = list(CollectConfig.objects.filter(id__in=config_ids).select_related("monitor_instance__monitor_object"))
+        if not config_objs:
+            return []
+
+        if actor_context is None:
+            return config_objs
+
+        configs_by_object = {}
+        for config_obj in config_objs:
+            configs_by_object.setdefault(config_obj.monitor_instance.monitor_object_id, []).append(config_obj)
+
+        authorized_ids = set()
+        for monitor_object_id, object_configs in configs_by_object.items():
+            instance_ids = {
+                instance_id
+                for instance_id in cls._get_authorized_monitor_instances(
+                    actor_context,
+                    monitor_object_id,
+                    require_operate=require_operate,
+                ).values_list("id", flat=True)
+            }
+            for config_obj in object_configs:
+                if config_obj.monitor_instance_id in instance_ids:
+                    authorized_ids.add(config_obj.id)
+
+        if len(authorized_ids) != len(config_ids):
+            raise UnauthorizedException("无权限访问指定采集配置")
+
+        return [config_obj for config_obj in config_objs if config_obj.id in authorized_ids]
+
+    @classmethod
+    def _ensure_instance_access(cls, collect_instance_id, actor_context=None, require_operate=False):
+        instance = MonitorInstance.objects.select_related("monitor_object").filter(id=collect_instance_id).first()
+        if not instance:
+            raise BaseAppException("监控实例不存在")
+        if actor_context is None:
+            return instance
+        authorized = (
+            cls._get_authorized_monitor_instances(
+                actor_context,
+                instance.monitor_object_id,
+                require_operate=require_operate,
+            )
+            .filter(id=collect_instance_id)
+            .exists()
+        )
+        if not authorized:
+            raise UnauthorizedException("无权限访问指定监控实例")
+        return instance
+
+    @classmethod
+    def _sanitize_instances_for_onboarding(cls, instances, actor_context):
+        authorized_scope_groups = set(cls._get_actor_scope_groups(actor_context) or [])
+        if not authorized_scope_groups:
+            raise UnauthorizedException("当前组织无可用权限范围")
+
+        requested_node_ids = set()
+        for instance in instances:
+            node_ids = instance.get("node_ids", [])
+            if not node_ids:
+                raise BaseAppException(f"实例 {instance.get('instance_name', instance.get('instance_id', 'unknown'))} 缺少 node_ids")
+            requested_node_ids.update(str(node_id) for node_id in node_ids if node_id not in (None, ""))
+
+        authorized_nodes = NodeMgmt().get_authorized_nodes_by_ids(
+            list(requested_node_ids),
+            cls._build_permission_data(actor_context),
+        )
+        authorized_node_map = {str(node["id"]): node for node in authorized_nodes}
+        unauthorized_node_ids = sorted(requested_node_ids - set(authorized_node_map))
+        if unauthorized_node_ids:
+            raise UnauthorizedException(f"存在无权限节点: {', '.join(unauthorized_node_ids)}")
+
+        sanitized_instances = []
+        for instance in instances:
+            node_ids = []
+            trusted_nodes = []
+            group_ids = set()
+            for raw_node_id in instance.get("node_ids", []):
+                node_id = str(raw_node_id)
+                node_info = authorized_node_map.get(node_id)
+                if not node_info:
+                    raise UnauthorizedException(f"节点 {node_id} 无权限访问")
+                node_ids.append(node_id)
+                trusted_nodes.append(node_info)
+                node_groups = set(node_info.get("organization_ids", []))
+                node_groups &= authorized_scope_groups
+                if not node_groups:
+                    raise UnauthorizedException(f"节点 {node_id} 不在当前组织授权范围内")
+                group_ids.update(node_groups)
+
+            sanitized_instance = {**instance}
+            sanitized_instance["node_ids"] = node_ids
+            sanitized_instance["_trusted_nodes"] = trusted_nodes
+            sanitized_instance["group_ids"] = sorted(group_ids)
+            sanitized_instances.append(sanitized_instance)
+        return sanitized_instances
+
+    @staticmethod
+    def _get_plugin_node_selector(monitor_plugin_id):
+        if not monitor_plugin_id:
+            return {}
+
+        plugin = MonitorPlugin.objects.filter(id=monitor_plugin_id).only("id", "node_selector").first()
+        if not plugin:
+            raise BaseAppException("监控插件不存在")
+        return normalize_node_selector(plugin.node_selector or {})
+
+    @staticmethod
+    def _validate_nodes_against_selector(nodes, node_selector):
+        if not node_selector:
+            return
+
+        if node_selector.get("is_container") is True:
+            invalid_nodes = [str(node.get("id")) for node in nodes if node.get("node_type") != ControllerConstants.NODE_TYPE_CONTAINER]
+            if invalid_nodes:
+                raise BaseAppException(f"当前插件仅允许选择容器节点: {', '.join(invalid_nodes)}")
+
+    @staticmethod
+    def _validate_instances_with_plugin_selector(instances, monitor_plugin_id, actor_context=None):
+        node_selector = InstanceConfigService._get_plugin_node_selector(monitor_plugin_id)
+        if not node_selector:
+            return
+
+        requested_node_ids = []
+        for instance in instances:
+            requested_node_ids.extend(instance.get("node_ids", []))
+
+        if not requested_node_ids:
+            return
+
+        permission_data = InstanceConfigService._build_permission_data(actor_context) if actor_context is not None else None
+        nodes = NodeMgmt().get_authorized_nodes_by_ids(requested_node_ids, permission_data)
+        InstanceConfigService._validate_nodes_against_selector(nodes, node_selector)
+
+    @classmethod
+    def _get_default_group_metric(cls, child_obj):
+        preferred_metric_name = cls.DEFAULT_GROUPING_METRIC_BY_OBJECT.get(child_obj.name)
+        if preferred_metric_name:
+            metric_obj = Metric.objects.filter(monitor_object_id=child_obj.id, name=preferred_metric_name).first()
+            if metric_obj:
+                return metric_obj
+            logger.warning(f"子对象 {child_obj.id} 默认分组指标 {preferred_metric_name} 不存在，回退到首个指标")
+
+        return Metric.objects.filter(monitor_object_id=child_obj.id).first()
+
+    @staticmethod
+    def _sync_existing_instance_attrs(existing_instances, actor_context=None):
+        """同步复用实例的可变属性（除主键外）
+
+        通过页面接入链路复用的实例应视为手动接入实例，
+        不再受自动发现任务生命周期管理影响，因此需要统一纠正为 auto=False。
+        """
+        if not existing_instances:
+            return 0
+
+        instances_to_update = []
+        existing_map = {obj.id: obj for obj in MonitorInstance.objects.filter(id__in=[item["instance_id"] for item in existing_instances])}
+        maintainer = maintainer_kwargs(actor_context, include_created=False)
+        for instance in existing_instances:
+            current = existing_map[instance["instance_id"]]
+            summary_facts = InstanceFactResolver.merge(
+                current.summary_facts,
+                instance.get("summary_facts", {}),
+                instance.get("_summary_fact_source"),
+            )
+            instances_to_update.append(
+                MonitorInstance(
+                    id=instance["instance_id"],
+                    name=instance.get("instance_name", ""),
+                    summary_facts=summary_facts,
+                    interval=normalize_collect_interval(
+                        instance.get("interval"),
+                        default=current.interval,
+                    ),
+                    auto=False,
+                    is_deleted=False,
+                    is_active=True,
+                    **maintainer,
+                )
+            )
+
+        MonitorInstance.objects.bulk_update(
+            instances_to_update,
+            ["name", "summary_facts", "interval", "auto", "is_active", "updated_by", "updated_by_domain"],
+            batch_size=DatabaseConstants.BULK_CREATE_BATCH_SIZE,
+        )
+        return len(instances_to_update)
+
+    @staticmethod
+    def get_config_content(ids, actor_context=None):
+        result = {}
+        config_objs = InstanceConfigService._get_authorized_collect_configs(
+            ids,
+            actor_context,
+            require_operate=False,
+        )
+        if not config_objs:
+            return result
+
+        for config_obj in config_objs:
+            content_key = "content" if config_obj.is_child else "config_template"
+            if config_obj.is_child:
+                configs = NodeMgmt().get_child_configs_by_ids([config_obj.id])
+            else:
+                configs = NodeMgmt().get_configs_by_ids([config_obj.id])
+            config = configs[0]
+            if config_obj.file_type == "toml":
+                raw_content = config[content_key]
+                config["content"] = ConfigFormat.toml_to_dict(raw_content)
+                from apps.monitor.utils.disk_fstype_filters import expose_disk_fstype_filters_for_edit
+                from apps.monitor.utils.snmp_ifmib_capability import is_interface_filter_capable_plugin
+
+                # 磁盘 fstype 过滤在 starlark.constants；表单只绑 content.config，需投影回显。
+                config["content"] = expose_disk_fstype_filters_for_edit(config["content"])
+                if (config_obj.collect_type or "").startswith("snmp") and is_interface_filter_capable_plugin(
+                    getattr(config_obj, "monitor_plugin", None)
+                ):
+                    from apps.monitor.utils.snmp_interface_filters import expose_snmp_interface_filters_for_edit
+                    from apps.monitor.utils.snmp_interface_template import mark_closed_ifmib_edit_state
+
+                    # 关闭态依赖注释标记；dict roundtrip 会丢注释，读取时打旗标供写回恢复。
+                    config["content"] = mark_closed_ifmib_edit_state(raw_content, config["content"])
+                    # tagpass 隔离后过滤在 snmp[1]；表单只读 content.config，需投影回显。
+                    config["content"] = expose_snmp_interface_filters_for_edit(config["content"])
+            elif config_obj.file_type == "yaml":
+                config["content"] = ConfigFormat.yaml_to_dict(config[content_key])
+            else:
+                raise BaseAppException("file_type must be toml or yaml")
+            config["content"] = _redact_config_secrets(config["content"])
+            if config_obj.is_child:
+                result["child"] = config
+            else:
+                result["base"] = config
+        return result
+
+    @staticmethod
+    def get_plugin_child_config_content(monitor_plugin_id, actor_context=None):
+        """读取插件最近一条已授权 child CollectConfig，供脚本接入页回填正文。"""
+        try:
+            plugin_pk = int(monitor_plugin_id)
+        except (TypeError, ValueError):
+            return {}
+        rows = list(
+            CollectConfig.objects.filter(
+                monitor_plugin_id=plugin_pk,
+                is_child=True,
+                collect_type="script",
+            ).order_by(
+                "-updated_at", "-id"
+            )[:20]
+        )
+        if not rows:
+            return {}
+        for row in rows:
+            try:
+                content = InstanceConfigService.get_config_content([row.id], actor_context)
+            except UnauthorizedException:
+                continue
+            except BaseAppException:
+                logger.warning(
+                    "event=script_collect_config_refill_failed plugin_id=%s config_id=%s error_type=BaseAppException failed_stage=get_config_content",
+                    plugin_pk,
+                    row.id,
+                )
+                continue
+            if content.get("child"):
+                return content
+        return {}
+
+    @staticmethod
+    def get_instance_configs(collect_instance_id, actor_context=None, monitor_plugin_id=None, collector=None, collect_type=None):
+        """获取实例配置"""
+
+        InstanceConfigService._ensure_instance_access(
+            collect_instance_id,
+            actor_context,
+            require_operate=False,
+        )
+
+        filter_kwargs = {"monitor_instance_id": collect_instance_id}
+        if monitor_plugin_id not in (None, ""):
+            filter_kwargs["monitor_plugin_id"] = monitor_plugin_id
+        elif collector not in (None, ""):
+            filter_kwargs["collector"] = collector
+        if collect_type not in (None, ""):
+            filter_kwargs["collect_type"] = collect_type
+
+        config_objs = CollectConfig.objects.filter(**filter_kwargs)
+
+        configs = []
+
+        for config_obj in config_objs:
+            configs.append(
+                {
+                    "config_id": config_obj.id,
+                    "collector": config_obj.collector,
+                    "collect_type": config_obj.collect_type,
+                    "config_type": config_obj.config_type,
+                    "monitor_plugin_id": config_obj.monitor_plugin_id,
+                    "instance_id": collect_instance_id,
+                    "is_child": config_obj.is_child,
+                }
+            )
+
+        result = {}
+        for config in configs:
+            key = (
+                config.get("monitor_plugin_id") or config["collect_type"],
+                config["config_type"],
+            )
+            if key not in result:
+                result[key] = {
+                    "instance_id": config["instance_id"],
+                    "collect_type": config["collect_type"],
+                    "config_type": config["config_type"],
+                    "monitor_plugin_id": config.get("monitor_plugin_id"),
+                    "config_ids": [config["config_id"]],
+                }
+            else:
+                result[key]["config_ids"].append(config["config_id"])
+
+        items = list(result.values())
+        for item in items:
+            config_content = InstanceConfigService.get_config_content(item["config_ids"], actor_context)
+            item.update(config_content=config_content)
+
+        return items
+
+    @staticmethod
+    def create_default_rule(monitor_object_id, monitor_instance_id, group_ids):
+        """存在子模型的要给子模型默认规则
+
+        返回创建的规则ID列表，用于失败时回滚
+        """
+        child_objs = MonitorObject.objects.filter(parent_id=monitor_object_id)
+        if not child_objs:
+            return []
+
+        rules = []
+        _monitor_instance_id = parse_instance_id(monitor_instance_id)[0]
+
+        for child_obj in child_objs:
+            metric_obj = InstanceConfigService._get_default_group_metric(child_obj)
+            if not metric_obj:
+                logger.warning(f"子对象 {child_obj.id} 没有关联指标，跳过规则创建")
+                continue
+
+            rules.append(
+                MonitorObjectOrganizationRule(
+                    name=f"{child_obj.name}-{_monitor_instance_id}",
+                    monitor_object_id=child_obj.id,
+                    rule={
+                        "type": "metric",
+                        "metric_id": metric_obj.id,
+                        "filter": [
+                            {
+                                "name": "instance_id",
+                                "method": "=",
+                                "value": _monitor_instance_id,
+                            }
+                        ],
+                    },
+                    organizations=group_ids,
+                    monitor_instance_id=monitor_instance_id,
+                )
+            )
+
+        if rules:
+            created_rules = bulk_create_with_primary_keys(
+                MonitorObjectOrganizationRule.objects,
+                rules,
+                batch_size=DatabaseConstants.BULK_CREATE_BATCH_SIZE,
+            )
+            return [rule.id for rule in created_rules]
+
+        return []
+
+    @staticmethod
+    def _batch_create_default_rules(instances, monitor_object_id):
+        """批量为多个实例创建默认分组规则
+
+        Args:
+            instances: 实例列表，每个实例包含 instance_id 和 group_ids
+            monitor_object_id: 监控对象ID
+
+        Returns:
+            list: 创建的规则ID列表
+        """
+        if not instances:
+            return []
+
+        # 一次性查询子对象和指标，避免重复查询
+        child_objs = MonitorObject.objects.filter(parent_id=monitor_object_id).prefetch_related(
+            models.Prefetch("metric_set", queryset=Metric.objects.all())
+        )
+
+        if not child_objs:
+            return []
+
+        # 构建子对象到指标的映射
+        child_metric_map = {}
+        for child_obj in child_objs:
+            metric_obj = InstanceConfigService._get_default_group_metric(child_obj)
+            if metric_obj:
+                child_metric_map[child_obj.id] = (child_obj, metric_obj)
+            else:
+                logger.warning(f"子对象 {child_obj.id} 没有关联指标，跳过规则创建")
+
+        if not child_metric_map:
+            return []
+
+        # 批量构建所有规则
+        all_rules = []
+        for instance in instances:
+            instance_id = instance["instance_id"]
+            group_ids = instance["group_ids"]
+            _monitor_instance_id = parse_instance_id(instance_id)[0]
+
+            for child_id, (child_obj, metric_obj) in child_metric_map.items():
+                all_rules.append(
+                    MonitorObjectOrganizationRule(
+                        name=f"{child_obj.name}-{_monitor_instance_id}",
+                        monitor_object_id=child_obj.id,
+                        rule={
+                            "type": "metric",
+                            "metric_id": metric_obj.id,
+                            "filter": [
+                                {
+                                    "name": "instance_id",
+                                    "method": "=",
+                                    "value": _monitor_instance_id,
+                                }
+                            ],
+                        },
+                        organizations=group_ids,
+                        monitor_instance_id=instance_id,
+                    )
+                )
+
+        # 批量创建所有规则
+        if all_rules:
+            created_rules = bulk_create_with_primary_keys(
+                MonitorObjectOrganizationRule.objects,
+                all_rules,
+                batch_size=DatabaseConstants.BULK_CREATE_BATCH_SIZE,
+            )
+            logger.info(f"批量创建默认规则数量: {len(created_rules)}")
+            return [rule.id for rule in created_rules]
+
+        return []
+
+    @staticmethod
+    def _prepare_instances_for_creation(instances, monitor_object_id, collect_type, collector, configs):
+        """准备待创建实例:格式化ID、检查已存在实例、分类处理、校验配置冲突
+
+        Args:
+            instances: 实例列表
+            monitor_object_id: 监控对象ID
+            collect_type: 采集类型
+            collector: 采集器名称
+            configs: 配置列表，包含将要创建的 config_type
+
+        Returns:
+            tuple: (new_instances, existing_instances, reclaimable_ids)
+
+        Raises:
+            BaseAppException: 当非脚本采集配置已存在时抛出异常。
+                脚本采集（collect_type=script）已有配置时复用实例，由 Controller 更新而非拒绝。
+        """
+        # 格式化实例ID：优先使用 Host adapter 已计算好的 storage_instance_key，否则沿用旧逻辑
+        for instance in instances:
+            storage_key = instance.get("storage_instance_key")
+            if storage_key:
+                instance["instance_id"] = storage_key
+            else:
+                instance["instance_id"] = str((instance["instance_id"],))
+
+        instance_ids = [inst["instance_id"] for inst in instances]
+        seen_ids = set()
+        duplicate_ids = set()
+        for instance_id in instance_ids:
+            if instance_id in seen_ids:
+                duplicate_ids.add(instance_id)
+            seen_ids.add(instance_id)
+        if duplicate_ids:
+            raise BaseAppException(f"请求中存在重复的监控实例标识: {', '.join(sorted(duplicate_ids))}")
+
+        config_intervals = [config.get("interval") for config in configs or []]
+        for instance in instances:
+            resolved_interval = normalize_collect_interval(
+                instance.get("interval"),
+                *config_intervals,
+                default=None,
+            )
+            if resolved_interval is not None:
+                instance["interval"] = resolved_interval
+
+        # 主键是全局唯一的，必须跨监控对象检查占用。调用方保证当前位于事务内。
+        existing_instances_qs = (
+            MonitorInstance.objects.select_for_update().filter(id__in=instance_ids).values_list("id", "is_deleted", "monitor_object_id")
+        )
+        existing_map = {row[0]: {"is_deleted": row[1], "monitor_object_id": row[2]} for row in existing_instances_qs}
+        reclaimable_ids = {instance_id for instance_id, state in existing_map.items() if state["is_deleted"]}
+
+        active_cross_object_ids = sorted(
+            instance_id for instance_id, state in existing_map.items() if not state["is_deleted"] and state["monitor_object_id"] != monitor_object_id
+        )
+        if active_cross_object_ids:
+            raise BaseAppException(f"监控实例标识已被占用: {', '.join(active_cross_object_ids)}")
+
+        # 提取将要创建的 config_type 列表
+        config_types_to_create = {config.get("type") for config in configs if config.get("type")}
+
+        # 检查已存在的配置（避免重复创建相同采集配置）。
+        # 脚本采集同一实例+script 走更新而非拒绝，由 Controller 复用已有 CollectConfig。
+        allow_script_upsert = str(collect_type or "").casefold() == "script"
+        if config_types_to_create:
+            existing_qs = CollectConfig.objects.filter(
+                monitor_instance_id__in=instance_ids,
+                collect_type=collect_type,
+                config_type__in=config_types_to_create,
+            )
+            if not allow_script_upsert:
+                existing_qs = existing_qs.filter(collector=collector)
+            else:
+                existing_qs = existing_qs.select_for_update()
+            existing_configs = existing_qs.values_list("monitor_instance_id", "config_type")
+
+            # 构建已存在配置的映射: {instance_id: set(config_types)}
+            config_map = {}
+            for instance_id, config_type in existing_configs:
+                if instance_id not in config_map:
+                    config_map[instance_id] = set()
+                config_map[instance_id].add(config_type)
+
+            # 检查冲突并抛出异常
+            for inst in instances:
+                instance_id = inst["instance_id"]
+                if instance_id in reclaimable_ids:
+                    continue
+                if instance_id in config_map:
+                    conflicting_types = config_map[instance_id] & config_types_to_create
+                    if conflicting_types:
+                        if allow_script_upsert:
+                            logger.debug(
+                                "event=script_collect_config_reuse instance_id=%s collect_type=%s config_types=%s",
+                                instance_id,
+                                collect_type,
+                                ",".join(sorted(conflicting_types)),
+                            )
+                            continue
+                        raise BaseAppException(
+                            f"实例 '{inst.get('instance_name', instance_id)}' 已存在采集配置，无法重复创建。"
+                            f"采集器={collector}, 采集类型={collect_type}, "
+                            f"冲突的配置类型={', '.join(sorted(conflicting_types))}"
+                        )
+
+        # 分类实例
+        new_instances = []  # 完全不存在的实例
+        existing_instances = []  # 已存在的实例（需要复用）
+        reclaimable_id_list = []
+
+        for inst in instances:
+            instance_id = inst["instance_id"]
+
+            if instance_id not in existing_map or instance_id in reclaimable_ids:
+                # 完全不存在，需要创建
+                new_instances.append(inst)
+                if instance_id in reclaimable_ids:
+                    reclaimable_id_list.append(instance_id)
+            else:
+                existing_instances.append(inst)
+                logger.info(f"实例 {inst.get('instance_name', instance_id)} 已存在，将复用该实例并添加新的采集配置")
+
+        return new_instances, existing_instances, reclaimable_id_list
+
+    @staticmethod
+    def _create_instances_in_db(new_instances, existing_instances, monitor_object_id, actor_context=None):
+        """在数据库事务中创建实例、更新已存在实例、规则和关联关系
+
+        Returns:
+            tuple: (created_instance_ids, created_rule_ids)
+        """
+        created_instance_ids = []
+        created_rule_ids = []
+
+        if existing_instances:
+            updated_count = InstanceConfigService._sync_existing_instance_attrs(
+                existing_instances,
+                actor_context=actor_context,
+            )
+            logger.info(f"复用已存在实例数量: {len(existing_instances)}, 同步属性并激活: {updated_count}")
+
+            # 清除所有复用实例的历史组织关联，以当前 group_ids 为唯一真值，避免跨组织纳管漂移
+            all_existing_ids = [inst["instance_id"] for inst in existing_instances]
+            MonitorInstanceOrganization.objects.filter(monitor_instance_id__in=all_existing_ids).delete()
+
+            # 以当前 group_ids 重建组织关联
+            org_objs = [
+                MonitorInstanceOrganization(monitor_instance_id=inst["instance_id"], organization=group_id)
+                for inst in existing_instances
+                for group_id in inst["group_ids"]
+            ]
+            if org_objs:
+                MonitorInstanceOrganization.objects.bulk_create(org_objs, batch_size=DatabaseConstants.BULK_CREATE_BATCH_SIZE)
+
+        # 批量创建实例的默认分组规则（优化：一次性查询+批量创建）
+        instances_to_process = new_instances + existing_instances
+        if instances_to_process:
+            rule_ids = InstanceConfigService._batch_create_default_rules(instances_to_process, monitor_object_id)
+            if rule_ids:
+                created_rule_ids.extend(rule_ids)
+
+        # 构建并批量创建新实例及关联关系
+        instance_objs, association_objs, created_instance_ids = InstanceConfigService._build_instance_objects(
+            new_instances,
+            monitor_object_id,
+            actor_context=actor_context,
+        )
+
+        if instance_objs:
+            MonitorInstance.objects.bulk_create(instance_objs, batch_size=DatabaseConstants.BULK_CREATE_BATCH_SIZE)
+
+        if association_objs:
+            MonitorInstanceOrganization.objects.bulk_create(association_objs, batch_size=DatabaseConstants.BULK_CREATE_BATCH_SIZE)
+
+        return created_instance_ids, created_rule_ids
+
+    @staticmethod
+    def _build_instance_objects(new_instances, monitor_object_id, actor_context=None):
+        """构建实例对象和关联关系,返回(实例列表, 关联列表, ID列表)"""
+        instance_objs = []
+        association_objs = []
+        instance_ids = []
+        maintainer = maintainer_kwargs(actor_context)
+
+        for instance in new_instances:
+            instance_id = instance["instance_id"]
+            instance_ids.append(instance_id)
+
+            # 创建实例对象
+            instance_objs.append(
+                MonitorInstance(
+                    id=instance_id,
+                    name=instance["instance_name"],
+                    monitor_object_id=monitor_object_id,
+                    interval=normalize_collect_interval(instance.get("interval")),
+                    ip=str(instance["ip"]).strip() if instance.get("ip") not in (None, "") else None,
+                    cloud_region_id=instance.get("cloud_region_id"),
+                    node_id=str(instance["node_id"]).strip() if instance.get("node_id") not in (None, "") else None,
+                    cmdb_id=str(instance["cmdb_id"]).strip() if instance.get("cmdb_id") not in (None, "") else None,
+                    summary_facts=InstanceFactResolver.merge(
+                        {},
+                        instance.get("summary_facts", {}),
+                        instance.get("_summary_fact_source"),
+                    ),
+                    **maintainer,
+                )
+            )
+
+            # 创建关联对象
+            for group_id in instance["group_ids"]:
+                association_objs.append(MonitorInstanceOrganization(monitor_instance_id=instance_id, organization=group_id))
+
+        return instance_objs, association_objs, instance_ids
+
+    @staticmethod
+    def _should_use_host_identity_adapter(monitor_object_name: str) -> bool:
+        """判断当前监控对象是否为 Host，Host 接入需要 identity adapter 处理实例ID。"""
+        return monitor_object_name == InstanceConfigService._HOST_MONITOR_OBJECT_NAME
+
+    @staticmethod
+    def _should_use_process_identity_adapter(monitor_object_name: str) -> bool:
+        """Process 接入：storage 用 (host_instance_id, process_name)，指标标签用主机 instance_id。"""
+        return monitor_object_name == InstanceConfigService._PROCESS_MONITOR_OBJECT_NAME
+
+    @staticmethod
+    def _should_use_network_device_identity_adapter(monitor_object_name: str) -> bool:
+        """判断当前监控对象是否为网络设备，网络设备接入需要跨插件统一实例ID。"""
+        return monitor_object_name in InstanceConfigService._NETWORK_DEVICE_MONITOR_OBJECT_NAMES
+
+    @staticmethod
+    def _prepare_host_identity_instances(instances: list) -> list:
+        """对 Host 实例列表应用 identity adapter，统一 storage/logical/raw 三层 ID。
+
+        Args:
+            instances: 原始实例列表，每个 instance 包含 instance_id 等字段
+
+        Returns:
+            enriched 实例列表，每个实例追加了
+            raw_instance_id / logical_instance_value / storage_instance_key
+            并将 instance_id 重写为 storage_instance_key
+        """
+        prepared = []
+        for instance in instances:
+            identity = normalize_instance_identity(instance.get("instance_id"))
+            prepared.append(
+                {
+                    **instance,
+                    "raw_instance_id": identity["raw_input"],
+                    "logical_instance_value": identity["logical_instance_value"],
+                    "storage_instance_key": identity["storage_instance_key"],
+                    "instance_id": identity["storage_instance_key"],
+                }
+            )
+        return prepared
+
+    @staticmethod
+    def _process_node_ids(instance: dict) -> list[str]:
+        raw_node_ids = instance.get("node_ids") or []
+        if isinstance(raw_node_ids, (str, bytes)):
+            raw_node_ids = [raw_node_ids]
+        elif not isinstance(raw_node_ids, (list, tuple)):
+            return []
+        node_ids = []
+        for raw_node_id in raw_node_ids:
+            if raw_node_id in (None, ""):
+                continue
+            node_id = str(raw_node_id).strip()
+            if node_id and node_id not in node_ids:
+                node_ids.append(node_id)
+        return node_ids
+
+    @staticmethod
+    def _process_lookup_ip(instance: dict) -> str:
+        candidates = [instance.get("ip")]
+        facts = instance.get("summary_facts")
+        if isinstance(facts, dict):
+            candidates.append(facts.get("asset.ip"))
+        for candidate in candidates:
+            if candidate in (None, ""):
+                continue
+            try:
+                return str(ipaddress.ip_address(str(candidate).strip()))
+            except ValueError:
+                continue
+        return ""
+
+    @staticmethod
+    def _process_lookup_cloud_region_id(instance: dict) -> int | None:
+        raw_cloud = instance.get("cloud_region_id")
+        if raw_cloud in (None, ""):
+            raw_cloud = instance.get("cloud_region")
+        if raw_cloud in (None, ""):
+            return None
+        try:
+            return int(raw_cloud)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _logical_id_from_host(host: MonitorInstance) -> str | None:
+        parts = parse_instance_id(host.id)
+        if not parts or parts[0] in (None, ""):
+            return None
+        return str(parts[0])
+
+    @staticmethod
+    def _unique_host_logical_id(hosts) -> tuple[str | None, bool]:
+        """返回 (logical id, 是否已有命中)。命中不是恰好一条时 logical id 为空，且不再继续猜测。"""
+        matched = list(hosts.order_by("id")[:2])
+        if not matched:
+            return None, False
+        if len(matched) != 1:
+            return None, True
+        return InstanceConfigService._logical_id_from_host(matched[0]), True
+
+    @staticmethod
+    def _resolve_process_host_logical_id(instance: dict) -> str | None:
+        """已有且唯一的 Host 时，返回其 logical instance_id，供进程指标标签对齐。
+
+        node_id 命中多条时不再按 IP 猜测。零条才继续用 IP + 云区域，仍须恰好一条。
+        """
+        hosts = MonitorInstance.objects.filter(
+            monitor_object__name=InstanceConfigService._HOST_MONITOR_OBJECT_NAME,
+            is_deleted=False,
+        )
+        node_ids = InstanceConfigService._process_node_ids(instance)
+        if node_ids:
+            logical_id, matched = InstanceConfigService._unique_host_logical_id(hosts.filter(node_id__in=node_ids))
+            if matched:
+                return logical_id
+
+        ip = InstanceConfigService._process_lookup_ip(instance)
+        cloud_region_id = InstanceConfigService._process_lookup_cloud_region_id(instance)
+        if not ip or cloud_region_id is None:
+            return None
+        logical_id, _matched = InstanceConfigService._unique_host_logical_id(hosts.filter(ip=ip, cloud_region_id=cloud_region_id))
+        return logical_id
+
+    @staticmethod
+    def _prepare_process_identity_instances(instances: list) -> list:
+        """Process 实例：与 Host 共用 logical instance_id，storage 追加 process_name 避免主键冲突。"""
+        prepared = []
+        for instance in instances:
+            process_name = str(instance.get("process_name") or "").strip()
+            if not process_name:
+                raise ValueError("process instance requires process_name")
+            host_identity = normalize_instance_identity(instance.get("instance_id"))
+            resolved_host_id = InstanceConfigService._resolve_process_host_logical_id(instance)
+            host_logical_id = resolved_host_id or host_identity["logical_instance_value"]
+            identity = normalize_instance_identity((host_logical_id, process_name))
+            storage_key = identity["storage_instance_key"]
+            if len(storage_key) > 200:
+                raise ValueError("process instance id too long " f"({len(storage_key)} > 200); shorten process_name or host id")
+            prepared.append(
+                {
+                    **instance,
+                    "raw_instance_id": instance.get("instance_id"),
+                    "logical_instance_value": identity["logical_instance_value"],
+                    "storage_instance_key": identity["storage_instance_key"],
+                    "instance_id": identity["storage_instance_key"],
+                    "process_name": process_name,
+                }
+            )
+        return prepared
+
+    @staticmethod
+    def _prepare_network_device_identity_instances(instances: list) -> list:
+        """对网络设备实例应用 identity adapter，按云区域和 IP 统一跨插件实例ID。"""
+        prepared = []
+        for instance in instances:
+            cloud_region, ip = InstanceConfigService._extract_network_device_identity_parts(instance)
+            identity = normalize_instance_identity(build_safe_instance_id(cloud_region, ip))
+            prepared.append(
+                {
+                    **instance,
+                    "raw_instance_id": instance.get("instance_id"),
+                    "logical_instance_value": identity["logical_instance_value"],
+                    "storage_instance_key": identity["storage_instance_key"],
+                    "instance_id": identity["storage_instance_key"],
+                }
+            )
+        return prepared
+
+    @staticmethod
+    def _extract_network_device_identity_parts(instance: dict) -> tuple:
+        cloud_region = instance.get("cloud_region_id") or instance.get("cloud_region")
+        ip = instance.get("ip")
+        raw_instance_id = str(instance.get("instance_id") or "").strip()
+
+        if (not cloud_region or not ip) and raw_instance_id:
+            colon_parts = raw_instance_id.split(":")
+            if len(colon_parts) >= 3:
+                cloud_region = cloud_region or colon_parts[0]
+                ip = ip or colon_parts[-1]
+
+            underscore_parts = raw_instance_id.split("_")
+            if len(underscore_parts) >= 2:
+                cloud_region = cloud_region or underscore_parts[0]
+                ip = ip or underscore_parts[-1]
+
+        if not cloud_region or not ip:
+            raise ValueError("network device instance requires cloud_region and ip")
+
+        return cloud_region, ip
+
+    @staticmethod
+    def _validate_expected_collect_configs(instances, configs, monitor_plugin_id, collect_type):
+        expected_types = {config.get("type") for config in configs if config.get("type")}
+        if not instances or not expected_types:
+            return
+
+        instance_ids = [instance.get("instance_id") for instance in instances if instance.get("instance_id")]
+        if not instance_ids:
+            return
+
+        filter_kwargs = {
+            "monitor_instance_id__in": instance_ids,
+            "collect_type": collect_type,
+            "config_type__in": expected_types,
+        }
+        if monitor_plugin_id not in (None, ""):
+            filter_kwargs["monitor_plugin_id"] = monitor_plugin_id
+
+        rows = CollectConfig.objects.filter(**filter_kwargs).values_list("monitor_instance_id", "config_type")
+        actual = {(instance_id, config_type) for instance_id, config_type in rows}
+        missing = [
+            f"{instance_id}:{config_type}"
+            for instance_id in instance_ids
+            for config_type in expected_types
+            if (instance_id, config_type) not in actual
+        ]
+        if missing:
+            raise BaseAppException(f"采集配置元数据缺失: {', '.join(missing)}")
+
+    @staticmethod
+    def create_monitor_instance_by_node_mgmt(data, actor_context=None):  # noqa: C901
+        """创建监控对象实例（支持同一实例ID多种采集方式）"""
+        instances = data.get("instances", [])
+        monitor_object_id = data["monitor_object_id"]
+        collect_type = data.get("collect_type", "")
+        collector = data.get("collector", "")
+        monitor_plugin_id = data.get("monitor_plugin_id")
+        # 快速失败:无实例直接返回
+        if not instances:
+            logger.info("没有需要创建的实例")
+            return []
+
+        sanitized_instances = instances
+        if actor_context is not None:
+            sanitized_instances = InstanceConfigService._sanitize_instances_for_onboarding(instances, actor_context)
+
+        plugin = (
+            MonitorPlugin.objects.filter(id=monitor_plugin_id).first()
+            if monitor_plugin_id not in (None, "")
+            else MonitorPlugin.objects.filter(
+                monitor_object=monitor_object_id,
+                collector=collector,
+                collect_type=collect_type,
+            )
+            .order_by("id")
+            .first()
+        )
+        if monitor_plugin_id not in (None, "") and not plugin:
+            raise BaseAppException("监控插件不存在")
+        requires_nodes = bool(plugin) and any(
+            binding.get("resolver") in {"selected_node", "selected_nodes"} for binding in (plugin.instance_fact_bindings or [])
+        )
+        prepared_fact_instances = []
+        for instance in sanitized_instances:
+            trusted_nodes = instance.get("_trusted_nodes", [])
+            if requires_nodes and not trusted_nodes:
+                trusted_nodes = NodeMgmt().get_nodes_by_ids(instance.get("node_ids", []))
+            summary_facts = InstanceFactResolver.resolve(plugin, instance, {"nodes": trusted_nodes}) if plugin else {}
+            clean_instance = {key: value for key, value in instance.items() if key != "_trusted_nodes"}
+            clean_instance["summary_facts"] = summary_facts
+            clean_instance["_summary_fact_source"] = (plugin.template_id or plugin.name) if plugin else ""
+            prepared_fact_instances.append(clean_instance)
+        sanitized_instances = prepared_fact_instances
+
+        InstanceConfigService._validate_instances_with_plugin_selector(
+            sanitized_instances,
+            monitor_plugin_id,
+            actor_context,
+        )
+
+        # 对需要统一实例身份的对象应用 identity adapter，统一 storage/logical/raw 三层 ID
+        monitor_object = MonitorObject.objects.filter(id=monitor_object_id).only("id", "name").first()
+        monitor_object_name = monitor_object.name if monitor_object else ""
+        is_host_monitoring_onboarding = HostDeploymentStatus.applies_to(
+            monitor_object_name,
+            collector,
+            collect_type,
+        )
+        if is_host_monitoring_onboarding:
+            requested_node_ids = list(
+                dict.fromkeys(
+                    str(node_id) for instance in sanitized_instances for node_id in instance.get("node_ids", []) if node_id not in (None, "")
+                )
+            )
+            configured_node_ids = HostDeploymentStatus().get_configured_node_ids(requested_node_ids)
+            if configured_node_ids:
+                raise BaseAppException(f"以下节点已接入主机监控，请刷新节点列表: {', '.join(sorted(configured_node_ids))}")
+        prepared_instances = sanitized_instances
+        if InstanceConfigService._should_use_host_identity_adapter(monitor_object_name):
+            try:
+                prepared_instances = InstanceConfigService._prepare_host_identity_instances(sanitized_instances)
+            except ValueError as e:
+                logger.error(f"实例识别失败: {e}")
+                raise BaseAppException(f"实例识别失败：{e}")
+        elif InstanceConfigService._should_use_process_identity_adapter(monitor_object_name):
+            try:
+                prepared_instances = InstanceConfigService._prepare_process_identity_instances(sanitized_instances)
+            except ValueError as e:
+                logger.error(f"实例识别失败: {e}")
+                raise BaseAppException(f"实例识别失败：{e}")
+        elif InstanceConfigService._should_use_network_device_identity_adapter(monitor_object_name):
+            try:
+                prepared_instances = InstanceConfigService._prepare_network_device_identity_instances(sanitized_instances)
+            except ValueError as e:
+                logger.error(f"实例识别失败: {e}")
+                raise BaseAppException(f"实例识别失败：{e}")
+
+        # ============ 使用单一外层事务包裹所有操作 ============
+        processed_instance_ids = []
+        created_instance_ids = []
+        existing_instances = []
+        try:
+            with transaction.atomic():
+                new_instances, existing_instances, reclaimable_ids = InstanceConfigService._prepare_instances_for_creation(
+                    prepared_instances,
+                    monitor_object_id,
+                    collect_type,
+                    collector,
+                    data.get("configs", []),
+                )
+                if is_host_monitoring_onboarding and existing_instances:
+                    existing_instance_ids = [instance["instance_id"] for instance in existing_instances]
+                    if CollectConfig.objects.filter(
+                        monitor_instance_id__in=existing_instance_ids,
+                        collector=HostDeploymentStatus.COLLECTOR,
+                        collect_type=HostDeploymentStatus.COLLECT_TYPE,
+                    ).exists():
+                        raise BaseAppException("监控实例已存在主机监控配置，无法重复接入")
+                if not new_instances and not existing_instances:
+                    logger.info("没有需要处理的实例")
+                    return []
+
+                logger.info(f"需要创建 {len(new_instances)} 个新实例,需要复用 {len(existing_instances)} 个已存在实例," f"需要回收 {len(reclaimable_ids)} 个历史墓碑")
+                if reclaimable_ids:
+                    from apps.monitor.services.monitor_instance_removal import MonitorInstanceRemovalService
+
+                    MonitorInstanceRemovalService.remove(reclaimable_ids)
+
+                # 阶段2：数据库操作（使用外层事务）
+                created_instance_ids, created_rule_ids = InstanceConfigService._create_instances_in_db(
+                    new_instances,
+                    existing_instances,
+                    monitor_object_id,
+                    actor_context=actor_context,
+                )
+                logger.info(f"创建实例和规则成功,实例数: {len(created_instance_ids)}")
+
+                # 阶段3：调用 Controller 创建采集配置（使用外层事务）
+                # 注意：所有实例（新建+已存在）都需要创建采集配置
+                sanitized_data = {**data}
+                sanitized_data["instances"] = [
+                    {key: value for key, value in instance.items() if key not in {"_summary_fact_source", "summary_facts"}}
+                    for instance in new_instances + existing_instances
+                ]
+                sanitized_data["monitor_plugin_id"] = monitor_plugin_id
+                Controller(sanitized_data).controller()
+                InstanceConfigService._validate_expected_collect_configs(
+                    sanitized_data["instances"],
+                    sanitized_data.get("configs", []),
+                    monitor_plugin_id,
+                    collect_type,
+                )
+                logger.info("采集配置创建成功")
+                processed_instance_ids = [
+                    str(instance["instance_id"]) for instance in new_instances + existing_instances if instance.get("instance_id") not in (None, "")
+                ]
+
+                # ✅ 所有操作成功，事务自动提交
+
+        except BaseAppException as e:
+            # 业务异常直接抛出（事务已自动回滚）
+            logger.error(f"创建监控实例失败: {e}")
+            raise
+        except IntegrityError as e:
+            logger.error("创建监控实例发生唯一键竞争", exc_info=True)
+            raise BaseAppException("监控实例标识已被占用，请刷新后重试") from e
+        except Exception as e:
+            # 系统异常包装后抛出（事务已自动回滚）
+            logger.error(f"创建监控实例失败: {e}", exc_info=True)
+            raise BaseAppException("创建监控实例失败，请稍后重试") from e
+
+        logger.info(f"创建监控实例成功,共 {len(created_instance_ids)} 个新实例,{len(existing_instances)} 个复用实例")
+        if processed_instance_ids and parent_has_child_objects(monitor_object_id):
+            for instance_id in processed_instance_ids:
+                enqueue_child_instance_discovery(instance_id)
+        return processed_instance_ids
+
+    @staticmethod
+    def update_instance_config(child_info, base_info, actor_context=None):
+        config_ids = []
+        if base_info and base_info.get("id"):
+            config_ids.append(base_info["id"])
+        if child_info and child_info.get("id"):
+            config_ids.append(child_info["id"])
+
+        config_objs = InstanceConfigService._get_authorized_collect_configs(
+            config_ids,
+            actor_context,
+            require_operate=True,
+        )
+        config_map = {config.id: config for config in config_objs}
+
+        if base_info and child_info:
+            base_config = config_map.get(base_info["id"])
+            child_config = config_map.get(child_info["id"])
+            if base_config and child_config and base_config.monitor_instance_id != child_config.monitor_instance_id:
+                raise BaseAppException("基础配置与子配置不属于同一监控实例")
+
+        if base_info:
+            config_obj = config_map.get(base_info["id"])
+            if config_obj:
+                content = ConfigFormat.json_to_yaml(base_info["content"])
+                env_config = base_info.get("env_config")
+                if (config_obj.config_type or "").lower() == "kafka":
+                    from apps.monitor.utils.kafka_sasl import ensure_kafka_sasl_mechanism_in_env
+
+                    ensure_kafka_sasl_mechanism_in_env(env_config)
+                NodeMgmt().update_config_content(base_info["id"], content, env_config)
+                from apps.monitor.services.collect_config_update import CollectConfigUpdateService
+
+                CollectConfigUpdateService.mark_hand_edited(config_obj, content)
+
+        if child_info:
+            config_obj = config_map.get(child_info["id"])
+            if not config_obj:
+                return
+            env_config = child_info.get("env_config")
+            if config_obj.collect_type == "web":
+                try:
+                    validate_rendered_website_config(child_info.get("content") or {}, env_config)
+                except ValueError as exc:
+                    raise BaseAppException(str(exc)) from exc
+            from apps.monitor.utils.snmp_ifmib_capability import is_interface_filter_capable_plugin
+
+            # 与创建路径同一能力边界：hardware_server 等非 Network Device 模板即便自带
+            # IF-MIB 表，也不得在编辑时被加上 ifType 排除或接口过滤。
+            ifmib_capable = (config_obj.collect_type or "").startswith("snmp") and is_interface_filter_capable_plugin(
+                getattr(config_obj, "monitor_plugin", None)
+            )
+            if ifmib_capable:
+                from apps.monitor.utils.snmp_interface_filters import normalize_snmp_interface_filter_config
+                from apps.monitor.utils.snmp_interface_template import has_interface_collection
+
+                # IF-MIB 是模板能力，而不是实例环境变量。child content 是首次下发时
+                # 已渲染的快照；编辑其他配置时不可按当前模板状态重建它，避免后续
+                # 关闭模板 IF-MIB 反向改变已开启实例的实际采集。
+                child_content = child_info.get("content")
+                if has_interface_collection(ConfigFormat.json_to_toml(child_content)):
+                    child_info["content"] = normalize_snmp_interface_filter_config(child_content)
+            if (config_obj.config_type or "").lower() == "kafka":
+                from apps.monitor.utils.kafka_collect_timeouts import (
+                    assert_kafka_group_metrics_timeout_lt_interval,
+                    extract_group_metrics_timeout_from_env,
+                )
+                from apps.monitor.utils.kafka_sasl import ensure_kafka_sasl_mechanism_in_env
+
+                ensure_kafka_sasl_mechanism_in_env(env_config)
+                child_content = child_info.get("content") or {}
+                child_interval = (child_content.get("config") or {}).get("interval") if isinstance(child_content, dict) else None
+                assert_kafka_group_metrics_timeout_lt_interval(
+                    extract_group_metrics_timeout_from_env(env_config),
+                    child_interval,
+                )
+            from apps.monitor.utils.disk_fstype_filters import sync_disk_fstype_filters_on_writeback
+
+            existing_rows = NodeMgmt().get_child_configs_by_ids([child_info["id"]])
+            if existing_rows and existing_rows[0].get("content"):
+                old_content = ConfigFormat.toml_to_dict(existing_rows[0]["content"])
+                child_info["content"] = _restore_config_secrets(child_info.get("content") or {}, old_content)
+
+            # 表单把 disk_*_fstypes 写在 content.config；Telegraf inputs.* 不认，必须挪回 starlark。
+            child_info["content"] = sync_disk_fstype_filters_on_writeback(child_info.get("content"))
+            if str(config_obj.collect_type or "").casefold() == "script":
+                from apps.monitor.services.custom_script_plugin import prepare_script_child_content_for_save
+
+                child_info["content"] = prepare_script_child_content_for_save(child_info.get("content") or {})
+            content = ConfigFormat.json_to_toml(child_info["content"]) if child_info else None
+            if ifmib_capable and content is not None:
+                from apps.monitor.utils.snmp_interface_template import (
+                    isolate_snmp_interface_tagpass,
+                    preserve_closed_ifmib_markers,
+                    restore_managed_ifmib_markers,
+                )
+
+                # 编辑改为「仅采集」时 create 路径的 isolate 不会重跑；这里强制拆分，
+                # 避免 tagpass 落在含厂商表的同一 input 上把 CPU/内存等指标过滤掉。
+                # tagexclude 走 dict 序列化天然落在 input 级，不需要再做文本补写。
+                # json_to_toml 会丢掉管理区间注释；无 tagpass 时 isolate 不 dump，必须补 restore。
+                content = isolate_snmp_interface_tagpass(content, force=True)
+                content = restore_managed_ifmib_markers(content)
+                content = preserve_closed_ifmib_markers(content, child_info.get("content"))
+            NodeMgmt().update_child_config_content(child_info["id"], content, env_config)
+            from apps.monitor.services.collect_config_update import CollectConfigUpdateService
+
+            CollectConfigUpdateService.mark_hand_edited(config_obj, content)

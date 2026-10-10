@@ -1,0 +1,56 @@
+"""配置文件 Schema 定义
+
+定义支持的枚举值和验证规则。
+配置值应存储在外部 JSON 文件中。
+"""
+
+from typing import List
+
+# 支持的模型类型
+SUPPORTED_MODELS: List[str] = [
+    "ECOD",
+    "PELT",
+    "EWMA",
+    # 未来可扩展: "IsolationForest", "LOF", "KNN"
+]
+
+
+# 支持的优化指标
+SUPPORTED_METRICS: List[str] = ["f1", "precision", "recall", "auc"]
+
+# PELT 支持的优化指标（包含点级兼容指标 + 变点级专属指标）
+SUPPORTED_PELT_METRICS: List[str] = [
+    "f1",
+    "precision",
+    "recall",
+    "auc",
+    "changepoint_precision",
+    "changepoint_recall",
+    "changepoint_f1",
+]
+
+
+# EWMA 支持的优化指标（点级兼容指标 + 漂移段专属指标）
+SUPPORTED_EWMA_METRICS: List[str] = [
+    "f1",
+    "precision",
+    "recall",
+    "auc",
+    "drift_precision",
+    "drift_recall",
+    "drift_f1",
+]
+
+
+# 支持的缺失值处理方法
+SUPPORTED_MISSING_HANDLERS: List[str] = [
+    "interpolate",
+    "ffill",
+    "bfill",
+    "drop",
+    "median",
+]
+
+
+# PELT 支持的 ruptures cost model
+SUPPORTED_PELT_COST_MODELS: List[str] = ["l1", "l2", "rbf"]

@@ -1,0 +1,407 @@
+import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
+import { Button, Table, TableProps, Pagination } from 'antd';
+import { SettingFilled, HolderOutlined } from '@ant-design/icons';
+import customTableStyle from './index.module.scss';
+import FieldSettingModal from './fieldSettingModal';
+import { ColumnItem, GroupFieldItem } from '@/types/index';
+import { TableCurrentDataSource, FilterValue, SorterResult } from 'antd/es/table/interface';
+import { cloneDeep } from 'lodash';
+import EllipsisWithTooltip from '../ellipsis-with-tooltip';
+import { useTranslation } from '@/utils/i18n';
+import ResizableTitle from './resizableTitle';
+import { createRafScheduler, resolveTableDimensions } from './tableHeight';
+import { getColumnKey, resolveColumnLayout, resolveSelectionColumnWidth } from './columnLayout';
+import { resolveTableScroll } from './tableScroll';
+
+interface CustomTableProps<T>
+  extends Omit<TableProps<T>, 'bordered' | 'fieldSetting' | 'onSelectFields'> {
+  bordered?: boolean;
+  size?: 'small' | 'middle' | 'large';
+  fieldSetting?: {
+    showSetting: boolean;
+    displayFieldKeys: string[];
+    choosableFields: ColumnItem[];
+    groupFields?: GroupFieldItem[];
+    searchable?: boolean;
+    modalWidth?: number;
+    enableFixedFields?: boolean;
+    fixedFieldKeys?: string[];
+    defaultFixedFieldKeys?: string[];
+  };
+  onSelectFields?: (
+    fields: string[],
+    fixedFields?: string[]
+  ) => void | Promise<void>;
+  rowDraggable?: boolean;
+  autoScrollX?: boolean;
+  onRowDragStart?: (index: number) => void;
+  onRowDragEnd?: (
+    targetTableData: TableProps<T>['dataSource'],
+    sourceIndex: number,
+    targetIndex: number
+  ) => void;
+}
+
+interface FieldRef {
+  showModal: () => void;
+}
+
+const CustomTable = <T extends object>({
+  bordered = false,
+  size = "middle",
+  fieldSetting = {
+    showSetting: false,
+    displayFieldKeys: [],
+    choosableFields: [],
+  },
+  onSelectFields = () => undefined,
+  loading,
+  scroll,
+  pagination,
+  onChange,
+  rowDraggable = false,
+  onRowDragStart,
+  onRowDragEnd,
+  rowSelection,
+  autoScrollX = true,
+  ...TableProps
+}: CustomTableProps<T>) => {
+  const { t } = useTranslation();
+  const fieldRef = useRef<FieldRef>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [containerHeight, setContainerHeight] = useState<number | undefined>(undefined);
+  const [tableHeight, setTableHeight] = useState<number | undefined>(undefined);
+  const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [filters, setFilters] = useState<Record<string, FilterValue | null>>({});
+  const [sorter, setSorter] = useState<SorterResult<T> | SorterResult<T>[]>({});
+  const [extra, setExtra] = useState<TableCurrentDataSource<T>>();
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
+  const [containerWidth, setContainerWidth] = useState<number | undefined>(undefined);
+  const scrollY = scroll?.y;
+  const hasPagination = Boolean(pagination);
+  const hasData = Boolean(TableProps.dataSource?.length);
+
+  // 监听父容器高度与自身宽度：横向按列宽定死会让短表缩在左侧，铺不满工作区
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const parentElement = container.parentElement;
+    if (!parentElement) return;
+
+    const updateTableLayout = () => {
+      const nextWidth = container.clientWidth;
+      setContainerWidth(previous => (previous === nextWidth ? previous : nextWidth));
+      const dimensions = resolveTableDimensions({
+        scrollY,
+        viewportHeight: window.innerHeight,
+        parentHeight: parentElement.clientHeight,
+        size,
+        hasPagination,
+      });
+      setTableHeight(previous =>
+        previous === dimensions.tableHeight ? previous : dimensions.tableHeight
+      );
+      setContainerHeight(previous =>
+        previous === dimensions.containerHeight
+          ? previous
+          : dimensions.containerHeight
+      );
+    };
+
+    updateTableLayout();
+
+    const scheduler = createRafScheduler(
+      updateTableLayout,
+      window.requestAnimationFrame.bind(window),
+      window.cancelAnimationFrame.bind(window)
+    );
+    let resizeObserver: ResizeObserver | undefined;
+
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(scheduler.schedule);
+      resizeObserver.observe(container);
+      resizeObserver.observe(parentElement);
+    }
+    if (typeof scrollY === 'string' && scrollY.includes('vh')) {
+      window.addEventListener('resize', scheduler.schedule);
+    }
+
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', scheduler.schedule);
+      scheduler.cancel();
+    };
+  }, [scrollY, hasPagination, size]);
+
+  const enhanceColumnRender = (column: any) => {
+    if (column.render) return column;
+
+    return {
+      ...column,
+      render: (text: any) => {
+        if ([null, undefined, ''].includes(text)) return '--';
+        if (typeof text === 'string') {
+          return (
+            <EllipsisWithTooltip
+              text={text}
+              className="truncate w-full"
+            />
+          );
+        }
+        return text;
+      }
+    };
+  };
+
+  const handleDragStart = (index: number) => () => {
+    setDraggedIndex(index);
+    onRowDragStart?.(index);
+  };
+
+  const columns = useMemo((): any[] => {
+    let cols = TableProps.columns || [];
+    cols = cols.map((col) => enhanceColumnRender(col));
+    if (!rowDraggable) return cols;
+    return [
+      {
+        key: 'sort',
+        align: 'center',
+        width: 30,
+        title: '',
+        dataIndex: 'sort',
+        render: (_: any, __: T, index: number) => (
+          <HolderOutlined
+            className="font-[800] text-[16px] mr-[6px] cursor-move"
+            draggable
+            onDragStart={handleDragStart(index)}
+          />
+        ),
+      },
+      ...cols,
+    ];
+  }, [TableProps.columns, rowDraggable, onRowDragStart]);
+
+  // 处理列宽拖拽
+  const handleColumnResize = (colKey: string) => (newWidth: number) => {
+    setColumnWidths(prev => ({
+      ...prev,
+      [colKey]: newWidth,
+    }));
+  };
+
+  // 将列宽状态和 onHeaderCell 合并到 columns
+  const reservedWidth = rowSelection
+    ? resolveSelectionColumnWidth(rowSelection.columnWidth)
+    : 0;
+  const columnLayout = useMemo(() => (
+    resolveColumnLayout({
+      autoScrollX,
+      columns,
+      columnWidths,
+      tableLayout: TableProps.tableLayout,
+      containerWidth,
+      reservedWidth,
+    })
+  ), [autoScrollX, columns, columnWidths, TableProps.tableLayout, containerWidth, reservedWidth]);
+
+  const resizableColumns = useCallback(() => {
+    return columns.map((col: any, index: number) => {
+      const colKey = getColumnKey(col, index);
+      const width = columnLayout.widths[index];
+      const hasWidth = width !== undefined && width !== null;
+
+      return {
+        ...col,
+        ...(hasWidth ? { width } : {}),
+        onHeaderCell: () => ({
+          ...(hasWidth ? { width } : {}),
+          resizeHandler: hasWidth ? handleColumnResize(colKey) : undefined,
+        }),
+      };
+    });
+  }, [columns, columnLayout.widths]);
+
+  const showFieldSetting = () => {
+    fieldRef.current?.showModal();
+  };
+
+  const handlePageChange = (current: number, pageSize: number) => {
+    if (pagination && pagination.onChange) {
+      pagination.onChange(current, pageSize);
+    }
+    onChange &&
+      onChange(
+        { current, pageSize },
+        filters,
+        sorter,
+        extra as TableCurrentDataSource<T>
+      );
+  };
+
+  const resetDragState = () => {
+    setDraggedIndex(null);
+    setHoveredIndex(null);
+  };
+
+  const handleDragEnd = () => {
+    resetDragState();
+  };
+
+  const handleDragOver =
+    (index: number) => (event: React.DragEvent<HTMLElement>) => {
+      if (!rowDraggable || draggedIndex === null) return;
+      event.preventDefault();
+      setHoveredIndex(index);
+    };
+
+  const handleDrop =
+    (index: number) => (event: React.DragEvent<HTMLElement>) => {
+      if (!rowDraggable || draggedIndex === null) return;
+      event.preventDefault();
+      const sourceIndex = draggedIndex;
+      const targetIndex = index;
+      resetDragState();
+
+      if (
+        sourceIndex !== null &&
+        targetIndex !== null &&
+        sourceIndex !== targetIndex
+      ) {
+        const targetTableData = cloneDeep(TableProps.dataSource) as T[];
+        const [movedItem] = targetTableData.splice(sourceIndex, 1);
+        targetTableData.splice(targetIndex, 0, movedItem);
+        onRowDragEnd?.(targetTableData, targetIndex, sourceIndex);
+      }
+    };
+
+  const renderRow = (index: number) => {
+    return {
+      index,
+      draggable: false,
+      onDragStart: undefined,
+      onDragEnd: rowDraggable ? handleDragEnd : undefined,
+      onDragOver: rowDraggable ? handleDragOver(index) : undefined,
+      onDrop: rowDraggable ? handleDrop(index) : undefined,
+    };
+  };
+
+  const handleTableChange = (
+    filters: Record<string, FilterValue | null>,
+    sorter: SorterResult<T> | SorterResult<T>[],
+    extra: TableCurrentDataSource<T>
+  ) => {
+    setFilters(filters);
+    setSorter(sorter);
+    setExtra(extra);
+    onChange &&
+      onChange(
+        {
+          total: pagination ? pagination.total : 0,
+          current: pagination ? pagination.current : 1,
+          pageSize: pagination ? pagination.pageSize : 20,
+        },
+        filters,
+        sorter,
+        extra
+      );
+  };
+
+  // 合并外部传入的 components 和列宽拖拽的 header cell
+  const mergedComponents = {
+    ...TableProps.components,
+    header: {
+      ...TableProps.components?.header,
+      cell: ResizableTitle,
+    },
+  };
+  const lockVerticalSize = containerHeight !== undefined && hasPagination;
+  const mergedScroll: TableProps<T>['scroll'] = resolveTableScroll({
+    calculatedScrollX: columnLayout.scrollX,
+    containerWidth,
+    scroll,
+    calculatedScrollY: tableHeight,
+    hasData,
+  });
+  const hideHorizontalScroll = mergedScroll.x === undefined;
+
+  return (
+    <div
+      ref={containerRef}
+      className={`relative min-h-0 ${customTableStyle.customTable}${hasPagination && scrollY !== 'auto' ? ' h-full' : ''}${hideHorizontalScroll ? ` ${customTableStyle.noHorizontalScroll}` : ''}`}
+      style={{
+        height: lockVerticalSize
+          ? `${containerHeight}px`
+          : hasPagination && scrollY !== 'auto'
+            ? '100%'
+            : 'auto',
+      }}
+    >
+      <Table
+        size={size}
+        bordered={bordered}
+        scroll={Object.keys(mergedScroll).length ? mergedScroll : undefined}
+        loading={loading}
+        pagination={false}
+        rowClassName={(record, index) =>
+          hoveredIndex === index ? 'bg-[var(--ant-table-row-hover-bg)]' : ''
+        }
+        onRow={(record, index) => renderRow(index!)}
+        {...TableProps}
+        tableLayout={columnLayout.tableLayout}
+        columns={resizableColumns()}
+        components={mergedComponents}
+        rowSelection={rowSelection}
+        onChange={(pageConfig, filters, sorter, extra) =>
+          handleTableChange(filters, sorter, extra)
+        }
+      />
+      {pagination && !loading && !!pagination.total && (
+        <div className={lockVerticalSize ? 'absolute right-0 bottom-0 flex justify-end' : 'mt-3 flex justify-end'}>
+          <Pagination
+            total={pagination?.total}
+            showSizeChanger={pagination?.showSizeChanger ?? true}
+            current={pagination?.current}
+            pageSize={pagination?.pageSize}
+            onChange={handlePageChange}
+            showTotal={(total) => (
+              <div className="flex items-center">
+                <span>{`${t('common.total')} ${total} ${t('common.items')}`}</span>
+                {rowSelection ? (
+                  <div className="text-sm h-[32px] flex items-center px-4">
+                    {`${t('common.checked')} ${rowSelection?.selectedRowKeys?.length} ${t('common.items')}`}
+                  </div>
+                ) : null}
+              </div>
+            )}
+          />
+        </div>
+      )}
+      {fieldSetting.showSetting ? (
+        <Button
+          type="text"
+          aria-label={t('cutomTable.fieldSetting')}
+          title={t('cutomTable.fieldSetting')}
+          style={{ top: size === 'small' ? 19 : size === 'middle' ? 23 : 27 }}
+          className={customTableStyle.setting}
+          onClick={showFieldSetting}
+          icon={<SettingFilled aria-hidden="true" />}
+        />
+      ) : null}
+      <FieldSettingModal
+        ref={fieldRef}
+        choosableFields={fieldSetting.choosableFields || []}
+        displayFieldKeys={fieldSetting.displayFieldKeys}
+        groupFields={fieldSetting.groupFields}
+        searchable={fieldSetting.searchable}
+        width={fieldSetting.modalWidth}
+        enableFixedFields={fieldSetting.enableFixedFields}
+        fixedFieldKeys={fieldSetting.fixedFieldKeys}
+        defaultFixedFieldKeys={fieldSetting.defaultFixedFieldKeys}
+        onConfirm={onSelectFields}
+      />
+    </div>
+  );
+};
+
+export default CustomTable;

@@ -1,0 +1,1157 @@
+/**
+ * AG-UI 协议消息处理器
+ * 负责处理不同类型的 AG-UI 消息
+ */
+
+import { getOpspilotTranslate } from './i18n';
+import {
+  AgentStepProgressValue,
+  AGUIMessage,
+  ApprovalRequestValue,
+  BrowserStepProgressValue,
+  BrowserTaskReceivedValue,
+  ConfigAnalysisReportValue,
+  ConfigAnalysisReportItemValue,
+  ConfigAnalysisRecommendationValue,
+  ConfigAnalysisSeveritySectionValue,
+  StructuredConfigAnalysisReportValue,
+  ConfigDiffReportValue,
+  RepairCommandsValue,
+  ReportFileDownloadValue,
+  SkillViewValue,
+  SubAgentProgressValue,
+  UserChoiceRequestValue
+} from '@/app/opspilot/types/chat';
+import {
+  AgentStepProgressData,
+  ApprovalRequest,
+  BrowserStepProgressData,
+  BrowserStepsHistory,
+  ConfigAnalysisReport,
+  ConfigAnalysisRecommendation,
+  ConfigDiffReport,
+  CustomChatMessage,
+  PlannedExecutionStepView,
+  PlannedStepToolCallView,
+  RepairCommands,
+  ReportFileDownload,
+  SkillViewItem,
+  UserChoiceRequest,
+  WikiCitation
+} from '@/app/opspilot/types/global';
+import {
+  closeActiveToolCallPanel,
+  initToolCallTooltips,
+  renderAllToolCalls,
+  renderErrorMessage,
+  syncActiveToolCallPanel,
+  ToolCallInfo
+} from './toolCallRenderer';
+import {
+  applyPlannedExecutionStep,
+  attachToolCallToCurrentStep,
+  plannedStepIndexFromToolEvent,
+  createPlannedExecutionState,
+  finalizePlannedExecutionSteps,
+  isFailedPlannedStepStatus,
+  isToolAssignedToPlannedStep,
+  PlannedExecutionState,
+} from './plannedExecutionState';
+import type { PlannedExecutionStatusValue, PlannedExecutionStepValue } from '@/app/opspilot/types/chat';
+import {
+  looksLikePlannedExecutionPayload,
+  unwrapCustomValue,
+  tryParseJsonValue,
+} from './plannedExecutionPayload';
+import { CONTEXT_USAGE_EVENT, parseLlmContextUsage, type LlmContextUsage } from './llmContextUsage';
+import { isToolResultErrorContent } from './toolResultStatus';
+
+export { isToolResultErrorContent } from './toolResultStatus';
+
+export interface MessageUpdateFn {
+  (updater: (prevMessages: CustomChatMessage[]) => CustomChatMessage[]): void;
+}
+
+// 内容块类型
+type ContentBlock =
+  | { type: 'text'; content: string }
+  | { type: 'toolCall'; id: string }
+  | { type: 'thinking' }
+  | { type: 'configDiff'; reportId: string }
+  | { type: 'configAnalysis'; reportId: string }
+  | { type: 'fileDownload'; downloadId: string }
+  | { type: 'repairCommands'; commandsId: string }
+  | { type: 'userChoice'; choiceId: string };
+
+const normalizeConfigAnalysisIssues = (
+  section: ConfigAnalysisSeveritySectionValue
+): ConfigAnalysisReportItemValue[] => {
+  if (Array.isArray(section.issues)) {
+    return section.issues;
+  }
+
+  if (Array.isArray(section.items)) {
+    return section.items;
+  }
+
+  return [];
+};
+
+const normalizeConfigAnalysisSection = (
+  section: ConfigAnalysisSeveritySectionValue
+): ConfigAnalysisSeveritySectionValue => ({
+  ...section,
+  issues: normalizeConfigAnalysisIssues(section),
+});
+
+const normalizeConfigAnalysisRecommendations = (
+  recommendations: ConfigAnalysisRecommendationValue[] | undefined
+): ConfigAnalysisRecommendation[] => {
+  if (!Array.isArray(recommendations)) {
+    return [];
+  }
+
+  return recommendations
+    .map((recommendation): ConfigAnalysisRecommendation | null => {
+      if (!recommendation || typeof recommendation !== 'object') {
+        return null;
+      }
+
+      const priority = typeof recommendation.priority === 'string' && ['P0', 'P1', 'P2', 'P3'].includes(recommendation.priority)
+        ? recommendation.priority as ConfigAnalysisRecommendation['priority']
+        : null;
+      const action = typeof recommendation.action === 'string' ? recommendation.action.trim() : '';
+      const target = typeof recommendation.target === 'string' ? recommendation.target.trim() : '';
+      const benefit = typeof recommendation.benefit === 'string' ? recommendation.benefit.trim() : '';
+
+      if (!priority || !action || !target || !benefit) {
+        return null;
+      }
+
+      return {
+        priority,
+        action,
+        target,
+        benefit,
+      };
+    })
+    .filter((recommendation): recommendation is ConfigAnalysisRecommendation => Boolean(recommendation));
+};
+
+const isStructuredConfigAnalysisReport = (
+  value: ConfigAnalysisReportValue
+): value is StructuredConfigAnalysisReportValue => (
+  Boolean(value.report_id) &&
+  Boolean(value.title) &&
+  Boolean(value.cluster_name) &&
+  value.summary !== undefined &&
+  Array.isArray(value.severity_sections) &&
+  Array.isArray(value.recommendations) &&
+  typeof value.markdown === 'string'
+);
+
+export const finalizePendingToolCalls = (
+  toolCalls: Map<string, ToolCallInfo>,
+  fallbackResult: string,
+  options?: { status?: 'completed' | 'error' }
+): boolean => {
+  let changed = false;
+  const nextStatus = options?.status ?? 'completed';
+  toolCalls.forEach((toolCall) => {
+    if (toolCall.status !== 'calling') {
+      return;
+    }
+    toolCall.status = nextStatus;
+    if (!toolCall.result) {
+      toolCall.result = fallbackResult;
+    }
+    changed = true;
+  });
+  return changed;
+};
+
+export class AGUIMessageHandler {
+  private contentBlocks: ContentBlock[] = [];
+  private currentTextBlock: string = '';
+  private thinkingContent: string = '';
+  private isThinking: boolean = false;
+  private isStreaming: boolean = true;  // 流式回复状态，默认为 true
+  private toolCallsRef: Map<string, ToolCallInfo>;
+  private botMessage: CustomChatMessage;
+  private updateMessages: MessageUpdateFn;
+  private browserStepsHistory: BrowserStepProgressData[] = [];
+  private approvalRequests: ApprovalRequest[] = [];
+  private userChoiceRequests: UserChoiceRequest[] = [];
+  private configDiffReports: ConfigDiffReport[] = [];
+  private configAnalysisReports: ConfigAnalysisReport[] = [];
+  private reportFileDownloads: ReportFileDownload[] = [];
+  private repairCommandsList: RepairCommands[] = [];
+  private agentStepProgressList: AgentStepProgressData[] = [];
+  private skillViews: SkillViewItem[] = [];
+  private wikiCitations: WikiCitation[] = [];
+  private plannedExecutionState: PlannedExecutionState = createPlannedExecutionState();
+  private plannedExecutionStatus: PlannedExecutionStatusValue | null = null;
+  private onContextUsage?: (usage: LlmContextUsage) => void;
+
+  constructor(
+    botMessage: CustomChatMessage,
+    updateMessages: MessageUpdateFn,
+    toolCallsRef: Map<string, ToolCallInfo>,
+    onContextUsage?: (usage: LlmContextUsage) => void
+  ) {
+    this.botMessage = botMessage;
+    this.updateMessages = updateMessages;
+    this.toolCallsRef = toolCallsRef;
+    this.onContextUsage = onContextUsage;
+
+    if (typeof window !== 'undefined') {
+      initToolCallTooltips();
+    }
+  }
+
+  private snapshotToolCalls(): PlannedStepToolCallView[] | undefined {
+    if (this.toolCallsRef.size === 0) {
+      return undefined;
+    }
+    return Array.from(this.toolCallsRef.entries()).map(([id, info]) => ({
+      id,
+      name: info.name,
+      args: info.args,
+      status: info.status,
+      result: info.result,
+    }));
+  }
+
+  private snapshotPlannedSteps(): PlannedExecutionStepView[] | undefined {
+    if (!this.plannedExecutionState.steps.length) {
+      return undefined;
+    }
+    return this.plannedExecutionState.steps.map((step) => ({
+      step_index: step.step_index,
+      total_steps: step.total_steps,
+      objective: step.objective,
+      status: step.status,
+      toolCallIds: [...step.toolCallIds],
+      reusedPriorResult: step.reusedPriorResult,
+      error: step.error,
+    }));
+  }
+
+  /**
+   * 更新消息内容
+   */
+  private updateMessageContent(
+    content: string,
+    browserStepProgress?: BrowserStepProgressData | null,
+    browserStepsHistory?: BrowserStepsHistory | null,
+    thinking?: string,
+    isThinking?: boolean,
+    agentStepProgress?: AgentStepProgressData[]
+  ) {
+    this.updateMessages(prevMessages =>
+      prevMessages.map(msgItem =>
+        msgItem.id === this.botMessage.id
+          ? {
+            ...msgItem,
+            // 流式过程中禁止用空串覆盖已有正文，避免中途「回答变空」
+            content: content || msgItem.content || '',
+            thinking: thinking !== undefined ? thinking : msgItem.thinking,
+            isThinking: isThinking !== undefined ? isThinking : msgItem.isThinking,
+            browserStepProgress: browserStepProgress !== undefined ? browserStepProgress : msgItem.browserStepProgress,
+            browserStepsHistory: browserStepsHistory !== undefined ? browserStepsHistory : msgItem.browserStepsHistory,
+            agentStepProgress: agentStepProgress !== undefined ? agentStepProgress : msgItem.agentStepProgress,
+            approvalRequests: this.approvalRequests.length > 0
+              ? this.approvalRequests.map(req => {
+                // 保留用户已做出的决策状态，不被 SSE 更新覆盖
+                const existing = msgItem.approvalRequests?.find(r => r.tool_call_id === req.tool_call_id);
+                return existing && existing.status !== 'pending' ? existing : req;
+              })
+              : msgItem.approvalRequests,
+            userChoiceRequests: this.userChoiceRequests.length > 0
+              ? this.userChoiceRequests.map(req => {
+                // 保留用户已做出的选择状态，不被 SSE 更新覆盖
+                const existing = msgItem.userChoiceRequests?.find(r => r.choice_id === req.choice_id);
+                return existing && existing.status !== 'pending' ? existing : req;
+              })
+              : msgItem.userChoiceRequests,
+            configDiffReports: this.configDiffReports.length > 0
+              ? this.configDiffReports
+              : msgItem.configDiffReports,
+            configAnalysisReports: this.configAnalysisReports.length > 0
+              ? this.configAnalysisReports
+              : msgItem.configAnalysisReports,
+            reportFileDownloads: this.reportFileDownloads.length > 0
+              ? this.reportFileDownloads
+              : msgItem.reportFileDownloads,
+            repairCommands: this.repairCommandsList.length > 0
+              ? this.repairCommandsList
+              : msgItem.repairCommands,
+            skillViews: this.skillViews.length > 0 ? this.skillViews : msgItem.skillViews,
+            wikiCitations: this.wikiCitations.length > 0 ? this.wikiCitations : msgItem.wikiCitations,
+            plannedExecutionSteps: this.snapshotPlannedSteps() ?? msgItem.plannedExecutionSteps,
+            plannedExecutionStatus: this.plannedExecutionStatus,
+            toolCalls: this.snapshotToolCalls() ?? msgItem.toolCalls,
+            isStreamingTools: this.isStreaming,
+            updateAt: new Date().toISOString()
+          }
+          : msgItem
+      )
+    );
+  }
+
+  /**
+   * 获取完整内容 - 按照内容块的顺序渲染
+   * 连续的工具调用会被合并成一个可折叠的组
+   */
+  private getFullContent(): string {
+    const parts: string[] = [];
+    let lastBlockType: string | null = null;
+    let pendingToolCalls: Map<string, ToolCallInfo> = new Map();
+
+    const flushToolCalls = () => {
+      if (pendingToolCalls.size > 0) {
+        // 传入 isStreaming 状态，控制工具列表是否展开
+        const toolCallsHtml = renderAllToolCalls(pendingToolCalls, this.isStreaming);
+        if (parts.length > 0) {
+          parts.push('\n\n' + toolCallsHtml);
+        } else {
+          parts.push(toolCallsHtml);
+        }
+        pendingToolCalls = new Map();
+        lastBlockType = 'toolCall';
+      }
+    };
+
+    for (const block of this.contentBlocks) {
+      if (block.type === 'text') {
+        // 遇到文本块，先输出累积的工具调用
+        if (looksLikePlannedExecutionPayload(tryParseJsonValue(block.content))) {
+          continue;
+        }
+        flushToolCalls();
+        if (parts.length > 0) {
+          parts.push('\n\n' + block.content);
+        } else {
+          parts.push(block.content);
+        }
+        lastBlockType = 'text';
+      } else if (block.type === 'toolCall') {
+        // 已挂到 planned_execution_step 的工具改由 React 面板渲染，避免与扁平工具组重复
+        if (isToolAssignedToPlannedStep(this.plannedExecutionState, block.id)) {
+          continue;
+        }
+        // 有执行计划时不再渲染独立「已调用 N 个工具」组，未归属的只打调试日志
+        if (this.plannedExecutionState.steps.length > 0) {
+          if (typeof console !== 'undefined' && typeof console.debug === 'function') {
+            console.debug('[planned-execution] unassigned tool call', block.id);
+          }
+          continue;
+        }
+        const toolInfo = this.toolCallsRef.get(block.id);
+        if (toolInfo) {
+          pendingToolCalls.set(block.id, toolInfo);
+        }
+      } else if (block.type === 'configDiff') {
+        flushToolCalls();
+        // Insert placeholder marker for React component rendering
+        parts.push(`\n\n<!--CONFIG_DIFF:${block.reportId}-->`);
+        lastBlockType = 'configDiff';
+      } else if (block.type === 'configAnalysis') {
+        flushToolCalls();
+        parts.push(`\n\n<!--CONFIG_ANALYSIS:${block.reportId}-->`);
+        lastBlockType = 'configAnalysis';
+      } else if (block.type === 'fileDownload') {
+        flushToolCalls();
+        // File download cards are rendered via reportFileDownloads, no inline marker needed
+        lastBlockType = 'fileDownload';
+      } else if (block.type === 'repairCommands') {
+        flushToolCalls();
+        // Repair commands rendered via repairCommands data, no inline marker needed
+        lastBlockType = 'repairCommands';
+      } else if (block.type === 'userChoice') {
+        flushToolCalls();
+        // Insert placeholder marker for React component rendering
+        parts.push(`\n\n<!--USER_CHOICE:${block.choiceId}-->`);
+        lastBlockType = 'userChoice';
+      } else if (block.type === 'thinking') {
+        // 忽略 thinking 块
+      }
+    }
+
+    // 输出剩余的工具调用
+    flushToolCalls();
+
+    // 添加当前正在累积的文本
+    if (this.currentTextBlock && !looksLikePlannedExecutionPayload(tryParseJsonValue(this.currentTextBlock))) {
+      if (parts.length > 0 && lastBlockType !== 'text') {
+        parts.push('\n\n' + this.currentTextBlock);
+      } else if (parts.length > 0) {
+        parts.push(this.currentTextBlock);
+      } else {
+        parts.push(this.currentTextBlock);
+      }
+    }
+
+    return parts.join('');
+  }
+
+  /**
+   * 清除"正在思考"提示
+   */
+  private clearThinkingPrompt() {
+    this.contentBlocks = this.contentBlocks.filter(block => block.type !== 'thinking');
+  }
+
+  private stopThinking() {
+    this.clearThinkingPrompt();
+    this.isThinking = false;
+  }
+
+  /**
+   * 提交当前文本块
+   */
+  private flushCurrentTextBlock() {
+    if (!this.currentTextBlock) {
+      return;
+    }
+    const pending = this.currentTextBlock;
+    this.currentTextBlock = '';
+    if (this.applyPlannedExecutionText(pending)) {
+      return;
+    }
+    this.contentBlocks.push({ type: 'text', content: pending });
+  }
+
+  private applyPlannedExecutionText(raw: string): boolean {
+    const parsed = unwrapCustomValue(tryParseJsonValue(raw));
+    const kind = looksLikePlannedExecutionPayload(parsed);
+    if (!kind || !parsed || typeof parsed !== 'object') {
+      return false;
+    }
+    if (kind === 'status') {
+      const value = parsed as PlannedExecutionStatusValue;
+      this.plannedExecutionStatus = {
+        phase: String(value.phase || ''),
+        step_count: value.step_count,
+        goal: value.goal,
+        replan_count: value.replan_count,
+        reason: value.reason,
+      };
+      return true;
+    }
+    this.plannedExecutionState = applyPlannedExecutionStep(
+      this.plannedExecutionState,
+      parsed as PlannedExecutionStepValue
+    );
+    if (this.plannedExecutionStatus) {
+      this.plannedExecutionStatus = {
+        ...this.plannedExecutionStatus,
+        phase: 'idle',
+      };
+    }
+    return true;
+  }
+
+  /**
+   * 撤回工具调用前已流式展示的旁白正文（后端 assistant_text_retract）。
+   */
+  handleAssistantTextRetract() {
+    this.stopThinking();
+    this.currentTextBlock = '';
+    while (this.contentBlocks.length > 0) {
+      const last = this.contentBlocks[this.contentBlocks.length - 1];
+      if (last.type !== 'text') {
+        break;
+      }
+      this.contentBlocks.pop();
+    }
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理 RUN_STARTED 事件
+   */
+  handleRunStarted() {
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  handleThinking(delta: string) {
+    if (!this.isThinking) {
+      this.isThinking = true;
+    }
+
+    this.thinkingContent += delta;
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理 TEXT_MESSAGE_CONTENT 事件
+   */
+  handleTextContent(delta: string) {
+    this.stopThinking();
+    if (this.applyPlannedExecutionText(delta)) {
+      this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+      return;
+    }
+    this.currentTextBlock += delta;
+    if (this.applyPlannedExecutionText(this.currentTextBlock)) {
+      this.currentTextBlock = '';
+    }
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理 TOOL_CALL_START 事件
+   */
+  handleToolCallStart(toolCallId: string, toolCallName: string, stepIndex?: number | null) {
+    this.stopThinking();
+    // 工具轮次前的流式正文视为旁白：丢弃而非落盘，避免「先分析再调工具」泄漏到对话。
+    this.currentTextBlock = '';
+
+    this.contentBlocks.push({ type: 'toolCall', id: toolCallId });
+
+    this.toolCallsRef.set(toolCallId, {
+      name: toolCallName,
+      args: '',
+      status: 'calling'
+    });
+    this.plannedExecutionState = attachToolCallToCurrentStep(this.plannedExecutionState, toolCallId, stepIndex);
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  handlePlannedExecutionStep(value: PlannedExecutionStepValue) {
+    this.stopThinking();
+    this.flushCurrentTextBlock();
+    // 首步开始后规划状态条收起，改由步骤面板展示进度
+    if (this.plannedExecutionStatus) {
+      this.plannedExecutionStatus = {
+        ...this.plannedExecutionStatus,
+        phase: 'idle',
+      };
+    }
+    this.plannedExecutionState = applyPlannedExecutionStep(this.plannedExecutionState, value);
+    // 凭据/配置失败收口时，把仍 calling 的本步工具标成 error，避免流结束补成绿色「已完成」
+    if (value?.phase === 'end' && isFailedPlannedStepStatus(value.status)) {
+      const step = this.plannedExecutionState.steps.find(
+        (item) => item.step_index === Number(value.step_index)
+      );
+      const errorText =
+        (typeof value.error === 'string' && value.error.trim()) ||
+        step?.error ||
+        getOpspilotTranslate()(
+          'chat.plannedStep.abortedByCredentials',
+          '步骤因凭据、权限或配置失败已中止'
+        );
+      for (const toolCallId of step?.toolCallIds || []) {
+        const toolCall = this.toolCallsRef.get(toolCallId);
+        if (!toolCall || toolCall.status !== 'calling') continue;
+        toolCall.status = 'error';
+        toolCall.result = errorText;
+      }
+    }
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  handlePlannedExecutionStatus(value: PlannedExecutionStatusValue) {
+    this.stopThinking();
+    this.plannedExecutionStatus = {
+      phase: String(value?.phase || ''),
+      step_count: value?.step_count,
+      goal: value?.goal,
+      replan_count: value?.replan_count,
+      reason: value?.reason,
+    };
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理 TOOL_CALL_ARGS 事件
+   */
+  handleToolCallArgs(toolCallId: string, delta: string) {
+    const toolCall = this.toolCallsRef.get(toolCallId);
+    if (toolCall) {
+      toolCall.args += delta;
+      this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+    }
+  }
+
+  private findLatestCallingToolCallId(preferredToolName?: string) {
+    const entries = Array.from(this.toolCallsRef.entries()).reverse();
+
+    if (preferredToolName) {
+      const matchedEntry = entries.find(([, toolCall]) => toolCall.status === 'calling' && toolCall.name === preferredToolName);
+      if (matchedEntry) {
+        return matchedEntry[0];
+      }
+    }
+
+    const latestCallingEntry = entries.find(([, toolCall]) => toolCall.status === 'calling');
+    return latestCallingEntry?.[0];
+  }
+
+  /**
+   * 处理 TOOL_CALL_RESULT 事件
+   */
+  handleToolCallResult(toolCallId: string, content: string) {
+    const toolCall = this.toolCallsRef.get(toolCallId);
+    if (toolCall) {
+      toolCall.status = isToolResultErrorContent(content) ? 'error' : 'completed';
+      toolCall.result = content;
+      this.syncAttachmentDownloadFromToolResult(toolCallId, toolCall.name, content);
+
+      // Fallback: if report_config_diff / generate_repair_report completed but CUSTOM
+      // repair_diff_report event wasn't received, construct DiffReportCard from args/result.
+      if (toolCall.name === 'report_config_diff' && toolCall.args) {
+        try {
+          const args = JSON.parse(toolCall.args);
+          const existingReport = this.configDiffReports.find(
+            r => r.cluster_name === args.cluster_name && r.title === args.title
+          );
+          if (!existingReport && args.items && args.items.length > 0) {
+            const report: ConfigDiffReport = {
+              report_id: `fallback_${toolCallId}`,
+              title: args.title || '',
+              cluster_name: args.cluster_name || '',
+              items: args.items,
+              received_at: Date.now(),
+            };
+            this.configDiffReports.push(report);
+            this.flushCurrentTextBlock();
+            this.contentBlocks.push({ type: 'configDiff', reportId: report.report_id });
+          }
+        } catch {
+          // args parse failed, skip fallback
+        }
+      }
+
+      if (toolCall.name === 'generate_repair_report' && content) {
+        try {
+          const parsed = JSON.parse(content);
+          const items = Array.isArray(parsed?.items) ? parsed.items : [];
+          if (items.length > 0 && this.configDiffReports.length === 0) {
+            const report: ConfigDiffReport = {
+              report_id: `fallback_repair_${toolCallId}`,
+              title:
+                parsed.title ||
+                getOpspilotTranslate()('chat.diffReport.k8sDefaultTitle', 'K8S 配置修复对比'),
+              cluster_name: parsed.cluster_name || '',
+              items,
+              received_at: Date.now(),
+            };
+            this.configDiffReports.push(report);
+            this.flushCurrentTextBlock();
+            this.contentBlocks.push({ type: 'configDiff', reportId: report.report_id });
+          }
+        } catch {
+          // result parse failed, skip fallback
+        }
+      }
+
+      closeActiveToolCallPanel(toolCallId);
+      this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+    }
+  }
+
+  private syncAttachmentDownloadFromToolResult(toolCallId: string, toolName: string, content: string) {
+    if (toolName !== 'generate_attachment_file') {
+      return;
+    }
+
+    try {
+      const parsed = this.parseAttachmentToolResult(content);
+      if (!parsed?.file_url || !parsed?.filename) {
+        return;
+      }
+
+      const downloadId = `attachment_${toolCallId}`;
+      const existed = this.reportFileDownloads.some(download => download.download_id === downloadId);
+      if (existed) {
+        return;
+      }
+
+      this.reportFileDownloads.push({
+        download_id: downloadId,
+        filename: parsed.filename,
+        file_url: parsed.file_url,
+        mime_type: parsed.mime_type || 'application/octet-stream',
+        received_at: Date.now(),
+      });
+      this.flushCurrentTextBlock();
+      this.contentBlocks.push({ type: 'fileDownload', downloadId });
+    } catch {
+      // ignore invalid tool result payloads
+    }
+  }
+
+  private parseAttachmentToolResult(content: string) {
+    try {
+      return JSON.parse(content);
+    } catch {
+      const extractField = (field: string) => {
+        const match = content.match(new RegExp(`[\"']${field}[\"']\\s*:\\s*[\"']([^\"']+)[\"']`));
+        return match?.[1];
+      };
+
+      return {
+        filename: extractField('filename'),
+        file_url: extractField('file_url'),
+        mime_type: extractField('mime_type'),
+      };
+    }
+  }
+
+  handleBrowserTaskReceived(value: BrowserTaskReceivedValue) {
+    const preferredToolName = typeof value.tool === 'string' ? value.tool : undefined;
+    const toolCallId = this.findLatestCallingToolCallId(preferredToolName);
+    if (!toolCallId) return;
+
+    const toolCall = this.toolCallsRef.get(toolCallId);
+    if (!toolCall) return;
+
+    toolCall.browserTaskReceived = value;
+    syncActiveToolCallPanel(toolCallId, toolCall);
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  handleAgentStepProgress(value: AgentStepProgressValue) {
+    const data = value as AgentStepProgressData;
+    // Update or append based on agent_name + step
+    const key = `${data.agent_name || 'main'}_${data.step}`;
+    const existingIdx = this.agentStepProgressList.findIndex(
+      d => `${d.agent_name || 'main'}_${d.step}` === key
+    );
+    if (existingIdx >= 0) {
+      this.agentStepProgressList[existingIdx] = data;
+    } else {
+      this.agentStepProgressList.push(data);
+    }
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking, this.agentStepProgressList);
+  }
+
+  handleSubAgentProgress(value: SubAgentProgressValue) {
+    const data: AgentStepProgressData = {
+      agent_name: value.agent_name,
+      step: 0,
+      max_steps: 0,
+      status: value.status,
+      description: value.description,
+    };
+    // For sub-agent lifecycle events, upsert by agent_name
+    const existingIdx = this.agentStepProgressList.findIndex(
+      d => d.agent_name === value.agent_name && (d.status === 'started' || d.status === 'running')
+    );
+    if (existingIdx >= 0 && (value.status === 'completed' || value.status === 'error')) {
+      this.agentStepProgressList[existingIdx] = data;
+    } else {
+      this.agentStepProgressList.push(data);
+    }
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking, this.agentStepProgressList);
+  }
+
+  handleSkillView(value: SkillViewValue) {
+    const items = Array.isArray(value.items) ? value.items : [];
+    this.skillViews = items.filter((item): item is SkillViewItem => Boolean(item && item.name));
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理 Wiki 知识库引用事件:存下答案 [n] 对应的来源,供消息下方渲染可点「来源」列表
+   */
+  handleWikiCitations(value: { citations?: WikiCitation[] }) {
+    const items = Array.isArray(value.citations) ? value.citations : [];
+    this.wikiCitations = items.filter((c): c is WikiCitation => Boolean(c && typeof c.n === 'number' && c.id));
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理审批请求事件
+   */
+  handleApprovalRequest(value: ApprovalRequestValue) {
+    const request: ApprovalRequest = {
+      ...value,
+      received_at: Date.now(),
+      status: 'pending',
+    };
+    this.approvalRequests.push(request);
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 更新审批请求状态
+   */
+  updateApprovalStatus(toolCallId: string, status: 'approved' | 'rejected') {
+    const request = this.approvalRequests.find(r => r.tool_call_id === toolCallId);
+    if (request) {
+      request.status = status;
+      this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+    }
+  }
+
+  /**
+   * 处理用户选择请求事件
+   */
+  handleUserChoiceRequest(value: UserChoiceRequestValue) {
+    const request: UserChoiceRequest = {
+      ...value,
+      received_at: Date.now(),
+      status: 'pending',
+    };
+    this.userChoiceRequests.push(request);
+    // Insert a placeholder block so the card renders in-order
+    this.flushCurrentTextBlock();
+    this.contentBlocks.push({ type: 'userChoice', choiceId: request.choice_id });
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 更新用户选择请求状态
+   */
+  updateUserChoiceStatus(choiceId: string, status: 'submitted' | 'timeout', selected?: string[]) {
+    const request = this.userChoiceRequests.find(r => r.choice_id === choiceId);
+    if (request) {
+      request.status = status;
+      if (selected) {
+        request.selected = selected;
+      }
+      this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+    }
+  }
+
+  /**
+   * 处理用户选择结果事件（来自后端超时或自动选择）
+   */
+  handleUserChoiceResult(value: { choice_id: string; selected: string[]; source: string }) {
+    const status = value.source === 'user' ? 'submitted' : 'timeout';
+    this.updateUserChoiceStatus(value.choice_id, status, value.selected);
+  }
+
+  /**
+   * 处理配置 diff 报告事件
+   */
+  handleConfigDiffReport(value: ConfigDiffReportValue) {
+    const report: ConfigDiffReport = {
+      ...value,
+      received_at: Date.now(),
+    };
+    const existingIndex = this.configDiffReports.findIndex(item => item.report_id === report.report_id);
+    if (existingIndex >= 0) {
+      this.configDiffReports[existingIndex] = report;
+    } else {
+      this.configDiffReports.push(report);
+    }
+    this.flushCurrentTextBlock();
+    const hasMarker = this.contentBlocks.some(
+      block => block.type === 'configDiff' && block.reportId === report.report_id
+    );
+    if (!hasMarker) {
+      this.contentBlocks.push({ type: 'configDiff', reportId: report.report_id });
+    }
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  handleConfigAnalysisReport(value: ConfigAnalysisReportValue) {
+    this.flushCurrentTextBlock();
+
+    if (isStructuredConfigAnalysisReport(value)) {
+      const existingIndex = this.configAnalysisReports.findIndex(
+        report => report.report_id === value.report_id
+      );
+      const severity_sections = value.severity_sections.map(normalizeConfigAnalysisSection);
+      const report: ConfigAnalysisReport = {
+        ...value,
+        summary: value.summary || {},
+        severity_sections,
+        recommendations: normalizeConfigAnalysisRecommendations(value.recommendations),
+        markdown: value.markdown,
+        fallback_markdown: value.fallback_markdown || value.markdown,
+        received_at: Date.now(),
+      };
+
+      if (existingIndex >= 0) {
+        this.configAnalysisReports[existingIndex] = report;
+      } else {
+        this.configAnalysisReports.push(report);
+      }
+
+      const hasMarker = this.contentBlocks.some(
+        block => block.type === 'configAnalysis' && block.reportId === value.report_id
+      );
+      if (!hasMarker) {
+        this.contentBlocks.push({ type: 'configAnalysis', reportId: value.report_id });
+      }
+    } else {
+      const fallbackMarkdown = value.fallback_markdown || value.markdown;
+      if (fallbackMarkdown) {
+        this.contentBlocks.push({ type: 'text', content: fallbackMarkdown });
+      }
+    }
+
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理报告文件下载事件
+   */
+  handleReportFileDownload(value: ReportFileDownloadValue) {
+    const download: ReportFileDownload = {
+      ...value,
+      received_at: Date.now(),
+    };
+    this.reportFileDownloads.push(download);
+    this.flushCurrentTextBlock();
+    this.contentBlocks.push({ type: 'fileDownload', downloadId: download.download_id });
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理修复命令事件
+   */
+  handleRepairCommands(value: RepairCommandsValue) {
+    const commands: RepairCommands = {
+      ...value,
+      received_at: Date.now(),
+    };
+    this.repairCommandsList.push(commands);
+    this.flushCurrentTextBlock();
+    this.contentBlocks.push({ type: 'repairCommands', commandsId: commands.commands_id });
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理 ERROR 事件
+   */
+  handleError(error: string) {
+    this.stopThinking();
+    this.isStreaming = false;
+    finalizePendingToolCalls(
+      this.toolCallsRef,
+      getOpspilotTranslate()(
+        'chat.toolCall.streamInterrupted',
+        '工具调用已结束，但流中断前未收到结果事件。'
+      )
+    );
+    this.plannedExecutionState = finalizePlannedExecutionSteps(this.plannedExecutionState);
+    if (this.plannedExecutionStatus) {
+      this.plannedExecutionStatus = { ...this.plannedExecutionStatus, phase: 'idle' };
+    }
+    this.flushCurrentTextBlock();
+    const errorMessage = renderErrorMessage(error, 'error', undefined, getOpspilotTranslate());
+    this.contentBlocks.push({ type: 'text', content: errorMessage });
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  /**
+   * 处理 RUN_ERROR 事件
+   */
+  handleRunError(message: string, code?: string) {
+    this.stopThinking();
+    this.isStreaming = false;
+    finalizePendingToolCalls(
+      this.toolCallsRef,
+      getOpspilotTranslate()(
+        'chat.toolCall.runErrorBeforeResult',
+        '工具调用已结束，但运行错误前未收到结果事件。'
+      )
+    );
+    this.plannedExecutionState = finalizePlannedExecutionSteps(this.plannedExecutionState);
+    if (this.plannedExecutionStatus) {
+      this.plannedExecutionStatus = { ...this.plannedExecutionStatus, phase: 'idle' };
+    }
+    this.flushCurrentTextBlock();
+    const errorMessage = renderErrorMessage(message, 'run_error', code);
+    this.contentBlocks.push({ type: 'text', content: errorMessage });
+    this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+  }
+
+  handleBrowserStepProgress(value: BrowserStepProgressValue) {
+    this.stopThinking();
+    const stepData = value as BrowserStepProgressData;
+
+    const existingIndex = this.browserStepsHistory.findIndex(
+      s => s.step_number === stepData.step_number
+    );
+
+    if (existingIndex >= 0) {
+      this.browserStepsHistory[existingIndex] = stepData;
+    } else {
+      this.browserStepsHistory.push(stepData);
+    }
+
+    this.browserStepsHistory.sort((a, b) => a.step_number - b.step_number);
+
+    const history: BrowserStepsHistory = {
+      steps: [...this.browserStepsHistory],
+      isRunning: true
+    };
+
+    this.updateMessageContent(this.getFullContent(), stepData, history, this.thinkingContent, this.isThinking);
+  }
+
+  handleBrowserStepComplete() {
+    this.clearThinkingPrompt();
+    this.isThinking = false;
+    if (this.browserStepsHistory.length > 0) {
+      const history: BrowserStepsHistory = {
+        steps: [...this.browserStepsHistory],
+        isRunning: false
+      };
+      const lastStep = this.browserStepsHistory[this.browserStepsHistory.length - 1];
+      this.updateMessageContent(this.getFullContent(), lastStep, history, this.thinkingContent, this.isThinking);
+    } else {
+      this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+    }
+  }
+
+  /**
+   * 处理消息并返回是否应该停止
+   */
+  handle(aguiData: AGUIMessage): boolean {
+    switch (aguiData.type) {
+      case 'RUN_STARTED':
+        this.handleRunStarted();
+        return false;
+
+      case 'THINKING':
+        if (aguiData.delta) {
+          this.handleThinking(aguiData.delta);
+        }
+        return false;
+
+      case 'TEXT_MESSAGE_START':
+        // 新文本消息开始前先落盘上一段，避免后续工具/自定义事件打空 currentTextBlock 时丢字
+        this.flushCurrentTextBlock();
+        return false;
+
+      case 'TEXT_MESSAGE_CONTENT':
+        if (aguiData.delta) {
+          this.handleTextContent(aguiData.delta);
+        }
+        return false;
+
+      case 'TEXT_MESSAGE_END':
+        this.flushCurrentTextBlock();
+        this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, this.isThinking);
+        return false;
+
+      case 'TOOL_CALL_START': {
+        const snake = aguiData as unknown as { tool_call_id?: string; tool_call_name?: string };
+        const toolCallId = aguiData.toolCallId || snake.tool_call_id;
+        const toolCallName = aguiData.toolCallName || snake.tool_call_name;
+        if (toolCallId && toolCallName) {
+          this.handleToolCallStart(
+            toolCallId,
+            toolCallName,
+            plannedStepIndexFromToolEvent(aguiData as { rawEvent?: unknown; raw_event?: unknown })
+          );
+        }
+        return false;
+      }
+
+      case 'TOOL_CALL_ARGS': {
+        const toolCallId = aguiData.toolCallId
+          || (aguiData as unknown as { tool_call_id?: string }).tool_call_id;
+        if (toolCallId && aguiData.delta) {
+          this.handleToolCallArgs(toolCallId, aguiData.delta);
+        }
+        return false;
+      }
+
+      case 'TOOL_CALL_END':
+        return false;
+
+      case 'TOOL_CALL_RESULT': {
+        const toolCallId = aguiData.toolCallId
+          || (aguiData as unknown as { tool_call_id?: string }).tool_call_id;
+        if (toolCallId && aguiData.content !== undefined) {
+          this.handleToolCallResult(toolCallId, aguiData.content);
+        }
+        return false;
+      }
+
+      case 'ERROR':
+        if (aguiData.error) {
+          this.handleError(aguiData.error);
+        }
+        return true;
+
+      case 'RUN_ERROR':
+        if (aguiData.message || aguiData.error) {
+          const errorContent =
+            aguiData.message ||
+            aguiData.error ||
+            getOpspilotTranslate()('chat.defaultError', '未知错误');
+          this.handleRunError(errorContent, aguiData.code);
+        }
+        return true;
+
+      case 'RUN_FINISHED':
+        // 流式回复结束，设置 isStreaming 为 false 并更新内容（收起工具列表）
+        this.isStreaming = false;
+        finalizePendingToolCalls(
+          this.toolCallsRef,
+          getOpspilotTranslate()('chat.toolCall.noResultEvent', '工具调用已结束，但未收到结果事件。')
+        );
+        this.plannedExecutionState = finalizePlannedExecutionSteps(this.plannedExecutionState);
+        if (this.plannedExecutionStatus) {
+          this.plannedExecutionStatus = { ...this.plannedExecutionStatus, phase: 'idle' };
+        }
+        this.handleBrowserStepComplete();
+        // 重新渲染内容以收起工具列表
+        this.updateMessageContent(this.getFullContent(), undefined, undefined, this.thinkingContent, false);
+        return true;
+
+      case 'CUSTOM': {
+        const customValue = unwrapCustomValue(aguiData.value);
+        const customName = aguiData.name || (typeof customValue === 'object' && customValue && 'name' in customValue
+          ? String((customValue as { name?: string }).name || '')
+          : '');
+        const plannedKind = looksLikePlannedExecutionPayload(customValue);
+        if (customName === 'stream_keepalive' || customName === 'planned_step_hidden_text') {
+          return false;
+        } else if (customName === 'browser_step_progress' && customValue) {
+          this.handleBrowserStepProgress(customValue as BrowserStepProgressValue);
+        } else if (customName === 'browser_task_received' && customValue) {
+          this.handleBrowserTaskReceived(customValue as BrowserTaskReceivedValue);
+        } else if (customName === 'approval_request' && customValue) {
+          this.handleApprovalRequest(customValue as ApprovalRequestValue);
+        } else if (customName === 'user_choice_request' && customValue) {
+          this.handleUserChoiceRequest(customValue as UserChoiceRequestValue);
+        } else if (customName === 'user_choice_result' && customValue) {
+          this.handleUserChoiceResult(customValue as { choice_id: string; selected: string[]; source: string });
+        } else if (customName === 'repair_diff_report' && customValue) {
+          this.handleConfigDiffReport(customValue as unknown as ConfigDiffReportValue);
+        } else if (customName === 'config_analysis_report' && customValue) {
+          this.handleConfigAnalysisReport(customValue as ConfigAnalysisReportValue);
+        } else if (customName === 'report_file_download' && customValue) {
+          this.handleReportFileDownload(customValue as unknown as ReportFileDownloadValue);
+        } else if (customName === 'repair_commands' && customValue) {
+          this.handleRepairCommands(customValue as unknown as RepairCommandsValue);
+        } else if (customName === 'agent_step_progress' && customValue) {
+          this.handleAgentStepProgress(customValue as AgentStepProgressValue);
+        } else if (customName === 'sub_agent_progress' && customValue) {
+          this.handleSubAgentProgress(customValue as SubAgentProgressValue);
+        } else if (customName === 'skill_view' && customValue) {
+          this.handleSkillView(customValue as SkillViewValue);
+        } else if (customName === 'wiki_citations' && customValue) {
+          this.handleWikiCitations(customValue as { citations?: WikiCitation[] });
+        } else if (customName === CONTEXT_USAGE_EVENT && customValue) {
+          const usage = parseLlmContextUsage(customValue);
+          if (usage) {
+            this.onContextUsage?.(usage);
+          }
+        } else if (customName === 'planned_execution_step' || plannedKind === 'step') {
+          this.handlePlannedExecutionStep(customValue as PlannedExecutionStepValue);
+        } else if (customName === 'planned_execution_status' || plannedKind === 'status') {
+          this.handlePlannedExecutionStatus(customValue as PlannedExecutionStatusValue);
+        } else if (customName === 'assistant_text_retract') {
+          this.handleAssistantTextRetract();
+        }
+        return false;
+      }
+
+      default:
+        console.warn('[AG-UI] Unknown message type:', aguiData.type);
+        return false;
+    }
+  }
+}

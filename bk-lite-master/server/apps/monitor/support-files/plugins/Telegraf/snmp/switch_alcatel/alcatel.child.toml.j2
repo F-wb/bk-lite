@@ -1,0 +1,134 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_alcatel"
+        config_type = "alcatel"
+        brand = "alcatel"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB, auto-walked column names) ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    # ---- 64-bit IF-MIB HC traffic counters (ifXTable, wrap-safe on high-speed ports) ----
+    # 待现网核验：ifHCInOctets 1.3.6.1.2.1.31.1.1.1.6 / ifHCOutOctets ...1.10，按 ifIndex 与上表接口行对齐。
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- Alcatel-Lucent TiMOS CPU utilization (TIMETRA-CHASSIS-MIB sgiCpuUsage, scalar %) ----
+    # 待现网核验：1.3.6.1.4.1.6527.3.1.2.1.1.1.0（已是 0-100%）。用 table(measurement=device_cpu)+field usage → 指标 device_cpu_usage。
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6527.3.1.2.1.1.1"
+        name = "usage"
+    # ---- Alcatel-Lucent TiMOS system memory pool (used + available, KB) ----
+    # 待现网核验：used sgiMemoryUsed 1.3.6.1.4.1.6527.3.1.2.1.1.9.0；free sgiMemoryAvailable ...1.1.10.0。
+    # ⚠ 原始单位 KB（模版有 MULTIPLIER 1024 → bytes），inputs.snmp 不能算术缩放 → 采到的是 KB；
+    #   利用率 used/(used+free) 比值与单位无关(KB 抵消)正确；绝对 device_memory_used 是 KB(显示偏小 1024 倍)留「待现网核验」。
+    [[inputs.snmp.table]]
+        name = "device_memory"
+        inherit_tags = ["source"]
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6527.3.1.2.1.1.9"
+        name = "used"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6527.3.1.2.1.1.10"
+        name = "free"
+    # ---- Alcatel-Lucent TiMOS hardware temperature (TIMETRA-CHASSIS-MIB tmnxHwTemperature, °C) ----
+    # 待现网核验：温度 1.3.6.1.4.1.6527.3.1.2.2.1.8.1.18（模版单位 °C，无需换算）；descr=tmnxHwName ...8.1.8。
+    [[inputs.snmp.table]]
+        name = "device_temperature"
+        inherit_tags = ["source"]
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6527.3.1.2.2.1.8.1.8"
+        name = "descr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6527.3.1.2.2.1.8.1.18"
+        name = "celsius"
+    # ---- Alcatel-Lucent TiMOS fans (TIMETRA-CHASSIS-MIB tmnxChassisFanOperStatus, TmnxDeviceState) ----
+    # 待现网核验：风扇状态 1.3.6.1.4.1.6527.3.1.2.2.1.4.1.2（无独立 descr 名列，省略 descr）。
+    # TmnxDeviceState 共 9 值：Ok(3)/NotEquipped(2)→1；Unknown(1)→3；其余→2。采集字段名是 state。
+    [[inputs.snmp.table]]
+        name = "device_fan"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6527.3.1.2.2.1.4.1.2"
+        name = "state"
+    # ---- Alcatel-Lucent TiMOS power supplies (TIMETRA-CHASSIS-MIB tmnxChassisPowerSupply2Status, TmnxDeviceState) ----
+    # 待现网核验：电源状态 1.3.6.1.4.1.6527.3.1.2.2.1.5.1.7（无独立 descr 名列，省略 descr）。
+    # 映射同风扇：NotEquipped(2) 按空槽规则为 1；仅 Unknown(1) 为 3。
+    [[inputs.snmp.table]]
+        name = "device_psu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.6527.3.1.2.2.1.5.1.7"
+        name = "state"
+
+# ---- 枚举归一：采集字段是 state。TmnxDeviceState 9 值里只有 Unknown(1)→3；
+# Ok(3)/NotEquipped(2)→1；Failed(4)/OutOfService(5)/NotProvisioned(6)/
+# NotApplicable(7)/Formatting(8)/SecureErase(9)→2。风扇、电源分两个 processor。
+[[processors.enum]]
+    namepass = ["device_fan"]
+    [processors.enum.tagpass]
+        brand = ["alcatel"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "1" = 3
+            "2" = 1
+            "3" = 1
+[[processors.enum]]
+    namepass = ["device_psu"]
+    [processors.enum.tagpass]
+        brand = ["alcatel"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "1" = 3
+            "2" = 1
+            "3" = 1

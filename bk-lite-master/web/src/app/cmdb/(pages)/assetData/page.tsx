@@ -1,0 +1,1621 @@
+'use client';
+
+import TransferDrawer from '@/app/cmdb/components/transfer/TransferDrawer';
+import { useTransferTasks } from '@/app/cmdb/hooks/useTransferTasks';
+import type { TransferTask } from '@/app/cmdb/types/transfer';
+
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { KeepAlive, useActivate, useUnactivate } from 'react-activation';
+import {
+  Button,
+  Space,
+  Modal,
+  message,
+  Spin,
+  Dropdown,
+  TablePaginationConfig,
+  Tree,
+  Input,
+  Tag,
+  Tooltip,
+} from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
+import type { MenuProps } from 'antd';
+import {
+  DownOutlined,
+  MinusSquareOutlined,
+  PlusSquareOutlined,
+  StarFilled,
+  StarOutlined,
+  UnorderedListOutlined,
+} from '@ant-design/icons';
+import { useSearchParams, usePathname } from 'next/navigation';
+import { useScreenAwareRouter } from '@/console-layout';
+import CustomTable from '@/components/custom-table';
+import GroupTreeSelector from '@/components/group-tree-select';
+import PermissionWrapper from '@/components/permission';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import RefreshIconButton from '@/components/refresh-icon-button';
+import { useTranslation } from '@/utils/i18n';
+import { useUserInfoContext } from '@/context/userInfo';
+import { useClientData } from '@/context/client';
+import { deepClone, getAssetColumns } from '@/app/cmdb/utils/common';
+import {
+  canSyncMonitor,
+  isMonitorSold,
+  pickBatchPushCounts,
+  resolveBatchPushSummaryLevel,
+  isSystemLinkAttr,
+  resolveListDisplayFieldKeys,
+  buildExternalIdLines,
+  displayExternalIdValue,
+  EXTERNAL_ID_COLUMN_KEY,
+} from '@/app/cmdb/utils/systemLinkage';
+import {
+  ensureCollectTaskMap,
+} from '@/app/cmdb/utils/collectTask';
+import { useCommon, useCmdbUserList } from '@/app/cmdb/context/common';
+import { resolveCmdbInstUuid } from '@/app/cmdb/utils/instUuid';
+import { useAssetDataStore, type FilterItem } from '@/app/cmdb/store';
+import { useModelApi, useClassificationApi, useInstanceApi, useCollectApi } from '@/app/cmdb/api';
+import {
+  GroupItem,
+  ModelItem,
+  ColumnItem,
+  UserItem,
+  AttrFieldType,
+  RelationInstanceRef,
+  AssoTypeItem,
+  FullInfoGroupItem,
+} from '@/app/cmdb/types/assetManage';
+import { ExportModalRef } from '@/app/cmdb/types/assetData';
+import SearchFilter from './list/searchFilter';
+import FilterBar from './list/filterBar';
+import ImportInst from './list/importInst';
+import FieldModal from './list/fieldModal';
+import SelectInstance from './detail/relationships/selectInstance';
+import ExportModal from './components/exportModal';
+import SubscriptionDrawer from '@/app/cmdb/components/subscription/subscriptionDrawer';
+import SubscriptionRuleForm, { type SubscriptionRuleFormRef } from '@/app/cmdb/components/subscription/subscriptionRuleForm';
+import { useQuickSubscribeDefaults, useSubscriptionMutation } from '@/app/cmdb/hooks/useSubscription';
+import { useFollowedAssets } from '@/app/cmdb/hooks/useFollowedAssets';
+import type { QuickSubscribeDefaults, QuickSubscribeSource } from '@/app/cmdb/types/subscription';
+import assetDataStyle from './index.module.scss';
+import {
+  applyTreeExpansionPreferenceOperation,
+  buildGroupKey,
+  createTreeExpansionPreferenceState,
+  getClassificationIdFromGroupKey,
+  readCollapsedClassificationIds,
+  reconcileTreeExpansionPreference,
+  recordTreeExpansionPreferenceWrite,
+  selectCollapsedClassificationIds,
+  transitionTreeExpansionSearch,
+  updateCollapsedClassificationIds,
+  writeCollapsedClassificationIds,
+} from './treeExpansionPreference';
+import { resetListPaginationToFirstPage } from './listPagination';
+import {
+  planFirstVisitTreeScroll,
+  queryAssetModelTreeNode,
+  scrollElementIntoContainer,
+  shouldFinishFirstVisitTreeScroll,
+} from './treeSelectedNodeScroll';
+
+const { confirm } = Modal;
+
+const COPY_EXCLUDE_FIELDS = ['_id', 'inst_id', 'inst_uuid', 'id', 'created_at', 'updated_at', 'created_by', 'updated_by'];
+
+const isGroupKey = (key: string) => getClassificationIdFromGroupKey(key) !== null;
+
+const getBrowserStorage = () => {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+};
+
+const parseUrlQueryList = (urlQueryList: string): FilterItem[] | null => {
+  if (!urlQueryList) return null;
+  try {
+    const parsed = JSON.parse(decodeURIComponent(urlQueryList));
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
+  } catch {
+    console.error('Failed to parse query_list from URL');
+    return null;
+  }
+};
+
+const buildModelGroups = (groupData: GroupItem[], modelList: ModelItem[]): GroupItem[] => {
+  const groups = deepClone(groupData).map((item: GroupItem) => ({
+    ...item,
+    list: [],
+    count: 0,
+  }));
+  modelList.forEach((modelItem: ModelItem) => {
+    const target = groups.find((item: GroupItem) => item.classification_id === modelItem.classification_id);
+    if (target) {
+      target.list.push(modelItem);
+      target.count++;
+    }
+  });
+  return groups;
+};
+
+const buildTreeData = (
+  modelGroup: GroupItem[],
+  renderTitle: (name: string, id: string) => React.ReactNode
+) => {
+  return modelGroup.map((group) => ({
+    title: group.classification_name,
+    content: group.classification_name,
+    key: buildGroupKey(group.classification_id),
+    children: group.list.map((item) => ({
+      content: item.model_name,
+      title: renderTitle(item.model_name, item.model_id),
+      key: item.model_id,
+    })),
+  }));
+};
+
+const filterTreeNodes = (nodes: any[], searchText: string, renderTitle: (name: string, id: string) => React.ReactNode): any[] => {
+  if (!searchText) return nodes;
+  const lowerSearch = searchText.toLowerCase();
+
+  return nodes.reduce((filtered: any[], node) => {
+    const matchesSearch = node.content?.toLowerCase().includes(lowerSearch);
+
+    if (node.children) {
+      const filteredChildren = filterTreeNodes(node.children, searchText, renderTitle);
+      if (filteredChildren.length > 0 || matchesSearch) {
+        filtered.push({
+          ...node,
+          children: filteredChildren.map((child) => ({
+            ...child,
+            title: renderTitle(child.content, child.key),
+          })),
+        });
+      }
+    } else if (matchesSearch) {
+      filtered.push(node);
+    }
+    return filtered;
+  }, []);
+};
+
+const getAllTreeKeys = (nodes: any[]): string[] => {
+  return nodes.reduce((keys: string[], node) => {
+    keys.push(node.key);
+    if (node.children) keys.push(...getAllTreeKeys(node.children));
+    return keys;
+  }, []);
+};
+
+interface ModelTabs {
+  key: string;
+  label: string;
+  icn: string;
+}
+
+interface FieldRef {
+  showModal: (config: {
+    type: string;
+    source?: 'create' | 'copy' | 'edit' | 'batchEdit';
+    attrList: FullInfoGroupItem[];
+    formInfo: any;
+    subTitle: string;
+    title: string;
+    model_id: string;
+    list: Array<any>;
+  }) => void;
+}
+
+interface ImportRef {
+  showModal: (config: {
+    subTitle: string;
+    title: string;
+    model_id: string;
+  }) => void;
+}
+
+const AssetDataContent = () => {
+  const { t } = useTranslation();
+  const { selectedGroup, userId } = useUserInfoContext();
+  const { clientData } = useClientData();
+  const { getModelAssociationTypes, getModelAttrList, getModelAttrGroupsFullInfo } = useModelApi();
+  const { getClassificationList } = useClassificationApi();
+  const {
+    getInstanceProxys,
+    searchInstances,
+    getModelInstanceCount,
+    getInstanceShowFieldDetail,
+    setInstanceShowFieldSettings,
+    deleteInstance,
+    batchDeleteInstances,
+    batchPushToMonitor,
+  } = useInstanceApi();
+  const { getCollectTaskNames } = useCollectApi();
+  const router = useScreenAwareRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const assetModelId: string = searchParams.get('modelId') || '';
+  const assetClassificationId: string =
+    searchParams.get('classificationId') || '';
+  const urlQueryList: string = searchParams.get('query_list') || '';
+  const commonContext = useCommon();
+  const userList: UserItem[] = useCmdbUserList();
+  const modelListFromContext = commonContext?.modelList || [];
+  const fieldRef = useRef<FieldRef>(null);
+  const importRef = useRef<ImportRef>(null);
+  const instanceRef = useRef<RelationInstanceRef>(null);
+  const exportRef = useRef<ExportModalRef>(null);
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [transferPageActive, setTransferPageActive] = useState(true);
+  const topRowRef = useRef<HTMLDivElement | null>(null);
+  const leftActionsRef = useRef<HTMLDivElement | null>(null);
+  const actionSizerRef = useRef<HTMLDivElement | null>(null);
+  const [selectedRowKeys, setSelectedRowKeys] = useState<Array<any>>([]);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [tableLoading, setTableLoading] = useState<boolean>(false);
+  const [modelGroup, setModelGroup] = useState<GroupItem[]>([]);
+  const [originModels, setOriginModels] = useState<ModelItem[]>([]);
+  const [groupId, setGroupId] = useState<string>('');
+  const [modelId, setModelId] = useState<string>('');
+  const [modelList, setModelList] = useState<ModelTabs[]>([]);
+  const [propertyListGroups, setPropertyListGroups] = useState<FullInfoGroupItem[]>([]);
+  const [propertyList, setPropertyList] = useState<AttrFieldType[]>([]);
+  const [displayFieldKeys, setDisplayFieldKeys] = useState<string[]>([]);
+  const [columns, setColumns] = useState<ColumnItem[]>([]);
+  const [currentColumns, setCurrentColumns] = useState<ColumnItem[]>([]);
+  const [assoTypes, setAssoTypes] = useState<AssoTypeItem[]>([]);
+  const [queryList, setQueryList] = useState<FilterItem | FilterItem[] | null>(null);
+  const [tableData, setTableData] = useState<any[]>([]);
+  const [organization, setOrganization] = useState<number[]>([]);
+  const [selectedTreeKeys, setSelectedTreeKeys] = useState<string[]>([]);
+  const [expandedTreeKeys, setExpandedTreeKeys] = useState<string[]>([]);
+  const preferenceStateRef = useRef(createTreeExpansionPreferenceState());
+  const [subscriptionDrawerOpen, setSubscriptionDrawerOpen] = useState(false);
+  const [quickSubscribeModalOpen, setQuickSubscribeModalOpen] = useState(false);
+  const [subscriptionSource, setSubscriptionSource] = useState<QuickSubscribeSource>('drawer');
+  const quickSubscribeFormRef = useRef<SubscriptionRuleFormRef>(null);
+  const { submitting: quickSubscribeSubmitting, createRule: quickSubscribeCreateRule } = useSubscriptionMutation();
+  const {
+    isFollowed,
+    followAsset,
+    unfollowAsset,
+  } = useFollowedAssets();
+  const [followPendingKey, setFollowPendingKey] = useState<string>('');
+  const [quickContext, setQuickContext] = useState<{
+    selectedInstanceUuids?: string[];
+    queryList?: any[];
+    currentInstanceUuid?: string;
+    currentInstanceName?: string;
+  }>({});
+  const [proxyOptions, setProxyOptions] = useState<
+    { proxy_id: string; proxy_name: string }[]
+  >([]);
+  const [pagination, setPagination] = useState<TablePaginationConfig>({
+    current: 1,
+    total: 0,
+    pageSize: 20,
+  });
+  const [treeSearchText, setTreeSearchText] = useState('');
+  const [filteredTreeData, setFilteredTreeData] = useState<any[]>([]);
+  const [modelInstCount, setModelInstCount] = useState<Record<string, number>>(
+    {}
+  );
+  // 是否折叠操作栏
+  const [isActionsCollapsed, setIsActionsCollapsed] = useState(false);
+  const urlQueryInitialized = useRef(false);
+  const initialDataLoaded = useRef(false);
+  const treeWrapperRef = useRef<HTMLDivElement | null>(null);
+  const firstVisitTreeScrollAttemptedRef = useRef(false);
+
+  useUnactivate(() => { setTransferPageActive(false); setTransferOpen(false); });
+  useActivate(() => {
+    setTransferPageActive(true);
+    const { needRefresh, setNeedRefresh } = useAssetDataStore.getState();
+    if (needRefresh && modelId) {
+      fetchData();
+      setNeedRefresh(false);
+    }
+  });
+
+  // 监听窗口大小变化，更新折叠状态
+  useEffect(() => {
+    const rowEl = topRowRef.current;
+    const leftEl = leftActionsRef.current;
+    const sizerEl = actionSizerRef.current;
+    if (!rowEl || !leftEl || !sizerEl) return;
+
+    let frameId: number | null = null;
+    const updateCollapseState = () => {
+      if (!rowEl || !leftEl || !sizerEl) return;
+      const rowWidth = rowEl.getBoundingClientRect().width;
+      const leftContentWidth = leftEl.scrollWidth;
+      const sizerWidth = sizerEl.getBoundingClientRect().width;
+      const recoveryBuffer = 30;
+      const shouldCollapse = leftContentWidth + sizerWidth > rowWidth + recoveryBuffer;
+      setIsActionsCollapsed((prev) => (prev === shouldCollapse ? prev : shouldCollapse));
+    };
+
+    // 创建一个观察器，当窗口大小变化时，更新折叠状态
+    const observer = new ResizeObserver(() => {
+      if (frameId) cancelAnimationFrame(frameId);
+      frameId = requestAnimationFrame(updateCollapseState);
+    });
+
+    // 监听窗口大小变化
+    observer.observe(rowEl);
+    observer.observe(leftEl);
+    observer.observe(sizerEl);
+    updateCollapseState();  // 更新折叠状态
+
+    // 不要忘记清理内存
+    return () => {
+      if (frameId) cancelAnimationFrame(frameId);
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    // 主页中当模型为host时，获取云区域选项test8.7
+    if (['host', 'subnet'].includes(modelId)) {
+      getInstanceProxys()
+        .then((data: any[]) => {
+          setProxyOptions(data || []);
+
+          // 保存云区域列表到前端store
+          useAssetDataStore.getState().setCloudList(data || []);
+        })
+        .catch(() => {
+          setProxyOptions([]);
+        });
+    }
+  }, [modelId]);
+
+  useEffect(() => {
+    // Given collect_task 跳转依赖任务映射和模型树，When 页面初始化，Then 并行预热两份缓存。
+    ensureCollectTaskMap(getCollectTaskNames).catch(() => {
+      const store = useAssetDataStore.getState();
+      store.setCollectTaskMap({});
+      store.setCollectTaskRouteMap({});
+      store.setCollectTaskOptions([]);
+    });
+  }, []);
+
+  const handleExport = async (
+    exportType: 'selected' | 'currentPage' | 'all'
+  ) => {
+    let title = '';
+    let selectedKeys: string[] = [];
+
+    switch (exportType) {
+      case 'selected':
+        title = `${t('export')}${t('selected')}`;
+        selectedKeys = selectedRowKeys;
+        break;
+      case 'currentPage':
+        title = `${t('export')}${t('currentPage')}`;
+        selectedKeys = tableData.map((item) => item.inst_uuid);
+        break;
+      case 'all':
+        title = `${t('export')}${t('all')}`;
+        selectedKeys = [];
+        break;
+    }
+
+    exportRef.current?.showModal({
+      title,
+      modelId,
+      columns: columns.filter((col) => col.key !== EXTERNAL_ID_COLUMN_KEY),
+      displayFieldKeys: displayFieldKeys.filter((key) => key !== EXTERNAL_ID_COLUMN_KEY),
+      selectedKeys,
+      exportType,
+      tableData,
+    } as any);
+  };
+
+  const currentModelName =
+    modelList.find((m) => m.key === modelId)?.label ||
+    originModels.find((m) => m.model_id === modelId)?.model_name ||
+    '';
+  const quickDefaults: QuickSubscribeDefaults = useQuickSubscribeDefaults(subscriptionSource, {
+    model_id: modelId,
+    model_name: currentModelName,
+    selectedInstanceUuids: quickContext.selectedInstanceUuids,
+    queryList: quickContext.queryList,
+    currentInstanceUuid: quickContext.currentInstanceUuid,
+    currentInstanceName: quickContext.currentInstanceName,
+    currentUser: Number(userId || userList[0]?.id || 0),
+    currentOrganization: Number(selectedGroup?.id || 0),
+  });
+
+  const openSubscription = (source: QuickSubscribeSource) => {
+    setSubscriptionSource(source);
+    if (source === 'list_selection') {
+      setQuickContext({ selectedInstanceUuids: selectedRowKeys.map((k) => String(k)) });
+    } else if (source === 'list_filter') {
+      setQuickContext({ queryList: storeQueryList });
+    } else {
+      setQuickContext({});
+    }
+
+    if (source === 'drawer') {
+      setSubscriptionDrawerOpen(true);
+    } else {
+      setQuickSubscribeModalOpen(true);
+    }
+  };
+
+  const handleQuickSubscribeSubmit = async (payload: any, enabled: boolean) => {
+    await quickSubscribeCreateRule({ ...payload, is_enabled: enabled });
+    setQuickSubscribeModalOpen(false);
+  };
+
+  const handleFollowToggle = useCallback(
+    async (record: any, event: React.MouseEvent<HTMLElement>) => {
+      event.stopPropagation();
+      if (!modelId || !record?.inst_uuid) return;
+      const pendingKey = `${modelId}:${record.inst_uuid}`;
+      if (followPendingKey) return;
+
+      setFollowPendingKey(pendingKey);
+      try {
+        if (isFollowed(modelId, record.inst_uuid)) {
+          await unfollowAsset(modelId, record.inst_uuid);
+          message.success(t('AssetSearch.unfollowSuccess'));
+          return;
+        }
+
+        await followAsset({ model_id: modelId, inst_uuid: record.inst_uuid });
+        message.success(t('AssetSearch.followSuccess'));
+      } finally {
+        setFollowPendingKey('');
+      }
+    },
+    [followAsset, followPendingKey, isFollowed, modelId, t, unfollowAsset]
+  );
+
+  const showImportModal = () => {
+    importRef.current?.showModal({
+      title: t('import'),
+      subTitle: '',
+      model_id: modelId,
+    });
+  };
+
+  // 添加实例菜单项
+  const addInstItems: MenuProps['items'] = [
+    {
+      key: '1',
+      label: (
+        <div
+          className={assetDataStyle.menuItemClickable}
+          onClick={() => showAttrModal('add')}
+        >
+          {t('common.add')}
+        </div>
+      ),
+    },
+    {
+      key: '2',
+      label: (
+        <div className={assetDataStyle.menuItemClickable} onClick={showImportModal}>
+          {t('import')}
+        </div>
+      ),
+    },
+  ];
+
+  useEffect(() => {
+    if (modelListFromContext.length > 0) {
+      getModelGroup();
+    }
+  }, [modelListFromContext]);
+
+  useEffect(() => {
+    if (modelId && initialDataLoaded.current) {
+      setSelectedTreeKeys([modelId]);
+      fetchData();
+    }
+  }, [pagination?.current, pagination?.pageSize, queryList, organization]);
+
+  useEffect(() => {
+    const validClassificationIds = modelGroup.map((item) => item.classification_id);
+    if (validClassificationIds.length === 0) {
+      if (!preferenceStateRef.current.searchActive) setExpandedTreeKeys([]);
+      return;
+    }
+
+    const preferenceUserId = userId ? String(userId) : null;
+    const storedCollapsedClassificationIds = preferenceUserId
+      ? readCollapsedClassificationIds(
+        getBrowserStorage(),
+        preferenceUserId,
+        validClassificationIds
+      )
+      : [];
+    const transition = reconcileTreeExpansionPreference(
+      preferenceStateRef.current,
+      preferenceUserId,
+      validClassificationIds,
+      storedCollapsedClassificationIds
+    );
+    preferenceStateRef.current = transition.state;
+    if (transition.writeRequest) {
+      const { userId: writeUserId, collapsedClassificationIds } = transition.writeRequest;
+      const succeeded = writeCollapsedClassificationIds(
+        getBrowserStorage(),
+        writeUserId,
+        collapsedClassificationIds
+      );
+      preferenceStateRef.current = recordTreeExpansionPreferenceWrite(
+        preferenceStateRef.current,
+        writeUserId,
+        succeeded
+      );
+    }
+
+    if (!preferenceStateRef.current.searchActive) {
+      setExpandedTreeKeys(transition.expandedKeys);
+    }
+  }, [modelGroup, userId]);
+
+  const fetchData = async () => {
+    setTableLoading(true);
+    try {
+      const data = await searchInstances(getTableParams());
+      setTableData(data.insts);
+      setPagination(prev => ({ ...prev, total: data.count }));
+    } catch (error) {
+      if ((error as { name?: string })?.name === 'CanceledError') return;
+    } finally {
+      setTableLoading(false);
+    }
+  };
+
+  const getModelGroup = async () => {
+    try {
+      setLoading(true);
+      const [groupData, assoType, instCount] = await Promise.all([
+        getClassificationList(),
+        getModelAssociationTypes(),
+        getModelInstanceCount(),
+      ]);
+
+      const groups = buildModelGroups(groupData, modelListFromContext);
+      const defaultGroupId = assetClassificationId || groupData[0].classification_id;
+      const filteredModels = modelListFromContext
+        .filter((item: ModelItem) => item.classification_id === defaultGroupId)
+        .map((item: ModelItem) => ({ key: item.model_id, label: item.model_name, icn: item.icn }));
+      const defaultModelId = assetModelId || filteredModels[0].key;
+
+      setModelInstCount(instCount);
+      setGroupId(defaultGroupId);
+      setModelGroup(groups);
+      setOriginModels(modelListFromContext);
+      setAssoTypes(assoType);
+      setModelList(filteredModels);
+      setModelId(defaultModelId);
+      setSelectedTreeKeys([defaultModelId]);
+
+      const initialQueryList = parseUrlQueryList(urlQueryList);
+      if (initialQueryList) {
+        useAssetDataStore.getState().setQueryList(initialQueryList);
+      }
+      urlQueryInitialized.current = true;
+
+      getInitData(defaultModelId, initialQueryList);
+      updateUrl(defaultModelId, defaultGroupId, urlQueryList);
+    } catch {
+      setLoading(false);
+    }
+  };
+
+  const updateUrl = (modelId: string, groupId: string, queryList?: string) => {
+    const urlParams = new URLSearchParams();
+    urlParams.set('modelId', modelId);
+    urlParams.set('classificationId', groupId);
+    if (queryList) urlParams.set('query_list', queryList);
+    router.replace(`/cmdb/assetData?${urlParams.toString()}`);
+  };
+
+  const getTableParams = (overrideQueryList?: FilterItem | FilterItem[] | null, overridePage?: number) => {
+    const activeQueryList = overrideQueryList !== undefined ? overrideQueryList : queryList;
+    const orgCondition = organization?.length
+      ? [{ field: 'organization', type: 'list[]', value: organization }]
+      : [];
+    const caseSensitive = useAssetDataStore.getState().case_sensitive;
+
+    let finalQueryList: (FilterItem | { field: string; type: string; value: number[] })[] = [];
+    if (activeQueryList) {
+      finalQueryList = Array.isArray(activeQueryList)
+        ? [...activeQueryList, ...orgCondition]
+        : [activeQueryList, ...orgCondition];
+    } else {
+      finalQueryList = orgCondition;
+    }
+
+    return {
+      query_list: finalQueryList,
+      page: overridePage ?? pagination.current,
+      page_size: pagination.pageSize,
+      order: '',
+      model_id: modelId,
+      role: '',
+      case_sensitive: caseSensitive,
+    };
+  };
+
+  const getInitData = (id: string, overrideQueryList?: FilterItem[] | null, overridePage?: number) => {
+    const tableParams = getTableParams(overrideQueryList, overridePage);
+
+    getModelAttrGroupsFullInfo(id)
+      .then((res) => setPropertyListGroups(res.groups))
+      .catch(() => message.error(t('common.loadFailed')));
+
+    setLoading(true);
+    Promise.all([
+      getModelAttrList(id),
+      searchInstances({ ...tableParams, model_id: id }),
+      getInstanceShowFieldDetail(id),
+    ])
+      .then(([attrList, instData, displayFields]) => {
+        const fieldKeys = resolveListDisplayFieldKeys(displayFields?.show_fields, attrList);
+        setDisplayFieldKeys(fieldKeys);
+        setPropertyList(attrList);
+        setTableData(instData.insts);
+        setPagination(prev => ({ ...prev, total: instData.count }));
+
+      })
+      .finally(() => {
+        setLoading(false);
+        requestAnimationFrame(() => {
+          initialDataLoaded.current = true;
+        });
+      });
+  };
+
+  const onSelectChange = (selectedKeys: any) => {
+    setSelectedRowKeys(selectedKeys);
+  };
+
+  const rowSelection = {
+    selectedRowKeys,
+    onChange: onSelectChange,
+  };
+
+  const onSelectFields = async (fields: string[]) => {
+    setLoading(true);
+    try {
+      await setInstanceShowFieldSettings(modelId, fields);
+      message.success(t('successfulSetted'));
+      getInitData(modelId, queryList ? (Array.isArray(queryList) ? queryList : [queryList]) : null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteWithConfirm = (deleteAction: () => Promise<void>) => {
+    confirm({
+      title: t('common.delConfirm'),
+      content: t('common.delConfirmCxt'),
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+      okButtonProps: { danger: true },
+      centered: true,
+      async onOk() {
+        try {
+          await deleteAction();
+          message.success(t('successfullyDeleted'));
+          if (pagination.current && pagination.current > 1 && tableData.length === 1) {
+            setPagination(prev => ({ ...prev, current: prev.current! - 1 }));
+          }
+          setSelectedRowKeys([]);
+          fetchData();
+        } catch { /* API error handled by interceptor */ }
+      },
+    });
+  };
+
+  const showDeleteConfirm = (row: { inst_uuid: string }) => {
+    handleDeleteWithConfirm(() => deleteInstance(row.inst_uuid));
+  };
+
+  const batchDeleteConfirm = () => {
+    handleDeleteWithConfirm(() => batchDeleteInstances(selectedRowKeys.map((k) => String(k))));
+  };
+
+  const batchSyncMonitorConfirm = () => {
+    const instUuids = selectedRowKeys.map((k) => String(k));
+    if (!instUuids.length) return;
+    confirm({
+      title: t('Model.systemLinkageBatchConfirm', '', { count: instUuids.length }),
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+      centered: true,
+      async onOk() {
+        try {
+          const summary = await batchPushToMonitor(instUuids);
+          const counts = pickBatchPushCounts(summary);
+          const level = resolveBatchPushSummaryLevel(counts);
+          const text = t('Model.systemLinkageBatchSummary', '', counts);
+          if (level === 'success') {
+            message.success(text);
+          } else if (level === 'warning') {
+            message.warning(text);
+          } else {
+            message.error(text);
+          }
+        } catch {
+          message.error(t('Model.systemLinkageSyncFailed'));
+        }
+      },
+    });
+  };
+
+  // 导出菜单项
+  const exportItems: MenuProps['items'] = [
+    {
+      key: 'batchExport',
+      label: (
+        <div
+          className={assetDataStyle.menuItemClickable}
+          onClick={() => handleExport('selected')}
+        >
+          {t('selected')}
+        </div>
+      ),
+      disabled: !selectedRowKeys.length,
+    },
+    {
+      key: 'exportCurrentPage',
+      label: (
+        <div
+          className={assetDataStyle.menuItemClickable}
+          onClick={() => handleExport('currentPage')}
+        >
+          {t('currentPage')}
+        </div>
+      ),
+    },
+    {
+      key: 'exportAll',
+      label: (
+        <div
+          className={assetDataStyle.menuItemClickable}
+          onClick={() => handleExport('all')}
+        >
+          {t('all')}
+        </div>
+      ),
+    },
+  ];
+
+  const updateFieldList = async (id?: string) => {
+    await fetchData();
+    const instCount = await getModelInstanceCount().catch(() => null);
+    if (instCount) setModelInstCount(instCount);
+    if (id) showInstanceModal({ inst_uuid: id });
+  };
+
+  const showAttrModal = (type: 'add' | 'edit' | 'batchEdit', row = {}) => {
+    const title = type === 'add' ? t('common.addNew') : t('common.edit');
+    fieldRef.current?.showModal({
+      title,
+      type,
+      source: type === 'add' ? 'create' : type,
+      attrList: propertyListGroups,
+      formInfo: row,
+      subTitle: '',
+      model_id: modelId,
+      list: selectedRowKeys,
+    });
+  };
+
+  const showCopyModal = (record: any) => {
+    const copyData = { ...record };
+    COPY_EXCLUDE_FIELDS.forEach((field) => delete copyData[field]);
+
+    propertyListGroups
+      .flatMap((group) => group.attrs || [])
+      .filter((attr) => attr.is_required && attr.is_only && copyData[attr.attr_id])
+      .forEach((attr) => { copyData[attr.attr_id] = `${copyData[attr.attr_id]}_copy`; });
+
+    fieldRef.current?.showModal({
+      title: t('common.copy'),
+      type: 'add',
+      source: 'copy',
+      attrList: propertyListGroups,
+      formInfo: copyData,
+      subTitle: '',
+      model_id: modelId,
+      list: [],
+    });
+  };
+
+  const handleTableChange = (pagination = {}) => {
+    setPagination(pagination);
+  };
+
+  const handleSearch = (condition: FilterItem | null) => {
+    const { add, remove, update, query_list: currentList } = useAssetDataStore.getState();
+    const isClearCondition = !condition || !condition.type;
+
+    if (isClearCondition) {
+      if (condition?.field) {
+        const index = currentList.findIndex((item) => item.field === condition.field);
+        if (index !== -1) remove(index);
+      }
+      return;
+    }
+
+    const existingIndex = currentList.findIndex((item) => item.field === condition.field);
+    if (existingIndex !== -1) {
+      update(existingIndex, condition);
+    } else {
+      add(condition);
+    }
+  };
+
+  const storeQueryList = useAssetDataStore((state) => state.query_list);
+
+  const IP_CONFLICT_FILTER: FilterItem = { field: 'ip_status', type: 'list_any[]', value: ['conflict'] };
+
+  const isConflictFilterActive = useMemo(
+    () => storeQueryList.some(
+      (f) =>
+        f.field === 'ip_status' &&
+        f.type === 'list_any[]' &&
+        Array.isArray(f.value) &&
+        (f.value as string[]).includes('conflict')
+    ),
+    [storeQueryList]
+  );
+
+  const handleConflictFilterToggle = () => {
+    if (isConflictFilterActive) {
+      handleSearch({ field: 'ip_status', type: '' });
+    } else {
+      handleSearch(IP_CONFLICT_FILTER);
+    }
+  };
+
+  useEffect(() => {
+    // 如果查询条件为空，则设置为 null，否则设置为查询条件
+    const newQueryList = storeQueryList.length === 0 ? null
+      : storeQueryList.length === 1
+        ? storeQueryList[0]
+        : storeQueryList;
+    setQueryList(newQueryList);
+    setPagination((prev) => resetListPaginationToFirstPage(prev));
+  }, [storeQueryList]);
+
+  useEffect(() => {
+    if (!urlQueryInitialized.current || !modelId) return;
+
+    const params = new URLSearchParams(searchParams.toString());
+    if (storeQueryList.length > 0) {
+      params.set('query_list', encodeURIComponent(JSON.stringify(storeQueryList)));
+    } else {
+      params.delete('query_list');
+    }
+
+    const newUrl = `${pathname}?${params.toString()}`;
+    const currentUrl = `${pathname}?${searchParams.toString()}`;
+    if (newUrl !== currentUrl) {
+      router.replace(newUrl, { scroll: false });
+    }
+  }, [storeQueryList, modelId, pathname, searchParams, router]);
+
+  const handleFilterBarChange = useCallback(() => { }, []);
+
+  const checkDetail = (row = { inst_uuid: '', inst_name: '', ip_addr: '' }) => {
+    const instUuid = resolveCmdbInstUuid(row.inst_uuid);
+    if (!instUuid) {
+      message.warning('实例缺少合法 inst_uuid，请先完成 UUID 存量清洗');
+      return;
+    }
+    const modelItem = modelList.find((item) => item.key === modelId);
+    router.push(
+      `/cmdb/assetData/detail/baseInfo?icn=${modelItem?.icn || ''}&model_name=${modelItem?.label || ''
+      }&model_id=${modelId}&classification_id=${groupId}&inst_uuid=${instUuid
+      }&${row.inst_name ? `inst_name=${row.inst_name}` : `ip_addr=${row.ip_addr}`}`
+    );
+  };
+
+  const selectOrganization = (value: number | number[] | undefined) => {
+    const orgArray = Array.isArray(value) ? value : (value ? [value] : []);
+    setOrganization(orgArray);
+    setPagination((prev) => resetListPaginationToFirstPage(prev));
+  };
+
+  const showInstanceModal = (row = { inst_uuid: '' }) => {
+    instanceRef.current?.showModal({
+      title: t('Model.association'),
+      model_id: modelId,
+      list: [],
+      instUuid: row.inst_uuid,
+    });
+  };
+
+  const renderModelTitle = useCallback(
+    (modelName: string, modelId: string) => (
+      <div className="flex items-center" data-asset-model-id={modelId}>
+        <EllipsisWithTooltip text={modelName} className={assetDataStyle.treeLabel} />
+        <span className="ml-1 text-gray-400">({modelInstCount[modelId] || 0})</span>
+      </div>
+    ),
+    [modelInstCount]
+  );
+
+  const persistCollapsedClassificationIds = useCallback(
+    (nextIds: string[]) => {
+      const validClassificationIds = modelGroup.map((item) => item.classification_id);
+      const transition = applyTreeExpansionPreferenceOperation(
+        preferenceStateRef.current,
+        userId ? String(userId) : null,
+        validClassificationIds,
+        nextIds
+      );
+      preferenceStateRef.current = transition.state;
+      if (transition.writeRequest) {
+        const { userId: writeUserId, collapsedClassificationIds } = transition.writeRequest;
+        const succeeded = writeCollapsedClassificationIds(
+          getBrowserStorage(),
+          writeUserId,
+          collapsedClassificationIds
+        );
+        preferenceStateRef.current = recordTreeExpansionPreferenceWrite(
+          preferenceStateRef.current,
+          writeUserId,
+          succeeded
+        );
+      }
+      return transition;
+    },
+    [modelGroup, userId]
+  );
+
+  const handleTreeExpand = useCallback(
+    (keys: React.Key[], info: { expanded: boolean; node: { key: React.Key } }) => {
+      setExpandedTreeKeys(keys.map(String));
+      const classificationId = getClassificationIdFromGroupKey(String(info.node.key));
+      if (!classificationId) return;
+
+      const validClassificationIds = modelGroup.map((item) => item.classification_id);
+      const nextIds = updateCollapsedClassificationIds(
+        validClassificationIds,
+        selectCollapsedClassificationIds(
+          preferenceStateRef.current,
+          userId ? String(userId) : null,
+          validClassificationIds
+        ),
+        classificationId,
+        info.expanded
+      );
+      persistCollapsedClassificationIds(nextIds);
+    },
+    [modelGroup, persistCollapsedClassificationIds, userId]
+  );
+
+  const handleExpandAllTreeGroups = useCallback(() => {
+    const transition = persistCollapsedClassificationIds([]);
+    setExpandedTreeKeys(transition.expandedKeys);
+  }, [modelGroup, persistCollapsedClassificationIds]);
+
+  const handleCollapseAllTreeGroups = useCallback(() => {
+    const validClassificationIds = modelGroup.map((item) => item.classification_id);
+    persistCollapsedClassificationIds(validClassificationIds);
+    setExpandedTreeKeys([]);
+  }, [modelGroup, persistCollapsedClassificationIds]);
+
+  const handleTreeSearch = useCallback(
+    (searchText: string) => {
+      setTreeSearchText(searchText);
+      const treeData = buildTreeData(modelGroup, renderModelTitle);
+      const filtered = filterTreeNodes(treeData, searchText, renderModelTitle);
+      setFilteredTreeData(filtered);
+      const validClassificationIds = modelGroup.map((item) => item.classification_id);
+      const transition = transitionTreeExpansionSearch(
+        preferenceStateRef.current,
+        userId ? String(userId) : null,
+        validClassificationIds,
+        searchText ? getAllTreeKeys(filtered) : null
+      );
+      preferenceStateRef.current = transition.state;
+      setExpandedTreeKeys(transition.expandedKeys);
+    },
+    [modelGroup, renderModelTitle, userId]
+  );
+
+  useEffect(() => {
+    setFilteredTreeData(buildTreeData(modelGroup, renderModelTitle));
+  }, [modelGroup, renderModelTitle]);
+
+  useEffect(() => {
+    const plan = planFirstVisitTreeScroll({
+      alreadyAttempted: firstVisitTreeScrollAttemptedRef.current,
+      selectedModelId: modelId,
+      treeLoaded: filteredTreeData.length > 0,
+      modelGroup,
+      expandedKeys: expandedTreeKeys,
+    });
+    if (plan.action === 'wait') return;
+    if (plan.action === 'skip') {
+      firstVisitTreeScrollAttemptedRef.current = true;
+      return;
+    }
+    if (plan.action === 'expand') {
+      setExpandedTreeKeys((prev) =>
+        prev.includes(plan.groupKey) ? prev : [...prev, plan.groupKey]
+      );
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      if (firstVisitTreeScrollAttemptedRef.current) return;
+      const didScroll = scrollElementIntoContainer(
+        treeWrapperRef.current,
+        queryAssetModelTreeNode(treeWrapperRef.current, plan.modelId)
+      );
+      if (shouldFinishFirstVisitTreeScroll({ didScroll, loading })) {
+        firstVisitTreeScrollAttemptedRef.current = true;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [expandedTreeKeys, filteredTreeData, loading, modelGroup, modelId]);
+
+  const onSelectUnified = (selectedKeys: React.Key[]) => {
+    useAssetDataStore.getState().clear();
+    useAssetDataStore.setState((state) => ({ ...state, searchAttr: '' }));
+    urlQueryInitialized.current = true;
+
+    if (!selectedKeys.length) return;
+    const key = selectedKeys[0] as string;
+    if (key === modelId || isGroupKey(key)) return;
+
+    const targetGroup = modelGroup.find((group) => group.list.some((item) => item.model_id === key));
+    if (!targetGroup) return;
+
+    initialDataLoaded.current = false;
+
+    setQueryList(null);
+    setSelectedTreeKeys([key]);
+    setModelId(key);
+    setSelectedRowKeys([]);
+    setPagination((prev) => ({ ...prev, current: 1 }));
+    setGroupId(targetGroup.classification_id);
+    setModelList(targetGroup.list.map((item) => ({ key: item.model_id, label: item.model_name, icn: item.icn })));
+    setPropertyListGroups([]);
+    setPropertyList([]);
+    router.push(`/cmdb/assetData?modelId=${key}&classificationId=${targetGroup.classification_id}`);
+    getInitData(key, null, 1);
+  };
+
+  useEffect(() => {
+    if (!propertyList.length) return;
+
+    const attrList = getAssetColumns({
+      attrList: propertyList.filter((item) => !isSystemLinkAttr(item)),
+      userList,
+      t,
+    });
+    const columnsWithFollow = attrList.map((column) => {
+      if (column.key !== 'inst_name') return column;
+
+      const originRender = column.render;
+      return {
+        ...column,
+        width: Math.max(Number(column.width) || 180, 220),
+        render: (value: unknown, record: any) => {
+          const followed = isFollowed(modelId, record.inst_uuid);
+          const pendingKey = `${modelId}:${record.inst_uuid}`;
+          const isPending = followPendingKey === pendingKey;
+          const content = originRender ? originRender(value, record) : <>{record.inst_name || '--'}</>;
+
+          return (
+            <span className={assetDataStyle.instanceNameCell}>
+              <Tooltip title={followed ? t('AssetSearch.unfollow') : t('AssetSearch.follow')}>
+                <Button
+                  type="text"
+                  size="small"
+                  loading={isPending}
+                  disabled={!!followPendingKey && !isPending}
+                  icon={followed ? <StarFilled /> : <StarOutlined />}
+                  className={`${assetDataStyle.instanceFollowButton} ${followed ? assetDataStyle.instanceFollowed : ''}`}
+                  aria-label={followed ? t('AssetSearch.unfollow') : t('AssetSearch.follow')}
+                  onClick={(event) => handleFollowToggle(record, event)}
+                />
+              </Tooltip>
+              <span className={assetDataStyle.instanceNameText}>{content}</span>
+            </span>
+          );
+        },
+      };
+    });
+    const externalIdColumn: ColumnItem | null = canSyncMonitor(modelId)
+      ? {
+        title: t('Model.systemLinkageExternalId'),
+        key: EXTERNAL_ID_COLUMN_KEY,
+        dataIndex: EXTERNAL_ID_COLUMN_KEY,
+        width: 100,
+        ellipsis: { showTitle: false },
+        onHeaderCell: () => ({ className: 'w-[100px] max-w-[100px]' }),
+        onCell: () => ({ className: 'w-[100px] max-w-[100px] overflow-hidden' }),
+        render: (_: unknown, record: any) => {
+          const lines = buildExternalIdLines(modelId, record);
+          const lineLabel = (key: string) =>
+            key === 'node_id'
+              ? t('Model.systemLinkageNodeId')
+              : t('Model.systemLinkageMonitorId');
+          return (
+            <Tooltip
+              title={
+                <div className="text-xs leading-5">
+                  {lines.map((line) => (
+                    <div key={line.key}>
+                      {lineLabel(line.key)}: {displayExternalIdValue(line.value)}
+                    </div>
+                  ))}
+                </div>
+              }
+            >
+              <div className="block w-[100px] max-w-[100px] overflow-hidden cursor-default">
+                {lines.map((line, index) => (
+                  <div
+                    key={line.key}
+                    className={`overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12px] leading-[18px] ${
+                      index > 0 ? 'text-[var(--color-text-3)]' : ''
+                    }`}
+                  >
+                    {displayExternalIdValue(line.value)}
+                  </div>
+                ))}
+              </div>
+            </Tooltip>
+          );
+        },
+      }
+      : null;
+    const actionColumn: ColumnItem = {
+      title: t('common.actions'),
+      key: 'action',
+      dataIndex: 'action',
+      width: 280,
+      fixed: 'right',
+      render: (_: unknown, record: any) => (
+        <>
+          <Button type="link" className="mr-[10px]" onClick={() => checkDetail(record)}>
+            {t('common.detail')}
+          </Button>
+          <PermissionWrapper requiredPermissions={['Add Associate']} instPermissions={record.permission}>
+            <Button type="link" className="mr-[10px]" onClick={() => showInstanceModal(record)}>
+              {t('Model.association')}
+            </Button>
+          </PermissionWrapper>
+          <PermissionWrapper requiredPermissions={['Add']}>
+            <Button type="link" className="mr-[10px]" disabled={!propertyListGroups.length} onClick={() => showCopyModal(record)}>
+              {t('common.copy')}
+            </Button>
+          </PermissionWrapper>
+          <PermissionWrapper requiredPermissions={['Edit']} instPermissions={record.permission}>
+            <Button type="link" className="mr-[10px]" disabled={!propertyListGroups.length} onClick={() => showAttrModal('edit', record)}>
+              {t('common.edit')}
+            </Button>
+          </PermissionWrapper>
+          <PermissionWrapper requiredPermissions={['Delete']} instPermissions={record.permission}>
+            <Button type="link" danger onClick={() => showDeleteConfirm(record)}>
+              {t('common.delete')}
+            </Button>
+          </PermissionWrapper>
+        </>
+      ),
+    };
+    const tableColumns = [...columnsWithFollow, ...(externalIdColumn ? [externalIdColumn] : []), actionColumn];
+    setColumns(tableColumns);
+
+    const orderedColumns = tableColumns
+      .filter((col) => displayFieldKeys.includes(col.key as string))
+      .sort((a, b) => displayFieldKeys.indexOf(a.key as string) - displayFieldKeys.indexOf(b.key as string));
+    setCurrentColumns([...orderedColumns, actionColumn]);
+  }, [propertyList, displayFieldKeys, propertyListGroups, modelId, followPendingKey, handleFollowToggle, isFollowed, t, userList]);
+
+  const showSubscribeAction = selectedRowKeys.length > 0 || storeQueryList.length > 0;
+  const showBatchSyncMonitor = canSyncMonitor(modelId) && isMonitorSold(clientData);
+  const batchSyncMonitorItem: NonNullable<MenuProps['items']>[number] = {
+    key: 'batchSyncMonitor',
+    label: (
+      <PermissionWrapper requiredPermissions={['Edit']}>
+        <a onClick={batchSyncMonitorConfirm}>{t('Model.systemLinkageBatchSync')}</a>
+      </PermissionWrapper>
+    ),
+    disabled: !selectedRowKeys.length,
+  };
+
+  const batchOperateItems: MenuProps['items'] = [
+    {
+      key: 'subscribe',
+      label: (
+        <a onClick={() => openSubscription(selectedRowKeys.length > 0 ? 'list_selection' : 'list_filter')}>
+          {t('subscription.subscribe')}
+        </a>
+      ),
+      disabled: !showSubscribeAction,
+    },
+    {
+      key: 'batchEdit',
+      label: (
+        <PermissionWrapper requiredPermissions={['Edit']}>
+          <a
+            onClick={() => {
+              showAttrModal('batchEdit');
+            }}
+          >
+            {t('batchEdit')}
+          </a>
+        </PermissionWrapper>
+      ),
+      disabled: !selectedRowKeys.length || !propertyListGroups.length,
+    },
+    ...(showBatchSyncMonitor ? [batchSyncMonitorItem] : []),
+    {
+      key: 'batchDelete',
+      label: (
+        <PermissionWrapper requiredPermissions={['Delete']}>
+          <a onClick={batchDeleteConfirm}>{t('common.batchDelete')}</a>
+        </PermissionWrapper>
+      ),
+      disabled: !selectedRowKeys.length,
+    },
+  ];
+
+  // 添加实例菜单项，添加权限检查
+  const addInstItemsWithPermission: MenuProps['items'] = addInstItems.map(
+    (item) => {
+      if (!item || ('type' in item && item.type === 'divider') || !('label' in item)) {
+        return item;
+      }
+      return {
+        ...item,
+        label: (
+          <PermissionWrapper requiredPermissions={['Add']} fallback={item.label}>
+            {item.label}
+          </PermissionWrapper>
+        ),
+      };
+    }
+  );
+
+  const transfers = useTransferTasks(transferOpen, (task) => {
+    if (task.model_id === modelId) void updateFieldList();
+  }, transferPageActive);
+  const pendingTransfers = transfers.tasks.filter(task => ['queued', 'running'].includes(task.status)).length;
+  const onTransferSubmitted = (task: TransferTask) => {
+    transfers.submitted(task);
+    setTransferOpen(true);
+  };
+
+  const buildPrefixedItems = (items: MenuProps['items'], prefix: string) =>
+    items.map((item, index) => {
+      if (!item) return item;
+      const baseKey = 'key' in item && item.key ? String(item.key) : `${prefix}-${index}`;
+      return {
+        ...item,
+        key: `${prefix}-${baseKey}`,
+      };
+    });
+
+  const collapsedMoreItems: MenuProps['items'] = [
+    ...buildPrefixedItems(addInstItemsWithPermission, 'add'),
+    { type: 'divider', key: 'divider-add-export' },
+    ...buildPrefixedItems(exportItems, 'export'),
+    { type: 'divider', key: 'divider-export-batch' },
+    ...buildPrefixedItems(batchOperateItems, 'batch'),
+  ];
+
+  return (
+    <Spin spinning={loading} wrapperClassName={assetDataStyle.assetLoading}>
+      <div className={assetDataStyle.assetData}>
+        {/* 左侧树形选择器 */}
+        <div className={`${assetDataStyle.groupSelector}`}>
+          <div className={assetDataStyle.treeSearchWrapper}>
+            <Input.Search
+              className={assetDataStyle.treeSearchInput}
+              placeholder={t('common.search')}
+              value={treeSearchText}
+              allowClear
+              enterButton
+              onSearch={handleTreeSearch}
+              onChange={(e) => setTreeSearchText(e.target.value)}
+            />
+            <div className={assetDataStyle.treeSearchActions}>
+              <Tooltip title={t('common.expandAll')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<PlusSquareOutlined aria-hidden="true" />}
+                  aria-label={t('common.expandAll')}
+                  disabled={modelGroup.length === 0}
+                  onClick={handleExpandAllTreeGroups}
+                />
+              </Tooltip>
+              <Tooltip title={t('common.collapseAll')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<MinusSquareOutlined aria-hidden="true" />}
+                  aria-label={t('common.collapseAll')}
+                  disabled={modelGroup.length === 0}
+                  onClick={handleCollapseAllTreeGroups}
+                />
+              </Tooltip>
+            </div>
+          </div>
+          <div ref={treeWrapperRef} className={assetDataStyle.treeWrapper}>
+            {filteredTreeData.length > 0 ? (
+              <Tree
+                showLine
+                selectedKeys={selectedTreeKeys}
+                expandedKeys={expandedTreeKeys}
+                onExpand={handleTreeExpand}
+                onSelect={onSelectUnified}
+                treeData={filteredTreeData}
+              />
+            ) : (
+              <div className="flex justify-center items-center h-full">
+                <CompactEmptyState description={t('common.noData')} />
+              </div>
+            )}
+          </div>
+        </div>
+        {/* 右侧资产列表 */}
+        <div className={assetDataStyle.assetList}>
+          <div
+            ref={topRowRef}
+            className={`flex justify-between ${storeQueryList.length === 0 ? 'mb-4' : ''}`}
+          >
+            {/* 左侧组织搜索框 */}
+            <div ref={leftActionsRef}>
+              <Space>
+                <GroupTreeSelector
+                  style={{
+                    width: '200px',
+                  }}
+                  placeholder={t('common.selectTip')}
+                  value={organization}
+                  onChange={selectOrganization}
+                  filterByRootId={
+                    selectedGroup?.id ? Number(selectedGroup.id) : undefined
+                  }
+                />
+                {/* 中间部分 */}
+                <SearchFilter
+                  key={modelId}
+                  proxyOptions={proxyOptions}
+                  userList={userList}
+                  modelId={modelId}
+                  displayFieldKeys={displayFieldKeys}
+                  attrList={propertyList.filter(
+                    (item) => item.attr_type !== 'organization'
+                  )}
+                  onSearch={handleSearch}
+                  onChange={handleFilterBarChange}
+                  onFilterChange={handleFilterBarChange}
+                />
+                {modelId === 'ip' && (
+                  <Tag
+                    color={isConflictFilterActive ? 'error' : 'default'}
+                    style={{ cursor: 'pointer', userSelect: 'none' }}
+                    onClick={handleConflictFilterToggle}
+                  >
+                    {t('IPAM.conflictFilter')}
+                  </Tag>
+                )}
+                <RefreshIconButton
+                  loading={loading}
+                  onClick={() => fetchData()}
+                />
+              </Space>
+            </div>
+            {/* 右侧操作按钮 */}
+            <Space>
+              <div
+                className={`${assetDataStyle.actionGroup} ${isActionsCollapsed ? assetDataStyle.actionGroupCollapsed : ''}`}
+                aria-hidden={isActionsCollapsed}
+              >
+                <PermissionWrapper requiredPermissions={['Add']}>
+                  <Dropdown menu={{ items: addInstItems }} placement="bottom">
+                    <Button type="primary">
+                      <Space>
+                        {t('common.addNew')}
+                        <DownOutlined />
+                      </Space>
+                    </Button>
+                  </Dropdown>
+                </PermissionWrapper>
+                <Dropdown menu={{ items: exportItems }} placement="bottom">
+                  <Button>
+                    <Space>
+                      {t('export')}
+                      <DownOutlined />
+                    </Space>
+                  </Button>
+                </Dropdown>
+              </div>
+              <Dropdown
+                menu={{ items: isActionsCollapsed ? collapsedMoreItems : batchOperateItems }}
+                placement="bottom"
+              >
+                <Button>
+                  <Space>
+                    {t('more')}
+                    <DownOutlined />
+                  </Space>
+                </Button>
+              </Dropdown>
+              <Button onClick={() => setTransferOpen(true)}>{t('Transfer.title')}
+                {pendingTransfers ? ` (${pendingTransfers})` : ''}
+              </Button>
+              <Button icon={<UnorderedListOutlined aria-hidden="true" />} onClick={() => openSubscription('drawer')}>
+                {t('subscription.dataSubscription')}
+              </Button>
+            </Space>
+          </div>
+          <div ref={actionSizerRef} className={assetDataStyle.actionSizer}>
+            <Space>
+              <Button type="primary">
+                <Space>
+                  {t('common.addNew')}
+                  <DownOutlined aria-hidden="true" />
+                </Space>
+              </Button>
+              <Button>
+                <Space>
+                  {t('export')}
+                  <DownOutlined aria-hidden="true" />
+                </Space>
+              </Button>
+              <Button>
+                <Space>
+                  {t('more')}
+                  <DownOutlined aria-hidden="true" />
+                </Space>
+              </Button>
+              <Button>{t('Transfer.title')}
+                {pendingTransfers ? ` (${pendingTransfers})` : ''}
+              </Button>
+              <Button icon={<UnorderedListOutlined aria-hidden="true" />}>
+                {t('subscription.dataSubscription')}
+              </Button>
+            </Space>
+          </div>
+
+          <div className="w-full">
+            <FilterBar
+              attrList={propertyList}
+              userList={userList}
+              proxyOptions={proxyOptions}
+              modelId={modelId}
+              onChange={handleFilterBarChange}
+              onFilterChange={handleFilterBarChange}
+            />
+          </div>
+
+          <CustomTable
+            style={{ marginTop: '-1px' }}
+            size="small"
+            rowSelection={rowSelection}
+            dataSource={tableData}
+            columns={currentColumns}
+            pagination={pagination}
+            loading={tableLoading}
+            scroll={{
+              x: 'max-content',
+              y: storeQueryList.length > 0
+                ? 'calc(100vh - 320px)'
+                : 'calc(100vh - 300px)'
+            }}
+            fieldSetting={{
+              showSetting: true,
+              displayFieldKeys,
+              choosableFields: columns.filter((item) => item.key !== 'action'),
+            }}
+            onSelectFields={onSelectFields}
+            rowKey="inst_uuid"
+            onChange={handleTableChange}
+          />
+          <FieldModal
+            ref={fieldRef}
+            userList={userList}
+            onSuccess={updateFieldList}
+          />
+          <ImportInst ref={importRef} onSubmitted={onTransferSubmitted} canSubmit={transfers.canSubmit} />
+          <TransferDrawer open={transferOpen} onClose={() => setTransferOpen(false)} tasks={transfers.tasks}
+            error={transfers.error} loading={transfers.loading} onRefresh={transfers.refresh} />
+          <SelectInstance
+            ref={instanceRef}
+            userList={userList}
+            models={originModels}
+            assoTypes={assoTypes}
+            needFetchAssoInstIds
+          />
+          <ExportModal
+            ref={exportRef}
+            onSubmitStart={() => setTransferOpen(true)}
+            onSubmitted={onTransferSubmitted}
+            canSubmit={transfers.canSubmit}
+            userList={userList}
+            models={originModels}
+            assoTypes={assoTypes}
+          />
+          <SubscriptionDrawer
+            open={subscriptionDrawerOpen}
+            onClose={() => setSubscriptionDrawerOpen(false)}
+            modelId={modelId}
+            modelName={currentModelName}
+            quickDefaults={quickDefaults}
+          />
+          <Modal
+            open={quickSubscribeModalOpen}
+            width={800}
+            title={t('subscription.createRule')}
+            centered
+            onCancel={() => setQuickSubscribeModalOpen(false)}
+            footer={(
+              <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+                <Button
+                  type="primary"
+                  loading={quickSubscribeSubmitting}
+                  onClick={() => void quickSubscribeFormRef.current?.submit(true)}
+                >
+                  {t('subscription.saveAndEnable')}
+                </Button>
+                <Button
+                  loading={quickSubscribeSubmitting}
+                  onClick={() => void quickSubscribeFormRef.current?.submit(false)}
+                >
+                  {t('subscription.saveOnly')}
+                </Button>
+                <Button onClick={() => setQuickSubscribeModalOpen(false)}>
+                  {t('subscription.cancel')}
+                </Button>
+              </Space>
+            )}
+            destroyOnHidden
+            styles={{
+              body: {
+                maxHeight: 'calc(100vh - 220px)',
+                overflowY: 'auto',
+                paddingTop: 24,
+                paddingLeft: 24,
+                paddingRight: 24,
+              },
+            }}
+          >
+            <SubscriptionRuleForm
+              ref={quickSubscribeFormRef}
+              quickDefaults={quickDefaults}
+              modelId={modelId}
+              modelName={currentModelName}
+              onSubmitAndEnable={(data) => handleQuickSubscribeSubmit(data, true)}
+              onSubmitOnly={(data) => handleQuickSubscribeSubmit(data, false)}
+            />
+          </Modal>
+        </div>
+      </div>
+    </Spin>
+  );
+};
+
+const AssetData = () => {
+  return (
+    <KeepAlive id="assetData" name="assetData">
+      <AssetDataContent />
+    </KeepAlive>
+  );
+};
+
+export default AssetData;

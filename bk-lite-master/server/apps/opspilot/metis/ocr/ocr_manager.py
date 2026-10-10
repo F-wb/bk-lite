@@ -1,0 +1,26 @@
+from typing import Optional
+
+from apps.opspilot.metis.ocr.azure_ocr import AzureOCR
+from apps.opspilot.metis.ocr.olm_ocr import OlmOcr
+from apps.opspilot.metis.ocr.rapid_ocr import RapidOCR
+from apps.opspilot.metis.ocr.tesseract_ocr import TesseractOCR
+
+
+class OcrManager:
+    @classmethod
+    def load_ocr(cls, ocr_type: str, model: Optional[str] = None, base_url: Optional[str] = None, api_key: Optional[str] = None):
+        ocr = None
+
+        if ocr_type == "olm_ocr":
+            ocr = OlmOcr(base_url=base_url or "", api_key=api_key or "", model=model or "olmOCR-7B-0225-preview")
+
+        if ocr_type == "azure_ocr":
+            ocr = AzureOCR(azure_ocr_key=api_key or "", azure_ocr_endpoint=base_url or "")
+
+        if ocr_type == "tesseract":
+            ocr = TesseractOCR(lang=model or "chi_sim+eng")
+
+        if ocr_type == "rapidocr":
+            ocr = RapidOCR()
+
+        return ocr

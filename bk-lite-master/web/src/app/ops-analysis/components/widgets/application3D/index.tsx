@@ -1,0 +1,1015 @@
+'use client';
+
+import './application3DChrome.css';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Button, Select, Spin } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
+import { ReloadOutlined } from '@ant-design/icons';
+import { useParams } from 'next/navigation';
+import { useTranslation } from '@/utils/i18n';
+import { useShareMode } from '@/app/ops-analysis/context/shareMode';
+import { useApplication3DApi } from '@/app/ops-analysis/api/application3D';
+import type {
+  Application3DAlarmDetailData,
+  Application3DDetailData,
+  Application3DMetricSeriesResult,
+  Application3DWallData,
+  Application3DWallItem,
+} from '@/app/ops-analysis/types/sceneWidget';
+import type { ScreenRenderContext, ValueConfig } from '@/app/ops-analysis/types/dashBoard';
+import type { OpsAnalysisWidgetSurface } from '@/app/ops-analysis/utils/chartTypeSurface';
+import { isSceneWidgetAllowedOnSurface } from '@/app/ops-analysis/types/sceneWidgetCapability';
+import type { Application3DSceneController } from './application3DScene';
+import Application3DDetail from './application3DDetail';
+import { bindApplication3DTranslate } from './application3DLayout';
+import { application3DPageEffectLeadMs } from './application3DMotion';
+import {
+  planApplication3DWallPages,
+  resolveApplication3DWallPageAfterRefresh,
+  type Application3DWallSectionPlace,
+} from './application3DWallPaging';
+import { resolveApplication3DWallConfig } from '@/app/ops-analysis/utils/application3DWallConfig';
+import {
+  formatArchitectureHostAlarmCount,
+  formatArchitectureHostIp,
+  formatArchitectureHostOs,
+  formatArchitectureHostSeverity,
+  formatArchitectureHostState,
+  type ArchitectureHostSelection,
+} from './application3DArchitectureOverlay';
+
+interface Application3DProps {
+  config?: ValueConfig;
+  refreshKey?: string | number;
+  editMode?: boolean;
+  screenRenderContext?: ScreenRenderContext;
+  surface?: OpsAnalysisWidgetSurface;
+  onReady?: (ready: boolean) => void;
+  onError?: (message: string) => void;
+  runtimeActive?: boolean;
+  onRawData?: (data: unknown) => void;
+  instUuid?: string;
+}
+
+const getErrorCode = (error: unknown): string | undefined => {
+  if (!error || typeof error !== 'object') return undefined;
+  if ('code' in error && typeof error.code === 'string') return error.code;
+  const response = 'response' in error ? error.response : undefined;
+  if (!response || typeof response !== 'object' || !('data' in response)) return undefined;
+  const data = response.data;
+  if (!data || typeof data !== 'object') return undefined;
+  if ('code' in data && typeof data.code === 'string') return data.code;
+  if ('data' in data && data.data && typeof data.data === 'object' && 'code' in data.data) {
+    return typeof data.data.code === 'string' ? data.data.code : undefined;
+  }
+  return undefined;
+};
+
+export default function Application3D({
+  config,
+  refreshKey,
+  editMode = false,
+  screenRenderContext,
+  surface,
+  onReady,
+  onError,
+  runtimeActive = true,
+  onRawData,
+  instUuid,
+}: Application3DProps) {
+  const { t } = useTranslation();
+  const translateRef = useRef(t);
+  translateRef.current = t;
+  const shareMode = useShareMode();
+  const params = useParams<{ sessionId?: string }>();
+  const {
+    getWall,
+    getApplicationDetail,
+    getArchitecture,
+    getAlarmDetail,
+    getMetric,
+  } = useApplication3DApi(shareMode ? params.sessionId : undefined);
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const controllerRef = useRef<Application3DSceneController | null>(null);
+  const resizeSceneRef = useRef<() => void>(() => undefined);
+  const mountedRef = useRef(true);
+  const wallGenerationRef = useRef(0);
+  const detailGenerationRef = useRef(0);
+  const wallAbortRef = useRef<AbortController | null>(null);
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const metricAbortRef = useRef<AbortController | null>(null);
+  const architectureAbortRef = useRef<AbortController | null>(null);
+  const [wall, setWall] = useState<Application3DWallData | null>(null);
+  const [appliedFilters, setAppliedFilters] = useState<Record<string, string[]>>({});
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState('');
+  const [refreshWarning, setRefreshWarning] = useState('');
+  const [selected, setSelected] = useState<Application3DWallItem | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detail, setDetail] = useState<Application3DDetailData | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [moreAlarmsLoading, setMoreAlarmsLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const [alarmDetail, setAlarmDetail] = useState<Application3DAlarmDetailData | null>(null);
+  const [alarmLoading, setAlarmLoading] = useState(false);
+  const [alarmError, setAlarmError] = useState('');
+  const lastAlarmIdRef = useRef<string | null>(null);
+  const [metric, setMetric] = useState<Application3DMetricSeriesResult | null>(null);
+  const [metricLoading, setMetricLoading] = useState(false);
+  const [toolbarEntered, setToolbarEntered] = useState(false);
+  const [architectureOpen, setArchitectureOpen] = useState(false);
+  const [architectureLoading, setArchitectureLoading] = useState(false);
+  const [architectureError, setArchitectureError] = useState('');
+  const [architectureHost, setArchitectureHost] = useState<ArchitectureHostSelection | null>(null);
+  const [wallPage, setWallPage] = useState(1);
+  const wallConfig = useMemo(
+    () => resolveApplication3DWallConfig(config?.application3DWall),
+    [config?.application3DWall],
+  );
+  const sectionRestorePendingRef = useRef(false);
+  const sectionPlaceRef = useRef<Application3DWallSectionPlace | null>(null);
+  const rearmDwellRef = useRef<(leadMs: number) => void>(() => undefined);
+  const architectureOpenRef = useRef(false);
+  const allowedOnSurface =
+    Boolean(instUuid) ||
+    isSceneWidgetAllowedOnSurface('application3D', surface) ||
+    screenRenderContext?.enabled === true;
+  const wallMotionRef = useRef<'intro' | 'filter' | 'page-next' | 'page-prev' | 'none'>('intro');
+  const wallRef = useRef(wall);
+  const selectedRef = useRef(selected);
+  const detailOpenRef = useRef(detailOpen);
+  wallRef.current = wall;
+  selectedRef.current = selected;
+  detailOpenRef.current = detailOpen;
+  architectureOpenRef.current = architectureOpen;
+  const pagedWall = useMemo(() => {
+    const items = wall?.items ?? [];
+    const page = editMode
+      ? 1
+      : sectionRestorePendingRef.current
+        ? resolveApplication3DWallPageAfterRefresh(items, sectionPlaceRef.current, wallConfig)
+        : wallPage;
+    return planApplication3DWallPages(items, page, wallConfig);
+  }, [editMode, wall, wallConfig, wallPage]);
+  const pagedWallRef = useRef(pagedWall);
+  pagedWallRef.current = pagedWall;
+  const wallPageRef = useRef(pagedWall.page);
+  const totalPagesRef = useRef(pagedWall.totalPages);
+  wallPageRef.current = pagedWall.page;
+  totalPagesRef.current = pagedWall.totalPages;
+
+  useEffect(() => {
+    sectionRestorePendingRef.current = false;
+    if (pagedWall.page !== wallPage) setWallPage(pagedWall.page);
+    if (pagedWall.section) {
+      sectionPlaceRef.current = {
+        section: pagedWall.section,
+        sectionPage: pagedWall.sectionPage,
+      };
+    }
+  }, [pagedWall, wallPage]);
+
+  const onRawDataRef = useRef(onRawData);
+  onRawDataRef.current = onRawData;
+  useEffect(() => {
+    onRawDataRef.current?.(wall);
+  }, [wall]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      wallGenerationRef.current += 1;
+      detailGenerationRef.current += 1;
+      wallAbortRef.current?.abort();
+      detailAbortRef.current?.abort();
+      metricAbortRef.current?.abort();
+      architectureAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    const mountNode = mountRef.current;
+    if (!allowedOnSurface) return undefined;
+    if (!mountNode) return undefined;
+    let cancelled = false;
+    void import('./application3DScene').then(({ createApplication3DScene }) => {
+      if (cancelled || !mountedRef.current) return;
+      const controller = createApplication3DScene(mountNode, {
+        interactive: !editMode,
+        active: runtimeActive,
+        translate: bindApplication3DTranslate(translateRef),
+        onSelect: (item) => {
+          if (editMode) return;
+          if (detailOpenRef.current) return;
+          if (architectureOpenRef.current) return;
+          if (selectedRef.current?.id === item.id) return;
+          selectedRef.current = item;
+          setSelected(item);
+          controller.focus(item.id);
+        },
+        onBackgroundClick: () => {
+          if (editMode || detailOpenRef.current || architectureOpenRef.current) return;
+          controller.focus(null);
+          selectedRef.current = null;
+          setSelected(null);
+        },
+        onArchitectureHostSelect: (selection) => {
+          if (editMode) return;
+          setArchitectureHost(selection);
+        },
+      });
+      controllerRef.current = controller;
+      resizeSceneRef.current = () => controller.resize();
+      if (wallRef.current) {
+        const motion = wallMotionRef.current;
+        const page = pagedWallRef.current;
+        const pageDirection =
+          motion === 'page-next' ? 'next' : motion === 'page-prev' ? 'prev' : undefined;
+        controller.reconcile(page.pageItems, {
+          playIntro: motion === 'intro',
+          playFilter: motion === 'filter',
+          pageDirection,
+          pageEffect: wallConfig.pageEffect,
+          layoutCount: page.layoutCount,
+        });
+        if (page.pageItems.length > 0 && motion !== 'none') {
+          wallMotionRef.current = 'none';
+        }
+      }
+      controller.resize();
+    });
+    return () => {
+      cancelled = true;
+      resizeSceneRef.current = () => undefined;
+      controllerRef.current?.dispose();
+      controllerRef.current = null;
+    };
+  }, [allowedOnSurface, editMode]);
+
+  useEffect(() => {
+    controllerRef.current?.setActive(runtimeActive);
+    if (runtimeActive) return;
+    wallGenerationRef.current += 1;
+    detailGenerationRef.current += 1;
+    wallAbortRef.current?.abort();
+    detailAbortRef.current?.abort();
+    metricAbortRef.current?.abort();
+    architectureAbortRef.current?.abort();
+    setLoading(false);
+    setRefreshing(false);
+    setDetailLoading(false);
+    setAlarmLoading(false);
+    setMetricLoading(false);
+    setMoreAlarmsLoading(false);
+    setArchitectureLoading(false);
+  }, [runtimeActive]);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!controller) return;
+    const motion = wallMotionRef.current;
+    const pageDirection =
+      motion === 'page-next' ? 'next' : motion === 'page-prev' ? 'prev' : undefined;
+    controller.reconcile(pagedWall.pageItems, {
+      playIntro: motion === 'intro',
+      playFilter: motion === 'filter',
+      pageDirection,
+      pageEffect: wallConfig.pageEffect,
+      layoutCount: pagedWall.layoutCount,
+    });
+    if (pagedWall.pageItems.length > 0 && motion !== 'none') {
+      wallMotionRef.current = 'none';
+    }
+  }, [pagedWall, wall]);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
+    const page = pagedWallRef.current;
+    if (!controller || !page.pageItems.length) return;
+    controller.reconcile(page.pageItems, {
+      forceRepaint: true,
+      pageEffect: wallConfig.pageEffect,
+      layoutCount: page.layoutCount,
+    });
+  }, [t]);
+
+  // Screen fitScale is a CSS transform; ResizeObserver content-box does not change.
+  useLayoutEffect(() => {
+    resizeSceneRef.current();
+  }, [screenRenderContext?.fitScale]);
+
+  const clearSelection = useCallback(() => {
+    detailGenerationRef.current += 1;
+    detailAbortRef.current?.abort();
+    metricAbortRef.current?.abort();
+    architectureAbortRef.current?.abort();
+    selectedRef.current = null;
+    detailOpenRef.current = false;
+    architectureOpenRef.current = false;
+    setSelected(null);
+    setDetailOpen(false);
+    setDetail(null);
+    setDetailError('');
+    setDetailLoading(false);
+    setAlarmDetail(null);
+    setAlarmLoading(false);
+    setAlarmError('');
+    lastAlarmIdRef.current = null;
+    setMetric(null);
+    setMetricLoading(false);
+    setArchitectureOpen(false);
+    setArchitectureLoading(false);
+    setArchitectureError('');
+    setArchitectureHost(null);
+    controllerRef.current?.hideArchitecture();
+    controllerRef.current?.focus(null);
+  }, []);
+
+  const fetchWall = useCallback(async (filters: Record<string, string[]>, silent = false) => {
+    const generation = ++wallGenerationRef.current;
+    wallAbortRef.current?.abort();
+    const abortController = new AbortController();
+    wallAbortRef.current = abortController;
+    const currentWall = wallRef.current;
+    if (silent && currentWall) setRefreshing(true);
+    else setLoading(true);
+    setError('');
+    setRefreshWarning('');
+    try {
+      const result = await getWall(filters, abortController.signal, instUuid);
+      if (!mountedRef.current || generation !== wallGenerationRef.current) return;
+      sectionRestorePendingRef.current = Boolean(silent && currentWall);
+      setWall(result);
+      if (!silent) setWallPage(1);
+      setAppliedFilters(result.appliedFilters || filters);
+      if (
+        selectedRef.current &&
+        !result.items.some((item) => item.id === selectedRef.current?.id)
+      ) {
+        clearSelection();
+      }
+      onReady?.(result.items.length > 0);
+    } catch (requestError) {
+      if (abortController.signal.aborted) return;
+      if (!mountedRef.current || generation !== wallGenerationRef.current) return;
+      const code = getErrorCode(requestError);
+      const message = code === 'capacity_exceeded'
+        ? t('dashboard.application3DCapacityExceeded')
+        : t('dashboard.application3DLoadFailed');
+      if (
+        currentWall &&
+        !['permission_denied', 'scope_changed', 'not_found'].includes(code || '')
+      ) {
+        setWall({
+          ...currentWall,
+          items: currentWall.items.map((item) => ({
+            ...item,
+            health: { ...item.health, stale: true, reason: 'stale_after_refresh_failure' },
+          })),
+        });
+        setRefreshWarning(t('dashboard.application3DStale'));
+      } else {
+        setWall(null);
+        clearSelection();
+        setError(message);
+        onError?.(message);
+      }
+    } finally {
+      if (mountedRef.current && generation === wallGenerationRef.current) {
+        if (wallAbortRef.current === abortController) wallAbortRef.current = null;
+        setLoading(false);
+        setRefreshing(false);
+      }
+    }
+  }, [clearSelection, getWall, instUuid, onError, onReady, t]);
+
+  useEffect(() => {
+    if (!allowedOnSurface || !runtimeActive) return;
+    void fetchWall(appliedFilters, Boolean(wall));
+  }, [refreshKey, runtimeActive, instUuid]);
+
+  useEffect(() => {
+    if (wall && !loading) setToolbarEntered(true);
+  }, [wall, loading]);
+
+  const filterDefinitions = wall?.filters ?? [];
+  const handleFilterChange = (filterId: string, values: string[]) => {
+    const next = { ...appliedFilters, [filterId]: values };
+    setAppliedFilters(next);
+    clearSelection();
+    wallMotionRef.current = 'filter';
+    rearmDwellRef.current(0);
+    void fetchWall(next);
+  };
+
+  const goToWallPage = (nextPage: number) => {
+    if (nextPage === wallPage || nextPage < 1 || nextPage > pagedWall.totalPages) return;
+    clearSelection();
+    wallMotionRef.current = nextPage > wallPage ? 'page-next' : 'page-prev';
+    setWallPage(nextPage);
+    rearmDwellRef.current(application3DPageEffectLeadMs(wallConfig.pageEffect));
+  };
+
+  const autoPageEligible = wallConfig.autoPageEnabled
+    && !editMode
+    && runtimeActive
+    && !selected
+    && !detailOpen
+    && !architectureOpen
+    && pagedWall.totalPages > 1
+    && !loading;
+
+  useEffect(() => {
+    if (!autoPageEligible) {
+      rearmDwellRef.current = () => undefined;
+      return undefined;
+    }
+    let timer = 0;
+    let cancelled = false;
+    const schedule = (leadMs: number) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (cancelled) return;
+        const total = totalPagesRef.current;
+        const current = wallPageRef.current;
+        if (total <= 1) return;
+        const next = current >= total ? 1 : current + 1;
+        wallMotionRef.current = 'page-next';
+        setWallPage(next);
+        schedule(application3DPageEffectLeadMs(wallConfig.pageEffect));
+      }, leadMs + wallConfig.dwellSeconds * 1000);
+    };
+    rearmDwellRef.current = schedule;
+    schedule(0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      rearmDwellRef.current = () => undefined;
+    };
+  }, [autoPageEligible, wallConfig.dwellSeconds, wallConfig.pageEffect]);
+
+  const loadDetail = useCallback(async (item: Application3DWallItem) => {
+    const generation = ++detailGenerationRef.current;
+    detailAbortRef.current?.abort();
+    metricAbortRef.current?.abort();
+    architectureAbortRef.current?.abort();
+    const abortController = new AbortController();
+    detailAbortRef.current = abortController;
+    selectedRef.current = item;
+    detailOpenRef.current = true;
+    architectureOpenRef.current = false;
+    setSelected(item);
+    setDetailOpen(true);
+    setDetailLoading(true);
+    setDetailError('');
+    setAlarmError('');
+    setAlarmDetail(null);
+    setAlarmLoading(false);
+    lastAlarmIdRef.current = null;
+    setMetric(null);
+    setMetricLoading(false);
+    setArchitectureOpen(false);
+    setArchitectureLoading(false);
+    setArchitectureError('');
+    setArchitectureHost(null);
+    controllerRef.current?.hideArchitecture();
+    controllerRef.current?.focus(null);
+    controllerRef.current?.resetCamera();
+    try {
+      const result = await getApplicationDetail(item.id, undefined, abortController.signal);
+      if (!mountedRef.current || generation !== detailGenerationRef.current) return;
+      setDetail(result);
+    } catch (requestError) {
+      if (abortController.signal.aborted) return;
+      if (!mountedRef.current || generation !== detailGenerationRef.current) return;
+      if (['permission_denied', 'scope_changed', 'not_found'].includes(getErrorCode(requestError) || '')) {
+        clearSelection();
+        return;
+      }
+      setDetail(null);
+      setDetailError(t('dashboard.application3DDetailFailed'));
+    } finally {
+      if (mountedRef.current && generation === detailGenerationRef.current) {
+        if (detailAbortRef.current === abortController) detailAbortRef.current = null;
+        setDetailLoading(false);
+      }
+    }
+  }, [clearSelection, getApplicationDetail, t]);
+
+  const loadArchitecture = useCallback(async (item: Application3DWallItem) => {
+    architectureAbortRef.current?.abort();
+    const abortController = new AbortController();
+    architectureAbortRef.current = abortController;
+    setArchitectureLoading(true);
+    setArchitectureError('');
+    try {
+      const result = await getArchitecture(item.id, abortController.signal);
+      if (!mountedRef.current || selectedRef.current?.id !== item.id) return;
+      architectureOpenRef.current = true;
+      setArchitectureOpen(true);
+      controllerRef.current?.showArchitecture(result);
+    } catch (requestError) {
+      if (abortController.signal.aborted) return;
+      if (!mountedRef.current || selectedRef.current?.id !== item.id) return;
+      if (['permission_denied', 'scope_changed', 'not_found'].includes(getErrorCode(requestError) || '')) {
+        clearSelection();
+        return;
+      }
+      setArchitectureError(t('dashboard.application3DArchitectureFailed'));
+    } finally {
+      if (mountedRef.current && architectureAbortRef.current === abortController) {
+        architectureAbortRef.current = null;
+        setArchitectureLoading(false);
+      }
+    }
+  }, [clearSelection, getArchitecture, t]);
+
+  const handleBackFromFocus = useCallback(() => {
+    architectureAbortRef.current?.abort();
+    architectureOpenRef.current = false;
+    setArchitectureOpen(false);
+    setArchitectureLoading(false);
+    setArchitectureError('');
+    setArchitectureHost(null);
+    controllerRef.current?.hideArchitecture();
+    controllerRef.current?.focus(null);
+    selectedRef.current = null;
+    setSelected(null);
+  }, []);
+
+  const handleBackFromArchitecture = useCallback(() => {
+    architectureAbortRef.current?.abort();
+    architectureOpenRef.current = false;
+    setArchitectureOpen(false);
+    setArchitectureLoading(false);
+    setArchitectureError('');
+    setArchitectureHost(null);
+    selectedRef.current = null;
+    setSelected(null);
+    controllerRef.current?.hideArchitecture();
+  }, []);
+
+  const loadMoreAlarms = useCallback(async () => {
+    if (!selected || detail?.alarms.state !== 'available' || !detail.alarms.page.nextCursor) return;
+    const generation = detailGenerationRef.current;
+    const abortController = new AbortController();
+    detailAbortRef.current?.abort();
+    detailAbortRef.current = abortController;
+    setMoreAlarmsLoading(true);
+    try {
+      const result = await getApplicationDetail(
+        selected.id,
+        detail.alarms.page.nextCursor,
+        abortController.signal,
+      );
+      if (!mountedRef.current || generation !== detailGenerationRef.current) return;
+      setDetail((current) => {
+        if (!current || current.alarms.state !== 'available' || result.alarms.state !== 'available') return current;
+        const byId = new Map(current.alarms.items.map((item) => [item.id, item]));
+        result.alarms.items.forEach((item) => byId.set(item.id, item));
+        return {
+          ...current,
+          alarms: { ...result.alarms, items: Array.from(byId.values()) },
+          refreshedAt: result.refreshedAt,
+        };
+      });
+    } catch (requestError) {
+      if (!abortController.signal.aborted && mountedRef.current && generation === detailGenerationRef.current) {
+        if (['permission_denied', 'scope_changed', 'not_found'].includes(getErrorCode(requestError) ?? '')) {
+          clearSelection();
+          return;
+        }
+        setDetailError(t('dashboard.application3DDetailFailed'));
+      }
+    } finally {
+      if (mountedRef.current && generation === detailGenerationRef.current) setMoreAlarmsLoading(false);
+    }
+  }, [clearSelection, detail, getApplicationDetail, selected, t]);
+
+  const loadMetric = useCallback(async (applicationId: string, alarmId: string) => {
+    const generation = detailGenerationRef.current;
+    metricAbortRef.current?.abort();
+    const abortController = new AbortController();
+    metricAbortRef.current = abortController;
+    setMetricLoading(true);
+    setMetric(null);
+    try {
+      const result = await getMetric(applicationId, alarmId, abortController.signal);
+      if (!mountedRef.current || generation !== detailGenerationRef.current) return;
+      setMetric(result);
+    } catch (requestError) {
+      if (abortController.signal.aborted) return;
+      if (!mountedRef.current || generation !== detailGenerationRef.current) return;
+      if (getErrorCode(requestError) === 'permission_denied') {
+        setMetric({
+          applicationId,
+          alarmId,
+          state: 'permission_denied',
+          series: null,
+          thresholds: [],
+          alarmMarker: null,
+        });
+        return;
+      }
+      setMetric({
+        applicationId,
+        alarmId,
+        state: 'failure',
+        series: null,
+        thresholds: [],
+        alarmMarker: null,
+        errorCode: 'metric_source_failure',
+      });
+    } finally {
+      if (mountedRef.current && generation === detailGenerationRef.current) {
+        if (metricAbortRef.current === abortController) metricAbortRef.current = null;
+        setMetricLoading(false);
+      }
+    }
+  }, [getMetric]);
+
+  const loadAlarm = useCallback(async (alarmId: string) => {
+    if (!selected) return;
+    const generation = ++detailGenerationRef.current;
+    detailAbortRef.current?.abort();
+    metricAbortRef.current?.abort();
+    const abortController = new AbortController();
+    detailAbortRef.current = abortController;
+    lastAlarmIdRef.current = alarmId;
+    setAlarmLoading(true);
+    setAlarmError('');
+    setDetailError('');
+    setAlarmDetail(null);
+    setMetric(null);
+    try {
+      const result = await getAlarmDetail(selected.id, alarmId, abortController.signal);
+      if (!mountedRef.current || generation !== detailGenerationRef.current) return;
+      setAlarmDetail(result);
+      void loadMetric(selected.id, alarmId);
+    } catch (requestError) {
+      if (abortController.signal.aborted) return;
+      if (!mountedRef.current || generation !== detailGenerationRef.current) return;
+      if (['permission_denied', 'scope_changed', 'not_found'].includes(getErrorCode(requestError) || '')) {
+        setAlarmDetail(null);
+        setMetric(null);
+        setAlarmError('');
+        return;
+      }
+      setAlarmError(t('dashboard.application3DAlarmFailed'));
+    } finally {
+      if (mountedRef.current && generation === detailGenerationRef.current) {
+        if (detailAbortRef.current === abortController) detailAbortRef.current = null;
+        setAlarmLoading(false);
+      }
+    }
+  }, [getAlarmDetail, loadMetric, selected, t]);
+
+  const filterControls = useMemo(
+    () =>
+      filterDefinitions.map((definition) => (
+        <Select
+          key={definition.id}
+          mode={definition.type === 'multiple' ? 'multiple' : undefined}
+          allowClear
+          maxTagCount="responsive"
+          value={appliedFilters[definition.id] || []}
+          options={definition.options}
+          placeholder={definition.label}
+          className="min-w-48"
+          // Root uses overflow-hidden; keep popup on body so reopen isn't clipped/stuck.
+          getPopupContainer={() => document.body}
+          popupMatchSelectWidth={false}
+          onChange={(value) =>
+            handleFilterChange(
+              definition.id,
+              Array.isArray(value) ? value : value ? [value] : [],
+            )
+          }
+        />
+      )),
+    [appliedFilters, filterDefinitions],
+  );
+
+  const showWallPageChrome = pagedWall.totalPages > 1;
+  const wallPageInteractive = !editMode && !selected && !detailOpen && !architectureOpen;
+  const showWallPageWings = showWallPageChrome && wallPageInteractive;
+  const showWallPageLabel = showWallPageChrome && (editMode || wallPageInteractive);
+
+  return (
+    <div className="relative h-full min-h-48 w-full overflow-hidden bg-[var(--screen-canvas-bg,#0c2138)] text-[var(--color-application3d-text)]">
+      <div
+        ref={mountRef}
+        className="absolute inset-0 z-0 [&>canvas]:relative [&>canvas]:z-0 [&>canvas]:block [&>canvas]:h-full [&>canvas]:w-full"
+        aria-hidden="true"
+      />
+      {!allowedOnSurface && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center p-6">
+          <Alert type="error" showIcon message={t('dashboard.application3DScreenOnly')} />
+        </div>
+      )}
+      {/* Full-screen status layers stay below chrome so filter Select stays clickable. */}
+      {loading && (
+        <div className="app3d-wall-loading pointer-events-none absolute inset-0 z-[5] flex flex-col items-center justify-center gap-3 bg-[var(--color-application3d-loading-overlay)]">
+          <Spin size="large" />
+          <span className="app3d-wall-loading__text">
+            {t('dashboard.application3DLoading')}
+          </span>
+        </div>
+      )}
+      {error && !loading && (
+        <div className="absolute inset-0 z-[5] flex items-center justify-center p-6">
+          <Alert
+            type="error"
+            showIcon
+            message={error}
+            action={<Button onClick={() => void fetchWall(appliedFilters)}>{t('common.retry')}</Button>}
+          />
+        </div>
+      )}
+      {!loading && !error && wall?.items.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 z-[5] flex items-center justify-center">
+          <CompactEmptyState description={t('dashboard.application3DEmpty')} />
+        </div>
+      )}
+      {!editMode && (
+        <div className={`pointer-events-none absolute left-3 right-3 top-3 z-20 flex items-start justify-between gap-3${toolbarEntered ? ' app3d-toolbar-in' : ''}`}>
+          <div className="pointer-events-auto flex flex-wrap gap-2">
+            {instUuid ? null : filterControls}
+          </div>
+          <Button
+            size="small"
+            className="pointer-events-auto border-[var(--color-application3d-refresh-border)] bg-[var(--color-application3d-refresh-bg)] text-[var(--color-application3d-text)]"
+            icon={<ReloadOutlined spin={refreshing} />}
+            disabled={refreshing}
+            onClick={() => {
+              controllerRef.current?.resetCamera();
+              void fetchWall(appliedFilters, true);
+            }}
+            title={t('common.refresh')}
+          />
+        </div>
+      )}
+      {refreshWarning && (
+        <Alert
+          className="absolute bottom-3 left-3 z-20"
+          type="warning"
+          showIcon
+          message={refreshWarning}
+        />
+      )}
+      {architectureError && !editMode && (
+        <Alert
+          className="absolute bottom-16 left-1/2 z-20 -translate-x-1/2"
+          type="error"
+          showIcon
+          message={architectureError}
+          action={(
+            <Button size="small" onClick={() => selected && void loadArchitecture(selected)}>
+              {t('common.retry')}
+            </Button>
+          )}
+        />
+      )}
+      {showWallPageWings && pagedWall.hasPrev && (
+        <button
+          type="button"
+          className="app3d-wall-page-wing app3d-wall-page-wing--prev"
+          aria-label={t('dashboard.application3DWallPrevPage', '上一页')}
+          onClick={() => goToWallPage(pagedWall.page - 1)}
+        >
+          <svg
+            className="app3d-wall-page-wing__icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        </button>
+      )}
+      {showWallPageWings && pagedWall.hasNext && (
+        <button
+          type="button"
+          className="app3d-wall-page-wing app3d-wall-page-wing--next"
+          aria-label={t('dashboard.application3DWallNextPage', '下一页')}
+          onClick={() => goToWallPage(pagedWall.page + 1)}
+        >
+          <svg
+            className="app3d-wall-page-wing__icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <polyline points="9 18 15 12 9 6" />
+          </svg>
+        </button>
+      )}
+      {showWallPageLabel && (
+        <div className="app3d-wall-page-indicator" aria-live="polite">
+          <span className="app3d-wall-page-indicator-dot" aria-hidden="true" />
+          <span>
+            {t('dashboard.application3DWallPage', '{page} / {total} 页', {
+              page: pagedWall.page,
+              total: pagedWall.totalPages,
+            })}
+          </span>
+        </div>
+      )}
+      {!editMode && selected && !detailOpen && (
+        <div className="app3d-focus-actions pointer-events-none absolute bottom-6 left-0 right-0 z-20 flex justify-center">
+          <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-3">
+            {!architectureOpen && (
+              <>
+                <button
+                  type="button"
+                  className="app3d-close-cta app3d-detail-cta"
+                  onClick={() => void loadDetail(selected)}
+                >
+                  {t('dashboard.application3DOpenDetail', '详情')}
+                </button>
+                <button
+                  type="button"
+                  className="app3d-close-cta app3d-architecture-cta"
+                  disabled={architectureLoading}
+                  onClick={() => void loadArchitecture(selected)}
+                >
+                  {t('dashboard.application3DOpenArchitecture', '部署架构')}
+                </button>
+              </>
+            )}
+            <button
+              type="button"
+              className="app3d-close-cta app3d-back-cta"
+              onClick={() => {
+                if (architectureOpen) handleBackFromArchitecture();
+                else handleBackFromFocus();
+              }}
+            >
+              {t('dashboard.application3DBackWall', '\u8fd4\u56de')}
+            </button>
+          </div>
+        </div>
+      )}
+      {!editMode && architectureOpen && architectureHost && (() => {
+        const state = architectureHost.node.health?.state;
+        const badgeModifier = state === 'alarming' ? 'alarming' : state === 'normal' ? 'normal' : 'unknown';
+        const isAlarming = state === 'alarming';
+        const isNormal = state === 'normal';
+        const alarmCount = formatArchitectureHostAlarmCount(
+          isAlarming ? architectureHost.node.health?.activeAlarmCount : isNormal ? 0 : null,
+        );
+        const highestSeverity = architectureHost.node.health?.highestSeverity;
+        const severityLabel = formatArchitectureHostSeverity(highestSeverity?.label, highestSeverity?.id, t);
+        const dismissHostOverlay = (event: { stopPropagation: () => void }) => {
+          event.stopPropagation();
+          setArchitectureHost(null);
+          controllerRef.current?.dismissArchitectureOverlay?.();
+        };
+
+        return (
+          <div
+            className={`app3d-arch-host-chip app3d-arch-host-chip--${badgeModifier}`}
+            style={{
+              left: architectureHost.overlay.left,
+              top: architectureHost.overlay.top,
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="app3d-arch-host-chip__header">
+              <div className="app3d-arch-host-chip__meta">
+                <span
+                  className={`app3d-arch-host-chip__status-dot app3d-arch-host-chip__status-dot--${badgeModifier}`}
+                  aria-hidden="true"
+                />
+                <span className="app3d-arch-host-chip__title" title={architectureHost.node.name}>
+                  {architectureHost.node.name}
+                </span>
+              </div>
+              <span
+                role="button"
+                tabIndex={0}
+                className="app3d-arch-host-chip__close"
+                onClick={dismissHostOverlay}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    dismissHostOverlay(e);
+                  }
+                }}
+                title={t('common.close', '关闭')}
+                aria-label={t('common.close', '关闭')}
+              >
+                ✕
+              </span>
+            </div>
+
+            <div className="app3d-arch-host-chip__body">
+              <div className="app3d-arch-host-chip__metric">
+                <div className={`app3d-arch-host-chip__metric-val app3d-arch-host-chip__metric-val--${badgeModifier}`}>
+                  {alarmCount}
+                </div>
+                <div className="app3d-arch-host-chip__metric-lbl">
+                  {t('dashboard.application3DHostAlarmCount', '条数')}
+                </div>
+              </div>
+
+              <div className="app3d-arch-host-chip__details">
+                <div className="app3d-arch-host-chip__row">
+                  <span className="app3d-arch-host-chip__label">
+                    {t('dashboard.application3DHostIp', 'IP 地址')}
+                  </span>
+                  <span className="app3d-arch-host-chip__value app3d-arch-host-chip__value--ip">
+                    {formatArchitectureHostIp(architectureHost.node.ip_addr)}
+                  </span>
+                </div>
+                <div className="app3d-arch-host-chip__row">
+                  <span className="app3d-arch-host-chip__label">
+                    {t('dashboard.application3DHostOs', '操作系统')}
+                  </span>
+                  <span
+                    className="app3d-arch-host-chip__value"
+                    title={formatArchitectureHostOs(architectureHost.node.os_name)}
+                  >
+                    {formatArchitectureHostOs(architectureHost.node.os_name)}
+                  </span>
+                </div>
+                <div className="app3d-arch-host-chip__row">
+                  <span className="app3d-arch-host-chip__label">
+                    {isAlarming
+                      ? t('dashboard.application3DHostHighestSeverity', '最高级别')
+                      : t('dashboard.application3DHostStatus', '状态')}
+                  </span>
+                  <span
+                    className={`app3d-arch-host-chip__value app3d-arch-host-chip__value--${badgeModifier}`}
+                  >
+                    {isAlarming
+                      ? severityLabel
+                      : formatArchitectureHostState(state, t, architectureHost.node.health?.reason)}
+                  </span>
+                  {isAlarming && (
+                    <span className="sr-only">
+                      {t('dashboard.application3DHostStatus', '状态')}: {formatArchitectureHostState(state, t, architectureHost.node.health?.reason)}
+                    </span>
+                  )}
+                  {!isAlarming && (
+                    <span className="sr-only">
+                      {t('dashboard.application3DHostHighestSeverity', '最高级别')}: {severityLabel}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+      {detailOpen && selected && !editMode && (
+        <Application3DDetail
+          selected={selected}
+          detail={detail}
+          alarmDetail={alarmDetail}
+          metric={metric}
+          loading={detailLoading}
+          alarmLoading={alarmLoading}
+          metricLoading={metricLoading}
+          moreAlarmsLoading={moreAlarmsLoading}
+          error={detailError}
+          alarmError={alarmError}
+          onClose={clearSelection}
+          onRetry={() => {
+            if (selected) void loadDetail(selected);
+          }}
+          onRetryAlarm={() => {
+            if (lastAlarmIdRef.current) void loadAlarm(lastAlarmIdRef.current);
+          }}
+          onOpenAlarm={(alarmId) => void loadAlarm(alarmId)}
+          onCloseAlarm={() => {
+            detailGenerationRef.current += 1;
+            detailAbortRef.current?.abort();
+            metricAbortRef.current?.abort();
+            setAlarmDetail(null);
+            setAlarmLoading(false);
+            setAlarmError('');
+            setMetric(null);
+            setMetricLoading(false);
+            setDetailError('');
+          }}
+          onNavigateAlarm={(alarmId) => void loadAlarm(alarmId)}
+          onRetryMetric={() => {
+            if (alarmDetail) void loadMetric(alarmDetail.applicationId, alarmDetail.alarm.id);
+          }}
+          onLoadMoreAlarms={() => void loadMoreAlarms()}
+        />
+      )}
+    </div>
+  );
+}

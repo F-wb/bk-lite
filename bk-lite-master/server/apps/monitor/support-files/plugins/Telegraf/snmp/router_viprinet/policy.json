@@ -1,0 +1,61 @@
+{
+  "object": "Router",
+  "plugin": "Router Viprinet SNMP",
+  "templates": [
+    {
+      "name": "Viprinet路由器温度过高",
+      "alert_name": "路由器${resource_name} 温度过高",
+      "description": "监控 Viprinet 路由器的系统/CPU 温度，当持续高于阈值时触发告警，提示可能存在散热不良或环境温度过高，避免器件过热损坏。",
+      "metric_name": "device_temperature_celsius",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 70,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 60,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 55,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "Viprinet路由器电源告警",
+      "alert_name": "路由器${resource_name} 电源状态异常",
+      "description": "监控 Viprinet 路由器电源失败标志（归一后 1=正常，>1=异常），当出现电源故障时提示电源异常。",
+      "metric_name": "device_psu_state",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "Viprinet路由器风扇告警",
+      "alert_name": "路由器${resource_name} 风扇状态异常",
+      "description": "监控 Viprinet 路由器风扇运行状态（归一后 1=正常，>1=异常），当风扇停转或故障时提示散热异常。",
+      "metric_name": "device_fan_state",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 1,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    }
+  ]
+}

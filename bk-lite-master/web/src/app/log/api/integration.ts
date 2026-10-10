@@ -1,0 +1,375 @@
+import useApiClient from '@/utils/request';
+import React from 'react';
+import {
+  InstanceInfo,
+  IntegrationLogInstance
+} from '@/app/log/types/integration';
+import { GroupInfo } from '@/app/log/types/integration';
+import { cloneDeep } from 'lodash';
+import { AxiosRequestConfig } from 'axios';
+import {
+  ExtractorPublicationStatus,
+  LogExtractorDraft,
+  LogExtractorListResponse,
+  LogExtractorPreviewResult,
+  LogExtractorRule,
+  LogExtractorScopeQuery
+} from '@/app/log/types/extractor';
+interface NodeConfigParam {
+  configs?: any;
+  collect_type?: string;
+  collector?: string;
+  instances?: Omit<IntegrationLogInstance, 'key'>[];
+}
+
+interface GetFieldsParams {
+  query?: string;
+  scope?: string;
+  start_time?: string;
+  end_time?: string;
+  log_groups?: React.Key[];
+}
+
+const useIntegrationApi = () => {
+  const { get, post, put, del, patch } = useApiClient();
+
+  const getCollectTypes = async (
+    params: {
+      collector?: React.Key | null;
+      collect_type_id?: React.Key | null;
+      add_policy_count?: boolean;
+      add_instance_count?: boolean;
+      name?: string;
+      page?: number;
+      page_size?: number;
+    } = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return await get('/log/collect_types/', {
+      params,
+      ...config
+    });
+  };
+
+  const getDisplayCategoryEnum = async () => {
+    return await get('/log/collect_types/display_category_enum/');
+  };
+
+  const getFields = async (
+    params: GetFieldsParams = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return await get('/log/collect_types/all_attrs/', {
+      params,
+      ...config
+    });
+  };
+
+  const getFieldValues = async (
+    params: {
+      filed?: string;
+      start_time?: string;
+      end_time?: string;
+      limit?: number;
+      log_groups?: React.Key[];
+    } = {},
+    config?: AxiosRequestConfig
+  ) => {
+    return await get(`/log/search/field_values/`, {
+      params,
+      ...config
+    });
+  };
+
+  const getCollectTypesById = async (
+    params: {
+      collect_type_id?: React.Key | null;
+    } = {}
+  ) => {
+    return await get(`/log/collect_types/${String(params.collect_type_id)}`);
+  };
+
+  const batchCreateInstances = async (data: NodeConfigParam) => {
+    return await post('/log/collect_instances/batch_create/', data);
+  };
+
+  const getLogNodeList = async (data: {
+    cloud_region_id?: number;
+    page?: number;
+    page_size?: number;
+    os?: 'linux' | 'windows';
+    is_active?: boolean;
+    is_container?: boolean;
+  }) => {
+    return await post('/log/node_mgmt/nodes/', data);
+  };
+
+  const getCloudRegionProxyAddress = async (data: {
+    cloud_region_id?: number | string | null;
+  }) => {
+    return await post('/log/node_mgmt/cloud_region_proxy_address/', data);
+  };
+
+  const getInstanceList = async (
+    data: {
+      collect_type_id?: React.Key;
+      page?: number;
+      page_size?: number;
+      name?: string;
+      unassigned?: boolean;
+    },
+    config?: AxiosRequestConfig
+  ) => {
+    return await post('/log/collect_instances/search/', data, config);
+  };
+
+  const getCloudRegionList = async () => {
+    return await get('/log/k8s_collect/cloud_region_list/');
+  };
+
+  const createK8sInstance = async (
+    params: {
+      organizations?: React.Key[];
+      id?: string;
+      name?: string;
+      collect_type_id?: React.Key;
+    } = {}
+  ) => {
+    return await post('/log/k8s_collect/create_instance/', params);
+  };
+
+  const getK8sCommand = async (
+    params: {
+      instance_id?: string;
+      cloud_region_id?: React.Key;
+      image_registry_prefix?: string;
+    } = {}
+  ) => {
+    return await post('/log/k8s_collect/generate_install_command/', params);
+  };
+
+  const getK8sCollectSetting = async (instanceId: string) => {
+    return await get('/log/k8s_collect/collect_setting/', {
+      params: { instance_id: instanceId }
+    });
+  };
+
+  const saveK8sCollectSetting = async (data: {
+    instance_id?: string;
+    cloud_region_id?: React.Key;
+    runtime_profile?: 'standard' | 'docker' | 'custom';
+    host_log_path?: string;
+    docker_container_log_path?: string;
+    namespace_patterns?: string;
+    pod_patterns?: string;
+    image_registry_prefix?: string;
+    tolerations?:
+      | { key: string; effect: 'NoSchedule' | 'NoExecute'; value?: string }[]
+      | null;
+  }) => {
+    return await post('/log/k8s_collect/collect_setting/', data);
+  };
+
+  const checkK8sCollectStatus = async (
+    params: {
+      instance_id?: string;
+    } = {}
+  ) => {
+    return await post('/log/k8s_collect/check_collect_status/', params);
+  };
+
+  const getInstanceChildConfig = async (data: {
+    instance_id?: string | number;
+    instance_type?: string;
+  }) => {
+    return await post(`/log/api/node_mgmt/get_instance_asso_config/`, data);
+  };
+
+  const deleteLogInstance = async (data: {
+    instance_ids: any;
+    clean_child_config: boolean;
+  }) => {
+    return await post(`/log/collect_instances/remove_collect_instance/`, data);
+  };
+
+  const updateMonitorInstance = async (data: InstanceInfo) => {
+    return await post('/log/collect_instances/instance_update/', data);
+  };
+
+  const setInstancesGroup = async (data: {
+    instance_ids: React.Key[];
+    organizations: React.Key[];
+  }) => {
+    return await post(`/log/collect_instances/set_organizations/`, data);
+  };
+
+  const getConfigContent = async (data: { ids: React.Key[] }) => {
+    return await post('/log/collect_configs/get_config_content/', data);
+  };
+
+  const updateInstanceCollectConfig = async (data: {
+    instance_id?: React.Key;
+    collect_type_id?: React.Key;
+    child: {
+      id: string;
+      content_data: any;
+    };
+  }) => {
+    return await post(
+      `/log/collect_configs/update_instance_collect_config/`,
+      data
+    );
+  };
+
+  const createLogStreams = async (data: GroupInfo) => {
+    return await post(`/log/log_group/`, data);
+  };
+
+  const updateLogStreams = async (data: GroupInfo) => {
+    const params = cloneDeep(data);
+    delete params.id;
+    return await put(`/log/log_group/${String(data.id)}/`, params);
+  };
+
+  const updateDefaultLogStreams = async (data: GroupInfo) => {
+    const params = cloneDeep(data);
+    delete params.id;
+    return await patch(`/log/log_group/${String(data.id)}/`, params);
+  };
+
+  const getLogStreams = async (
+    params: {
+      name?: string;
+      page?: number;
+      page_size?: number;
+      collect_type_id?: React.Key;
+    } = {}
+  ) => {
+    return await get('/log/log_group/', {
+      params
+    });
+  };
+
+  const deleteLogStream = async (id: React.Key) => {
+    return await del(`/log/log_group/${String(id)}/`);
+  };
+
+  const getLogExtractors = async (scope: LogExtractorScopeQuery) => {
+    return await get<LogExtractorListResponse>('/log/log_extractors/', {
+      params: scope
+    });
+  };
+
+  const createLogExtractor = async (data: LogExtractorDraft) => {
+    return await post<{
+      resource: LogExtractorRule;
+      publication: ExtractorPublicationStatus;
+      generation: number;
+    }>('/log/log_extractors/', data);
+  };
+
+  const updateLogExtractor = async (
+    id: number,
+    data: LogExtractorDraft
+  ) => {
+    return await put<{
+      resource: LogExtractorRule;
+      publication: ExtractorPublicationStatus;
+      generation: number;
+    }>(`/log/log_extractors/${id}/`, data);
+  };
+
+  const deleteLogExtractor = async (id: number) => {
+    return await del<{
+      generation: number;
+      publication: ExtractorPublicationStatus;
+    }>(`/log/log_extractors/${id}/`);
+  };
+
+  const reorderLogExtractors = async (
+    scope: LogExtractorScopeQuery,
+    ids: number[]
+  ) => {
+    return await post<{
+      generation: number;
+      publication: ExtractorPublicationStatus;
+    }>('/log/log_extractors/reorder/', { ...scope, ids });
+  };
+
+  const previewLogExtractor = async (
+    data: LogExtractorScopeQuery & {
+      event: Record<string, unknown>;
+      draft: LogExtractorDraft;
+      rule_id?: number;
+    }
+  ) => {
+    return await post<LogExtractorPreviewResult>(
+      '/log/log_extractors/preview/',
+      data
+    );
+  };
+
+  const getLogExtractorSamples = async (scope: LogExtractorScopeQuery) => {
+    return await get<unknown>('/log/log_extractors/samples/', {
+      params: scope
+    });
+  };
+
+  const getLogExtractorPublicationStatus = async (
+    scope: LogExtractorScopeQuery
+  ) => {
+    return await get<ExtractorPublicationStatus>(
+      '/log/log_extractors/publication_status/',
+      { params: scope }
+    );
+  };
+
+  const retryLogExtractorPublication = async (
+    scope: LogExtractorScopeQuery
+  ) => {
+    return await post<{
+      generation: number;
+      publication: ExtractorPublicationStatus;
+    }>('/log/log_extractors/retry/', scope);
+  };
+
+  return {
+    getCollectTypes,
+    getDisplayCategoryEnum,
+    getLogNodeList,
+    getCloudRegionProxyAddress,
+    batchCreateInstances,
+    getInstanceList,
+    getCloudRegionList,
+    createK8sInstance,
+    getK8sCommand,
+    getK8sCollectSetting,
+    saveK8sCollectSetting,
+    checkK8sCollectStatus,
+    getInstanceChildConfig,
+    deleteLogInstance,
+    updateMonitorInstance,
+    setInstancesGroup,
+    getConfigContent,
+    updateInstanceCollectConfig,
+    getLogStreams,
+    createLogStreams,
+    updateLogStreams,
+    deleteLogStream,
+    updateDefaultLogStreams,
+    getCollectTypesById,
+    getFields,
+    getFieldValues,
+    getLogExtractors,
+    createLogExtractor,
+    updateLogExtractor,
+    deleteLogExtractor,
+    reorderLogExtractors,
+    previewLogExtractor,
+    getLogExtractorSamples,
+    getLogExtractorPublicationStatus,
+    retryLogExtractorPublication
+  };
+};
+
+export default useIntegrationApi;

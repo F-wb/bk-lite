@@ -1,0 +1,119 @@
+.asset {
+    display: flex;
+    gap: 10px;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+    max-width: 100%;
+    overflow: hidden;
+
+    .tree {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 20px 10px;
+        background-color: var(--color-bg-1);
+
+        :global(.ant-tree-list) {
+            width: 100%;
+        }
+    }
+
+    .table {
+        display: flex;
+        flex: 1 1 0%;
+        flex-direction: column;
+        min-width: 0;
+        max-width: 100%;
+        height: 100%;
+        min-height: 0;
+        overflow: hidden;
+        background: var(--color-bg-1);
+        padding: 20px;
+
+        .search {
+            display: flex;
+            flex-shrink: 0;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 16px;
+            min-width: 0;
+        }
+    }
+}
+
+.conditionItem {
+    :global(.ant-btn-default) {
+        min-width: 32px;
+    }
+
+    .itemLabel {
+        font-weight: 600;
+        font-size: 13px;
+        margin-bottom: 10px;
+    }
+
+    .itemOption {
+        display: flex;
+    }
+
+    .source {
+        .sourceObjectType {
+            :global(.ant-select-selector) {
+                border-radius: 6px 0 0 6px;
+            }
+        }
+
+        .sourceObject {
+            :global(.ant-select-selector) {
+                border-radius: 0 6px 6px 0;
+            }
+        }
+    }
+
+    .conditions {
+        display: flex;
+        flex-wrap: wrap;
+        margin-bottom: -10px;
+
+        .conditionTitle {
+            height: 32px;
+            line-height: 32px;
+            margin-right: 10px;
+        }
+
+        .filter {
+            margin-bottom: 10px;
+
+            :global(.ant-btn:nth-of-type(1)) {
+                border-radius: 0 6px 6px 0;
+                margin-right: 10px;
+            }
+
+            :global(.ant-btn:nth-of-type(2)) {
+                margin-right: 10px;
+            }
+
+            :global(.ant-btn) {
+                background: var(--color-fill-2);
+            }
+
+            :global(.ant-btn-icon) {
+                transform: scale(0.8);
+            }
+
+            :global(.ant-select-selector) {
+                border-radius: 0;
+            }
+
+            :global(.ant-input) {
+                border-radius: 0;
+            }
+        }
+    }
+}

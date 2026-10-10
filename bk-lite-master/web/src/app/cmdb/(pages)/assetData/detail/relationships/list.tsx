@@ -1,0 +1,416 @@
+'use client';
+
+import { useSearchParams } from 'next/navigation';
+import { getAssetColumns } from '@/app/cmdb/utils/common';
+import { Spin, Collapse, Button, Modal, message } from 'antd';
+import { CaretRightOutlined } from '@ant-design/icons';
+import { useTranslation } from '@/utils/i18n';
+import { AssoListProps } from '@/app/cmdb/types/assetData';
+import { useRelationships } from '@/app/cmdb/context/relationships';
+import CustomTable from '@/components/custom-table';
+import CompactEmptyState from '@/components/compact-empty-state';
+import { useModelApi, useInstanceApi } from '@/app/cmdb/api';
+import assoListStyle from './index.module.scss';
+import SelectInstance from './selectInstance';
+import PermissionWrapper from '@/components/permission';
+import { RACK_ROOM_ASSET_PERMISSION_PATH } from './rackRoomEdit';
+import {
+  areAllRelationshipsExpanded,
+  getDefaultExpandedRelationshipKeys,
+  visibleRelationshipAssociations,
+} from '../../relationshipMenuData';
+import React, {
+  useEffect,
+  useMemo,
+  useState,
+  useRef,
+  forwardRef,
+  useImperativeHandle,
+} from 'react';
+import {
+  CrentialsAssoInstItem,
+  CrentialsAssoDetailItem,
+  ModelItem,
+  AssoTypeItem,
+  AssoListRef,
+  RelationListInstItem,
+  RelationInstanceRef,
+} from '@/app/cmdb/types/assetManage';
+
+const { confirm } = Modal;
+
+const AssoList = forwardRef<AssoListRef, AssoListProps>(
+  ({ modelList, userList, assoTypeList, onExpandStateChange }, ref) => {
+    const { t } = useTranslation();
+    const [activeKey, setActiveKey] = useState<string[]>([]);
+    const [allActiveKeys, setAllActiveKeys] = useState<string[]>([]);
+    const [instIds, setInstIds] = useState<RelationListInstItem[]>([]);
+    const [assoCredentials, setAssoCredentials] = useState<
+      CrentialsAssoInstItem[]
+    >([]);
+    const [pageLoading, setPageLoading] = useState<boolean>(false);
+    const searchParams = useSearchParams();
+    const modelApi = useModelApi();
+    const instanceApi = useInstanceApi();
+    const modelId: string = searchParams.get('model_id') || '';
+    const instUuid: string = searchParams.get('inst_uuid') || '';
+    const instanceRef = useRef<RelationInstanceRef>(null);
+    const {
+      assoInstances,
+      loading,
+      selectedAssoId,
+      fetchAssoInstances,
+      setSelectedAssoId,
+    } = useRelationships();
+
+    const visibleAssociations = useMemo(
+      () => visibleRelationshipAssociations(assoInstances || []),
+      [assoInstances]
+    );
+
+    useEffect(() => {
+      if (!modelList.length) return;
+      getInitData(visibleAssociations as CrentialsAssoInstItem[]);
+    }, [visibleAssociations, modelId, modelList]);
+
+    useEffect(() => {
+      onExpandStateChange?.(
+        areAllRelationshipsExpanded(activeKey, allActiveKeys)
+      );
+    }, [activeKey, allActiveKeys, onExpandStateChange]);
+
+    const getInitData = async (data: any[]) => {
+      setPageLoading(true);
+      try {
+        processedData(data);
+        await updateInstAttrList(data);
+        if (!data?.length) {
+          setInstIds([]);
+          setAssoCredentials([]);
+        }
+        if (selectedAssoId) {
+          scrollToElement(`collapse-${selectedAssoId}`);
+        }
+      } finally {
+        setPageLoading(false);
+      }
+    };
+
+    const processedData = (assoInstancesList: any) => {
+      if (!assoInstancesList?.length) {
+        setInstIds([]);
+        return [];
+      }
+      const newInstIds = assoInstancesList.reduce(
+        (pre: RelationListInstItem[], cur: CrentialsAssoInstItem) => {
+          if (!cur.inst_list) return pre;
+          const allInstIds = cur.inst_list.map((item) => {
+            const peerUuid = String(item.inst_uuid || '');
+            const srcInstUuid =
+              cur.src_model_id === modelId ? instUuid : peerUuid;
+            const dstInstUuid =
+              cur.dst_model_id === modelId ? instUuid : peerUuid;
+            return {
+              id: peerUuid,
+              src_inst_uuid: srcInstUuid,
+              dst_inst_uuid: dstInstUuid,
+              model_asst_id: cur.model_asst_id,
+            };
+          });
+          return [...pre, ...allInstIds];
+        },
+        []
+      );
+      setInstIds(newInstIds);
+    };
+
+    const updateInstAttrList = async (
+      assoInstancesList: any,
+      targetId?: string
+    ) => {
+      if (targetId) {
+        const targetItem = assoInstancesList.find(
+          (item: any) => item.model_asst_id === targetId
+        );
+        if (targetItem) {
+          const updatedItem = await getModelAttrList(targetItem, {
+            assoList: assoInstancesList,
+            userData: userList,
+            models: modelList,
+            assoTypeList,
+          });
+          setAssoCredentials((prev: any) => {
+            const newCredentials = prev.map((item: any) =>
+              item.model_asst_id === targetId ? updatedItem : item
+            );
+            const keys = newCredentials.map((item: any) => item.model_asst_id);
+            setAllActiveKeys(keys);
+            setActiveKey((previousKeys) => {
+              return previousKeys.includes(targetId)
+                ? previousKeys
+                : [...previousKeys, targetId];
+            });
+            return newCredentials;
+          });
+          return;
+        }
+      }
+
+      const updatedItems = await Promise.all(
+        assoInstancesList.map((item: any) =>
+          getModelAttrList(item, {
+            assoList: assoInstancesList,
+            userData: userList,
+            models: modelList,
+            assoTypeList,
+          })
+        )
+      );
+      const allKeys = updatedItems.map((item) => item.model_asst_id);
+      const defaultExpandedKeys = getDefaultExpandedRelationshipKeys(
+        assoInstancesList
+      );
+      setActiveKey(defaultExpandedKeys);
+      setAllActiveKeys(allKeys);
+      setAssoCredentials(updatedItems);
+    };
+
+    const scrollToElement = (elementId: string) => {
+      setTimeout(() => {
+        const element = document.getElementById(elementId);
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+        setSelectedAssoId('');
+      }, 100);
+    };
+
+    useEffect(() => {
+      if (selectedAssoId && assoCredentials.length) {
+        setActiveKey((previousKeys) => {
+          return previousKeys.includes(selectedAssoId)
+            ? previousKeys
+            : [...previousKeys, selectedAssoId];
+        });
+        scrollToElement(`collapse-${selectedAssoId}`);
+      }
+    }, [selectedAssoId]);
+
+    useImperativeHandle(ref, () => ({
+      expandAll: (type: boolean) => {
+        const nextKeys = type ? allActiveKeys : [];
+        setActiveKey(nextKeys);
+      },
+      showRelateModal: () => {
+        instanceRef.current?.showModal({
+          title: t('Model.association'),
+          model_id: modelId,
+          list: instIds,
+          instUuid,
+        });
+      },
+    }));
+
+    const linkToDetail = (row: any, item: any) => {
+      const linkModelId =
+        item.src_model_id === modelId ? item.dst_model_id : item.src_model_id;
+      const params: any = {
+        icn: '',
+        model_name:
+          item.src_model_id === modelId
+            ? item.dst_model_name || item.dst_model_id
+            : item.src_model_name || item.src_model_id,
+        model_id: linkModelId,
+        classification_id: '',
+        inst_uuid: row.inst_uuid,
+        inst_name: row.inst_name,
+      };
+      const queryString = new URLSearchParams(params).toString();
+      const url = `/cmdb/assetData/detail/baseInfo?${queryString}`;
+      window.open(url, '_blank', 'noopener,noreferrer');
+    };
+
+    const getModelAttrList = async (item: any, config: any) => {
+      const instanceCount = Array.isArray(item.inst_list)
+        ? item.inst_list.length
+        : 0;
+      const collapseItem = {
+        key: item.model_asst_id,
+        label: showConnectName(item, config),
+        model_asst_id: item.model_asst_id,
+        extra: (
+          <span className="inline-flex min-w-6 justify-center rounded-full bg-[var(--color-fill-3)] px-2 py-0.5 text-xs font-normal text-[var(--color-text-2)]">
+            {instanceCount}
+          </span>
+        ),
+      };
+
+      if (!instanceCount) {
+        return {
+          ...collapseItem,
+          children: (
+            <CompactEmptyState description={t('Model.noAssociations')} />
+          ),
+        };
+      }
+
+      const attrId = getAttrId(item as CrentialsAssoDetailItem);
+      const responseData = await modelApi.getModelAttrList(attrId as string);
+      const columns = [
+        ...getAssetColumns({
+          attrList: responseData,
+          userList: config.userData,
+          t,
+        }),
+        {
+          title: t('common.actions'),
+          dataIndex: 'action',
+          key: 'action',
+          fixed: 'right',
+          width: 120,
+          render: (_: unknown, record: any) => (
+            <PermissionWrapper
+              requiredPermissions={['Delete Associate']}
+              permissionPath={RACK_ROOM_ASSET_PERMISSION_PATH}
+              instPermissions={record.permission}
+            >
+              <Button
+                type="link"
+                onClick={() => cancelRelate(record, item)}
+              >
+                {t('Model.disassociation')}
+              </Button>
+            </PermissionWrapper>
+          ),
+        },
+      ];
+
+      if (columns[0]) {
+        columns[0].fixed = 'left';
+        const originalRender = columns[0].render;
+        columns[0].render = (value: unknown, record: any) => (
+          <a
+            className="text-[var(--color-primary)]"
+            onClick={() => linkToDetail(record, item)}
+          >
+            {originalRender
+              ? originalRender(value, record)
+              : record[columns[0].dataIndex]}
+          </a>
+        );
+      }
+
+      const updatedItem = {
+        ...collapseItem,
+        children: (
+          <CustomTable
+            size="middle"
+            pagination={false}
+            dataSource={item.inst_list}
+            columns={columns as any}
+            rowKey="inst_uuid"
+          />
+        ),
+      };
+
+      return updatedItem;
+    };
+
+    const cancelRelate = async (record: any, item: any) => {
+      const peerUuid = String(record.inst_uuid || '');
+      const srcInstUuid =
+        item.src_model_id === modelId ? instUuid : peerUuid;
+      const dstInstUuid =
+        item.dst_model_id === modelId ? instUuid : peerUuid;
+      confirm({
+        title: t('disassociationTitle'),
+        content: t('common.disassociationContent'),
+        centered: true,
+        onOk() {
+          return new Promise(async (resolve) => {
+            try {
+              await instanceApi.deleteInstanceAssociation(
+                srcInstUuid,
+                dstInstUuid,
+                item.model_asst_id
+              );
+              message.success(t('successfullyDisassociated'));
+              const data = await fetchAssoInstances(modelId, instUuid);
+              await getInitData(visibleRelationshipAssociations(data));
+            } finally {
+              resolve(true);
+            }
+          });
+        },
+      });
+    };
+
+    const showConnectName = (row: any, config: any) => {
+      const sourceName = showModelName(row.src_model_id, config.models);
+      const targetName = showModelName(row.dst_model_id, config.models);
+      const relation = showConnectType(row.asst_id, config.assoTypeList);
+      return `${targetName} ${relation} ${sourceName}`;
+    };
+
+    const showModelName = (id: string, list: ModelItem[]) => {
+      return list.find((item) => item.model_id === id)?.model_name || '--';
+    };
+    const showConnectType = (id: string, assoTypeList: AssoTypeItem[]) => {
+      return (
+        assoTypeList.find((item) => item.asst_id === id)?.asst_name || '--'
+      );
+    };
+
+    const getAttrId = (item: CrentialsAssoDetailItem) => {
+      const { dst_model_id: dstModelId, src_model_id: srcModelId } = item;
+      if (modelId === dstModelId) {
+        return srcModelId;
+      }
+      return dstModelId;
+    };
+
+    const handleCollapseChange = (keys: any) => {
+      const nextKeys = Array.isArray(keys) ? keys : [keys].filter(Boolean);
+      setActiveKey(nextKeys);
+    };
+
+    const confirmRelate = async () => {
+      const data = await fetchAssoInstances(modelId, instUuid);
+      getInitData(visibleRelationshipAssociations(data));
+    };
+
+    return (
+      <Spin
+        spinning={!loading && pageLoading}
+      >
+        <div className={assoListStyle.relationships}>
+          {assoCredentials.length ? (
+            <Collapse
+              bordered={false}
+              activeKey={activeKey}
+              expandIcon={({ isActive }) => (
+                <CaretRightOutlined rotate={isActive ? 90 : 0} />
+              )}
+              items={assoCredentials.map((item) => ({
+                ...item,
+                id: `collapse-${item.key}`,
+              }))}
+              onChange={handleCollapseChange}
+            />
+          ) : (
+            <CompactEmptyState description={t('common.noData')} />
+          )}
+        </div>
+        <SelectInstance
+          ref={instanceRef}
+          userList={userList}
+          models={modelList}
+          assoTypes={assoTypeList}
+          onSuccess={confirmRelate}
+        />
+      </Spin>
+    );
+  }
+);
+AssoList.displayName = 'assoList';
+export default AssoList;

@@ -1,0 +1,37 @@
+@use '../common/simple-dashboard.module.scss';
+
+// sectionLabel 已上收到共享壳（带品牌蓝指示条与现代间距）；此处仅保留进程趋势图高度与图例微调。
+
+.chartLegendHeader {
+  justify-content: flex-end;
+  max-width: none;
+  white-space: nowrap;
+}
+
+.compactTrend {
+  .chartWrap {
+    height: 180px;
+  }
+}
+
+@media (max-width: 768px) {
+  .chartLegendHeader {
+    justify-content: flex-start;
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .compactTrend {
+    .chartWrap {
+      height: 140px;
+    }
+  }
+}
+
+@media (max-width: 480px) {
+  .compactTrend {
+    .chartWrap {
+      height: 120px;
+    }
+  }
+}

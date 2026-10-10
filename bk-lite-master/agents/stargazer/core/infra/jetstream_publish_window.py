@@ -1,0 +1,459 @@
+"""JetStream 指标发布的异步确认与双信贷窗口。"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import time
+from collections import deque
+from collections.abc import Callable, Iterable
+from contextlib import nullcontext
+from dataclasses import dataclass
+
+from core.infra.publish_budget import PublishBudget
+
+
+@dataclass(frozen=True)
+class JetStreamMessage:
+    """一条可去重的 JetStream 消息。"""
+
+    payload: bytes
+    message_id: str
+    deadline: float | None = None
+    budget: PublishBudget | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, bytes):
+            raise TypeError("payload must be bytes")
+        if not self.message_id:
+            raise ValueError("message_id must not be empty")
+
+
+@dataclass(frozen=True)
+class JetStreamPublishWindowSettings:
+    max_pending_messages: int = 256
+    max_pending_messages_per_call: int | None = None
+    max_pending_bytes: int = 32 * 1024 * 1024
+    puback_timeout_seconds: float = 30.0
+    max_attempts: int = 2
+    expected_stream: str = "metrics"
+
+    def __post_init__(self) -> None:
+        if self.max_pending_messages <= 0:
+            raise ValueError("max_pending_messages must be greater than zero")
+        if self.max_pending_messages_per_call is not None and self.max_pending_messages_per_call <= 0:
+            raise ValueError("max_pending_messages_per_call must be greater than zero")
+        if self.max_pending_bytes <= 0:
+            raise ValueError("max_pending_bytes must be greater than zero")
+        if self.puback_timeout_seconds <= 0:
+            raise ValueError("puback_timeout_seconds must be greater than zero")
+        if self.max_attempts <= 0:
+            raise ValueError("max_attempts must be greater than zero")
+        if not str(self.expected_stream).strip():
+            raise ValueError("expected_stream must not be empty")
+
+
+@dataclass(frozen=True)
+class JetStreamPublishWindowSnapshot:
+    pending_messages: int
+    pending_bytes: int
+    waiting_messages: int
+    waiting_bytes: int
+    peak_pending_messages: int
+    peak_pending_bytes: int
+    peak_waiting_messages: int
+    peak_waiting_bytes: int
+    confirmed_total: int
+    retry_total: int
+    deadline_expired_total: int
+    credit_wait_timeout_total: int
+    publish_call_timeout_total: int
+    puback_timeout_total: int
+    rejected_total: int
+    puback_duration_seconds_p95: float
+    puback_duration_seconds_p99: float
+
+
+class JetStreamWindowPublishError(RuntimeError):
+    """窗口内至少一条消息未获得 PubAck。"""
+
+    delivery_detected = True
+
+    def __init__(
+        self,
+        *,
+        attempted_indices: tuple[int, ...],
+        confirmed_indices: tuple[int, ...],
+        error: BaseException,
+    ) -> None:
+        self.attempted_indices = attempted_indices
+        self.confirmed_indices = confirmed_indices
+        self.error = error
+        self.timeout_stage = getattr(error, "timeout_stage", None)
+        self.timeout_phase = getattr(error, "timeout_phase", None)
+        super().__init__(
+            "JetStream publish window incomplete: "
+            f"confirmed={len(confirmed_indices)}/{len(attempted_indices)}, "
+            f"error_type={type(error).__name__}"
+        )
+        self.__cause__ = error
+
+
+class JetStreamPublishWindow:
+    """在所有调用之间共享消息数与字节数信贷，并等待逐消息 PubAck。"""
+
+    def __init__(
+        self,
+        jetstream_provider: Callable,
+        *,
+        settings: JetStreamPublishWindowSettings | None = None,
+    ) -> None:
+        self._provider = jetstream_provider
+        self.settings = settings or JetStreamPublishWindowSettings()
+        self._condition = asyncio.Condition()
+        self._pending_messages = 0
+        self._pending_bytes = 0
+        self._waiting_messages = 0
+        self._waiting_bytes = 0
+        self._peak_pending_messages = 0
+        self._peak_pending_bytes = 0
+        self._peak_waiting_messages = 0
+        self._peak_waiting_bytes = 0
+        self._confirmed_total = 0
+        self._retry_total = 0
+        self._deadline_expired_total = 0
+        self._credit_wait_timeout_total = 0
+        self._publish_call_timeout_total = 0
+        self._puback_timeout_total = 0
+        self._rejected_total = 0
+        self._puback_durations: deque[float] = deque(maxlen=500)
+
+    def snapshot(self) -> JetStreamPublishWindowSnapshot:
+        ordered_durations = sorted(self._puback_durations)
+        return JetStreamPublishWindowSnapshot(
+            pending_messages=self._pending_messages,
+            pending_bytes=self._pending_bytes,
+            waiting_messages=self._waiting_messages,
+            waiting_bytes=self._waiting_bytes,
+            peak_pending_messages=self._peak_pending_messages,
+            peak_pending_bytes=self._peak_pending_bytes,
+            peak_waiting_messages=self._peak_waiting_messages,
+            peak_waiting_bytes=self._peak_waiting_bytes,
+            confirmed_total=self._confirmed_total,
+            retry_total=self._retry_total,
+            deadline_expired_total=self._deadline_expired_total,
+            credit_wait_timeout_total=self._credit_wait_timeout_total,
+            publish_call_timeout_total=self._publish_call_timeout_total,
+            puback_timeout_total=self._puback_timeout_total,
+            rejected_total=self._rejected_total,
+            puback_duration_seconds_p95=_percentile(ordered_durations, 0.95),
+            puback_duration_seconds_p99=_percentile(ordered_durations, 0.99),
+        )
+
+    async def publish(  # noqa: C901 - 准入、取消和 PubAck 聚合必须共享同一额度所有权
+        self,
+        subject: str,
+        messages: Iterable[JetStreamMessage],
+        *,
+        before_publish: Callable[[int], bool] | None = None,
+    ) -> int:
+        """懒消费消息并并行发布；返回获得 PubAck 的消息数。"""
+        pending: set[asyncio.Task] = set()
+        attempted_indices: list[int] = []
+        confirmed_indices: list[int] = []
+        first_error: BaseException | None = None
+        per_call_limit = min(
+            self.settings.max_pending_messages,
+            self.settings.max_pending_messages_per_call or self.settings.max_pending_messages,
+        )
+
+        async def release_if_unstarted(task: asyncio.Task) -> None:
+            if bool(getattr(task, "credit_owner_started", False)):
+                return
+            if bool(getattr(task, "credit_released", False)):
+                return
+            await self._release(int(getattr(task, "payload_bytes")))
+            task.credit_released = True  # type: ignore[attr-defined]
+
+        async def cancel_pending() -> None:
+            tasks = tuple(pending)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                for task in tasks:
+                    await release_if_unstarted(task)
+                pending.clear()
+
+        async def collect_done(*, wait_for_one: bool) -> None:
+            nonlocal first_error
+            if not pending:
+                return
+            try:
+                if wait_for_one:
+                    done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    done = set(pending)
+                    await asyncio.wait(done)
+            except asyncio.CancelledError:
+                await cancel_pending()
+                raise
+            for task in done:
+                pending.discard(task)
+                index = int(getattr(task, "message_index"))
+                try:
+                    await task
+                except BaseException as error:  # 每条失败在批次边界统一归因
+                    if first_error is None:
+                        first_error = error
+                else:
+                    confirmed_indices.append(index)
+                finally:
+                    await release_if_unstarted(task)
+
+        try:
+            for index, message in enumerate(messages):
+                if first_error is not None:
+                    break
+                if len(message.payload) > self.settings.max_pending_bytes:
+                    raise ValueError("message payload exceeds JetStream byte window")
+                if message.deadline is not None and asyncio.get_running_loop().time() >= message.deadline:
+                    first_error = _timeout_error(
+                        "JetStream publish deadline expired before delivery",
+                        stage="deadline",
+                    )
+                    self._deadline_expired_total += 1
+                    first_error.timeout_phase = "before_delivery"
+                    break
+                while len(pending) >= per_call_limit:
+                    await collect_done(wait_for_one=True)
+                    if first_error is not None:
+                        break
+                if first_error is not None:
+                    break
+                try:
+                    with message.budget.waiting_for_credit() if message.budget is not None else nullcontext():
+                        await self._reserve(len(message.payload), deadline=message.deadline)
+                except TimeoutError as error:
+                    error.timeout_stage = "credit_wait"  # type: ignore[attr-defined]
+                    error.timeout_phase = "credit_wait"  # type: ignore[attr-defined]
+                    self._credit_wait_timeout_total += 1
+                    first_error = error
+                    break
+                if message.deadline is not None and asyncio.get_running_loop().time() >= message.deadline:
+                    await self._release(len(message.payload))
+                    first_error = _timeout_error("JetStream deadline expired after credit wait", stage="deadline")
+                    first_error.timeout_phase = "credit_wait"
+                    self._deadline_expired_total += 1
+                    break
+                try:
+                    accepted = before_publish is None or before_publish(index)
+                except BaseException:
+                    await self._release(len(message.payload))
+                    raise
+                if not accepted:
+                    await self._release(len(message.payload))
+                    continue
+
+                def attempted(index=index):
+                    if index not in attempted_indices:
+                        attempted_indices.append(index)
+                        started = getattr(before_publish, "mark_transport_started", None)
+                        if callable(started):
+                            started(index)
+
+                try:
+                    task = asyncio.create_task(
+                        self._publish_one(subject, message, on_attempt=attempted),
+                        name=f"jetstream-puback:{message.message_id[:64]}",
+                    )
+                except BaseException:
+                    await self._release(len(message.payload))
+                    raise
+                task.message_index = index  # type: ignore[attr-defined]
+                task.payload_bytes = len(message.payload)  # type: ignore[attr-defined]
+                task.credit_owner_started = False  # type: ignore[attr-defined]
+                task.credit_released = False  # type: ignore[attr-defined]
+                pending.add(task)
+
+            if first_error is None:
+                while pending and first_error is None:
+                    await collect_done(wait_for_one=True)
+            if first_error is not None:
+                await cancel_pending()
+        except BaseException:
+            await cancel_pending()
+            raise
+        if first_error is not None:
+            raise JetStreamWindowPublishError(
+                attempted_indices=tuple(attempted_indices),
+                confirmed_indices=tuple(sorted(confirmed_indices)),
+                error=first_error,
+            ) from first_error
+        return len(confirmed_indices)
+
+    async def _publish_one(self, subject: str, message: JetStreamMessage, *, on_attempt: Callable) -> None:
+        # 信贷已取得才进入发送区间；同目标的并发 ACK 不重复消耗预算。
+        with message.budget.sending() if message.budget is not None else nullcontext(message.deadline) as deadline:
+            if message.deadline is not None:
+                deadline = min(deadline, message.deadline) if deadline is not None else message.deadline
+            await self._send_with_retry(subject, message, deadline=deadline, on_attempt=on_attempt)
+
+    async def _send_with_retry(self, subject: str, message: JetStreamMessage, *, deadline: float | None, on_attempt: Callable) -> None:
+        last_error: BaseException | None = None
+        attempted = False
+        budget = message.budget
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            current_task.credit_owner_started = True  # type: ignore[attr-defined]
+        try:
+            for attempt in range(self.settings.max_attempts):
+                if attempt:
+                    self._retry_total += 1
+                    if budget is not None:
+                        budget.retry_count += 1
+                attempt_started_at = time.monotonic()
+                phase_started_at = attempt_started_at
+                phase = "connect"
+                phase_ms = {"connect_ms": 0.0, "publish_call_ms": 0.0, "puback_ms": 0.0}
+                future = None
+                timeout_stage = "publish_call"
+                try:
+                    timeout_seconds = self.settings.puback_timeout_seconds
+                    if deadline is not None:
+                        remaining_seconds = deadline - asyncio.get_running_loop().time()
+                        timeout_seconds = min(timeout_seconds, max(0.0, remaining_seconds))
+                        if remaining_seconds <= 0:
+                            phase = "before_delivery"
+                            raise _timeout_error(
+                                "JetStream publish deadline expired",
+                                stage="deadline",
+                            )
+                    async with asyncio.timeout(timeout_seconds):
+                        jetstream = self._provider()
+                        if inspect.isawaitable(jetstream):
+                            jetstream = await jetstream
+                        now = time.monotonic()
+                        phase_ms["connect_ms"] = (now - phase_started_at) * 1000
+                        phase_started_at = now
+                        phase = "publish_call"
+                        on_attempt()
+                        if not attempted:
+                            attempted = True
+                            if budget is not None:
+                                budget.attempted_lines += 1
+                        future = await jetstream.publish_async(
+                            subject,
+                            message.payload,
+                            wait_stall=self.settings.puback_timeout_seconds,
+                            stream=self.settings.expected_stream,
+                            headers={"Nats-Msg-Id": message.message_id},
+                        )
+                        timeout_stage = "puback"
+                        now = time.monotonic()
+                        phase_ms["publish_call_ms"] = (now - phase_started_at) * 1000
+                        phase_started_at = now
+                        phase = "puback"
+                        await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    if future is not None and not future.done():
+                        future.cancel()
+                    raise
+                except Exception as error:
+                    last_error = error
+                    if isinstance(error, TimeoutError):
+                        error.timeout_phase = timeout_stage  # type: ignore[attr-defined]
+                        if getattr(error, "timeout_stage", None) is None:
+                            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                                error.timeout_stage = "deadline"  # type: ignore[attr-defined]
+                            else:
+                                error.timeout_stage = timeout_stage  # type: ignore[attr-defined]
+                        recorded_stage = getattr(error, "timeout_stage", None)
+                        if recorded_stage == "deadline":
+                            self._deadline_expired_total += 1
+                        elif recorded_stage == "publish_call":
+                            self._publish_call_timeout_total += 1
+                        elif recorded_stage == "puback":
+                            self._puback_timeout_total += 1
+                    phase_ms[phase + "_ms"] = (time.monotonic() - phase_started_at) * 1000
+                    error.publish_diagnostics = {
+                        **phase_ms,
+                        "failed_stage": phase,
+                        "error_type": type(error).__name__,
+                        "timeout_kind": ("total_budget" if getattr(error, "timeout_stage", None) == "deadline" else "attempt")
+                        if isinstance(error, TimeoutError)
+                        else "-",
+                        "timeout_limit_ms": timeout_seconds * 1000 if isinstance(error, TimeoutError) else "-",
+                    }
+                    if future is not None and not future.done():
+                        future.cancel()
+                    if getattr(error, "timeout_stage", None) == "deadline":
+                        break
+                else:
+                    self._puback_durations.append(time.monotonic() - attempt_started_at)
+                    self._confirmed_total += 1
+                    if budget is not None:
+                        budget.confirmed_lines += 1
+                    return
+                finally:
+                    if budget is not None:
+                        budget.slowest_attempt_seconds = max(budget.slowest_attempt_seconds, time.monotonic() - attempt_started_at)
+            self._rejected_total += 1
+            assert last_error is not None
+            raise last_error
+        finally:
+            await self._release(len(message.payload))
+            if current_task is not None:
+                current_task.credit_released = True  # type: ignore[attr-defined]
+
+    async def _reserve(self, payload_bytes: int, *, deadline: float | None = None) -> None:
+        async with self._condition:
+
+            def has_capacity() -> bool:
+                return (
+                    self._pending_messages < self.settings.max_pending_messages
+                    and self._pending_bytes + payload_bytes <= self.settings.max_pending_bytes
+                )
+
+            if not has_capacity():
+                self._waiting_messages += 1
+                self._waiting_bytes += payload_bytes
+                self._peak_waiting_messages = max(
+                    self._peak_waiting_messages,
+                    self._waiting_messages,
+                )
+                self._peak_waiting_bytes = max(
+                    self._peak_waiting_bytes,
+                    self._waiting_bytes,
+                )
+                try:
+                    if deadline is None:
+                        await self._condition.wait_for(has_capacity)
+                    else:
+                        async with asyncio.timeout_at(deadline):
+                            await self._condition.wait_for(has_capacity)
+                finally:
+                    self._waiting_messages -= 1
+                    self._waiting_bytes -= payload_bytes
+            self._pending_messages += 1
+            self._pending_bytes += payload_bytes
+            self._peak_pending_messages = max(self._peak_pending_messages, self._pending_messages)
+            self._peak_pending_bytes = max(self._peak_pending_bytes, self._pending_bytes)
+
+    async def _release(self, payload_bytes: int) -> None:
+        async with self._condition:
+            self._pending_messages -= 1
+            self._pending_bytes -= payload_bytes
+            self._condition.notify_all()
+
+
+def _percentile(ordered: list[float], fraction: float) -> float:
+    if not ordered:
+        return 0.0
+    return ordered[int((len(ordered) - 1) * fraction)]
+
+
+def _timeout_error(message: str, *, stage: str) -> TimeoutError:
+    error = TimeoutError(message)
+    error.timeout_stage = stage  # type: ignore[attr-defined]
+    return error

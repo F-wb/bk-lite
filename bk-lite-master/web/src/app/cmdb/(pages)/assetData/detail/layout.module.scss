@@ -1,0 +1,20 @@
+.attrLayout {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.attrLayout :global(.ant-card-body) {
+  padding: 10px !important;
+  border: none !important;
+}
+
+.attrLayout :global(aside) {
+  height: calc(100vh - 90px);
+}
+
+.attrLayout :global(section) {
+  min-width: 0;
+}

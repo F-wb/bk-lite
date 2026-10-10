@@ -1,0 +1,95 @@
+{
+  "plugin": "Nginx",
+  "plugin_desc": "By collecting metrics such as Nginx requests, connection status, and processing efficiency, this helps monitor and optimize the website's performance and stability.",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='nginx', collect_type='middleware'}) by (instance_id)",
+  "instance_fact_bindings": [{"fact":"asset.ip","value_type":"ip","resolver":"input","options":{"field":"url"}}],
+  "instance_summary_columns": [{"fact":"asset.ip","title":"monitor.views.assetIp","order":10}],
+  "name": "Nginx",
+  "icon": "mm-nginx_Nginx",
+  "type": "Middleware",
+  "description": "",
+  "default_metric": "any({instance_type='nginx'}) by (instance_id)",
+  "instance_id_keys": ["instance_id"],
+  "supplementary_indicators": ["nginx_active", "nginx_requests_rate", "nginx_handled_rate"],
+  "display_fields": [{"name": "Active Connections", "sort_order": 0, "metrics": [{"plugin": "Nginx", "metric": "nginx_active"}]}, {"name": "Request Rate", "sort_order": 1, "metrics": [{"plugin": "Nginx", "metric": "nginx_requests_rate"}]}, {"name": "Connection Handling Rate", "sort_order": 2, "metrics": [{"plugin": "Nginx", "metric": "nginx_handled_rate"}]}],
+  "metrics": [
+    {
+      "metric_group": "StubStatus",
+      "name": "nginx_active",
+      "display_name": "Active Connections",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "description": "Number of active client connections, reflecting concurrent load",
+      "query": "nginx_active{__$labels__}"
+    },
+    {
+      "metric_group": "StubStatus",
+      "name": "nginx_reading",
+      "display_name": "Reading Connections",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "description": "Number of connections reading request headers, reflecting request processing status",
+      "query": "nginx_reading{__$labels__}"
+    },
+    {
+      "metric_group": "StubStatus",
+      "name": "nginx_writing",
+      "display_name": "Writing Connections",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "description": "Number of connections writing responses, reflecting response processing status",
+      "query": "nginx_writing{__$labels__}"
+    },
+    {
+      "metric_group": "StubStatus",
+      "name": "nginx_waiting",
+      "display_name": "Waiting Connections",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "description": "Number of idle connections waiting for requests, reflecting connection pool usage",
+      "query": "nginx_waiting{__$labels__}"
+    },
+    {
+      "metric_group": "Performance",
+      "name": "nginx_requests_rate",
+      "display_name": "Request Rate",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "description": "Rate of requests handled by Nginx, reflecting real-time load",
+      "query": "rate(nginx_requests{__$labels__}[5m])"
+    },
+    {
+      "metric_group": "Performance",
+      "name": "nginx_accepts_rate",
+      "display_name": "Connection Acceptance Rate",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "description": "Rate of new connections accepted by Nginx, reflecting connection establishment frequency",
+      "query": "rate(nginx_accepts{__$labels__}[5m])"
+    },
+    {
+      "metric_group": "Performance",
+      "name": "nginx_handled_rate",
+      "display_name": "Connection Handling Rate",
+      "instance_id_keys": ["instance_id"],
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [],
+      "description": "Rate of connections handled by Nginx, reflecting connection processing capacity",
+      "query": "rate(nginx_handled{__$labels__}[5m])"
+    }
+  ]
+}

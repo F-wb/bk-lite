@@ -1,0 +1,755 @@
+import type {
+  SnmpTopologyFormValues,
+  TopologyFallbackStrategy,
+  TopologyProtocol,
+  TopologyTaskParams,
+} from '@/app/cmdb/types/autoDiscovery';
+
+export type ExecStatusKey = 'add' | 'update' | 'delete';
+
+export interface ExecStatus {
+  color: string;
+  text: string;
+}
+
+type ExecStatusMapType = {
+  [K in ExecStatusKey]: ExecStatus;
+};
+
+export const createExecStatusMap = (
+  t: (key: string) => string
+): ExecStatusMapType => ({
+  add: {
+    color: 'success',
+    text: t('Collection.syncStatus.add'),
+  },
+  update: {
+    color: 'processing',
+    text: t('Collection.syncStatus.update'),
+  },
+  delete: {
+    color: 'error',
+    text: t('Collection.syncStatus.delete'),
+  },
+});
+
+export const EXEC_STATUS = {
+  UNEXECUTED: 0,
+  COLLECTING: 1,
+  SUCCESS: 2,
+  ERROR: 3,
+  TIMEOUT: 4,
+  WRITING: 5,
+  FORCE_STOP: 6,
+  PENDING_APPROVAL: 7,
+  PARTIAL_SUCCESS: 8,
+} as const;
+
+export type ExecStatusType = (typeof EXEC_STATUS)[keyof typeof EXEC_STATUS];
+
+export const getExecStatusConfig = (t: (key: string) => string) => ({
+  [EXEC_STATUS.UNEXECUTED]: {
+    text: t('Collection.syncStatus.unexecuted'),
+    color: 'var(--color-text-3)',
+  },
+  [EXEC_STATUS.COLLECTING]: {
+    text: t('Collection.syncStatus.collecting'),
+    color: 'var(--color-primary)',
+  },
+  [EXEC_STATUS.SUCCESS]: {
+    text: t('Collection.syncStatus.success'),
+    color: '#4ACF88',
+  },
+  [EXEC_STATUS.ERROR]: {
+    text: t('Collection.syncStatus.error'),
+    color: '#FF6A57',
+  },
+  [EXEC_STATUS.TIMEOUT]: {
+    text: t('Collection.syncStatus.timeout'),
+    color: '#FF6A57',
+  },
+  [EXEC_STATUS.WRITING]: {
+    text: t('Collection.syncStatus.writing'),
+    color: 'var(--color-primary)',
+  },
+  [EXEC_STATUS.FORCE_STOP]: {
+    text: t('Collection.syncStatus.forceStop'),
+    color: '#FF6A57',
+  },
+  [EXEC_STATUS.PENDING_APPROVAL]: {
+    text: t('Collection.syncStatus.pendingApproval'),
+    color: '#F7BA1E',
+  },
+  [EXEC_STATUS.PARTIAL_SUCCESS]: {
+    text: t('Collection.syncStatus.partialSuccess'),
+    color: '#F7BA1E',
+  },
+});
+
+export const CYCLE_OPTIONS = {
+  DAILY: 'timing',
+  INTERVAL: 'cycle',
+  ONCE: 'close',
+} as const;
+
+export const ENTER_TYPE = {
+  AUTOMATIC: 'automatic',
+  APPROVAL: 'approval',
+} as const;
+
+// 密码占位符，用于编辑时隐藏真实密码
+export const PASSWORD_PLACEHOLDER = '******';
+export const MAX_CREDENTIAL_POOL_SIZE = 3;
+export const DEFAULT_TOPOLOGY_PROTOCOLS: TopologyProtocol[] = [
+  'lldp',
+  'huawei_ndp',
+  'cdp',
+  'fdb',
+  'arp',
+];
+export const DEFAULT_TOPOLOGY_FALLBACK_STRATEGY: TopologyFallbackStrategy =
+  'prefer_neighbors_then_fdb_then_arp';
+export const DEFAULT_TOPOLOGY_MIN_CONFIDENCE = 0;
+export const DEFAULT_DEVICE_INTERVAL_MINUTES = 30;
+export const DEFAULT_TOPOLOGY_TIMEOUT_SECONDS = 600;
+export const recommendedTopologyIntervalMinutes = (deviceMinutes: number) =>
+  deviceMinutes * 5;
+export interface TopologyFactRowKeyFields {
+  source_protocol?: string;
+  instance_id?: string;
+  local_device_id?: string;
+  local_port_id?: string | number;
+  local_port_name?: string;
+  remote_device_id?: string;
+  remote_port_id?: string | number;
+  remote_port_name?: string;
+}
+
+export const buildTopologyFactRowKey = (
+  fact: TopologyFactRowKeyFields,
+  suffix?: string | number
+) =>
+  [
+    fact.source_protocol || 'protocol',
+    fact.local_device_id || fact.instance_id || 'unknown',
+    fact.local_port_id || fact.local_port_name || 'local',
+    fact.remote_device_id || 'remote',
+    fact.remote_port_id || fact.remote_port_name || 'port',
+    suffix,
+  ]
+    .filter((part) => part !== undefined && part !== null && part !== '')
+    .join('-');
+
+export const TOPOLOGY_PROTOCOL_OPTIONS: Array<{
+  value: TopologyProtocol;
+  labelKey: string;
+}> = [
+  { value: 'lldp', labelKey: 'Collection.SNMPTask.topologyProtocolOptions.lldp' },
+  {
+    value: 'huawei_ndp',
+    labelKey: 'Collection.SNMPTask.topologyProtocolOptions.huaweiNdp',
+  },
+  { value: 'cdp', labelKey: 'Collection.SNMPTask.topologyProtocolOptions.cdp' },
+  { value: 'fdb', labelKey: 'Collection.SNMPTask.topologyProtocolOptions.fdb' },
+  { value: 'arp', labelKey: 'Collection.SNMPTask.topologyProtocolOptions.arp' },
+];
+export const TOPOLOGY_FALLBACK_STRATEGY_OPTIONS: Array<{
+  value: TopologyFallbackStrategy;
+  labelKey: string;
+}> = [
+  {
+    value: 'prefer_neighbors_then_fdb_then_arp',
+    labelKey:
+      'Collection.SNMPTask.topologyFallbackStrategyOptions.prefer_neighbors_then_fdb_then_arp',
+  },
+  {
+    value: 'strict_neighbors_only',
+    labelKey:
+      'Collection.SNMPTask.topologyFallbackStrategyOptions.strict_neighbors_only',
+  },
+];
+
+export const getSnmpTopologyFormValues = (
+  params?: TopologyTaskParams,
+  deviceCycleMinutes = DEFAULT_DEVICE_INTERVAL_MINUTES
+): Required<SnmpTopologyFormValues> => {
+  const hasNetworkTopo = params?.has_network_topo ?? false;
+  const normalizedDeviceCycleMinutes =
+    Number.isInteger(deviceCycleMinutes) && deviceCycleMinutes > 0
+      ? deviceCycleMinutes
+      : DEFAULT_DEVICE_INTERVAL_MINUTES;
+  const hasPersistedInterval =
+    Number.isInteger(params?.topology_interval_minutes) &&
+    Number(params?.topology_interval_minutes) >= 1;
+  const hasPersistedMode =
+    params?.topology_interval_mode === 'recommended' ||
+    params?.topology_interval_mode === 'custom';
+
+  return {
+    hasNetworkTopo,
+    topologyIntervalMinutes: hasPersistedInterval
+      ? Number(params?.topology_interval_minutes)
+      : recommendedTopologyIntervalMinutes(normalizedDeviceCycleMinutes),
+    topologyIntervalMode:
+      hasPersistedInterval && hasPersistedMode
+        ? params.topology_interval_mode!
+        : 'recommended',
+    topologyTimeout: Number.isInteger(params?.topology_timeout) &&
+      Number(params?.topology_timeout) >= 1
+      ? Number(params?.topology_timeout)
+      : DEFAULT_TOPOLOGY_TIMEOUT_SECONDS,
+    topologyProtocols: params?.topology_protocols
+      ? [...params.topology_protocols]
+      : [...DEFAULT_TOPOLOGY_PROTOCOLS],
+    topologyFallbackStrategy:
+      params?.topology_fallback_strategy ??
+      DEFAULT_TOPOLOGY_FALLBACK_STRATEGY,
+    minConfidence:
+      params?.min_confidence ?? DEFAULT_TOPOLOGY_MIN_CONFIDENCE,
+  };
+};
+
+export const getTaskTopologyDisplayConfig = (
+  params?: TopologyTaskParams,
+  deviceCycleMinutes?: number
+): Required<SnmpTopologyFormValues> =>
+  getSnmpTopologyFormValues(params, deviceCycleMinutes);
+
+export const buildSnmpTopologyParams = (
+  values: SnmpTopologyFormValues
+): TopologyTaskParams => ({
+  has_network_topo: values.hasNetworkTopo ?? false,
+  topology_interval_minutes: values.topologyIntervalMinutes,
+  topology_interval_mode: values.topologyIntervalMode ?? 'recommended',
+  topology_timeout:
+    values.topologyTimeout ?? DEFAULT_TOPOLOGY_TIMEOUT_SECONDS,
+  topology_protocols: values.topologyProtocols
+    ? [...values.topologyProtocols]
+    : [...DEFAULT_TOPOLOGY_PROTOCOLS],
+  topology_fallback_strategy:
+    values.topologyFallbackStrategy ??
+    DEFAULT_TOPOLOGY_FALLBACK_STRATEGY,
+  min_confidence:
+    values.minConfidence ?? DEFAULT_TOPOLOGY_MIN_CONFIDENCE,
+});
+
+export const K8S_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalMinutes: 30,
+  intervalValue: 30,
+  timeout: 300,
+  cleanupStrategy: 'immediately',
+  cleanupDays: 3,
+  tolerations: null,
+};
+
+/** IP 表单 timeout 是所选子网整次正式扫描预算，单 IP 探测由插件固定为 5 秒。 */
+export const IP_DISCOVERY_MIN_TIMEOUT_SECONDS = 30;
+export const IP_DISCOVERY_FORM_INITIAL_VALUES = {
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 60,
+  scanMethod: 'icmp',
+  tcpPorts: '22,80,443,3389',
+  timeout: IP_DISCOVERY_MIN_TIMEOUT_SECONDS,
+  cleanupStrategy: 'no_cleanup',
+  cleanupDays: 3,
+};
+
+export const resolveIpDiscoveryFormTimeout = (
+  isCopy: boolean,
+  sourceTimeout?: number
+) =>
+  isCopy
+    ? IP_DISCOVERY_FORM_INITIAL_VALUES.timeout
+    : Number.isInteger(sourceTimeout) && Number(sourceTimeout) >= 1
+      ? Number(sourceTimeout)
+      : IP_DISCOVERY_FORM_INITIAL_VALUES.timeout;
+
+export const VM_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 30,
+  enterType: ENTER_TYPE.AUTOMATIC,
+  port: '443',
+  timeout: 600,
+  sslVerify: false,
+  cleanupStrategy: 'after_expiration',
+  cleanupDays: 3,
+};
+
+export const SNMP_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 30,
+  enterType: ENTER_TYPE.AUTOMATIC,
+  version: 'v2',
+  snmp_port: '161',
+  timeout: 30,
+  integrity: 'sha',
+  privacy: 'aes',
+  hasNetworkTopo: true,
+  topologyIntervalMinutes: recommendedTopologyIntervalMinutes(
+    DEFAULT_DEVICE_INTERVAL_MINUTES
+  ),
+  topologyIntervalMode: 'recommended',
+  topologyTimeout: DEFAULT_TOPOLOGY_TIMEOUT_SECONDS,
+  topologyProtocols: [...DEFAULT_TOPOLOGY_PROTOCOLS],
+  topologyFallbackStrategy: DEFAULT_TOPOLOGY_FALLBACK_STRATEGY,
+  minConfidence: DEFAULT_TOPOLOGY_MIN_CONFIDENCE,
+  cleanupStrategy: 'no_cleanup',
+  cleanupDays: 3,
+};
+
+export const SNMP_INTEGRITY_OPTIONS = [
+  { value: 'sha', label: 'SHA-1' },
+  { value: 'sha224', label: 'SHA-224' },
+  { value: 'sha256', label: 'SHA-256' },
+  { value: 'sha384', label: 'SHA-384' },
+  { value: 'sha512', label: 'SHA-512' },
+  { value: 'md5', label: 'MD5' },
+] as const;
+
+export const SNMP_PRIVACY_OPTIONS = [
+  { value: 'aes', label: 'AES-128' },
+  { value: 'aes256', label: 'AES-256' },
+  { value: 'des', label: 'DES' },
+] as const;
+
+export const SQL_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 30,
+  enterType: ENTER_TYPE.AUTOMATIC,
+  name: '',
+  database: '',
+  password: '',
+  port: '3306',
+  timeout: 60,
+  cleanupStrategy: 'no_cleanup',
+  cleanupDays: 3,
+};
+
+export const CLOUD_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 30,
+  enterType: ENTER_TYPE.APPROVAL,
+  accessKey: '',
+  accessSecret: '',
+  regionId: '',
+  timeout: 600,
+  cleanupStrategy: 'after_expiration',
+  cleanupDays: 3,
+};
+
+const resolveFormTimeout = (value: number | undefined, fallback: number) =>
+  Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 86400
+    ? Number(value)
+    : fallback;
+
+export const getCloudFormInitialValues = (defaultTimeout?: number) => ({
+  ...CLOUD_FORM_INITIAL_VALUES,
+  timeout: resolveFormTimeout(defaultTimeout, CLOUD_FORM_INITIAL_VALUES.timeout),
+});
+
+/** FusionInsight / OceanStor / 华三 UIS 等平台 HTTPS API 采集表单默认值 */
+export const PLATFORM_API_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 30,
+  enterType: ENTER_TYPE.AUTOMATIC,
+  timeout: 300,
+  cleanupStrategy: 'no_cleanup',
+  cleanupDays: 3,
+};
+
+/** 优先使用采集对象元数据 default_timeout（如深信服 SCP/HCI=3000）。 */
+export const getPlatformApiFormInitialValues = (defaultTimeout?: number) => ({
+  ...PLATFORM_API_FORM_INITIAL_VALUES,
+  timeout: resolveFormTimeout(
+    defaultTimeout,
+    PLATFORM_API_FORM_INITIAL_VALUES.timeout
+  ),
+});
+
+export const HOST_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 30,
+  enterType: ENTER_TYPE.AUTOMATIC,
+  username: '',
+  password: '',
+  port: '22',
+  timeout: 120,
+  cleanupStrategy: 'no_cleanup',
+  cleanupDays: 3,
+};
+
+export const PC_FORM_INITIAL_VALUES = {
+  instUuid: undefined,
+  cycle: CYCLE_OPTIONS.INTERVAL,
+  intervalValue: 30,
+  enterType: ENTER_TYPE.AUTOMATIC,
+  osType: 'windows',
+  timeout: 180,
+  cleanupStrategy: 'immediately',
+  cleanupDays: 3,
+};
+
+export const CONFIG_FILE_FORM_INITIAL_VALUES = {
+  ...HOST_FORM_INITIAL_VALUES,
+  intervalValue: 15,
+  configFilePath: '',
+};
+
+export const NETWORK_CONFIG_FILE_FORM_INITIAL_VALUES = {
+  ...HOST_FORM_INITIAL_VALUES,
+  intervalValue: 60,
+  timeout: 180,
+  configName: '',
+  commands: '',
+  needEnable: false,
+  credentialPool: [{ port: '22' }],
+};
+
+export const NETWORK_CONFIG_SUPPORTED_BRANDS = [
+  '华为',
+  'Huawei',
+  'H3C',
+  'HP Comware',
+  'Cisco',
+  'Juniper',
+  'F5',
+  'Fortinet',
+];
+
+const NETWORK_CONFIG_BRAND_ALIASES = new Set(
+  NETWORK_CONFIG_SUPPORTED_BRANDS.map((item) => item.toLowerCase())
+);
+
+const DANGEROUS_EXACT_COMMANDS = new Set(['conf t', 'write erase']);
+const DANGEROUS_COMMAND_PREFIXES = new Set([
+  'configure',
+  'reload',
+  'reboot',
+  'reset',
+  'delete',
+  'erase',
+  'format',
+  'copy',
+  'scp',
+  'tftp',
+  'ftp',
+  'install',
+  'upgrade',
+  'commit',
+  'save',
+  'shutdown',
+  'undo',
+  'set',
+]);
+
+export const normalizeNetworkConfigBrand = (brand?: string) =>
+  String(brand || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+export const isSupportedNetworkConfigBrand = (brand?: string) =>
+  NETWORK_CONFIG_BRAND_ALIASES.has(normalizeNetworkConfigBrand(brand));
+
+type Translate = (
+  id: string,
+  fallback?: string,
+  values?: Record<string, string>
+) => string;
+
+export const validateNetworkConfigCommands = (
+  value: string,
+  t: Translate = (_id, fallback) => fallback || _id
+) => {
+  const commands = (value || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!commands.length) {
+    return t('Collection.networkConfigFileTask.commandsRequired', '请输入采集命令');
+  }
+  const badCommand = commands.find((command) => {
+    const lowered = command.toLowerCase().replace(/\s+/g, ' ');
+    const firstWord = lowered.split(' ')[0];
+    return DANGEROUS_EXACT_COMMANDS.has(lowered) || DANGEROUS_COMMAND_PREFIXES.has(firstWord);
+  });
+  return badCommand
+    ? t(
+      'Collection.networkConfigFileTask.dangerousCommand',
+      '命令存在高危操作：{command}',
+      { command: badCommand }
+    )
+    : '';
+};
+
+export const validateCycleTime = (
+  type: string,
+  value: any,
+  message: string
+) => {
+  if (!value && (type === 'daily' || type === 'every')) {
+    return Promise.reject(new Error(message));
+  }
+  return Promise.resolve();
+};
+
+export type AlertType = 'info' | 'warning' | 'error';
+
+export interface TabConfig {
+  count: number;
+  label: string;
+  alertType: AlertType;
+  columns: {
+    title: string;
+    dataIndex: string;
+    width?: number;
+  }[];
+}
+interface ValidationContext {
+  form: any;
+  t: (key: string) => string;
+  taskType?: string;
+}
+
+const baseValidators = {
+  required: (message: string) => ({ required: true, message }),
+};
+
+const cycleValidators = (context: ValidationContext) => ({
+  dailyTime: [
+    {
+      validator: (_: any, value: any) => {
+        const cycle = context.form.getFieldValue('cycle');
+        if (cycle === CYCLE_OPTIONS.DAILY && !value) {
+          return Promise.reject(new Error(context.t('Collection.selectTime')));
+        }
+        return Promise.resolve();
+      },
+    },
+  ],
+  intervalValue: [
+    {
+      validator: (_: any, value: any) => {
+        const cycle = context.form.getFieldValue('cycle');
+        if (cycle === CYCLE_OPTIONS.INTERVAL && !value) {
+          return Promise.reject(
+            new Error(context.t('Collection.k8sTask.intervalRequired'))
+          );
+        }
+        if (cycle === CYCLE_OPTIONS.INTERVAL && Number(value) < 1) {
+          return Promise.reject(new Error(context.t('Collection.everyMinuteMin')));
+        }
+        return Promise.resolve();
+      },
+    },
+  ],
+});
+
+export const createTaskValidationRules = (context: ValidationContext) => {
+  const { t, form, taskType } = context;
+
+  const baseRules = {
+    taskName: [
+      baseValidators.required(
+        `${t('common.inputMsg')}${t('Collection.taskNameLabel')}`
+      ),
+    ],
+    cycle: [
+      baseValidators.required(
+        `${t('common.selectMsg')}${t('Collection.cycle')}`
+      ),
+    ],
+    instUuid: [baseValidators.required(`${t('required')}`)],
+    timeout: [
+      baseValidators.required(
+        `${t('common.inputMsg')}${t('Collection.timeout')}`
+      ),
+    ],
+    ...cycleValidators(context),
+    assetInst: [
+      {
+        validator: () => {
+          const selectedData = form.getFieldValue('assetInst');
+          if (!selectedData?.length) {
+            return Promise.reject(new Error(t('required')));
+          }
+          return Promise.resolve();
+        }
+      }
+    ],
+  };
+
+  if (taskType === 'vm') {
+    return {
+      ...baseRules,
+      enterType: [
+        baseValidators.required(
+          `${t('common.selectMsg')}${t('Collection.enterType')}`
+        ),
+      ],
+      accessPointId: [
+        baseValidators.required(
+          `${t('common.selectMsg')}${t('Collection.accessPoint')}`
+        ),
+      ],
+      username: [
+        baseValidators.required(
+          `${t('common.inputMsg')}${t('Collection.VMTask.username')}`
+        ),
+      ],
+      password: [
+        baseValidators.required(
+          `${t('common.inputMsg')}${t('Collection.VMTask.password')}`
+        ),
+      ],
+      port: [
+        baseValidators.required(
+          `${t('common.inputMsg')}${t('Collection.port')}`
+        ),
+      ],
+      sslVerify: [
+        baseValidators.required(
+          `${t('common.selectMsg')}${t('Collection.VMTask.sslVerify')}`
+        ),
+      ],
+    };
+  }
+
+  if (taskType === 'snmp') {
+    return {
+      ...baseRules,
+      enterType: [
+        baseValidators.required(
+          `${t('common.selectMsg')}${t('Collection.enterType')}`
+        ),
+      ],
+      snmpVersion: [
+        baseValidators.required(
+          `${t('common.selectMsg')}${t('Collection.SNMPTask.version')}`
+        ),
+      ],
+      port: [
+        baseValidators.required(
+          `${t('common.inputMsg')}${t('Collection.port')}`
+        ),
+      ],
+      communityString: [
+        {
+          validator: (_: any, value: any) => {
+            const version = context.form.getFieldValue('version');
+            if (['v2', 'v2C'].includes(version) && !value) {
+              return Promise.reject(
+                new Error(
+                  `${t('common.inputMsg')}${t('Collection.SNMPTask.communityString')}`
+                )
+              );
+            }
+            return Promise.resolve();
+          },
+        },
+      ],
+      userName: [
+        {
+          validator: (_: any, value: any) => {
+            const version = context.form.getFieldValue('version');
+            if (version === 'v3' && !value) {
+              return Promise.reject(
+                new Error(
+                  `${t('common.inputMsg')}${t('Collection.SNMPTask.userName')}`
+                )
+              );
+            }
+            return Promise.resolve();
+          },
+        },
+      ],
+      authPassword: [
+        {
+          validator: (_: any, value: any) => {
+            const version = context.form.getFieldValue('snmpVersion');
+            if (version === 'v3' && !value) {
+              return Promise.reject(
+                new Error(
+                  `${t('common.inputMsg')}${t('Collection.SNMPTask.authPassword')}`
+                )
+              );
+            }
+            return Promise.resolve();
+          },
+        },
+      ],
+      encryptKey: [
+        {
+          validator: (_: any, value: any) => {
+            const version = context.form.getFieldValue('version');
+            const securityLevel = context.form.getFieldValue('level');
+            if (version === 'v3' && securityLevel === 'authPriv' && !value) {
+              return Promise.reject(
+                new Error(
+                  `${t('common.inputMsg')}${t('Collection.SNMPTask.encryptKey')}`
+                )
+              );
+            }
+            return Promise.resolve();
+          },
+        },
+      ],
+    };
+  }
+
+  return baseRules;
+};
+
+export const CREATE_TASK_DETAIL_CONFIG = (t: (key: string) => string) => ({
+  add: {
+    count: 0,
+    label: t('Collection.syncStatus.add'),
+    alertType: 'warning',
+    columns: [
+      { title: t('Collection.objectType'), dataIndex: 'model_id', width: 140 },
+      { title: t('Collection.instanceName'), dataIndex: 'inst_name', width: 250 },
+    ],
+  },
+  update: {
+    count: 4,
+    label: t('Collection.syncStatus.update'),
+    alertType: 'warning',
+    columns: [
+      { title: t('Collection.objectType'), dataIndex: 'model_id', width: 140 },
+      { title: t('Collection.instanceName'), dataIndex: 'inst_name', width: 250 },
+    ],
+  },
+  delete: {
+    count: 3,
+    label: t('Collection.syncStatus.delete'),
+    alertType: 'warning',
+    columns: [
+      { title: t('Collection.objectType'), dataIndex: 'model_id', width: 140 },
+      { title: t('Collection.instanceName'), dataIndex: 'inst_name', width: 250 },
+    ],
+  },
+});
+
+export const getNetworkDeviceOptions = (t: (key: string) => string) => [
+  {
+    key: 'switch',
+    label: t('Collection.networkDevice.switch'),
+  },
+  {
+    key: 'router',
+    label: t('Collection.networkDevice.router'),
+  },
+  {
+    key: 'firewall',
+    label: t('Collection.networkDevice.firewall'),
+  },
+  {
+    key: 'loadbalance',
+    label: t('Collection.networkDevice.loadbalance'),
+  },
+]

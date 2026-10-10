@@ -1,0 +1,97 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_bintec"
+        config_type = "bintec"
+        brand = "bintec"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB) + 64-bit HC ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- Bintec CPU（cpuTable cpuLoadIdle60s，INDEX cpuNumber；usage=100-idle）----
+    [[inputs.snmp.table]]
+        name = "device_cpu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.272.4.17.4.1.1.18"
+        name = "idle"
+    # ---- Bintec DRAM 内存（memoryType=dram 实例 GET：memoryTotal / memoryInuse，字节）----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.272.4.17.4.2.1.4.2"
+        name = "device_memory_total"
+        conversion = "int"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.272.4.17.4.2.1.5.2"
+        name = "device_memory_used"
+        conversion = "int"
+# ---- 温度/风扇/电源：私有 MIB 未提供温度/风扇/电源 → N/A。----
+
+[[processors.starlark]]
+    namepass = ["device_cpu"]
+    source = '''
+def apply(metric):
+    idle = metric.fields.get("idle")
+    if idle != None:
+        metric.fields["usage"] = 100 - idle
+        metric.fields.pop("idle", None)
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["bintec"]
+
+[[processors.starlark]]
+    namepass = ["snmp"]
+    source = '''
+def apply(metric):
+    total = metric.fields.get("device_memory_total")
+    used = metric.fields.get("device_memory_used")
+    if total != None and used != None:
+        metric.fields["device_memory_free"] = total - used
+    return metric
+'''
+    [processors.starlark.tagpass]
+        brand = ["bintec"]

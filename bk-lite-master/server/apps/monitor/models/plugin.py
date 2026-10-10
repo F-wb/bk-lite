@@ -1,0 +1,49 @@
+from django.db import models
+
+from apps.core.models.maintainer_info import MaintainerInfo
+from apps.core.models.time_info import TimeInfo
+from apps.monitor.models.monitor_object import MonitorObject
+
+
+class MonitorPlugin(TimeInfo, MaintainerInfo):
+    monitor_object = models.ManyToManyField(MonitorObject, verbose_name="监控对象")
+    name = models.CharField(unique=True, max_length=100, verbose_name="插件名称")
+    display_name = models.CharField(max_length=100, default="", verbose_name="插件展示名称")
+    template_id = models.CharField(max_length=100, null=True, blank=True, unique=True, verbose_name="模板ID")
+    template_type = models.CharField(max_length=50, default="builtin", verbose_name="模板类型")
+    collector = models.CharField(max_length=100, default="", verbose_name="采集器名称")
+    collect_type = models.CharField(max_length=50, default="", verbose_name="采集类型")
+    node_selector = models.JSONField(default=dict, blank=True, verbose_name="节点选择约束")
+    instance_fact_bindings = models.JSONField(default=list, blank=True, verbose_name="实例事实绑定")
+    support_collect_detect = models.BooleanField(default=False, verbose_name="是否支持接入前采集检测")
+    description = models.TextField(blank=True, verbose_name="插件描述")
+    status_query = models.TextField(blank=True, verbose_name="状态查询语句(PromQL)")
+    is_pre = models.BooleanField(default=True, verbose_name="是否内置")
+    pack_version = models.CharField(max_length=100, blank=True, default="", verbose_name="导入的探针包版本")
+    pack_content_sha256 = models.CharField(max_length=64, blank=True, default="", verbose_name="导入包内容哈希")
+
+    class Meta:
+        verbose_name = "监控插件"
+        verbose_name_plural = "监控插件"
+
+
+class MonitorPluginConfigTemplate(TimeInfo, MaintainerInfo):
+    plugin = models.ForeignKey(MonitorPlugin, on_delete=models.CASCADE, verbose_name="监控插件")
+    type = models.CharField(max_length=50, verbose_name="模板类型")
+    config_type = models.CharField(max_length=50, default="", verbose_name="配置类型")
+    file_type = models.CharField(max_length=50, default="", verbose_name="文件类型")
+    content = models.TextField(verbose_name="模板内容")
+
+    class Meta:
+        verbose_name = "监控插件配置模板"
+        verbose_name_plural = "监控插件配置模板"
+        unique_together = ("plugin", "type", "config_type", "file_type")
+
+
+class MonitorPluginUITemplate(TimeInfo, MaintainerInfo):
+    plugin = models.ForeignKey(MonitorPlugin, on_delete=models.CASCADE, verbose_name="监控插件")
+    content = models.JSONField(default=dict, verbose_name="模版内容")
+
+    class Meta:
+        verbose_name = "监控插件UI模板"
+        verbose_name_plural = "监控插件UI模板"

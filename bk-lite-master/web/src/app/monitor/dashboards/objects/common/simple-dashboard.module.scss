@@ -1,0 +1,2018 @@
+.page {
+  // 仪表盘外壳填满 DashboardLayout 的 .content(已是 flex:1 + overflow:auto 的滚动容器)。
+  // 不再用 calc(100vh-88px) + 自身 overflow:auto —— 那会形成「.content 与 .page 两层嵌套滚动」,
+  // 且固定视口高比 .content 实际可用高更高,溢出后由 .content 再滚一层(外层滚动条),并在底部留白。
+  // min-height:100% 保证内容不足时背景铺满,内容超出时由 .content 单一滚动条接管。
+  min-height: 100%;
+  width: 100%;
+  background: var(--color-background-body);
+  color: var(--color-text-1);
+  font-family: Inter, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+.shell {
+  width: 100%;
+  padding: 16px 20px 24px;
+  box-sizing: border-box;
+}
+
+// 区块小标题：各对象盘复用，避免每盘复制硬编码灰字。
+.sectionLabel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 2px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--color-text-1);
+}
+
+.sectionLabel::before {
+  content: '';
+  display: inline-block;
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--color-primary);
+  flex-shrink: 0;
+}
+
+.dashboardSection + .sectionLabel {
+  margin-top: 22px;
+}
+
+.page :global(.ant-spin-nested-loading),
+.page :global(.ant-spin-container) {
+  width: 100%;
+}
+
+.pageHeader {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 16px 20px 14px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.03), 0 1px 2px -1px rgba(15, 23, 42, 0.02);
+  transition: border-color 0.15s ease;
+}
+
+.pageHeader:hover {
+  border-color: color-mix(in srgb, var(--color-primary) 18%, var(--color-border));
+}
+
+.protocolBar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 8px 0 16px;
+  padding: 0 2px;
+  // 切换路由/刷新插件时保留高度，避免采集视图条消失导致内容区跳动。
+  min-height: 32px;
+}
+
+.protocolBarLabel {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-3);
+  white-space: nowrap;
+}
+
+// 采集视图 Segmented：容器贴近页面渐变底，选中项白色高亮 + 主题色文字，弱化边框。
+.protocolSegmented {
+  height: 32px;
+  padding: 2px !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--color-border);
+  background: var(--color-fill-1) !important;
+}
+
+.protocolSegmented :global(.ant-segmented-item) {
+  min-height: 26px;
+  line-height: 26px;
+  border-radius: 6px !important;
+  color: var(--color-text-3);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.protocolSegmented :global(.ant-segmented-item-selected) {
+  color: var(--color-primary) !important;
+  background: var(--color-bg) !important;
+  box-shadow: none;
+}
+
+.protocolSegmented :global(.ant-segmented-thumb) {
+  border-radius: 6px !important;
+  background: var(--color-bg) !important;
+  box-shadow: none;
+}
+
+.protocolSegmented :global(.ant-segmented-item:hover:not(.ant-segmented-item-selected)) {
+  color: var(--color-text-1);
+}
+
+.pageTitleRow {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 0;
+}
+
+.titleBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.titleControlsRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.breadcrumb {
+  margin-bottom: 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.title {
+  margin: 0;
+  color: var(--color-text-1);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  min-width: 0;
+  flex: 1;
+}
+
+.controlsWrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+// 视图模式切换：Ant Design Segmented，单层边框，不与下方控件叠套。
+.modeSegmented {
+  height: 32px;
+  padding: 2px !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--color-border);
+  background: var(--color-fill-1) !important;
+}
+
+.modeSegmented :global(.ant-segmented-item) {
+  min-height: 26px;
+  line-height: 26px;
+  border-radius: 6px !important;
+  color: var(--color-text-3);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.modeSegmented :global(.ant-segmented-item-selected) {
+  color: var(--color-text-1) !important;
+  background: var(--color-bg) !important;
+  box-shadow: none;
+}
+
+.modeSegmented :global(.ant-segmented-thumb) {
+  border-radius: 6px !important;
+  background: var(--color-bg) !important;
+  box-shadow: none;
+}
+
+.toolbarTimeSelector {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.toolbarTimeSelector > div {
+  align-items: center;
+  display: flex;
+}
+
+// 时间组合区：只约束 Select / 可见 RangePicker 外观，二者同槽位单层边框。
+// 禁止改 picker dropdown 的 panel 结构样式，避免弹出层「双层方框」。
+.toolbarTimeSelector > div > div:first-child {
+  position: relative;
+  width: 220px;
+  overflow: visible;
+  transition: width 0.15s ease;
+}
+
+.toolbarTimeSelector > div > div:first-child :global(.ant-select),
+.toolbarTimeSelector > div > div:first-child :global(.ant-picker) {
+  width: 100% !important;
+}
+
+// 自定义面板打开中或已确认自定义：加宽以完整显示起止时间。
+.toolbarTimeSelector > div[class*='customActive'] > div:first-child,
+.toolbarTimeSelector > div[class*='pickerVisible'] > div:first-child {
+  width: 340px;
+}
+
+.toolbarTimeSelector > div > div:first-child :global(.ant-select-selector),
+.toolbarTimeSelector > div[class*='pickerVisible'] > div:first-child :global(.ant-picker) {
+  min-height: 32px !important;
+  height: 32px !important;
+  border: 1px solid var(--color-border) !important;
+  border-radius: 8px !important;
+  background: var(--color-bg) !important;
+  box-shadow: none !important;
+}
+
+.toolbarTimeSelector > div > div:first-child :global(.ant-picker-focused),
+.toolbarTimeSelector > div[class*='pickerVisible'] > div:first-child :global(.ant-picker-focused) {
+  border-color: var(--color-primary) !important;
+}
+
+.toolbarTimeSelector > div > div:first-child :global(.ant-picker-input > input) {
+  font-size: 12px;
+}
+
+.toolbarTimeSelector > div > div:first-child :global(.ant-select-selection-item),
+.toolbarTimeSelector > div > div:first-child :global(.ant-select-selection-placeholder) {
+  color: var(--color-text-2) !important;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 30px !important;
+}
+
+// RangePicker 自带的后缀日历隐藏，统一用外层 CalendarOutlined，避免右侧再套一层图标框。
+.toolbarTimeSelector > div > div:first-child :global(.ant-picker-suffix) {
+  display: none !important;
+}
+
+// 刷新组：与时间选择器并排，单层边框，内部发丝分隔。
+.toolbarTimeSelector > div > div:last-child {
+  margin-left: 8px !important;
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg);
+  overflow: hidden;
+}
+
+.toolbarTimeSelector > div > div:last-child :global(.ant-btn) {
+  height: 100% !important;
+  border: none !important;
+  border-right: 1px solid var(--color-border) !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--color-text-3) !important;
+  padding: 0 10px !important;
+}
+
+.toolbarTimeSelector > div > div:last-child :global(.ant-btn:hover) {
+  color: var(--color-primary) !important;
+  background: var(--color-fill-1) !important;
+}
+
+.toolbarTimeSelector > div > div:last-child :global(.ant-select) {
+  width: 96px !important;
+}
+
+.toolbarTimeSelector > div > div:last-child :global(.ant-select-selector) {
+  min-height: 30px !important;
+  height: 30px !important;
+  border: none !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.toolbarTimeSelector > div > div:last-child :global(.ant-select-selection-item),
+.toolbarTimeSelector > div > div:last-child :global(.ant-select-selection-placeholder) {
+  color: var(--color-text-2) !important;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 30px !important;
+}
+
+.toolbarBackBtn {
+  height: 32px !important;
+  padding-inline: 12px !important;
+  border-radius: 6px !important;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-2) !important;
+  border: 1px solid var(--color-border) !important;
+  background: var(--color-bg) !important;
+  transition: all 0.15s ease;
+}
+
+.toolbarBackBtn:hover {
+  color: var(--color-primary) !important;
+  border-color: var(--color-primary) !important;
+  background: var(--color-bg) !important;
+}
+
+.instanceCard {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 12px;
+  padding-bottom: 0;
+  border-top: 1px solid var(--color-border-1);
+  border-bottom: none;
+  min-width: 0;
+}
+
+.instanceMain {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
+}
+
+.instanceIcon {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-primary);
+  font-size: 19px;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--color-primary) 10%, var(--color-bg));
+  border: none;
+  box-shadow: none;
+}
+
+.meta {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+  color: var(--color-text-3);
+  min-width: 0;
+}
+
+.instanceName {
+  color: var(--color-text-1);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  word-break: break-word;
+  margin-right: 4px;
+}
+
+.instanceInfo {
+  min-width: 0;
+  flex: 1;
+}
+
+.instanceActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.instanceSelectorField {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.instanceSelectorLabel {
+  color: var(--color-text-3);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.instanceMetaInline {
+  color: var(--color-text-3);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.4;
+  background: transparent;
+  border: none;
+  padding: 0;
+  white-space: nowrap;
+}
+
+.instanceMetaInline:first-of-type {
+  color: var(--color-text-2);
+  font-weight: 500;
+}
+
+.instanceMetaDivider {
+  // 隐藏共享组件硬编码的竖线字符，改用更轻的中点分隔。
+  font-size: 0;
+  line-height: 1;
+}
+
+.instanceMetaDivider::before {
+  content: '·';
+  color: var(--color-text-4);
+  font-size: 14px;
+  font-weight: 700;
+  margin: 0 3px;
+}
+
+// 次要环境信息（实例ID、时区等）：弱化为浅灰常规字重。
+.instanceMetaMuted {
+  color: var(--color-text-3);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.35;
+  min-width: 0;
+}
+
+.inlineInstanceSelector {
+  width: 170px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  transition: border-color 0.15s ease;
+}
+
+.inlineInstanceSelector:hover {
+  border-color: var(--color-primary);
+}
+
+.inlineInstanceSelector :global(.ant-select-selector) {
+  min-height: 32px !important;
+  height: 32px !important;
+  padding: 0 20px 0 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.inlineInstanceSelector :global(.ant-select-selection-item),
+.inlineInstanceSelector :global(.ant-select-selection-placeholder) {
+  color: var(--color-text-2) !important;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 30px !important;
+}
+
+.inlineInstanceSelector :global(.ant-select-item-option-content) {
+  color: var(--color-text-1);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.inlineInstanceSelector :global(.ant-select-arrow) {
+  color: var(--color-text-4);
+}
+
+// 身份/状态胶囊组的横向布局（胶囊配色由各仪表盘按品牌自定义）。
+.instanceIdentityGroup {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.primaryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.statCard,
+.panel {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.04), 0 1px 2px -1px rgba(15, 23, 42, 0.02);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.statCard:hover,
+.panel:hover {
+  border-color: color-mix(in srgb, var(--color-primary) 22%, var(--color-border));
+  box-shadow: 0 4px 12px -2px rgba(15, 23, 42, 0.06), 0 2px 4px -2px rgba(15, 23, 42, 0.02);
+}
+
+.statCard {
+  // 收紧卡高:内容自然高度即可,sparkline 由 margin-top:auto 钉底,不再被强行拉空。
+  min-height: 156px;
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.statHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.statLabel {
+  color: var(--color-text-1);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.statIcon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 15px;
+}
+
+.statBody {
+  // 不再 flex:1 + space-between 撑开:内容(值/对比/footer)按自然高度紧凑堆叠在顶部,
+  // 余量交给 .miniTrend 的 margin-top:auto 钉到卡底,消除文字之间的大块空白。
+  margin-top: 8px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.statValue {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--color-text-1);
+  letter-spacing: -0.02em;
+  word-break: break-word;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+  font-variant-numeric: tabular-nums;
+  min-height: 34px;
+}
+
+.statUnit {
+  margin-left: 2px;
+  color: var(--color-text-2);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.statCompare {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-height: 18px;
+  color: var(--color-text-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.statComparePositive .statCompareValue {
+  color: var(--color-fail);
+}
+
+.statCompareNegative .statCompareValue {
+  color: var(--color-success);
+}
+
+.statCompareFlat .statCompareValue {
+  color: var(--color-text-4);
+}
+
+.statMeta {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  line-height: 1.4;
+  // 仅按内容占高,不再预留过多高度。
+  min-height: 18px;
+  align-content: flex-start;
+}
+
+.statMetaItem {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.statMetaLabel {
+  color: var(--color-text-3);
+  font-weight: 400;
+}
+
+.statMetaValue {
+  color: var(--color-text-2);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.miniTrend {
+  height: 52px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-radius: 8px;
+  overflow: hidden;
+  opacity: 0.95;
+}
+
+// ── 运行时长卡片专用样式 ──────────────────────────────────
+
+.statCardRelaxed {
+  padding-top: 18px;
+}
+
+.statBodyRelaxed {
+  margin-top: 22px;
+  justify-content: flex-start;
+}
+
+.statExtra {
+  margin-top: auto;
+  padding-top: 10px;
+}
+
+.uptimeStatus {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 40px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--color-fill-1);
+  border: 1px solid var(--color-border);
+}
+
+.uptimeStatusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-text-4);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-text-4) 16%, transparent);
+}
+
+.uptimeStatusMain {
+  color: var(--color-text-2);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.uptimeStatusMainWrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.uptimeStatusSuccess {
+  background: color-mix(in srgb, var(--color-success) 6%, var(--color-bg));
+  border-color: color-mix(in srgb, var(--color-success) 24%, var(--color-border));
+}
+
+.uptimeStatusSuccess .uptimeStatusMain {
+  color: var(--color-success);
+}
+
+.uptimeStatusSuccess .uptimeStatusDot {
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 18%, transparent);
+}
+
+.uptimeStatusWarning {
+  background: color-mix(in srgb, var(--color-warning, #faad14) 7%, var(--color-bg));
+  border-color: color-mix(in srgb, var(--color-warning, #faad14) 26%, var(--color-border));
+}
+
+.uptimeStatusWarning .uptimeStatusMain {
+  color: var(--color-warning, #faad14);
+}
+
+.uptimeStatusWarning .uptimeStatusDot {
+  background: var(--color-warning, #faad14);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-warning, #faad14) 18%, transparent);
+}
+
+.uptimeStatusEmpty .uptimeStatusMain {
+  color: var(--color-text-3);
+}
+
+.miniTrendPlaceholder {
+  width: 100%;
+  height: 100%;
+}
+
+.collectionStatusCard {
+  // 与同排 StatCard 等高由 grid stretch 对齐；内容高度跟随共享壳。
+  justify-content: flex-start;
+  min-height: 122px;
+}
+
+.collectionStatusHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.collectionStatusHeaderIcon {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 14px;
+  border: none;
+  box-shadow: none;
+  transition: all 0.2s ease;
+}
+
+.collectionStatusHeaderIconSuccess {
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+  color: var(--color-success);
+}
+
+.collectionStatusHeaderIconWarning {
+  background: color-mix(in srgb, var(--color-warning, #faad14) 12%, transparent);
+  color: var(--color-warning, #faad14);
+}
+
+.collectionStatusHeaderIconError {
+  background: color-mix(in srgb, var(--color-fail) 12%, transparent);
+  color: var(--color-fail);
+}
+
+.collectionStatusHeaderIconEmpty {
+  background: var(--color-fill-2);
+  color: var(--color-text-4);
+}
+
+.collectionStatusPulseDot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.collectionStatusHeaderIconSuccess .collectionStatusPulseDot {
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-success) 60%, transparent);
+  animation: collectionStatusPulse 2s infinite ease-out;
+}
+
+@keyframes collectionStatusPulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-success) 60%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-success) 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-success) 0%, transparent);
+  }
+}
+
+.collectionStatusBody {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 4px;
+}
+
+.collectionStatusHeadlineRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-height: 28px;
+}
+
+.collectionStatusPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  border: 1px solid transparent;
+}
+
+.collectionStatusPillDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.collectionStatusPillSuccess {
+  background: color-mix(in srgb, var(--color-success) 10%, var(--color-bg));
+  color: var(--color-success);
+  border-color: color-mix(in srgb, var(--color-success) 24%, transparent);
+}
+
+.collectionStatusPillSuccess .collectionStatusPillDot {
+  background: var(--color-success);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-success) 22%, transparent);
+}
+
+.collectionStatusPillError {
+  background: color-mix(in srgb, var(--color-fail) 10%, var(--color-bg));
+  color: var(--color-fail);
+  border-color: color-mix(in srgb, var(--color-fail) 24%, transparent);
+}
+
+.collectionStatusPillError .collectionStatusPillDot {
+  background: var(--color-fail);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-fail) 22%, transparent);
+}
+
+.collectionStatusPillWarning {
+  background: color-mix(in srgb, var(--color-warning, #faad14) 10%, var(--color-bg));
+  color: var(--color-warning, #faad14);
+  border-color: color-mix(in srgb, var(--color-warning, #faad14) 24%, transparent);
+}
+
+.collectionStatusPillEmpty {
+  background: var(--color-fill-1);
+  color: var(--color-text-3);
+  border-color: var(--color-border);
+}
+
+.collectionStatusPillEmpty .collectionStatusPillDot {
+  background: var(--color-text-4);
+}
+
+.collectionStatusTimelineBlock {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 6px;
+}
+
+.collectionStatusTimelineTitle {
+  margin-top: 0;
+  color: var(--color-text-3);
+  font-size: 11px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.collectionStatusTimelineHint {
+  flex-shrink: 0;
+  color: var(--color-text-4);
+  font-size: 11px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.collectionStatusTimeline {
+  display: grid;
+  grid-template-columns: repeat(18, minmax(0, 1fr));
+  gap: 3px;
+  align-items: center;
+  padding: 1px 0;
+}
+
+.collectionStatusSegment {
+  display: block;
+  min-width: 0;
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: var(--color-fill-3, var(--color-fill-2));
+  cursor: pointer;
+  transition: transform 0.15s ease, filter 0.15s ease;
+}
+
+.collectionStatusSegment:hover {
+  transform: scaleY(1.4);
+  filter: brightness(1.08);
+}
+
+.collectionStatusSegmentSuccess {
+  background: var(--color-success);
+  border-color: color-mix(in srgb, var(--color-success) 35%, transparent);
+}
+
+.collectionStatusSegmentError {
+  background: var(--color-fail);
+  border-color: color-mix(in srgb, var(--color-fail) 35%, transparent);
+}
+
+.collectionStatusSegmentWarning {
+  background: var(--color-warning, #faad14);
+  border-color: color-mix(in srgb, var(--color-warning, #faad14) 35%, transparent);
+}
+
+.collectionStatusSegmentEmpty {
+  background: var(--color-fill-3, var(--color-fill-2));
+  border-color: transparent;
+}
+
+.collectionStatusTimelineFooter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--color-text-4);
+  line-height: 1;
+  padding-top: 2px;
+}
+
+.collectionStatusTimelineScaleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.collectionStatusTimelineScale {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--color-text-4);
+  font-size: 11px;
+}
+
+.collectionStatusLegend {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  min-width: 0;
+  color: var(--color-text-3);
+  font-size: 11px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.collectionStatusLegendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.collectionStatusLegendDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sectionHeading {
+  margin-bottom: 14px;
+}
+
+.panelTitle {
+  margin: 0;
+  color: var(--color-text-1);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+
+.panelSubTitle {
+  margin-top: 2px;
+  color: var(--color-text-3);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.chartGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.panel {
+  min-width: 0;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+}
+
+.panelHeader.chartPanelHeader {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    'heading'
+    'legend';
+  align-items: start;
+  row-gap: 6px;
+  min-height: 0;
+  padding-right: 0;
+}
+
+.chartPanelHeader > .panelHeading {
+  grid-area: heading;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    'title'
+    'subtitle';
+  row-gap: 4px;
+  align-content: start;
+}
+
+.chartHeaderTitle {
+  grid-area: title;
+}
+
+.chartHeaderSubTitle {
+  grid-area: subtitle;
+  margin-top: 0;
+}
+
+.chartLegendHeader {
+  grid-area: legend;
+  position: static;
+  margin-top: 0;
+  justify-content: flex-end;
+  align-items: center;
+  align-self: flex-start;
+  flex-shrink: 0;
+  gap: 10px;
+  max-width: none;
+  white-space: nowrap;
+}
+
+.chartLegend {
+  display: flex;
+  align-items: center;
+  gap: 10px 12px;
+  flex-wrap: wrap;
+  color: var(--color-text-1);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.chartLegendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text-2);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.chartLegendDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  border: 1px solid transparent;
+}
+
+.chartLegendDash {
+  width: 12px;
+  height: 0;
+  border-radius: 0;
+  border-top-width: 2px;
+  border-top-style: dashed;
+  background: transparent !important;
+}
+
+.chartWrap {
+  height: 206px;
+  margin-top: 10px;
+}
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+
+.insightGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.panelHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panelHeading {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.panelTitleWithGuide {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ringCard {
+  // donut 居左、图例(metricList)弹性占满剩余宽度并将数值锚定面板右缘，
+  // 消除宽面板内的大片留白；窄断点由媒体查询回退为堆叠。
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  justify-content: stretch;
+  gap: 32px;
+  align-items: center;
+  min-height: 190px;
+  margin-top: 14px;
+}
+
+.ringChartWrap {
+  position: relative;
+  height: 176px;
+  min-height: 176px;
+  width: 176px;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  overflow: visible;
+}
+
+.ringChartWrap::before {
+  content: '';
+  position: absolute;
+  inset: 26px;
+  border-radius: 999px;
+  background: var(--color-fill-1);
+  box-shadow: inset 0 0 0 1px var(--color-border);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.ringCenter {
+  text-align: left;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--color-border);
+  min-height: 132px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.ringCenterOverlay {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 176px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0;
+  min-height: 0;
+  border-bottom: 0;
+  pointer-events: none;
+}
+
+.ringValue {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--color-text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.ringCaption {
+  font-size: 12px;
+  color: var(--color-text-2);
+  font-weight: 500;
+  margin-top: 2px;
+}
+
+.ringInfoPanel {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 4px 0;
+}
+
+.metricList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  // 图例占满 ringCard 的弹性列(1fr)：每行 space-between 将指标名锚左、数值锚右，
+  // 填满宽面板余宽，避免单边留白。
+  width: 100%;
+  max-width: 100%;
+}
+
+.metricRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.metricRowPercentOnly {
+  padding: 4px 0;
+}
+
+.metricKey,
+.metricLabelGroup {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.metricLabelGroup {
+  gap: 6px;
+}
+
+.metricDot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.metricName {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-1);
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metricValueGroup {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.metricPercent {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.metricCount {
+  font-size: 12px;
+  color: var(--color-text-2);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.bars {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.compactBars {
+  gap: 10px;
+  min-height: 0;
+}
+
+.barsFull {
+  // 行组在卡内垂直居中 + 固定适中行距,卡片等高时上下留白均衡、行距不被拉散。
+  flex: 1;
+  justify-content: center;
+  gap: 16px;
+  padding: 14px 0;
+}
+
+.barRow {
+  display: grid;
+  // 进度条/缩略图列弹性撑满行内余宽,数值锚定面板右缘 —— 与详情行一致,消除右侧留白。
+  grid-template-columns: minmax(88px, 128px) 1fr auto;
+  justify-content: stretch;
+  gap: 12px;
+  align-items: center;
+}
+
+// 趋势(sparkline)面板：每个指标独占一行（标签 · sparkline · 数值），关联最清晰。
+// sparkline 占据行内余宽但封顶适中宽度，数值锚定面板右缘——既不过长、又不留单边大片空白。
+.barsTrend .barRow {
+  grid-template-columns: minmax(88px, 128px) 1fr auto;
+  justify-content: stretch;
+}
+
+.barsTrend .barSpark {
+  // 弹性撑满行内余宽,封顶放宽到 560px:宽屏/宽卡(span8、span12)下缩略图延伸至数值前,
+  // 不再 strand 出大片空白;窄卡(span4/6)由 1fr 列自然约束,不会过长。
+  max-width: min(100%, 560px);
+}
+
+.barLabel {
+  color: var(--color-text-1);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.barTrack {
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-border) 75%, transparent);
+  overflow: hidden;
+}
+
+.barFill {
+  height: 100%;
+  border-radius: 999px;
+}
+
+.barSpark {
+  width: 100%;
+  height: 28px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.barValue {
+  // 数值是焦点:加大加深加粗,条退为配角。
+  color: var(--color-text-1);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+// Top-N 强调行:前几名放大(更大字号 / 更高条 / 更大缩略图),拉开与其余名次的视觉层级。
+.barRowEmphasis {
+  .barLabel {
+    font-size: 14px;
+    color: var(--color-text-1);
+    font-weight: 600;
+  }
+
+  .barValue {
+    font-size: 18px;
+  }
+
+  .barTrack {
+    height: 10px;
+  }
+
+  .barSpark {
+    height: 32px;
+  }
+}
+
+/* 分档榜单尾部(rank ≥4):缩小变淡,退为背景,让重点自然浮现。 */
+.barRowMuted {
+  opacity: 0.85;
+
+  .barLabel {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-text-2);
+  }
+
+  .barValue {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-text-2);
+  }
+
+  .barTrack {
+    height: 6px;
+  }
+}
+
+/* ── Status board (boolean/flag signals: dot + state badge) ───── */
+.statusList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
+  flex: 1;
+  justify-content: center;
+}
+
+.statusRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--color-fill-1);
+  border: 1px solid var(--color-border);
+}
+
+.statusRowOk {
+  background: color-mix(in srgb, var(--color-success) 8%, var(--color-bg));
+  border-color: color-mix(in srgb, var(--color-success) 22%, var(--color-border));
+}
+
+.statusRowAlarm {
+  background: color-mix(in srgb, var(--color-fail) 8%, var(--color-bg));
+  border-color: color-mix(in srgb, var(--color-fail) 22%, var(--color-border));
+}
+
+.statusRowUnknown {
+  background: var(--color-fill-1);
+  border-color: var(--color-border);
+}
+
+.statusDotUnknown {
+  background: var(--color-text-4);
+}
+
+.statusBadgeUnknown {
+  color: var(--color-text-3);
+  background: var(--color-fill-2);
+}
+
+.statusMain {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.statusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-text-4);
+  flex-shrink: 0;
+}
+
+.statusDotOk {
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 16%, transparent);
+}
+
+.statusDotAlarm {
+  background: var(--color-fail);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-fail) 16%, transparent);
+}
+
+.statusLabel {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.statusBadge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: var(--color-fill-2);
+  color: var(--color-text-3);
+}
+
+.statusBadgeOk {
+  color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+}
+
+.statusBadgeAlarm {
+  color: var(--color-fail);
+  background: color-mix(in srgb, var(--color-fail) 12%, transparent);
+}
+
+.detailMetricRow {
+  display: grid;
+  // 标签 · 缩略图 · 数值:缩略图列弹性撑满行内余宽(封顶见 detailRowViz),
+  // 数值锚定面板右缘 —— 消除卡内右侧大片空白,与 barsTrend 口径一致。
+  grid-template-columns: minmax(88px, 140px) minmax(0, 1fr) auto;
+  justify-content: stretch;
+  align-items: center;
+  gap: 14px;
+  // 行间距交由 detailRowsFill 的 gap 统一管理(与异常信号条一致);去掉分隔线让两类面板缩略图样式统一。
+  padding: 0;
+  color: var(--color-text-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.snapshotTilesPanel {
+  padding: 12px 14px;
+}
+
+.snapshotTilesHeader {
+  margin-bottom: 10px;
+}
+
+.snapshotTilesTitle {
+  margin: 0;
+  color: var(--color-text-1);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.snapshotTilesSubTitle {
+  margin-top: 2px;
+  color: var(--color-text-4);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.snapshotTilesGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+  gap: 8px;
+}
+
+.snapshotTile {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-fill-1);
+}
+
+.snapshotTileLabel {
+  margin-bottom: 4px;
+  overflow: hidden;
+  color: var(--color-text-3);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.snapshotTileValue {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--color-text-1);
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+
+@media (max-width: 768px) {
+  .snapshotTilesGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.detailMetricValue {
+  color: var(--color-text-1);
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  // 数值贴右,跨行对齐成一列(无论该行是 sparkline 还是纯文本)。
+  justify-self: end;
+}
+
+.detailMetricLabel {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.detailRowViz {
+  // 缩略图撑满弹性列但封顶放宽到 560px(同 barsTrend):宽卡下延伸至数值前消除空白,窄卡由 1fr 约束;
+  // 空行也渲染本占位以保证数值跨行对齐。
+  width: 100%;
+  max-width: min(100%, 560px);
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  height: 30px;
+}
+
+// 详情行容器:行组在卡内垂直居中 + 固定行距,与异常信号条(barsFull)节奏一致。
+.detailRowsFill {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 16px;
+  padding: 14px 0;
+}
+
+// 自定义详情面板(redis/mongodb 经 DetailPanel)的内层容器:撑满卡高,使标题置顶、行组居中。
+.detailCard {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.detailBar {
+  width: 100%;
+  height: 8px;
+  border-radius: 5px;
+  background: var(--color-fill-2);
+  overflow: hidden;
+}
+
+.detailBarFill {
+  height: 100%;
+  border-radius: 5px;
+  transition: none;
+}
+
+.detailStatusDot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.detailEmpty {
+  display: flex;
+  align-items: center;
+  min-height: 72px;
+  color: var(--color-text-4);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.titleWithGuide {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.metricGuideIcon {
+  color: var(--color-text-4);
+  font-size: 13px;
+}
+
+.metricGuideTooltip,
+.uptimeStatusTooltip {
+  max-width: 360px;
+  color: var(--color-text-3);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.metricGuideTooltipRow,
+.uptimeStatusTooltipRow {
+  display: grid;
+  gap: 4px;
+}
+
+.metricGuideTooltipRow + .metricGuideTooltipRow,
+.uptimeStatusTooltipRow + .uptimeStatusTooltipRow {
+  margin-top: 10px;
+}
+
+.metricGuideTooltipRow strong,
+.uptimeStatusTooltipRow strong {
+  color: var(--color-text-1);
+  font-size: 13px;
+}
+
+// guide Tooltip 挂载在 body：需全局覆盖 ant-tooltip 默认深色底，避免浅色字色/深色底或深色字/深色底对比失效。
+:global(.ant-tooltip.lightMetricTooltip) :global(.ant-tooltip-inner) {
+  background: var(--color-bg);
+  color: var(--color-text-2);
+  border: 1px solid var(--color-border);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--color-text-1) 12%, transparent);
+}
+
+:global(.ant-tooltip.lightMetricTooltip) :global(.ant-tooltip-arrow::before) {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+}
+
+.metricsMode {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+
+.fullPanel {
+  width: 100%;
+}
+
+
+.overviewGrid {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  margin-bottom: 12px;
+}
+
+.statusColumn {
+  min-width: 0;
+}
+
+.kpiGrid {
+  // 固定 N 列 grid：落单卡片只占一格，不撑满整行（flex-grow 曾把末行单卡拉成全宽）。
+  display: grid;
+  grid-template-columns: repeat(var(--kpi-cols, 5), minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+  align-items: stretch;
+  margin-bottom: 12px;
+}
+
+.kpiGrid > * {
+  min-width: 0;
+}
+
+.dashboardSection {
+  margin-bottom: 12px;
+}
+
+.sectionGrid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.span12,
+.span8,
+.span6,
+.span4,
+.span3,
+.span2 {
+  min-width: 0;
+}
+
+.span12 {
+  grid-column: span 12;
+}
+
+.span8 {
+  grid-column: span 8;
+}
+
+.span6 {
+  grid-column: span 6;
+}
+
+.span4 {
+  grid-column: span 4;
+}
+
+.span3 {
+  grid-column: span 3;
+}
+
+.span2 {
+  grid-column: span 2;
+}
+
+.detailGridBalanced {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 420px));
+  gap: 12px;
+  justify-content: start;
+}
+
+@media (max-width: 1200px) {
+  .overviewGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .span8,
+  .span6,
+  .span4,
+  .span3,
+  .span2 {
+    grid-column: span 12;
+  }
+
+  .chartGrid,
+  .detailGrid,
+  .insightGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .ringCard {
+    // 全宽断点:donut 居中、图例堆叠其下并占满宽度,避免横向拉伸过宽。
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+}
+
+@media (max-width: 768px) {
+  .shell {
+    padding: 14px 12px 22px;
+  }
+
+  .pageTitleRow,
+  .instanceCard {
+    align-items: stretch;
+  }
+
+  .titleControlsRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .controlsWrap {
+    justify-content: flex-start;
+  }
+
+  .primaryGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .instanceSelectorField {
+    width: 100%;
+  }
+
+  .inlineInstanceSelector {
+    width: 100%;
+    max-width: none;
+  }
+
+  .toolbarTimeSelector,
+  .toolbarTimeSelector > div,
+  .toolbarTimeSelector > div > div:first-child,
+  .toolbarTimeSelector > div > div:first-child :global(.ant-select),
+  .toolbarTimeSelector > div > div:first-child :global(.ant-picker) {
+    width: 100% !important;
+  }
+
+  .toolbarTimeSelector > div {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .toolbarTimeSelector > div > div:last-child {
+    margin-left: 0 !important;
+  }
+
+  .chartPanelHeader {
+    padding-right: 0;
+  }
+
+  .chartLegendHeader {
+    position: static;
+    margin-top: 0;
+  }
+
+  .ringCard,
+  .barRow {
+    grid-template-columns: 1fr;
+  }
+
+  .ringCard {
+    max-width: none;
+  }
+
+  .ringChartWrap {
+    justify-self: center;
+  }
+
+  .barValue {
+    text-align: left;
+  }
+
+  .kpiGrid,
+  .detailGridBalanced {
+    grid-template-columns: 1fr;
+  }
+
+  .chartWrap {
+    height: 160px;
+  }
+}
+
+@media (max-width: 480px) {
+  .kpiGrid,
+  .detailGridBalanced {
+    grid-template-columns: 1fr;
+  }
+
+  .chartWrap {
+    height: 130px;
+  }
+}
+
+// 暗色：表面色已走语义 token，此处只补仍依赖硬编码/混色的局部。
+:global(html.dark) .modeSegmented {
+  background: var(--color-fill-1) !important;
+  border-color: var(--color-border);
+}
+
+:global(html.dark) .modeSegmented :global(.ant-segmented-item) {
+  color: var(--color-text-3);
+}
+
+:global(html.dark) .modeSegmented :global(.ant-segmented-item-selected),
+:global(html.dark) .modeSegmented :global(.ant-segmented-thumb) {
+  color: var(--color-text-1) !important;
+  background: var(--color-bg) !important;
+}
+
+:global(html.dark) .inlineInstanceSelector,
+:global(html.dark) .toolbarTimeSelector > div > div:first-child :global(.ant-select-selector),
+:global(html.dark) .toolbarTimeSelector > div > div:last-child,
+:global(html.dark) .toolbarBackBtn {
+  background: var(--color-bg) !important;
+  border-color: var(--color-border) !important;
+}
+
+:global(html.dark) .toolbarTimeSelector > div > div:last-child :global(.ant-btn),
+:global(html.dark) .toolbarTimeSelector > div > div:last-child :global(.ant-select-selector) {
+  background: transparent !important;
+  color: var(--color-text-2) !important;
+}
+
+:global(html.dark) .toolbarTimeSelector > div > div:last-child :global(.ant-btn) {
+  border: none !important;
+  border-right: 1px solid var(--color-border) !important;
+}
+
+:global(html.dark) .collectionStatusSegment {
+  background: var(--color-fill-2);
+  border-color: transparent;
+}
+
+:global(html.dark) .collectionStatusSegmentSuccess {
+  background: var(--color-success);
+  border-color: color-mix(in srgb, var(--color-success) 40%, transparent);
+}
+
+:global(html.dark) .collectionStatusSegmentError {
+  background: var(--color-fail);
+  border-color: color-mix(in srgb, var(--color-fail) 40%, transparent);
+}
+
+:global(html.dark) .instanceIcon {
+  background: color-mix(in srgb, var(--color-primary) 16%, var(--color-bg));
+  color: var(--color-primary);
+}

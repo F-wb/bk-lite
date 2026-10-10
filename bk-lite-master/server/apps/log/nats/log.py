@@ -1,0 +1,763 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+from django.db.models import Count, Q
+
+import nats_client
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.logger import log_logger as logger
+from apps.core.logger import safe_exception_info
+from apps.core.utils.current_team_scope import _normalize_organization_ids
+from apps.core.utils.permission_utils import check_instance_permission, get_permission_rules, get_permissions_rules, permission_filter
+from apps.core.utils.team_utils import group_tree_allows_team
+from apps.core.utils.time_util import format_rfc3339_utc, parse_rfc3339_range_utc
+from apps.log.constants.permission import PermissionConstants
+from apps.log.constants.victoriametrics import VictoriaLogsConstants
+from apps.log.models.extractor import LogExtractor
+from apps.log.models.instance import CollectInstance
+from apps.log.models.log_group import LogGroup
+from apps.log.models.policy import Alert, Policy
+from apps.log.services.alert_access import filter_alerts_by_organizations, orphaned_log_policy_q
+from apps.log.services.log_event_contract import to_logical_event, to_storage_field
+from apps.log.services.search import SearchService
+from apps.log.services.successful_login_count import (
+    build_host_match_clause,
+    build_linux_login_stats_query,
+    build_windows_login_stats_query,
+    classify_login_coverage,
+    is_windows_os,
+    merge_login_counts,
+)
+from apps.log.utils.log_group import LogGroupQueryBuilder
+from apps.log.utils.query_log import VictoriaMetricsAPI
+from apps.rpc.system_mgmt import SystemMgmt
+
+
+def _normalize_bounded_int(value, field_name: str, default, max_value: int):
+    return VictoriaLogsConstants.normalize_bounded_int(value, field_name, default, max_value)
+
+
+def _normalize_query_time_range(time_range):
+    start_time, end_time = parse_rfc3339_range_utc(time_range)
+    VictoriaLogsConstants.ensure_query_window_span(start_time, end_time)
+    return format_rfc3339_utc(start_time), format_rfc3339_utc(end_time)
+
+
+def _resolve_log_group_scope(user_info):
+    """从 user_info 中解析当前用户可访问的日志分组，返回受限 LogGroup 对象列表。
+
+    复用 LogAccessScopeService 的权限模型：
+    1. 通过 get_permission_rules 获取用户在 log_group 模块的权限规则
+    2. 通过 permission_filter 过滤出可访问的 LogGroup 对象
+    """
+    if not isinstance(user_info, dict):
+        return []
+
+    username = user_info.get("user")
+    domain = user_info.get("domain")
+    current_team = user_info.get("team")
+    include_children = user_info.get("include_children", False)
+
+    if (
+        not isinstance(username, str)
+        or not username.strip()
+        or not isinstance(domain, str)
+        or not domain.strip()
+        or type(include_children) is not bool
+    ):
+        return []
+
+    try:
+        current_team = next(iter(_normalize_organization_ids([current_team])))
+    except BaseAppException:
+        return []
+
+    actor_context = {
+        "username": username,
+        "domain": domain,
+        "current_team": current_team,
+    }
+    try:
+        scope_result = SystemMgmt().get_authorized_groups_scoped(
+            actor_context,
+            include_children=include_children,
+        )
+    except Exception:
+        return []
+    if not isinstance(scope_result, dict) or not scope_result.get("result") or not isinstance(scope_result.get("data"), list):
+        return []
+    try:
+        scope_ids = _normalize_organization_ids(scope_result["data"])
+    except BaseAppException:
+        return []
+    if current_team not in scope_ids:
+        return []
+
+    # 超管身份必须来自 SystemMgmt 对持久化用户角色的服务端判定，
+    # caller user_info 中的同名字段仅是非可信上下文，不能用于授权。
+    if scope_result.get("is_superuser") is True:
+        queryset = LogGroup.objects.filter(loggrouporganization__organization__in=list(scope_ids)).distinct()
+        return list(queryset.only("id", "name", "rule"))
+
+    # 构造与 get_permission_rules 兼容的 user 对象
+    user_obj = SimpleNamespace(username=username, domain=domain)
+
+    permission = get_permission_rules(
+        user_obj,
+        current_team,
+        "log",
+        PermissionConstants.LOG_GROUP_MODULE,
+        include_children=include_children,
+    )
+    if not isinstance(permission, dict):
+        permission = {}
+
+    queryset = (
+        permission_filter(
+            LogGroup,
+            permission,
+            team_key="loggrouporganization__organization__in",
+            id_key="id__in",
+        )
+        .filter(loggrouporganization__organization__in=list(scope_ids))
+        .distinct()
+    )
+
+    accessible_groups = list(queryset.only("id", "name", "rule"))
+    return accessible_groups
+
+
+def _apply_log_group_scope(query, user_info):
+    """对查询语句应用日志分组权限限制，返回改写后的 query。
+
+    如果无法解析权限（缺少 user_info），返回拒绝所有结果的查询。
+    超级管理员同样必须使用明确的日志分组范围。
+    """
+    if not user_info:
+        # 未提供身份信息，拒绝所有查询
+        return LogGroupQueryBuilder.DENY_ALL_QUERY
+
+    accessible_groups = _resolve_log_group_scope(user_info)
+
+    if not accessible_groups:
+        # 无可访问分组，拒绝所有查询
+        return LogGroupQueryBuilder.DENY_ALL_QUERY
+
+    log_group_ids = [group.id for group in accessible_groups]
+    final_query, _ = SearchService._build_storage_query(query, log_group_ids, resolved_groups=accessible_groups)
+    return final_query
+
+
+@nats_client.register
+def log_search(query, time_range, limit=10, *args, **kwargs):
+    """搜索日志"""
+    user_info = kwargs.get("user_info")
+    query = _apply_log_group_scope(query, user_info)
+
+    try:
+        start_time, end_time = _normalize_query_time_range(time_range)
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    try:
+        limit = VictoriaLogsConstants.normalize_query_limit(limit, default=10)
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    if query == LogGroupQueryBuilder.DENY_ALL_QUERY:
+        return {"result": True, "data": [], "message": ""}
+    vm_api = VictoriaMetricsAPI()
+    data = vm_api.query(query, start_time, end_time, limit)
+    if isinstance(data, list):
+        data = [to_logical_event(item) for item in data]
+    return {"result": True, "data": data, "message": ""}
+
+
+@nats_client.register
+def log_hits(query, time_range, field, fields_limit=5, step="5m", *args, **kwargs):
+    """搜索日志命中数"""
+    user_info = kwargs.get("user_info")
+    query = _apply_log_group_scope(query, user_info)
+
+    try:
+        start_time, end_time = _normalize_query_time_range(time_range)
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    try:
+        fields_limit = VictoriaLogsConstants.normalize_hits_fields_limit(fields_limit, default=5)
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    if query == LogGroupQueryBuilder.DENY_ALL_QUERY:
+        return {"result": True, "data": [], "message": ""}
+    vm_api = VictoriaMetricsAPI()
+    resp = vm_api.hits(query, start_time, end_time, to_storage_field(field), fields_limit, step)
+    data = []
+    for hit_dict in resp["hits"]:
+        timestamps = hit_dict.get("timestamps", [])
+        values = hit_dict.get("values", [])
+        data.extend([{"name": k, "value": v} for k, v in zip(timestamps, values)])
+
+    return {"result": True, "data": data, "message": ""}
+
+
+@nats_client.register
+def get_vmlogs_disk_usage(*args, **kwargs):
+    """获取 VictoriaLogs 已占用磁盘容量。"""
+    vm_api = VictoriaMetricsAPI()
+    data = vm_api.get_disk_usage()
+    return {"result": True, "data": data, "message": ""}
+
+
+def _normalize_positive_int(value, field_name: str, default=None):
+    if value in (None, ""):
+        return default
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} 必须是整数")
+    if normalized < 1:
+        raise ValueError(f"{field_name} 必须大于等于 1")
+    return normalized
+
+
+def _normalize_time_value(value, field_name: str):
+    if value in (None, ""):
+        raise ValueError(f"{field_name} 不能为空")
+    if isinstance(value, str):
+        value = value.strip()
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    raise ValueError(f"{field_name} 时间格式错误，应为 YYYY-MM-DD HH:MM:SS")
+
+
+def _normalize_filter_values(value, field_name: str):
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    raise ValueError(f"{field_name} 必须是字符串或列表")
+
+
+def _paginate_items(items: list, page, page_size):
+    total_count = len(items)
+    start = (page - 1) * page_size
+    end = start + page_size
+    return {
+        "count": total_count,
+        "page": page,
+        "page_size": page_size,
+        "items": items[start:end],
+    }
+
+
+def _build_paginated_alert_segments(queryset, page, page_size):
+    total_count = queryset.count()
+    start = (page - 1) * page_size
+    end = start + page_size
+    paged_alerts = queryset.order_by("-start_event_time", "-created_at")[start:end]
+    return {
+        "count": total_count,
+        "page": page,
+        "page_size": page_size,
+        "items": [_build_log_alert_segment(alert) for alert in paged_alerts],
+    }
+
+
+def _build_log_alert_segment(alert: Alert) -> dict:
+    start_event_time = getattr(alert, "start_event_time", None)
+    created_at = getattr(alert, "created_at", None)
+    end_event_time = getattr(alert, "end_event_time", None)
+    updated_at = getattr(alert, "updated_at", None)
+
+    segment_start = start_event_time or created_at
+    segment_end = end_event_time or updated_at or segment_start
+    duration_seconds = 0
+    if segment_start and segment_end:
+        duration_seconds = max(int((segment_end - segment_start).total_seconds()), 0)
+    return {
+        "id": alert.id,
+        "policy_id": getattr(alert, "policy_id", None),
+        "collect_type_id": getattr(alert, "collect_type_id", None),
+        "source_id": alert.source_id,
+        "level": alert.level,
+        "value": alert.value,
+        "content": alert.content,
+        "status": alert.status,
+        "start_event_time": segment_start.isoformat() if segment_start else None,
+        "end_event_time": segment_end.isoformat() if segment_end else None,
+        "duration_seconds": duration_seconds,
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
+
+
+def _get_log_actor_scope(user_info: dict):
+    if not isinstance(user_info, dict):
+        return None, None, {"result": False, "data": [], "message": "缺少用户或组织信息"}
+
+    user = user_info.get("user")
+    username = user if isinstance(user, str) else getattr(user, "username", None)
+    domain = user_info.get("domain")
+    current_team = user_info.get("team")
+    include_children = user_info.get("include_children", False)
+    if (
+        not isinstance(username, str)
+        or not username.strip()
+        or not isinstance(domain, str)
+        or not domain.strip()
+        or type(include_children) is not bool
+    ):
+        return None, None, {"result": False, "data": [], "message": "缺少用户或组织信息"}
+
+    try:
+        current_team = next(iter(_normalize_organization_ids([current_team])))
+    except BaseAppException:
+        return None, None, {"result": False, "data": [], "message": "用户或组织权限校验失败"}
+
+    actor_context = {
+        "username": username,
+        "domain": domain,
+        "current_team": current_team,
+    }
+    try:
+        scope_result = SystemMgmt().get_authorized_groups_scoped(
+            actor_context,
+            include_children=include_children,
+        )
+    except Exception:
+        return None, None, {"result": False, "data": [], "message": "用户或组织权限校验失败"}
+    if not isinstance(scope_result, dict) or not scope_result.get("result") or not isinstance(scope_result.get("data"), list):
+        return None, None, {"result": False, "data": [], "message": "用户或组织权限校验失败"}
+    try:
+        scope_ids = _normalize_organization_ids(scope_result["data"])
+    except BaseAppException:
+        return None, None, {"result": False, "data": [], "message": "用户或组织权限校验失败"}
+    if current_team not in scope_ids:
+        return None, None, {"result": False, "data": [], "message": "用户或组织权限校验失败"}
+    return scope_ids, scope_result, None
+
+
+def _get_log_policy_ids(collect_type_id: str, user_info: dict):
+    scope_ids, scope_result, error = _get_log_actor_scope(user_info)
+    if error:
+        return [], error
+
+    user = user_info.get("user")
+    username = user if isinstance(user, str) else getattr(user, "username", None)
+    domain = user_info.get("domain")
+    current_team = next(iter(_normalize_organization_ids([user_info.get("team")])))
+    include_children = user_info.get("include_children", False)
+
+    policies = (
+        Policy.objects.filter(
+            collect_type_id=collect_type_id,
+            policyorganization__organization__in=list(scope_ids),
+        )
+        .select_related("collect_type")
+        .prefetch_related("policyorganization_set")
+        .distinct()
+    )
+    if scope_result.get("is_superuser") is True:
+        return list(policies.values_list("id", flat=True)), None
+
+    user_obj = SimpleNamespace(username=username, domain=domain)
+    permissions_result = get_permissions_rules(
+        user_obj,
+        current_team,
+        "log",
+        PermissionConstants.POLICY_MODULE,
+        include_children=include_children,
+    )
+    if not isinstance(permissions_result, dict):
+        permissions_result = {}
+
+    policy_permissions = permissions_result.get("data", {})
+    if not isinstance(policy_permissions, dict) or not policy_permissions:
+        return [], None
+
+    policy_ids = []
+    for policy_obj in policies:
+        teams = {org.organization for org in policy_obj.policyorganization_set.all() if org.organization in scope_ids}
+        if check_instance_permission(
+            collect_type_id,
+            policy_obj.id,
+            teams,
+            policy_permissions,
+            scope_ids,
+        ):
+            policy_ids.append(policy_obj.id)
+
+    return policy_ids, None
+
+
+@nats_client.register
+def query_log_alert_segments(query_data: dict, *args, **kwargs):
+    required_fields = ["collect_type_id", "start", "end"]
+    for field in required_fields:
+        if field not in query_data:
+            return {"result": False, "data": [], "message": f"缺少必要参数: {field}"}
+
+    collect_type_id = str(query_data["collect_type_id"])
+    user_info = kwargs.get("user_info", {})
+
+    try:
+        start_dt = _normalize_time_value(query_data.get("start"), "start")
+        end_dt = _normalize_time_value(query_data.get("end"), "end")
+        if start_dt > end_dt:
+            raise ValueError("开始时间不能大于结束时间")
+        page = _normalize_positive_int(query_data.get("page", 1), "page", default=1)
+        page_size = _normalize_positive_int(query_data.get("page_size", 100), "page_size", default=100)
+        if page_size > 500:
+            raise ValueError("page_size 不能大于 500")
+        source_ids = _normalize_filter_values(query_data.get("source_id"), "source_id")
+        status_values = _normalize_filter_values(query_data.get("status"), "status")
+        level_values = _normalize_filter_values(query_data.get("level"), "level")
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+
+    policy_ids, error = _get_log_policy_ids(collect_type_id, user_info)
+    if error:
+        return error
+
+    scope_ids, _, scope_error = _get_log_actor_scope(user_info)
+    if scope_error:
+        return scope_error
+
+    queryset = Alert.objects.filter(collect_type_id=collect_type_id)
+    queryset = filter_alerts_by_organizations(queryset, scope_ids)
+    queryset = queryset.filter(Q(policy_id__in=policy_ids) | orphaned_log_policy_q())
+    queryset = queryset.filter(
+        Q(end_event_time__isnull=True) | Q(end_event_time__gte=start_dt),
+        start_event_time__lte=end_dt,
+    )
+
+    if source_ids:
+        queryset = queryset.filter(source_id__in=source_ids)
+
+    if status_values:
+        queryset = queryset.filter(status__in=status_values)
+    if level_values:
+        queryset = queryset.filter(level__in=level_values)
+
+    return {
+        "result": True,
+        "data": _build_paginated_alert_segments(queryset, page, page_size),
+        "message": "",
+    }
+
+
+def _usage_team_scope(user_info):
+    if not isinstance(user_info, dict) or user_info.get("team") in (None, ""):
+        return None
+    try:
+        current_team = next(iter(_normalize_organization_ids([user_info.get("team")])))
+    except BaseAppException:
+        return None
+    if not group_tree_allows_team(user_info.get("group_tree"), current_team):
+        return None
+    if user_info.get("include_children"):
+        from apps.system_mgmt.utils.group_utils import GroupUtils
+
+        team_ids = GroupUtils.get_group_with_descendants(current_team)
+    else:
+        team_ids = [current_team]
+    return current_team, team_ids
+
+
+def _log_usage_actor(user_info):
+    if not isinstance(user_info, dict):
+        return None
+    user = user_info.get("user")
+    username = user if isinstance(user, str) else getattr(user, "username", None)
+    domain = user_info.get("domain") or getattr(user, "domain", None)
+    if not isinstance(username, str) or not username.strip() or not isinstance(domain, str) or not domain.strip():
+        return None
+    return SimpleNamespace(username=username, domain=domain)
+
+
+def _authorized_log_instances(user_info):
+    scope = _usage_team_scope(user_info)
+    actor = _log_usage_actor(user_info)
+    if scope is None or actor is None:
+        return CollectInstance.objects.none()
+    current_team, team_ids = scope
+    permission = get_permission_rules(
+        actor,
+        current_team,
+        "log",
+        PermissionConstants.INSTANCE_MODULE,
+        include_children=bool(user_info.get("include_children", False)),
+    )
+    if not isinstance(permission, dict):
+        permission = {}
+    return (
+        permission_filter(
+            CollectInstance,
+            permission,
+            team_key="collectinstanceorganization__organization__in",
+            id_key="id__in",
+        )
+        .filter(collectinstanceorganization__organization__in=list(team_ids))
+        .distinct()
+    )
+
+
+def _authorized_log_policies(user_info):
+    scope = _usage_team_scope(user_info)
+    actor = _log_usage_actor(user_info)
+    if scope is None or actor is None:
+        return Policy.objects.none()
+    current_team, team_ids = scope
+    permission = get_permission_rules(
+        actor,
+        current_team,
+        "log",
+        PermissionConstants.POLICY_MODULE,
+        include_children=bool(user_info.get("include_children", False)),
+    )
+    if not isinstance(permission, dict):
+        permission = {}
+    return (
+        permission_filter(
+            Policy,
+            permission,
+            team_key="policyorganization__organization__in",
+            id_key="id__in",
+        )
+        .filter(policyorganization__organization__in=list(team_ids))
+        .distinct()
+    )
+
+
+@nats_client.register
+def get_log_usage_statistics(user_info=None, **kwargs):
+    user_info = user_info or {}
+    instance_qs = _authorized_log_instances(user_info)
+    policy_qs = _authorized_log_policies(user_info)
+    collect_instance_count = instance_qs.count()
+    bound_instance_count = instance_qs.exclude(Q(node_id__isnull=True) | Q(node_id="")).count()
+    instance_ids = list(instance_qs.values_list("id", flat=True))
+    type_ids = list(instance_qs.values_list("collect_type_id", flat=True).distinct())
+    extractor_count = (
+        LogExtractor.objects.filter(Q(collect_instance_id__in=instance_ids) | Q(collect_type_id__in=type_ids)).distinct().count()
+        if instance_ids or type_ids
+        else 0
+    )
+    return {
+        "result": True,
+        "data": {
+            "collect_instance_count": collect_instance_count,
+            "extractor_count": extractor_count,
+            "policy_count": policy_qs.count(),
+            "bound_instance_count": bound_instance_count,
+            "bound_instance_rate": round(bound_instance_count / collect_instance_count * 100, 1) if collect_instance_count else 0,
+        },
+        "message": "",
+    }
+
+
+@nats_client.register
+def get_log_policy_alert_top(user_info=None, limit=10, time=None, **kwargs):
+    user_info = user_info or {}
+    policy_qs = _authorized_log_policies(user_info)
+    try:
+        start, end = parse_rfc3339_range_utc(time if time is not None else kwargs.get("time"))
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    try:
+        limit = int(limit or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    if limit <= 0:
+        limit = 10
+    if limit > 100:
+        limit = 100
+    policy_ids = list(policy_qs.values_list("id", flat=True))
+    if not policy_ids:
+        return {"result": True, "data": [], "message": ""}
+    rows = (
+        Alert.objects.filter(policy_id__in=policy_ids, created_at__gte=start, created_at__lt=end)
+        .order_by()
+        .values("policy_id", "policy__name")
+        .annotate(count=Count("id"))
+        .order_by("-count", "policy__name")[:limit]
+    )
+    data = [{"policy_id": item["policy_id"], "policy_name": item["policy__name"], "count": item["count"]} for item in rows]
+    return {"result": True, "data": data, "message": ""}
+
+
+def _query_login_stats(vm_api, query, start_time, end_time, limit):
+    rows = vm_api.query(query, start_time, end_time, limit)
+    return rows if isinstance(rows, list) else []
+
+
+def _query_login_stats_concurrently(queries, start_time, end_time, limit):
+    """Run Windows/Linux stats queries in parallel and wait for all of them."""
+    if not queries:
+        return []
+
+    def _run(query):
+        return _query_login_stats(VictoriaMetricsAPI(), query, start_time, end_time, limit)
+
+    if len(queries) == 1:
+        return _run(queries[0])
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        futures = [pool.submit(_run, query) for query in queries]
+        for fut in futures:
+            rows.extend(fut.result())
+    return rows
+
+
+def _counted_hosts_for_os(counted_hosts, windows: bool):
+    if windows:
+        return [host for host in counted_hosts if is_windows_os(host.get("os_type"))]
+    return [host for host in counted_hosts if not is_windows_os(host.get("os_type"))]
+
+
+@nats_client.register
+def count_successful_logins_by_host(hosts, time_range, user_info=None, **kwargs):
+    """按授权采集覆盖统计主机成功登录次数。"""
+    if not isinstance(hosts, list):
+        return {"result": False, "data": [], "message": "hosts 必须是列表"}
+    try:
+        start_time, end_time = _normalize_query_time_range(time_range)
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    if not hosts:
+        return {"result": True, "data": [], "message": ""}
+
+    failed_stage = "authorize_instances"
+    try:
+        instances = list(_authorized_log_instances(user_info).select_related("collect_type"))
+        covered = classify_login_coverage(hosts, instances)
+        counted_hosts = [host for host in covered if host.get("login_status") == "counted"]
+        stats_rows = []
+        host_clause = build_host_match_clause(counted_hosts)
+        if counted_hosts and host_clause:
+            failed_stage = "victoria_logs_query"
+            has_windows = any(is_windows_os(host.get("os_type")) for host in counted_hosts)
+            has_linux = any(not is_windows_os(host.get("os_type")) for host in counted_hosts)
+            limit = max(len(counted_hosts), 1)
+            scoped_queries = []
+            if has_windows:
+                logical = build_windows_login_stats_query(_counted_hosts_for_os(counted_hosts, True))
+                if logical:
+                    scoped_queries.append(_apply_log_group_scope(logical, user_info))
+            if has_linux:
+                logical = build_linux_login_stats_query(_counted_hosts_for_os(counted_hosts, False))
+                if logical:
+                    scoped_queries.append(_apply_log_group_scope(logical, user_info))
+            runnable = [query for query in scoped_queries if query != LogGroupQueryBuilder.DENY_ALL_QUERY]
+            if runnable:
+                stats_rows.extend(_query_login_stats_concurrently(runnable, start_time, end_time, limit))
+        failed_stage = "merge_login_counts"
+        data = merge_login_counts(covered, stats_rows)
+        counted_n = sum(1 for host in data if host.get("login_status") == "counted")
+        uncollected_n = len(data) - counted_n
+        logger.info(
+            "event=successful_login_count_completed counted_hosts=%s uncollected_hosts=%s",
+            counted_n,
+            uncollected_n,
+        )
+        return {"result": True, "data": data, "message": ""}
+    except Exception as exc:
+        logger.error(
+            "event=successful_login_count_failed failed_stage=%s error_type=%s",
+            failed_stage,
+            type(exc).__name__,
+            exc_info=safe_exception_info(exc),
+        )
+        return {"result": False, "data": [], "message": "成功登录计数失败"}
+
+
+def _llm_keyword_to_query(keyword: str) -> str:
+    return _llm_keywords_to_query([keyword] if str(keyword or "").strip() else [])
+
+
+def _llm_keywords_to_query(keywords: list[str] | tuple[str, ...]) -> str:
+    parts: list[str] = []
+    field = LogGroupQueryBuilder._encode_logsql_field("message")
+    for keyword in keywords:
+        text = str(keyword or "").strip()
+        if not text:
+            continue
+        pattern = f".*{LogGroupQueryBuilder._escape_regex_value(text)}.*"
+        encoded = LogGroupQueryBuilder._encode_logsql_string(pattern)
+        parts.append(f"{field}:re({encoded})")
+    if not parts:
+        return "*"
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " OR ".join(parts) + ")"
+
+
+def _llm_accessible_log_groups(user_info, requested_group_ids=None):
+    accessible = _resolve_log_group_scope(user_info)
+    if not requested_group_ids:
+        return accessible
+    wanted = {str(item) for item in requested_group_ids if item not in (None, "")}
+    return [group for group in accessible if str(group.id) in wanted]
+
+
+def _llm_default_time_range():
+    now = datetime.now(timezone.utc)
+    return format_rfc3339_utc(now - timedelta(hours=24)), format_rfc3339_utc(now)
+
+
+def _llm_execute_log_search(query, time_range, limit, user_info, log_group_ids=None):
+    accessible_groups = _llm_accessible_log_groups(user_info, log_group_ids)
+    if not accessible_groups:
+        return {"result": True, "data": [], "message": ""}
+    group_ids = [group.id for group in accessible_groups]
+    final_query, _ = SearchService._build_storage_query(query, group_ids, resolved_groups=accessible_groups)
+    try:
+        start_time, end_time = _normalize_query_time_range(time_range) if time_range else _llm_default_time_range()
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    try:
+        limit = VictoriaLogsConstants.normalize_query_limit(limit, default=10)
+    except ValueError as exc:
+        return {"result": False, "data": [], "message": str(exc)}
+    if final_query == LogGroupQueryBuilder.DENY_ALL_QUERY:
+        return {"result": True, "data": [], "message": ""}
+    vm_api = VictoriaMetricsAPI()
+    data = vm_api.query(final_query, start_time, end_time, limit)
+    if isinstance(data, list):
+        data = [to_logical_event(item) for item in data]
+    return {"result": True, "data": data, "message": ""}
+
+
+@nats_client.register
+def list_log_groups(user_info=None, **kwargs):
+    """列出当前用户可访问的日志分组。"""
+    user_info = user_info or kwargs.get("user_info")
+    groups = _resolve_log_group_scope(user_info)
+    return {
+        "result": True,
+        "data": [{"id": group.id, "name": group.name} for group in groups],
+        "message": "",
+    }
+
+
+@nats_client.register
+def log_search_structured(query_data=None, user_info=None, **kwargs):
+    """结构化/高级日志查询：在权限分组范围内执行 keyword 或原生 LogsQL。"""
+    query_data = query_data or kwargs.get("query_data") or {}
+    user_info = user_info or kwargs.get("user_info")
+    raw_query = str(query_data.get("query") or "").strip()
+    raw_keywords = query_data.get("keywords")
+    if isinstance(raw_keywords, (list, tuple)):
+        keywords = [str(term).strip() for term in raw_keywords if str(term).strip()]
+    else:
+        keyword = str(query_data.get("keyword") or "").strip()
+        keywords = [keyword] if keyword else []
+    query = raw_query or _llm_keywords_to_query(keywords)
+    return _llm_execute_log_search(
+        query,
+        query_data.get("time_range"),
+        query_data.get("limit") or 10,
+        user_info,
+        query_data.get("log_group_ids"),
+    )

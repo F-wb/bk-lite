@@ -1,0 +1,74 @@
+from rest_framework import serializers
+
+from apps.monitor.models.monitor_policy import MonitorAlert, MonitorAlertMetricSnapshot
+
+
+class AssignHandlersSerializer(serializers.Serializer):
+    handlers = serializers.ListField(child=serializers.JSONField(), allow_empty=False)
+
+    def validate_handlers(self, value):
+        cleaned = []
+        for item in value:
+            if item in (None, "") or isinstance(item, bool):
+                raise serializers.ValidationError("处理人标识无效")
+            cleaned.append(item)
+        if not cleaned:
+            raise serializers.ValidationError("至少指定一名处理人")
+        return cleaned
+
+
+class MonitorAlertSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MonitorAlert
+        fields = [
+            "id",
+            "created_at",
+            "updated_at",
+            "policy_id",
+            "monitor_instance_id",
+            "monitor_instance_name",
+            "metric_instance_id",
+            "dimensions",
+            "alert_type",
+            "level",
+            "value",
+            "content",
+            "status",
+            "start_event_time",
+            "end_event_time",
+            "operator",
+            "info_event_count",
+            "operation_logs",
+            "notice_type_ids",
+            "notice_users",
+            "handlers",
+            "notice_logs",
+            "alert_center_notified",
+            "alert_center_retry_count",
+            "organizations",
+        ]
+        # 告警中心补偿状态机的内部簿记字段，仅由服务端维护，禁止客户端写入
+        read_only_fields = ["alert_center_notified", "alert_center_retry_count"]
+
+
+class MonitorAlertUpdateSerializer(MonitorAlertSerializer):
+    """用户只允许修改告警状态，归属、身份和生命周期簿记均由服务端维护。"""
+
+    allowed_input_fields = {"status", "update_baseline"}
+
+    class Meta(MonitorAlertSerializer.Meta):
+        read_only_fields = [field.name for field in MonitorAlert._meta.fields if field.name != "status"]
+
+    def validate(self, attrs):
+        forbidden_fields = set(self.initial_data) - self.allowed_input_fields
+        if forbidden_fields:
+            raise serializers.ValidationError({field: "该字段不允许修改" for field in sorted(forbidden_fields)})
+        return super().validate(attrs)
+
+
+class MonitorAlertMetricSnapshotSerializer(serializers.ModelSerializer):
+    """告警指标快照序列化器"""
+
+    class Meta:
+        model = MonitorAlertMetricSnapshot
+        fields = "__all__"

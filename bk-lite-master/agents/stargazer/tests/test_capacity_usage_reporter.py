@@ -1,0 +1,321 @@
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+from core.collection.application import CollectionApplication
+from core.collection.capacity_observer import CapacityUsageReporter
+from core.collection.enums import WorkloadClass
+
+
+@pytest.mark.asyncio
+async def test_capacity_reporter_periodically_emits_150_target_slot_usage():
+    emitted = []
+    snapshot = {
+        "active_runs": 12,
+        "target_slots_used": 120,
+        "target_slots_capacity": 150,
+        "target_slots_peak": 145,
+        "pending_targets": 380,
+        "pending_runs": 8,
+        "publish_queue_depth": 40,
+        "publish_queue_capacity": 150,
+    }
+    reporter = CapacityUsageReporter(
+        snapshot=lambda: dict(snapshot),
+        emit=emitted.append,
+        interval_seconds=0.01,
+    )
+
+    reporter.start()
+    await asyncio.sleep(0.025)
+    await reporter.stop()
+
+    assert len(emitted) >= 2
+    assert emitted[0] == {
+        **snapshot,
+        "target_slots_available": 30,
+        "target_slots_utilization_percent": 80.0,
+        "publish_queue_utilization_percent": 26.67,
+    }
+
+
+@pytest.mark.asyncio
+async def test_capacity_reporter_stop_is_idempotent_before_start():
+    reporter = CapacityUsageReporter(snapshot=dict, emit=lambda _snapshot: None, interval_seconds=30)
+    await reporter.stop()
+
+
+def test_application_capacity_snapshot_exposes_derived_values_for_health_metrics(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "core.collection.application.snmp_engine_pool_snapshot",
+        lambda: {
+            "live_engines": 2,
+            "active_engines": 1,
+            "draining_engines": 1,
+            "max_engines": 160,
+            "total_distinct_targets": 800,
+            "total_target_budget": 4000,
+        },
+    )
+    monkeypatch.setattr(
+        "core.collection.application.nats_metrics_connection_stats",
+        lambda: {
+            "nats_js_publish_pending_messages": 12,
+            "nats_js_publish_waiting_messages": 7,
+            "nats_js_puback_duration_seconds_p99": 0.25,
+            "nats_js_deadline_expired_total": 6,
+            "nats_js_credit_wait_timeout_total": 2,
+            "nats_js_publish_call_timeout_total": 1,
+            "nats_js_puback_timeout_total": 3,
+            "nats_js_publish_retry_total": 4,
+            "nats_js_publish_rejected_total": 5,
+        },
+    )
+    application = SimpleNamespace(
+        active_runs=3,
+        runtime=SimpleNamespace(active_runs=3, active_run_targets=2400),
+        _scheduler=SimpleNamespace(
+            active=120,
+            topology_active=45,
+            capacity=150,
+            peak=145,
+            pending=80,
+            pending_runs=4,
+            completed=600,
+            completed_total=1800,
+            pending_by_workload={workload: 0 for workload in WorkloadClass},
+            borrowed_by_workload={workload: 0 for workload in WorkloadClass},
+            pending_by_capacity_group={},
+            capacity_group_limits={},
+            active_by_capacity_group={},
+            active_by_workload={workload: 0 for workload in WorkloadClass},
+        ),
+        settings=SimpleNamespace(
+            max_active_targets=150,
+            max_active_run_targets=4000,
+            publish_total_timeout_seconds=120,
+            configuration_max_active_targets=100,
+            monitoring_max_active_targets=30,
+            network_topology_max_active_targets=50,
+            target_task_window=150,
+        ),
+        _target_activity=SimpleNamespace(active=110),
+        _publisher=SimpleNamespace(
+            queue_depth=45,
+            capacity=150,
+            pending_payloads=90,
+            current_batch_age_seconds=1.25,
+        ),
+        _metrics=SimpleNamespace(
+            snapshot=lambda: {
+                "publish_queue_residence_seconds_p99": 2.5,
+                "result_deliveries_pending": 23,
+            }
+        ),
+        _loop_lag=SimpleNamespace(latest_seconds=0.008, p99_seconds=0.035),
+        _resource_sampler=SimpleNamespace(
+            sample=lambda: {
+                "process_cpu_percent": 62.5,
+                "process_rss_mb": 384.0,
+                "cgroup_memory_utilization_percent": 37.5,
+            }
+        ),
+    )
+
+    snapshot = CollectionApplication.capacity_snapshot(application)
+
+    assert snapshot["target_slots_available"] == 30
+    assert snapshot["target_slots_utilization_percent"] == 80.0
+    assert snapshot["publish_queue_utilization_percent"] == 30.0
+    assert snapshot["publish_batch_age_ms"] == 1250.0
+    assert snapshot["publish_queue_residence_p99_ms"] == 2500.0
+    assert snapshot["completed_targets"] == 600
+    assert snapshot["completed_targets_total"] == 1800
+    assert snapshot["configured_network_topology_max_active_targets"] == 50
+    assert snapshot["active_run_targets"] == 2400
+    assert snapshot["configured_max_active_run_targets"] == 4000
+    assert snapshot["network_topology_active_targets"] == 45
+    assert snapshot["process_cpu_percent"] == 62.5
+    assert snapshot["process_rss_mb"] == 384.0
+    assert snapshot["cgroup_memory_utilization_percent"] == 37.5
+    assert snapshot["result_deliveries_pending"] == 23
+    assert snapshot["publish_payloads_pending"] == 90
+    assert snapshot["publish_payload_capacity"] == 150
+    assert snapshot["configured_publish_total_timeout_ms"] == 120000.0
+    assert snapshot["nats_js_publish_waiting_messages"] == 7
+    assert snapshot["snmp_live_engines"] == 2
+    assert snapshot["snmp_draining_engines"] == 1
+    assert snapshot["snmp_engine_capacity"] == 160
+    assert snapshot["snmp_distinct_targets"] == 800
+    assert snapshot["snmp_target_budget"] == 4000
+
+
+def test_capacity_log_includes_process_and_cgroup_resources(monkeypatch):
+    messages = []
+    fake_logger = SimpleNamespace(info=lambda message, *args: messages.append(message % args))
+    monkeypatch.setattr("core.collection.application.logger", fake_logger)
+
+    CollectionApplication._emit_capacity_log(
+        {
+            "active_runs": 3,
+            "pending_runs": 2,
+            "active_run_targets": 2400,
+            "configured_max_active_run_targets": 4000,
+            "target_slots_used": 120,
+            "target_slots_capacity": 150,
+            "target_slots_available": 30,
+            "target_slots_utilization_percent": 80.0,
+            "target_slots_peak": 145,
+            "active_targets": 110,
+            "pending_targets": 80,
+            "completed_targets": 600,
+            "completed_targets_total": 1800,
+            "configured_max_active_targets": 150,
+            "configured_target_task_window": 150,
+            "publish_queue_depth": 45,
+            "publish_queue_capacity": 150,
+            "publish_queue_utilization_percent": 30.0,
+            "publish_batch_age_ms": 1250.0,
+            "publish_queue_residence_p99_ms": 2500.0,
+            "publish_payloads_pending": 90,
+            "publish_payload_capacity": 150,
+            "configured_publish_total_timeout_ms": 120000.0,
+            "nats_js_publish_pending_messages": 12,
+            "nats_js_publish_waiting_messages": 7,
+            "nats_js_puback_duration_seconds_p99": 0.25,
+            "nats_js_deadline_expired_total": 6,
+            "nats_js_deadline_expired_delta": 2,
+            "nats_js_credit_wait_timeout_total": 2,
+            "nats_js_credit_wait_timeout_delta": 1,
+            "nats_js_publish_call_timeout_total": 1,
+            "nats_js_publish_call_timeout_delta": 1,
+            "nats_js_puback_timeout_total": 3,
+            "nats_js_puback_timeout_delta": 1,
+            "nats_js_publish_retry_total": 4,
+            "nats_js_publish_retry_delta": 2,
+            "nats_js_publish_rejected_total": 5,
+            "nats_js_publish_rejected_delta": 1,
+            "event_loop_lag_ms": 8.0,
+            "event_loop_lag_p99_ms": 35.0,
+            "process_cpu_percent": 62.5,
+            "process_cpu_quota_utilization_percent": 31.25,
+            "process_rss_mb": 384.0,
+            "process_threads": 9,
+            "process_open_fds": 128,
+            "cgroup_memory_current_mb": 512.0,
+            "cgroup_memory_limit_mb": 1024.0,
+            "cgroup_memory_utilization_percent": 50.0,
+            "cgroup_cpu_limit_cores": 2.0,
+            "cgroup_cpu_throttled_seconds_total": 8.5,
+            "cgroup_cpu_throttled_seconds_delta": 1.25,
+            "cgroup_cpu_throttled_periods_total": 40,
+            "cgroup_cpu_throttled_periods_delta": 5,
+        }
+    )
+
+    assert "event=collection_capacity" in messages[0]
+    assert "状态=需关注" in messages[0]
+    assert "提示=CPU发生限流" in messages[0]
+    assert "采集任务[正在执行=3 调度中=2 准入目标=2400/4000]" in messages[0]
+    assert "目标任务[等待执行=80 正在执行=120 本轮已完成=600 累计已完成=1800]" in messages[0]
+    assert "目标并发槽位[已用=120/150 可用=30 使用率=80.0% 峰值=145]" in messages[0]
+    assert "发布队列[深度=45/150 使用率=30.0%" in messages[0]
+    assert "最老活动发布单元=1250.0ms" in messages[0]
+    assert "首次投递前P99=" in messages[0]
+    assert "Payload[未终态=90/150]" in messages[0]
+    assert ("JetStream[在途=12 等待信贷=7 PubAck-P99=250.0ms " "截止超时=6(+2) 信贷超时=2(+1) 调用超时=1(+1) PubAck超时=3(+1) " "重试=4(+2) 未确认=5(+1)]") in messages[0]
+    assert "事件循环[当前延迟=8.0ms P99延迟=35.0ms]" in messages[0]
+    assert "进程[CPU=62.5% CPU配额使用率=31.25% RSS内存=384.0MiB 线程=9 FD=128]" in messages[0]
+    assert "容器[内存=512.0MiB/1024.0MiB 使用率=50.0% CPU限额=2.0核" in messages[0]
+    assert "CPU限流增量=1.25秒/5次" in messages[0]
+
+
+def test_capacity_log_snapshot_reports_counter_deltas():
+    snapshots = iter(
+        (
+            {
+                "nats_js_deadline_expired_total": 6,
+                "nats_js_credit_wait_timeout_total": 2,
+                "nats_js_publish_call_timeout_total": 1,
+                "nats_js_puback_timeout_total": 3,
+                "nats_js_publish_retry_total": 4,
+                "nats_js_publish_rejected_total": 5,
+            },
+            {
+                "nats_js_deadline_expired_total": 8,
+                "nats_js_credit_wait_timeout_total": 3,
+                "nats_js_publish_call_timeout_total": 2,
+                "nats_js_puback_timeout_total": 4,
+                "nats_js_publish_retry_total": 6,
+                "nats_js_publish_rejected_total": 8,
+            },
+        )
+    )
+    application = SimpleNamespace(
+        capacity_snapshot=lambda: next(snapshots),
+        _capacity_counter_baseline={},
+    )
+
+    first = CollectionApplication._capacity_log_snapshot(application)
+    second = CollectionApplication._capacity_log_snapshot(application)
+
+    assert first["nats_js_puback_timeout_delta"] == 0
+    assert first["nats_js_deadline_expired_delta"] == 0
+    assert first["nats_js_credit_wait_timeout_delta"] == 0
+    assert first["nats_js_publish_call_timeout_delta"] == 0
+    assert first["nats_js_publish_retry_delta"] == 0
+    assert first["nats_js_publish_rejected_delta"] == 0
+    assert second["nats_js_puback_timeout_delta"] == 1
+    assert second["nats_js_deadline_expired_delta"] == 2
+    assert second["nats_js_credit_wait_timeout_delta"] == 1
+    assert second["nats_js_publish_call_timeout_delta"] == 1
+    assert second["nats_js_publish_retry_delta"] == 2
+    assert second["nats_js_publish_rejected_delta"] == 3
+
+
+def test_capacity_status_detects_publisher_and_jetstream_backpressure(monkeypatch):
+    messages = []
+    fake_logger = SimpleNamespace(info=lambda message, *args: messages.append(message % args))
+    monkeypatch.setattr("core.collection.application.logger", fake_logger)
+
+    CollectionApplication._emit_capacity_log(
+        {
+            "active_runs": 1,
+            "target_slots_used": 20,
+            "target_slots_capacity": 160,
+            "publish_payloads_pending": 160,
+            "publish_payload_capacity": 160,
+            "publish_batch_age_ms": 120001,
+            "configured_publish_total_timeout_ms": 120000,
+            "nats_js_publish_waiting_messages": 3,
+            "nats_js_deadline_expired_delta": 1,
+            "nats_js_credit_wait_timeout_delta": 1,
+            "nats_js_publish_call_timeout_delta": 1,
+            "nats_js_puback_timeout_delta": 1,
+            "nats_js_publish_rejected_delta": 1,
+        }
+    )
+
+    assert "状态=需关注" in messages[0]
+    assert "Payload容量使用率超过80%" in messages[0]
+    assert "发布活动单元驻留较久(含等待，非发送超时)" in messages[0]
+    assert "JetStream等待信贷" in messages[0]
+    assert "发布截止本周期发生超时" in messages[0]
+    assert "JetStream信贷等待本周期发生超时" in messages[0]
+    assert "JetStream调用本周期发生超时" in messages[0]
+    assert "PubAck本周期发生超时" in messages[0]
+    assert "JetStream本周期存在未确认消息" in messages[0]
+
+
+def test_capacity_log_displays_unavailable_values_in_chinese(monkeypatch):
+    messages = []
+    fake_logger = SimpleNamespace(info=lambda message, *args: messages.append(message % args))
+    monkeypatch.setattr("core.collection.application.logger", fake_logger)
+
+    CollectionApplication._emit_capacity_log({})
+
+    assert "状态=空闲" in messages[0]
+    assert "进程[CPU=不可用" in messages[0]
+    assert "容器[内存=不可用/不可用" in messages[0]

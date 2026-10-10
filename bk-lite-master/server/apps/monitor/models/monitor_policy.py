@@ -1,0 +1,426 @@
+from django.db import IntegrityError, models
+from django.db.models import Q
+from django.db.models.functions import Cast, Concat
+
+from apps.core.fields.s3_json_field import S3JSONField
+from apps.core.models.maintainer_info import MaintainerInfo
+from apps.core.models.time_info import TimeInfo
+from apps.core.utils.database_constraints import ConstraintValidatedQuerySet
+from apps.monitor.constants.monitor_object import MonitorObjConstants
+from apps.monitor.models import MonitorPlugin
+from apps.monitor.models.monitor_object import MonitorObject
+
+
+class PolicyTemplateQuerySet(ConstraintValidatedQuerySet):
+    protected_fields = frozenset({"template_type", "organization", "scope_key"})
+
+
+class PolicyTemplate(TimeInfo, MaintainerInfo):
+    TYPE_BUILTIN = "builtin"
+    TYPE_CUSTOM = "custom"
+    TYPE_CHOICES = ((TYPE_BUILTIN, "内置"), (TYPE_CUSTOM, "自定义"))
+
+    key = models.CharField(max_length=255, verbose_name="模板稳定标识")
+    scope_key = models.CharField(max_length=64, db_index=True, verbose_name="模板唯一性作用域")
+    template_type = models.CharField(
+        max_length=20,
+        choices=TYPE_CHOICES,
+        db_index=True,
+        verbose_name="模板类型",
+    )
+    organization = models.IntegerField(null=True, blank=True, db_index=True, verbose_name="所属项目")
+    monitor_object = models.ForeignKey(MonitorObject, on_delete=models.CASCADE, verbose_name="监控对象")
+    plugin = models.ForeignKey(MonitorPlugin, on_delete=models.CASCADE, verbose_name="监控插件")
+    name = models.CharField(max_length=100, verbose_name="模板名称")
+    description = models.TextField(blank=True, default="", verbose_name="模板描述")
+    config = models.JSONField(default=dict, verbose_name="策略模板配置")
+
+    objects = PolicyTemplateQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = "监控策略模板"
+        verbose_name_plural = "监控策略模板"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("scope_key", "key"),
+                name="uniq_policy_template_scope_key",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        template_type="builtin",
+                        organization__isnull=True,
+                        scope_key="builtin",
+                    )
+                    | models.Q(
+                        template_type="custom",
+                        organization__isnull=False,
+                        scope_key=Concat(
+                            models.Value("custom:"),
+                            Cast(models.F("organization"), output_field=models.CharField()),
+                        ),
+                    )
+                ),
+                name="policy_template_type_org_consistent",
+            ),
+        ]
+
+    def _validate_database_constraints(self):
+        valid_builtin = self.template_type == self.TYPE_BUILTIN and self.organization is None and self.scope_key == "builtin"
+        valid_custom = self.template_type == self.TYPE_CUSTOM and self.organization is not None and self.scope_key == f"custom:{self.organization}"
+        if not (valid_builtin or valid_custom):
+            raise IntegrityError("policy_template_type_org_consistent")
+
+    def save(self, *args, **kwargs):
+        self._validate_database_constraints()
+        return super().save(*args, **kwargs)
+
+
+class MonitorPolicy(TimeInfo, MaintainerInfo):
+    monitor_object = models.ForeignKey(MonitorObject, on_delete=models.CASCADE, verbose_name="监控对象")
+
+    name = models.CharField(max_length=100, verbose_name="监控策略名称")
+    organizations = models.JSONField(default=list, verbose_name="策略所属组织")
+
+    alert_name = models.CharField(max_length=200, default="", verbose_name="告警名称")
+
+    collect_type = models.CharField(max_length=50, default="", verbose_name="采集类型")
+
+    query_condition = models.JSONField(default=dict, verbose_name="查询条件")
+
+    source = models.JSONField(default=dict, verbose_name="策略适用的资源")
+
+    schedule = models.JSONField(default=dict, verbose_name="策略执行周期, eg: 1h执行一次, 5m执行一次")
+    period = models.JSONField(default=dict, verbose_name="每次监控检测的数据周期,eg: 1h内, 5m内")
+
+    group_algorithm = models.CharField(max_length=50, default="avg", verbose_name="分组聚合算法")
+    algorithm = models.CharField(max_length=50, verbose_name="周期聚合算法")
+    group_by = models.JSONField(default=list, verbose_name="分组字段")
+    threshold = models.JSONField(default=list, verbose_name="阈值")
+    trigger_count = models.SmallIntegerField(default=1, verbose_name="连续多少个汇聚周期满足阈值触发告警")
+    recovery_condition = models.SmallIntegerField(default=1, verbose_name="多少周期不满足阈值自动恢复")
+
+    # 单位配置
+    metric_unit = models.CharField(max_length=50, default="", blank=True, verbose_name="指标原始单位")
+    calculation_unit = models.CharField(
+        max_length=50,
+        default="",
+        blank=True,
+        verbose_name="计算单位（用于阈值对比和结果记录）",
+    )
+    threshold_unit = models.CharField(
+        max_length=50,
+        default="",
+        blank=True,
+        verbose_name="告警阈值单位",
+    )
+    compare_mode = models.CharField(
+        max_length=32,
+        default="absolute",
+        blank=True,
+        verbose_name="比较基准",
+    )
+    compare_value_kind = models.CharField(
+        max_length=16,
+        default="",
+        blank=True,
+        verbose_name="比较值类型",
+    )
+    compare_offset_hours = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        verbose_name="对照小时数",
+    )
+    compare_offset_days = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        verbose_name="对照天数",
+    )
+    compare_baseline_weeks = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        verbose_name="对照周数",
+    )
+    count_predicate = models.JSONField(default=dict, verbose_name="条件计数内阈")
+    forecast_target = models.FloatField(blank=True, null=True, verbose_name="容量线目标")
+    forecast_target_unit = models.CharField(
+        max_length=50,
+        default="",
+        blank=True,
+        verbose_name="容量线单位",
+    )
+    forecast_lookback = models.JSONField(default=dict, verbose_name="斜率回看窗")
+    recovery_threshold = models.JSONField(default=dict, verbose_name="恢复阈值")
+
+    no_data_period = models.JSONField(default=dict, verbose_name="无数据告警的数据周期（eg:10m内无数据）")
+    no_data_level = models.CharField(max_length=20, default="", verbose_name="无数据告警级别")
+    no_data_alert_name = models.CharField(max_length=200, default="", verbose_name="无数据告警名称")
+    no_data_recovery_period = models.JSONField(default=dict, verbose_name="无数据告警恢复的数据周期（eg:10m内有数据）")
+
+    notice = models.BooleanField(default=True, verbose_name="是否通知")
+    notice_type = models.CharField(max_length=50, default="", verbose_name="通知方式")
+    notice_type_ids = models.JSONField(default=list, verbose_name="通知方式ID列表")
+    notice_users = models.JSONField(default=list, verbose_name="通知人")
+    handlers = models.JSONField(default=list, verbose_name="处理人")
+
+    # 是否启动策略
+    enable = models.BooleanField(default=True, verbose_name="是否启用")
+    enable_alerts = models.JSONField(default=list, verbose_name="启用的告警类型")
+    last_run_time = models.DateTimeField(blank=True, null=True, verbose_name="最后一次执行时间")
+    source_template = models.ForeignKey(
+        PolicyTemplate,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="issued_policies",
+        verbose_name="来源策略模板",
+    )
+
+    class Meta:
+        verbose_name = "监控策略"
+        verbose_name_plural = "监控策略"
+
+
+class PolicyOrganization(TimeInfo, MaintainerInfo):
+    policy = models.ForeignKey(MonitorPolicy, on_delete=models.CASCADE, verbose_name="监控策略")
+    organization = models.IntegerField(verbose_name="组织id")
+
+    class Meta:
+        verbose_name = "监控策略组织"
+        verbose_name_plural = "监控策略组织"
+        unique_together = ("policy", "organization")
+
+
+class MonitorEvent(models.Model):
+    class Action(models.TextChoices):
+        TRIGGERED = "triggered", "触发"
+        ESCALATED = "escalated", "级别升级"
+        CLAIMED = "claimed", "认领"
+        ASSIGNED = "assigned", "分派"
+        REASSIGNED = "reassigned", "转派"
+        RECOVERED = "recovered", "恢复"
+        CLOSED = "closed", "人工关闭"
+
+    LEVEL_CHOICES = [
+        ("no_data", "No Data"),
+        ("info", "Info"),
+        ("warning", "Warning"),
+        ("error", "Error"),
+        ("critical", "Critical"),
+    ]
+    id = models.CharField(primary_key=True, max_length=50, verbose_name="事件ID")
+
+    alert = models.ForeignKey(
+        "MonitorAlert",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        db_index=True,
+        related_name="events",
+        verbose_name="关联告警",
+    )
+
+    policy_id = models.IntegerField(db_index=True, verbose_name="监控策略ID")
+    monitor_instance_id = models.CharField(
+        db_index=True,
+        max_length=MonitorObjConstants.INSTANCE_ID_MAX_LENGTH,
+        verbose_name="监控对象实例ID",
+    )
+    metric_instance_id = models.CharField(db_index=True, default="", max_length=255, verbose_name="指标实例ID")
+    dimensions = models.JSONField(default=dict, verbose_name="维度值")
+    created_at = models.DateTimeField(db_index=True, auto_now_add=True, verbose_name="事件生成时间")
+    # 事件发生时间
+    event_time = models.DateTimeField(blank=True, null=True, verbose_name="事件发生时间")
+    value = models.FloatField(blank=True, null=True, verbose_name="事件值")
+    level = models.CharField(max_length=20, choices=LEVEL_CHOICES, verbose_name="事件级别")
+    action = models.CharField(
+        max_length=20,
+        choices=Action.choices,
+        blank=True,
+        default="",
+        db_index=True,
+        verbose_name="生命周期动作",
+    )
+    content = models.TextField(blank=True, verbose_name="事件内容")
+    notice_result = models.JSONField(default=list, verbose_name="通知结果")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["policy_id", "monitor_instance_id", "created_at"]),
+            models.Index(fields=["alert", "created_at"]),
+            models.Index(fields=["alert", "action"], name="idx_mon_event_alert_action"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("alert", "action"),
+                condition=Q(alert__isnull=False, action__in=["triggered", "recovered", "closed"]),
+                name="uniq_monitor_event_alert_status_action",
+            ),
+            models.UniqueConstraint(
+                fields=("alert", "action", "level"),
+                condition=Q(alert__isnull=False, action="escalated"),
+                name="uniq_monitor_event_alert_escalated_level",
+            ),
+        ]
+
+
+class MonitorEventRawData(models.Model):
+    event = models.ForeignKey(MonitorEvent, on_delete=models.CASCADE, verbose_name="事件")
+    data = S3JSONField(
+        bucket_name="monitor-alert-raw-data",
+        compressed=True,
+        default=dict,
+        verbose_name="原始数据",
+    )
+
+
+class MonitorAlert(TimeInfo):
+    STATUS_CHOICES = [("new", "New"), ("closed", "Closed"), ("recovered", "Recovered")]
+    ALERT_TYPE_CHOICES = [("alert", "Alert"), ("no_data", "No Data")]
+
+    policy_id = models.IntegerField(db_index=True, default=0, verbose_name="监控策略ID")
+    monitor_instance_id = models.CharField(
+        db_index=True,
+        default="",
+        max_length=MonitorObjConstants.INSTANCE_ID_MAX_LENGTH,
+        verbose_name="监控对象实例ID",
+    )
+    monitor_instance_name = models.CharField(
+        default="",
+        max_length=MonitorObjConstants.INSTANCE_NAME_MAX_LENGTH,
+        verbose_name="监控对象实例名称",
+    )
+    metric_instance_id = models.CharField(db_index=True, default="", max_length=255, verbose_name="指标实例ID")
+    dimensions = models.JSONField(default=dict, verbose_name="维度值")
+    alert_type = models.CharField(
+        db_index=True,
+        default="alert",
+        choices=ALERT_TYPE_CHOICES,
+        max_length=50,
+        verbose_name="告警类型",
+    )
+    level = models.CharField(db_index=True, default="", max_length=20, verbose_name="最高告警级别")
+    value = models.FloatField(blank=True, null=True, verbose_name="最高告警值")
+    content = models.TextField(blank=True, verbose_name="告警内容")
+    status = models.CharField(
+        db_index=True,
+        max_length=20,
+        default="new",
+        choices=STATUS_CHOICES,
+        verbose_name="告警状态",
+    )
+    start_event_time = models.DateTimeField(blank=True, null=True, verbose_name="开始事件时间")
+    end_event_time = models.DateTimeField(blank=True, null=True, verbose_name="结束事件时间")
+    operator = models.CharField(blank=True, null=True, max_length=50, verbose_name="告警处理人")
+    info_event_count = models.IntegerField(default=0, verbose_name="信息事件数量")
+    operation_logs = models.JSONField(default=list, verbose_name="操作记录")
+    notice_type_ids = models.JSONField(default=list, verbose_name="通知方式ID列表")
+    notice_users = models.JSONField(default=list, verbose_name="通知人")
+    handlers = models.JSONField(default=list, verbose_name="处理人")
+    notice_logs = models.JSONField(default=list, verbose_name="通知记录")
+    alert_center_notified = models.BooleanField(default=True, verbose_name="告警中心已同步")
+    alert_center_retry_count = models.IntegerField(default=0, verbose_name="告警中心通知重试次数")
+    # Receiver-first rollout 中保持 False，直到 outbox 明确完成渠道解析与意图落库。
+    # 这样 producer 关闭期和进程在生命周期提交后退出的窗口都会由有界对账收敛。
+    alert_center_delivery_backfilled = models.BooleanField(default=False, verbose_name="告警中心投递意图已对账")
+    organizations = models.JSONField(default=list, verbose_name="告警生成时所属组织")
+
+    class Meta:
+        verbose_name = "监控告警"
+        verbose_name_plural = "监控告警"
+        indexes = [
+            # 支撑补偿任务查询（alert_center_notified=False + status__in）；
+            # notified=False 行稀少（default=True），该索引选择性极高
+            models.Index(fields=["alert_center_notified", "status"], name="idx_alert_center_notified"),
+        ]
+
+
+class MonitorAlertCenterDelivery(TimeInfo):
+    """监控告警向告警中心投递的不可变意图。"""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "待投递"
+        DELIVERING = "delivering", "投递中"
+        DELIVERED = "delivered", "已投递"
+        FAILED = "failed", "投递失败"
+
+    alert = models.ForeignKey(
+        MonitorAlert,
+        on_delete=models.CASCADE,
+        related_name="alert_center_deliveries",
+        verbose_name="监控告警",
+    )
+    action = models.CharField(max_length=20, verbose_name="生命周期动作")
+    generation = models.PositiveIntegerField(verbose_name="告警内投递代次")
+    delivery_id = models.CharField(max_length=64, unique=True, verbose_name="投递幂等标识")
+    channel_id = models.PositiveBigIntegerField(verbose_name="通知通道 ID")
+    payload = models.JSONField(default=dict, verbose_name="不可变投递载荷")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
+    attempts = models.PositiveIntegerField(default=0, verbose_name="投递次数")
+    max_attempts = models.PositiveIntegerField(default=10, verbose_name="最大投递次数")
+    next_retry_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "monitor_alert_center_delivery"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["alert", "generation"],
+                name="uniq_monitor_alert_delivery_gen",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["status", "next_retry_at"], name="idx_monitor_delivery_retry"),
+            models.Index(fields=["alert", "generation"], name="idx_monitor_delivery_order"),
+        ]
+
+
+class MonitorAlertMetricSnapshot(TimeInfo):
+    """告警指标快照表 - 记录告警全生命周期内的原始指标数据"""
+
+    alert = models.OneToOneField("MonitorAlert", on_delete=models.CASCADE, verbose_name="关联告警", db_index=True)
+    policy_id = models.IntegerField(db_index=True, verbose_name="监控策略ID")
+    monitor_instance_id = models.CharField(
+        db_index=True,
+        max_length=MonitorObjConstants.INSTANCE_ID_MAX_LENGTH,
+        verbose_name="监控对象实例ID",
+    )
+
+    # 快照数据 - 使用 S3JSONField 存储到 S3/MinIO，节省数据库空间
+    # 格式: [
+    #   {"type": "pre_alert", "snapshot_time": "xxx", "raw_data": {...}},
+    #   {"type": "event", "event_id": "xxx", "event_time": "xxx", "snapshot_time": "xxx", "raw_data": {...}},
+    #   ...
+    # ]
+    snapshots = S3JSONField(
+        bucket_name="monitor-alert-raw-data",
+        compressed=True,
+        default=list,
+        delete_previous_on_update=True,
+        verbose_name="快照数据集合",
+    )
+
+    class Meta:
+        verbose_name = "告警指标快照"
+        verbose_name_plural = "告警指标快照"
+        indexes = [
+            models.Index(fields=["alert", "policy_id"]),
+        ]
+
+
+class PolicyInstanceBaseline(TimeInfo):
+    """策略实例基准表 - 记录策略监控的所有维度组合，用于无数据检测"""
+
+    policy = models.ForeignKey(MonitorPolicy, on_delete=models.CASCADE, verbose_name="监控策略")
+    monitor_instance_id = models.CharField(
+        db_index=True,
+        max_length=MonitorObjConstants.INSTANCE_ID_MAX_LENGTH,
+        verbose_name="监控实例ID",
+    )
+    metric_instance_id = models.CharField(max_length=255, verbose_name="指标实例ID")
+
+    class Meta:
+        verbose_name = "策略实例基准"
+        verbose_name_plural = "策略实例基准"
+        unique_together = ("policy", "metric_instance_id")

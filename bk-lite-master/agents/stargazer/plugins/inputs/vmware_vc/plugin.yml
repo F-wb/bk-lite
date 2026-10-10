@@ -1,0 +1,26 @@
+name: vmware_vc
+version: 2.0.0
+category: virtualization
+metadata:
+  display_name: VMware vCenter
+  description: VMware vCenter 虚拟化平台采集插件
+  author: WeOps
+  tags:
+  - virtualization
+  - vmware_vc
+  - vcenter
+  cloud_protocol: false
+  model_id: vmware_vc
+executors:
+  protocol:
+    type: protocol
+    execution_mode: sync
+    capacity_group: sync_sdk
+    collector:
+      module: plugins.inputs.vmware_vc.vmware_info
+      class: VmwareManage
+    target_policy:
+      mode: tls
+      port: 443
+      tls: true
+default_executor: protocol

@@ -1,0 +1,109 @@
+/**
+ * 消息发送逻辑 Hook
+ */
+
+import { useCallback, MutableRefObject } from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import { CustomChatMessage } from '@/app/opspilot/types/global';
+
+interface UseSendMessageProps {
+  loading: boolean;
+  token: string | null;
+  messages: CustomChatMessage[];
+  updateMessages: (updater: CustomChatMessage[] | ((prev: CustomChatMessage[]) => CustomChatMessage[])) => void;
+  setLoading: (loading: boolean) => void;
+  handleSendMessage?: (message: string, currentMessages?: any[], userMessage?: CustomChatMessage) => Promise<{
+    url: string;
+    payload: any;
+    interruptRequest?: {
+      enabled: boolean;
+      url: string;
+      reason?: string;
+    };
+  } | null>;
+  handleSSEStream: (url: string, payload: any, botMessage: CustomChatMessage, interruptRequest?: {
+    enabled: boolean;
+    url: string;
+    reason?: string;
+  }) => Promise<void>;
+  currentBotMessageRef: MutableRefObject<CustomChatMessage | null>;
+  t: (key: string) => string;
+}
+
+export const useSendMessage = ({
+  loading,
+  token,
+  messages,
+  updateMessages,
+  setLoading,
+  handleSendMessage,
+  handleSSEStream,
+  currentBotMessageRef,
+  t
+}: UseSendMessageProps) => {
+  
+  const sendMessage = useCallback(
+    async (content: string, currentMessages?: CustomChatMessage[], images?: any[]) => {
+      if ((!content && !images?.length) || loading || !token) {
+        return;
+      }
+
+      setLoading(true);
+
+      const newUserMessage: CustomChatMessage = {
+        id: uuidv4(),
+        content,
+        role: 'user',
+        createAt: new Date().toISOString(),
+        updateAt: new Date().toISOString(),
+        ...(images && images.length > 0 && { images })
+      };
+
+      const botLoadingMessage: CustomChatMessage = {
+        id: uuidv4(),
+        content: '',
+        role: 'bot',
+        createAt: new Date().toISOString(),
+        updateAt: new Date().toISOString(),
+      };
+
+      // 设置当前 bot 消息引用，用于显示 loading 动画
+      currentBotMessageRef.current = botLoadingMessage;
+
+      const messagesToUse = currentMessages || messages;
+      // 用函数式更新追加，避免绝对数组覆盖正在流式写入的正文
+      updateMessages(prev => [...prev, newUserMessage, botLoadingMessage]);
+
+      try {
+        if (handleSendMessage) {
+          const result = await handleSendMessage(content, messagesToUse, newUserMessage);
+
+          if (result === null) {
+            updateMessages(prev => prev.filter(
+              msg => msg.id !== newUserMessage.id && msg.id !== botLoadingMessage.id
+            ));
+            setLoading(false);
+            return;
+          }
+
+          const { url, payload, interruptRequest } = result;
+          await handleSSEStream(url, payload, botLoadingMessage, interruptRequest);
+        }
+      } catch (error: any) {
+        console.error(`${t('chat.sendFailed')}:`, error);
+
+        updateMessages(prevMessages =>
+          prevMessages.map(msgItem =>
+            msgItem.id === botLoadingMessage.id
+              ? { ...msgItem, content: t('chat.connectionError') }
+              : msgItem
+          )
+        );
+        setLoading(false);
+      }
+    },
+    [loading, token, messages, handleSendMessage, handleSSEStream, updateMessages, setLoading, currentBotMessageRef, t]
+  );
+
+  return { sendMessage };
+};

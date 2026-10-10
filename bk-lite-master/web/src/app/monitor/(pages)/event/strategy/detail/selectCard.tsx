@@ -1,0 +1,96 @@
+import React from 'react';
+import { Checkbox, Tag } from 'antd';
+import Icon from '@/components/icon';
+import { CardItem, SelectCardProps } from '@/app/monitor/types/event';
+
+const getColorWithOpacity = (cssVar: string, opacity: number): string => {
+  return `color-mix(in srgb, var(${cssVar}) ${opacity * 100}%, transparent)`;
+};
+
+const SelectCard: React.FC<SelectCardProps> = ({
+  data = [],
+  value = [],
+  onChange,
+  cardWidth,
+  showCheckbox = false
+}) => {
+  const handleCardClick = (item: CardItem) => {
+    const currentValue = value || [];
+    const exists = currentValue.includes(item.value);
+    const newValue = exists
+      ? currentValue.filter((v) => v !== item.value)
+      : [...currentValue, item.value];
+    onChange?.(newValue);
+  };
+
+  return (
+    <div
+      className={cardWidth ? 'grid gap-4' : 'grid grid-cols-3 gap-4'}
+      style={{
+        gridAutoRows: '1fr',
+        ...(cardWidth
+          ? { gridTemplateColumns: `repeat(auto-fill, ${cardWidth}px)` }
+          : {})
+      }}
+    >
+      {data.map((item, index) => {
+        const isSelected = (value || []).includes(item.value);
+        return (
+          <div
+            key={index}
+            onClick={() => handleCardClick(item)}
+            style={{
+              width: cardWidth ? `${cardWidth}px` : undefined,
+              backgroundColor: isSelected
+                ? getColorWithOpacity('--color-primary', 0.04)
+                : undefined
+            }}
+            className={`relative bg-[var(--color-bg-1)] border-2 ${
+              isSelected
+                ? 'border-[var(--color-primary)] shadow-[0_8px_24px_rgba(0,112,243,0.2)]'
+                : 'border-transparent'
+            } shadow-md transition-all duration-300 ease-in-out rounded-lg p-3 cursor-pointer group hover:shadow-lg`}
+          >
+            {showCheckbox ? (
+              <Checkbox
+                checked={isSelected}
+                className="pointer-events-none absolute right-2 top-2"
+              />
+            ) : null}
+            <div className={`flex gap-3 h-full ${showCheckbox ? 'pr-6' : ''}`}>
+              {item.icon && (
+                <Icon
+                  type={item.icon}
+                  className="text-2xl flex-shrink-0 mt-1"
+                />
+              )}
+              <div className="flex-1 min-w-0 flex flex-col">
+                <h2
+                  className="text-[14px] font-bold m-0 truncate"
+                  title={item.title}
+                >
+                  {item.title}
+                </h2>
+                {item.tag && (
+                  <div className="mt-1">
+                    <Tag color="blue" className="text-[12px]">
+                      {item.tag}
+                    </Tag>
+                  </div>
+                )}
+                <p
+                  className="text-[var(--color-text-3)] text-[12px] m-0 mt-1 line-clamp-2 flex-1"
+                  title={item.description || '--'}
+                >
+                  {item.description || '--'}
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+export default SelectCard;

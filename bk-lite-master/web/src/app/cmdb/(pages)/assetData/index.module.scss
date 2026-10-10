@@ -1,0 +1,185 @@
+.assetLoading {
+    .assetData {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    background: var(--color-bg-1);
+    padding: 12px;
+
+    .assetList {
+      flex: 1;
+      min-width: 0;
+      max-width: 100%;
+      height: calc(100vh - 124px);
+      overflow: hidden;
+      padding: 12px 16px;
+      position: relative;
+
+      &::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 12px;
+        bottom: 0;
+        width: 1px;
+        background-color: var(--color-border-1);
+      }
+    }
+
+    .groupSelector {
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 124px);
+      padding: 12px 0 0 4px;
+      overflow: hidden;
+      width: 240px;
+      min-width: 240px;
+      position: relative;
+
+      .treeSearchWrapper {
+        display: flex;
+        flex: none;
+        flex-direction: column;
+        padding-bottom: 12px;
+        padding-right: 16px;
+        background-color: var(--color-bg-1);
+      }
+
+      .treeSearchInput {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .treeSearchActions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 4px;
+        margin-top: 4px;
+      }
+
+      .treeLabel {
+        display: inline-block;
+        max-width: 126px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .treeWrapper {
+        flex: 1;
+        min-height: 0;
+        height: auto;
+        overflow: auto;
+      }
+    }
+
+    .owner {
+      display: flex;
+      align-items: center;
+
+      .userAvatar {
+        display: flex;
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        margin-right: 10px;
+        align-items: center;
+        justify-content: center;
+        background: var(--color-fill-3);
+        color: var(--color-bg-1);
+        font-size: 12px;
+      }
+    }
+  }
+}
+
+.actionSizer {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  visibility: hidden;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.menuItemClickable {
+  display: block;
+  width: 100%;
+}
+
+.instanceNameCell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  vertical-align: middle;
+}
+
+.instanceFollowButton {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  padding: 0;
+  color: var(--color-text-3);
+}
+
+.instanceFollowed {
+  color: #fa8c16 !important;
+}
+
+.instanceNameText {
+  display: inline-block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.actionGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  max-width: 400px;
+  opacity: 1;
+  transform: translateY(0);
+  transition: max-width 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
+}
+
+.actionGroupCollapsed {
+  max-width: 0;
+  opacity: 0;
+  transform: translateY(-2px);
+  pointer-events: none;
+}
+
+.assetLoading .assetData .groupSelector :global(.ant-radio-button-wrapper) {
+  border: none;
+  background: transparent;
+  border-radius: 4px !important;
+  white-space: nowrap;
+  margin-right: 10px;
+}
+
+.assetLoading .assetData .groupSelector :global(.ant-radio-button-wrapper::before) {
+  width: 0;
+}
+
+.assetLoading .assetData .groupSelector :global(.ant-radio-button-wrapper:hover) {
+  color: var(--color-primary);
+  background: var(--color-bg-1);
+}
+
+.assetLoading .assetData .groupSelector :global(.ant-radio-button-wrapper-checked) {
+  background: var(--color-bg-1);
+  color: var(--color-primary);
+}
+
+.assetLoading .assetData .groupSelector :global(.ant-radio-group-solid) {
+  display: flex;
+  overflow-x: auto;
+  overflow-y: hidden;
+}

@@ -1,0 +1,217 @@
+"""Local Memory Engine - Uses PostgreSQL database for memory storage."""
+
+from typing import Any, Dict, List, Optional
+
+from django.db.models import Q
+
+from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.memory.engines.base import BaseMemoryEngine, MemoryEntity, MemoryReadResult, MemoryWriteResult
+from apps.opspilot.memory.identity import resolve_owner_identity
+from apps.opspilot.models.memory_mgmt import Memory
+
+
+class LocalMemoryEngine(BaseMemoryEngine):
+    """本地记忆引擎
+
+    使用 PostgreSQL 数据库存储记忆，复用现有的 Memory 模型。
+    """
+
+    def read(
+        self,
+        entity: MemoryEntity,
+        query: Optional[str] = None,
+        top_k: int = 5,
+    ) -> MemoryReadResult:
+        """读取记忆
+
+        本地引擎不支持语义搜索，按更新时间倒序返回最近的记忆。
+        """
+        try:
+            if entity.organization_id is not None:
+                memories = Memory.objects.filter(
+                    memory_space_id=self.memory_space_id,
+                    organization_id=entity.organization_id,
+                ).order_by(
+                    "-updated_at"
+                )[:top_k]
+            elif entity.user_id:
+                owner = resolve_owner_identity(external_user_id=entity.user_id)
+                owner_q = Q(organization_id__isnull=True)
+                if owner.user_id:
+                    owner_q &= Q(owner_user_id=owner.user_id) | Q(
+                        owner_user_id__isnull=True,
+                        owner_username=owner.username,
+                        owner_domain=owner.domain,
+                    )
+                else:
+                    owner_q &= Q(owner_username=owner.username, owner_domain=owner.domain)
+                memories = Memory.objects.filter(owner_q, memory_space_id=self.memory_space_id).order_by("-updated_at")[:top_k]
+            else:
+                # 既无组织也无用户标识：无法确定记忆归属，返回空结果，
+                # 避免在仅按 memory_space_id 过滤时泄露其他用户的个人记忆。
+                logger.info("[LocalMemoryEngine] No entity identity for space=%s, returning empty", self.memory_space_id)
+                return MemoryReadResult(context="", raw_memories=[], source="local")
+
+            # 构建上下文字符串
+            context_parts = []
+            raw_memories = []
+            for mem in memories:
+                context_parts.append(mem.content)
+                raw_memories.append(
+                    {
+                        "id": str(mem.id),
+                        "title": mem.title,
+                        "content": mem.content,
+                        "updated_at": mem.updated_at.isoformat() if mem.updated_at else None,
+                    }
+                )
+
+            context = "\n\n---\n\n".join(context_parts)
+            logger.info(f"[LocalMemoryEngine] Read {len(raw_memories)} memories for space={self.memory_space_id}")
+
+            return MemoryReadResult(
+                context=context,
+                raw_memories=raw_memories,
+                source="local",
+            )
+        except Exception as e:
+            logger.error(f"[LocalMemoryEngine] Read failed: {e}", exc_info=True)
+            return MemoryReadResult(context="", raw_memories=[], source="local")
+
+    def write(
+        self,
+        entity: MemoryEntity,
+        content: str,
+        title: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        model_id: Optional[int] = None,
+    ) -> MemoryWriteResult:
+        """写入记忆
+
+        调用现有的 Celery 任务进行异步写入，支持 LLM 智能合并。
+
+        Args:
+            model_id: 可选的模型 ID，用于覆盖记忆空间的默认模型
+        """
+        from apps.opspilot.tasks import process_memory_write, process_memory_write_cache
+
+        try:
+            # 解析实体信息
+            if entity.organization_id is not None:
+                # 组织记忆
+                owner_username = f"组织-{entity.organization_id}"
+                owner_domain = ""
+                organization_id = entity.organization_id
+                owner_user_id = None
+
+                # 尝试获取组织名称
+                try:
+                    from apps.system_mgmt.models import Group
+
+                    group = Group.objects.get(id=entity.organization_id)
+                    owner_username = group.name
+                except Exception:
+                    pass
+            else:
+                owner = resolve_owner_identity(external_user_id=entity.user_id, assign_if_missing=True)
+                owner_username = owner.username or (entity.user_id or "system")
+                owner_domain = owner.domain
+                organization_id = None
+                owner_user_id = owner.user_id
+
+            workflow_id = metadata.get("workflow_id") if isinstance(metadata, dict) else None
+            node_id = metadata.get("node_id") if isinstance(metadata, dict) else None
+            write_batch_size = metadata.get("write_batch_size") if isinstance(metadata, dict) else None
+
+            if workflow_id and node_id:
+                process_memory_write_cache.delay(
+                    memory_space_id=self.memory_space_id,
+                    title=title or "自动记忆",
+                    content=content,
+                    owner_username=owner_username,
+                    owner_domain=owner_domain,
+                    organization_id=organization_id,
+                    model_id=model_id,
+                    workflow_id=workflow_id,
+                    node_id=node_id,
+                    write_batch_size=write_batch_size,
+                    owner_user_id=owner_user_id,
+                )
+            else:
+                process_memory_write.delay(
+                    memory_space_id=self.memory_space_id,
+                    title=title or "自动记忆",
+                    content=content,
+                    owner_username=owner_username,
+                    owner_domain=owner_domain,
+                    organization_id=organization_id,
+                    model_id=model_id,
+                    owner_user_id=owner_user_id,
+                )
+            return MemoryWriteResult(
+                success=True,
+                message="记忆写入任务已提交",
+            )
+        except Exception as e:
+            logger.error(f"[LocalMemoryEngine] Write failed: {e}", exc_info=True)
+            return MemoryWriteResult(
+                success=False,
+                message=str(e),
+            )
+
+    def delete(
+        self,
+        entity: MemoryEntity,
+        memory_id: Optional[str] = None,
+    ) -> bool:
+        """删除记忆"""
+        try:
+            if memory_id:
+                deleted, _ = Memory.objects.filter(
+                    id=int(memory_id),
+                    memory_space_id=self.memory_space_id,
+                ).delete()
+                return deleted > 0
+
+            if entity.organization_id is not None:
+                deleted, _ = Memory.objects.filter(
+                    memory_space_id=self.memory_space_id,
+                    organization_id=entity.organization_id,
+                ).delete()
+            elif entity.user_id:
+                owner = resolve_owner_identity(external_user_id=entity.user_id)
+                owner_q = Q(memory_space_id=self.memory_space_id, organization_id__isnull=True)
+                if owner.user_id:
+                    owner_q &= Q(owner_user_id=owner.user_id) | Q(
+                        owner_user_id__isnull=True,
+                        owner_username=owner.username,
+                        owner_domain=owner.domain,
+                    )
+                else:
+                    owner_q &= Q(owner_username=owner.username, owner_domain=owner.domain)
+                deleted, _ = Memory.objects.filter(owner_q).delete()
+            else:
+                return False
+            logger.info("[LocalMemoryEngine] Deleted %s memories for space=%s", deleted, self.memory_space_id)
+            return deleted > 0
+        except Exception as e:
+            logger.error(f"[LocalMemoryEngine] Delete failed: {e}", exc_info=True)
+            return False
+
+    def test_connection(self) -> Dict[str, Any]:
+        """本地存储无需测试连接"""
+        return {"success": True, "message": "本地存储无需测试"}
+
+    @classmethod
+    def get_engine_info(cls) -> Dict[str, str]:
+        """获取引擎信息"""
+        return {
+            "type": "local",
+            "name": "本地存储",
+            "description": "使用 PostgreSQL 数据库存储记忆",
+        }
+
+    @classmethod
+    def get_config_schema(cls) -> List[Dict[str, Any]]:
+        """本地存储无需额外配置"""
+        return []

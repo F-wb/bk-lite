@@ -1,0 +1,459 @@
+import base64
+import hashlib
+import hmac
+import json
+import smtplib
+import time
+import urllib.parse
+import uuid
+from datetime import datetime, timezone
+from email import encoders
+from email.header import Header
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from urllib.parse import urlparse
+
+import requests
+from wechatpy import WeChatClientException
+from wechatpy.enterprise import WeChatClient
+
+import nats_client
+from apps.core.logger import system_mgmt_logger as logger
+from apps.core.utils.ssrf_validator import SSRFError, SSRFValidator
+from apps.system_mgmt.models import Channel
+from apps.system_mgmt.utils.network_whitelist_error import build_network_whitelist_error_payload
+
+try:
+    from apps.system_mgmt.enterprise import nats_notifications
+except (ImportError, ModuleNotFoundError):
+    nats_notifications = None
+
+
+def is_valid_webhook_url(url: str) -> bool:
+    """验证 Webhook URL 是否允许出站。
+
+    统一委托 ``SSRFValidator.validate``：公网域名默认通；内网/危险网段需
+    CIDR 或域名白名单例外；纯 IP 必须命中 CIDR；云 metadata 硬挡。
+    """
+    if not url:
+        return False
+    try:
+        SSRFValidator.validate(url)
+        return True
+    except SSRFError as exc:
+        logger.warning(f"[SSRF] 阻断 webhook URL: url_host={_webhook_hostname(url)}, reason={exc}")
+        return False
+    except Exception as exc:
+        logger.exception(f"[SSRF] webhook 校验异常: {exc}")
+        return False
+
+
+def _webhook_hostname(url: str) -> str:
+    """返回可安全记录的 hostname,避免 path/query 中的 token 泄露到日志。"""
+    try:
+        return urlparse(url).hostname or "<invalid>"
+    except ValueError:
+        return "<invalid>"
+
+
+def send_wechat(channel_obj: Channel, content, user_list):
+    """发送企业微信应用消息，接收人为平台用户名对应的企微 userid。"""
+    if user_list is None or not user_list.exists():
+        return {"result": False, "message": "No valid recipients found"}
+    channel_config = channel_obj.config
+    channel_obj.decrypt_field("secret", channel_config)
+    channel_obj.decrypt_field("token", channel_config)
+    channel_obj.decrypt_field("aes_key", channel_config)
+    receivers = list(user_list.values_list("username", flat=True))
+    try:
+        # 创建企业微信客户端
+        client = WeChatClient(corp_id=channel_config["corp_id"], secret=channel_config["secret"])
+        # 发送文本消息
+        client.message.send_text(agent_id=channel_config["agent_id"], user_ids=receivers, content=content)
+        return {"result": True, "message": "Successfully sent WeChat message"}
+    except WeChatClientException as e:
+        return {"result": False, "message": f"WeChat API error: {e.errmsg}"}
+    except Exception as e:
+        return {"result": False, "message": f"Error sending WeChat message: {str(e)}"}
+
+
+def send_email(channel_obj: Channel, title, content, user_list, attachments=None):
+    """发送邮件"""
+    channel_config = channel_obj.config
+    channel_obj.decrypt_field("smtp_pwd", channel_config)
+    receivers = list(user_list.values_list("email", flat=True).distinct())
+    return send_email_to_user(channel_config, content, receivers, title, attachments)
+
+
+def is_smtp_auth_enabled(channel_config: dict) -> bool:
+    """是否启用 SMTP 认证。缺省或非显式 false 时视为启用，保持存量行为。"""
+    return channel_config.get("smtp_auth_enabled", True) is not False
+
+
+def send_personalized_email_messages(channel_obj: Channel, messages: list[dict], timeout: int = 30) -> dict:
+    """复用 SMTP 连接发送多封不同正文的邮件，仅供内部批任务调用。"""
+    channel_config = dict(channel_obj.config or {})
+    channel_obj.decrypt_field("smtp_pwd", channel_config)
+    server = None
+    results = {}
+    try:
+        if channel_config.get("smtp_usessl", False):
+            server = smtplib.SMTP_SSL(channel_config["smtp_server"], channel_config["port"], timeout=timeout)
+        else:
+            server = smtplib.SMTP(channel_config["smtp_server"], channel_config["port"], timeout=timeout)
+        if channel_config.get("smtp_usetls", False):
+            server.starttls()
+        if is_smtp_auth_enabled(channel_config):
+            server.login(channel_config["smtp_user"], channel_config["smtp_pwd"])
+        for item in messages:
+            msg = MIMEMultipart()
+            msg["From"] = channel_config["mail_sender"]
+            msg["To"] = item["receiver"]
+            msg["Subject"] = item["title"]
+            msg.attach(MIMEText(item["content"], "html", "utf-8"))
+            try:
+                server.send_message(msg)
+                results[item["key"]] = {"result": True}
+            except (smtplib.SMTPAuthenticationError, smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected):
+                # 连接级错误由批任务租约恢复，不将未尝试用户误记为终态失败。
+                raise
+            except smtplib.SMTPException as exc:
+                results[item["key"]] = {"result": False, "message": str(exc)}
+        return results
+    finally:
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:
+                pass
+
+
+def send_email_to_user(channel_config, content, receivers, title, attachments=None):
+    """
+    发送邮件给用户
+    :param channel_config: 邮件通道配置
+    :param content: 邮件正文内容（HTML格式）
+    :param receivers: 收件人邮箱列表
+    :param title: 邮件主题
+    :param attachments: 附件列表，每个附件格式为:
+        - {"filename": "文件名", "content": "base64编码内容"} (用于NATS远程调用，推荐)
+        - {"filename": "文件名", "data": bytes} (仅用于本地直接调用)
+        注意: 通过NATS传输时，附件必须使用base64编码的content字段，因为NATS使用JSON序列化
+    """
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = channel_config["mail_sender"]
+        msg["To"] = ",".join(receivers)
+        msg["Subject"] = title
+        msg.attach(MIMEText(content, "html", "utf-8"))
+
+        # 处理附件
+        if attachments:
+            for attachment in attachments:
+                filename = attachment.get("filename", "attachment")
+                # 支持两种方式：base64编码的content（NATS传输）或原始bytes的data（本地调用）
+                if "content" in attachment:
+                    file_data = base64.b64decode(attachment["content"])
+                elif "data" in attachment:
+                    file_data = attachment["data"]
+                else:
+                    continue
+
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(file_data)
+                header_filename = filename if filename.isascii() else Header(filename, "utf-8").encode()
+                part.add_header(
+                    "Content-Disposition",
+                    "attachment",
+                    filename=header_filename,
+                )
+                # 对附件内容进行 base64 编码
+                encoders.encode_base64(part)
+                msg.attach(part)
+
+        # 根据配置决定使用 SSL 还是普通连接
+        if channel_config.get("smtp_usessl", False):
+            server = smtplib.SMTP_SSL(channel_config["smtp_server"], channel_config["port"])
+        else:
+            server = smtplib.SMTP(channel_config["smtp_server"], channel_config["port"])
+
+        # 如果配置使用 TLS，则启用 TLS
+        if channel_config.get("smtp_usetls", False):
+            server.starttls()
+
+        # 仅在显式启用认证时 login；关闭认证不在失败后降级匿名重试
+        if is_smtp_auth_enabled(channel_config):
+            server.login(channel_config["smtp_user"], channel_config["smtp_pwd"])
+        server.send_message(msg)
+        server.quit()
+
+        return {"result": True, "message": "Successfully sent email"}
+    except Exception as e:
+        return {
+            "result": False,
+            "message": f"Error sending email: {str(e)}",
+            "error_type": type(e).__name__,
+        }
+
+
+def send_by_wecom_bot(channel_obj: Channel, content, receivers):
+    if receivers:
+        to_user_mentions = " ".join(f"@{name} " for name in receivers)
+        content = f"{content}\nTo: {to_user_mentions}"
+    channel_config = channel_obj.config
+    payload = {"msgtype": "markdown", "markdown": {"content": content}}
+
+    # 优先使用 webhook_url（通用 webhook）
+    channel_obj.decrypt_field("webhook_url", channel_config)
+    webhook_url = channel_config.get("webhook_url")
+    if not webhook_url:
+        channel_obj.decrypt_field("bot_key", channel_config)
+        bot_key = channel_config.get("bot_key")
+        webhook_url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={bot_key}"
+
+    # SSRF 防护：验证 webhook URL 域名
+    if not is_valid_webhook_url(webhook_url):
+        logger.warning(f"[SSRF] 阻断非法 webhook hostname: {_webhook_hostname(webhook_url)}")
+        return build_network_whitelist_error_payload()
+
+    try:
+        res = requests.post(webhook_url, json=payload, timeout=5, allow_redirects=False)
+        return res.json()
+    except Exception as e:
+        logger.exception(e)
+        return {"result": False, "message": "failed to send bot message"}
+
+
+def send_by_feishu_bot(channel_obj: Channel, title, content, receivers):
+    """发送飞书机器人消息（interactive 卡片格式，支持 Markdown，可选 HMAC-SHA256 签名）"""
+    if receivers:
+        to_user_mentions = " ".join(f"@{name} " for name in receivers)
+        content = f"{content}\nTo: {to_user_mentions}"
+    channel_config = channel_obj.config
+    channel_obj.decrypt_field("webhook_url", channel_config)
+    webhook_url = channel_config.get("webhook_url")
+    if not webhook_url:
+        return {"result": False, "message": "Feishu bot webhook_url is not configured"}
+
+    # SSRF 防护：验证 webhook URL 域名
+    if not is_valid_webhook_url(webhook_url):
+        logger.warning(f"[SSRF] 阻断非法 webhook hostname: {_webhook_hostname(webhook_url)}")
+        return build_network_whitelist_error_payload()
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {"title": {"tag": "plain_text", "content": title or "\u901a\u77e5"}},
+            "elements": [{"tag": "markdown", "content": content}],
+        },
+    }
+
+    # 可选签名验证（秒级时间戳）
+    channel_obj.decrypt_field("sign_secret", channel_config)
+    sign_secret = channel_config.get("sign_secret")
+    if sign_secret:
+        timestamp = str(int(time.time()))
+        string_to_sign = f"{timestamp}\n{sign_secret}"
+        hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+        sign = base64.b64encode(hmac_code).decode("utf-8")
+        payload["timestamp"] = timestamp
+        payload["sign"] = sign
+
+    try:
+        res = requests.post(webhook_url, json=payload, timeout=5, allow_redirects=False)
+        return res.json()
+    except Exception as e:
+        logger.exception(e)
+        return {"result": False, "message": "failed to send feishu bot message"}
+
+
+def send_by_dingtalk_bot(channel_obj: Channel, title, content, receivers):
+    """发送钉钉机器人消息（markdown 格式，可选 HMAC-SHA256 签名）"""
+    # at_mobiles = []
+    if receivers:
+        to_user_mentions = " ".join(f"@{name} " for name in receivers)
+        content = f"{content}<br>To: {to_user_mentions}"
+    channel_config = channel_obj.config
+    channel_obj.decrypt_field("webhook_url", channel_config)
+    webhook_url = channel_config.get("webhook_url")
+    if not webhook_url:
+        return {"result": False, "message": "DingTalk bot webhook_url is not configured"}
+
+    # SSRF protection: validate webhook URL against allowlist before signing
+    if not is_valid_webhook_url(webhook_url):
+        logger.warning(f"[SSRF] 阻断非法 webhook hostname: {_webhook_hostname(webhook_url)}")
+        return build_network_whitelist_error_payload()
+
+    # 可选签名验证（毫秒级时间戳，URL 编码）
+    channel_obj.decrypt_field("sign_secret", channel_config)
+    sign_secret = channel_config.get("sign_secret")
+    if sign_secret:
+        timestamp = str(int(round(time.time() * 1000)))
+        string_to_sign = f"{timestamp}\n{sign_secret}"
+        hmac_code = hmac.new(sign_secret.encode("utf-8"), string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code).decode("utf-8"))
+        webhook_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
+
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {"title": title or "\u901a\u77e5", "text": content},
+        # "at": {"atMobiles": at_mobiles},
+    }
+
+    try:
+        res = requests.post(webhook_url, json=payload, timeout=5, allow_redirects=False)
+        return res.json()
+    except Exception as e:
+        logger.exception(e)
+        return {"result": False, "message": "failed to send dingtalk bot message"}
+
+
+def send_nats_message(channel_obj: Channel, content: dict, *, timeout_override=None, title="", test=False):
+    """
+    发送 NATS 消息（Request 模式）
+    :param channel_obj: NATS Channel 对象
+    :param content: 消息内容，dict 类型，将作为 kwargs 传递给目标方法
+    :return: 目标服务的响应
+    """
+    config = channel_obj.config
+    if nats_notifications is not None and nats_notifications.handles_config(config):
+        return nats_notifications.send(channel_obj, content, title=title, test=test)
+    if config.get("nats_mode") not in (None, "request_reply"):
+        return {"result": False, "code": "unsupported_nats_extension_mode", "retryable": False}
+
+    namespace = config.get("namespace")
+    method_name = config.get("method_name")
+    bot_id = config.get("bot_id")
+    node_id = config.get("node_id")
+    timeout = timeout_override if timeout_override is not None else config.get("timeout", 60)
+
+    if not namespace or not method_name:
+        return {"result": False, "message": "NATS channel config missing namespace or method_name"}
+
+    payload = dict(content)
+    if method_name == "trigger_workflow_by_nats":
+        if bot_id is None or not node_id:
+            return {"result": False, "message": "NATS channel config missing bot_id or node_id"}
+        payload = {
+            "message": payload.get("message"),
+            "team": payload.get("team"),
+            "user_ids": payload.get("user_ids") or [],
+            "bot_id": bot_id,
+            "node_id": node_id,
+        }
+    elif method_name == "trigger_orchestration_workflow_by_nats":
+        trigger_id = str(config.get("trigger_id") or "").strip()
+        subject = str(config.get("subject") or "").strip()
+        if not trigger_id or not subject:
+            return {"result": False, "message": "NATS channel config missing trigger_id or subject"}
+        if config.get("active") is not True:
+            return {"result": False, "message": "The orchestration workflow is inactive"}
+        try:
+            team = int(payload.get("team"))
+            channel_teams = {int(item) for item in (getattr(channel_obj, "team", None) or [])}
+        except (TypeError, ValueError):
+            return {"result": False, "message": "NATS content.team must be a single integer team id"}
+        if team not in channel_teams:
+            return {"result": False, "message": "NATS content.team is outside the channel organization scope"}
+        event_id = str(payload.get("event_id") or f"notification-{uuid.uuid4().hex}").strip()
+        occurred_at = str(payload.get("occurred_at") or datetime.now(timezone.utc).isoformat()).strip()
+        producer = str(payload.get("producer") or "system-mgmt").strip()
+        if not event_id or len(event_id) > 128 or not occurred_at or len(occurred_at) > 64 or not producer or len(producer) > 100:
+            return {"result": False, "message": "NATS event metadata is invalid"}
+        event_payload = {
+            "message": payload.get("message"),
+            "team": team,
+            "user_ids": payload.get("user_ids") or [],
+        }
+        for field in ("object_id", "scene"):
+            if payload.get(field):
+                event_payload[field] = payload[field]
+        payload = {
+            "data": {
+                "trigger_id": trigger_id,
+                "team": team,
+                "subject": subject,
+                "event": {
+                    "event_id": event_id,
+                    "occurred_at": occurred_at,
+                    "producer": producer,
+                    "payload": event_payload,
+                },
+            },
+            "actor_context": {
+                "authorized_team_ids": sorted(channel_teams),
+                "username": "managed-nats-channel",
+                "domain": "domain.com",
+            },
+        }
+
+    try:
+        result = nats_client.request_sync(namespace, method_name, _timeout=timeout, **payload)
+        return result
+    except Exception as e:
+        logger.exception(e)
+        return {"result": False, "message": f"NATS request failed: {str(e)}"}
+
+
+def send_by_custom_webhook(channel_obj: Channel, content, receivers):
+    """发送自定义 Webhook 消息，body_template 中的 {{content}} 被替换为实际内容"""
+    channel_config = channel_obj.config
+    channel_obj.decrypt_field("webhook_url", channel_config)
+    webhook_url = channel_config.get("webhook_url")
+    if not webhook_url:
+        return {"result": False, "message": "Custom webhook url is not configured"}
+    if not is_valid_webhook_url(webhook_url):
+        return build_network_whitelist_error_payload()
+    if receivers:
+        to_user_mentions = " ".join(f"@{name} " for name in receivers)
+        content = f"{content}<br>To: {to_user_mentions}"
+    body_template = channel_config.get("body_template", "")
+    request_method = channel_config.get("request_method", "POST").upper()
+
+    try:
+        headers = json.loads(channel_config.get("headers")) or {}
+    except (json.JSONDecodeError, TypeError):
+        headers = {}
+
+    body_str = ""
+    try:
+        body = _replace_placeholder(json.loads(body_template), "{{content}}", content)
+    except (json.JSONDecodeError, TypeError):
+        body = None
+        body_str = body_template.replace("{{content}}", content)
+    try:
+        if body is not None:
+            res = requests.request(
+                request_method,
+                webhook_url,
+                json=body,
+                headers=headers,
+                timeout=10,
+                allow_redirects=False,
+            )
+        else:
+            headers.setdefault("Content-Type", "text/plain")
+            res = requests.request(
+                request_method,
+                webhook_url,
+                data=body_str.encode("utf-8"),
+                headers=headers,
+                timeout=10,
+                allow_redirects=False,
+            )
+        return res.json()
+    except Exception as e:
+        logger.exception(e)
+        return {"result": False, "message": "failed to send custom webhook message"}
+
+
+# 先解析模板为结构体，再递归替换 {{content}}，避免 content 中的换行符等破坏 JSON 语法
+def _replace_placeholder(obj, placeholder, value):
+    if isinstance(obj, str):
+        return obj.replace(placeholder, value)
+    if isinstance(obj, dict):
+        return {k: _replace_placeholder(v, placeholder, value) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_replace_placeholder(i, placeholder, value) for i in obj]
+    return obj

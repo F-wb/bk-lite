@@ -1,0 +1,116 @@
+export const useFirewallConfig = () => {
+  return {
+    instance_type: 'firewall',
+    dashboardDisplay: [
+      {
+        indexId: 'device_cpu_usage',
+        displayType: 'single',
+        sortIndex: 0,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '24%'
+        }
+      },
+      {
+        indexId: 'device_memory_usage',
+        displayType: 'single',
+        sortIndex: 1,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '24%'
+        }
+      },
+      {
+        indexId: 'device_total_incoming_traffic',
+        displayType: 'single',
+        sortIndex: 2,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '24%'
+        }
+      },
+      {
+        indexId: 'device_total_outgoing_traffic',
+        displayType: 'single',
+        sortIndex: 3,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '24%'
+        }
+      },
+      {
+        indexId: 'snmp_uptime',
+        displayType: 'lineChart',
+        sortIndex: 4,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '100%'
+        }
+      },
+      {
+        indexId: 'interfaces',
+        displayType: 'multipleIndexsTable',
+        sortIndex: 5,
+        displayDimension: ['ifOperStatus', 'ifHighSpeed', 'ifInErrors', 'ifOutErrors', 'ifInUcastPkts', 'ifOutUcastPkts', 'ifInOctets', 'ifOutOctets'],
+        style: {
+          height: '400px',
+          width: '100%'
+        }
+      }
+    ],
+    groupIds: {
+      list: ['instance_id'],
+      default: ['instance_id']
+    },
+    collectTypes: {
+      'Firewall SNMP General': 'snmp',
+      'Firewall Cisco SNMP': 'snmp_cisco_firewall',
+      'Firewall Cisco ESA SNMP': 'snmp_cisco_esa',
+      'Firewall Fortinet SNMP': 'snmp_fortinet',
+      'Firewall Fortinet FortiWeb SNMP': 'snmp_fortiweb',
+      'Firewall Hillstone SNMP': 'snmp_hillstone',
+      'Firewall Sophos XG SNMP': 'snmp_sophos',
+      'Firewall Forcepoint SNMP': 'snmp_forcepoint',
+      'Firewall Fortinet FortiMail SNMP': 'snmp_fortimail',
+      'Firewall ScreenOS SNMP': 'snmp_screenos',
+      'Firewall Neteye SNMP': 'snmp_neteye',
+      'Firewall Bluedon SNMP': 'snmp_bluedon',
+      'Firewall Pulse Secure SNMP': 'snmp_pulsesecure',
+      'Firewall DPtech SNMP': 'snmp_dptech',
+      'Firewall FireEye SNMP': 'snmp_fireeye',
+      'Firewall Westone SNMP': 'snmp_westone',
+      'Firewall Amaranten SNMP': 'snmp_amaranten',
+      'Firewall Secworld SNMP': 'snmp_secworld',
+      'Firewall Barracuda CloudGen SNMP': 'snmp_barracuda_cloudgen',
+      'Firewall Check Point SNMP': 'snmp_checkpoint',
+      'Firewall Cisco WSA SNMP': 'snmp_cisco_wsa',
+      'Firewall Stormshield SNMP': 'snmp_stormshield',
+      'Firewall Palo Alto SNMP': 'snmp_paloalto',
+      'Firewall SonicWall SNMP': 'snmp_sonicwall',
+      'Firewall Sangfor SNMP': 'snmp_sangfor',
+      'Firewall Topsec SNMP': 'snmp_topsec',
+      'Firewall Huawei SNMP': 'snmp_huawei_usg',
+      'Firewall H3C SNMP': 'snmp_h3c_firewall',
+      'Firewall Juniper SNMP': 'snmp_juniper_firewall',
+      'Firewall Kerio Control SNMP': 'snmp_kerio',
+      'Firewall mGuard SNMP': 'snmp_mguard',
+      'Firewall Clavister SNMP': 'snmp_clavister',
+      'Firewall Blockbit SNMP': 'snmp_blockbit',
+      'Firewall Barracuda SNMP': 'snmp_barracuda',
+      'Firewall Securepoint SNMP': 'snmp_securepoint',
+      'Firewall Zorp SNMP': 'snmp_zorp',
+      'Firewall WatchGuard SNMP': 'snmp_watchguard',
+      'Firewall pfSense SNMP': 'snmp_pfsense',
+      'Firewall OPNsense SNMP': 'snmp_opnsense',
+      'Firewall IPFire SNMP': 'snmp_ipfire',
+      'Firewall Zyxel SNMP': 'snmp_zyxel_firewall',
+      'Firewall Flow NetFlow': 'netflow',
+      'Firewall Flow sFlow': 'sflow'
+    }
+  };
+};

@@ -1,0 +1,25 @@
+name: mssql
+version: 2.0.0
+category: database
+metadata:
+  display_name: SQL Server 数据库
+  description: Microsoft SQL Server 数据库采集插件，支持协议方式采集
+  author: WeOps
+  tags:
+  - database
+  - mssql
+  - sqlserver
+  cloud_protocol: false
+  model_id: mssql
+executors:
+  protocol:
+    type: protocol
+    execution_mode: sync
+    capacity_group: sync_sdk
+    collector:
+      module: plugins.inputs.mssql.mssql_info
+      class: MSSQLInfo
+    target_policy:
+      mode: tcp
+      port: 1433
+default_executor: protocol

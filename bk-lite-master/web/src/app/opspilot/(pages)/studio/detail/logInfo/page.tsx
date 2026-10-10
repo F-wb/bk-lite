@@ -1,0 +1,849 @@
+'use client';
+import React, { useEffect, useState, useCallback } from 'react';
+import { Input, Spin, Drawer, Button, Tag, Tooltip, Timeline, Segmented } from 'antd';
+import { ClockCircleOutlined, SyncOutlined, RightOutlined } from '@ant-design/icons';
+import { useTranslation } from '@/utils/i18n';
+import { useSearchParams } from 'next/navigation';
+import type { ColumnType } from 'antd/es/table';
+import useApiClient from '@/utils/request';
+import ProChatComponent from '@/app/opspilot/components/studio/proChat';
+import TimeSelector from '@/components/time-selector';
+import CustomTable from '@/components/custom-table';
+import { LogRecord, Channel, WorkflowTaskResult, WorkflowExecutionDetailItem } from '@/app/opspilot/types/studio';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import { fetchLogDetails, createConversation } from '@/app/opspilot/utils/logUtils';
+import { formatDurationMs } from '@/app/opspilot/utils/duration';
+import { useStudioApi } from '@/app/opspilot/api/studio';
+import dayjs from 'dayjs';
+
+const { Search } = Input;
+
+const StudioLogsPage: React.FC = () => {
+  const { t } = useTranslation();
+  const { post } = useApiClient();
+  const { fetchLogs, fetchChannels, fetchBotDetail, fetchWorkflowTaskResult, fetchWorkflowLogs, fetchExecutionOutputData, fetchExecutionDetail } = useStudioApi();
+  const { convertToLocalizedTime } = useLocalizedTime();
+  const [searchText, setSearchText] = useState('');
+  const [dates, setDates] = useState<number[]>([
+    dayjs().subtract(1440, 'minute').valueOf(),
+    dayjs().valueOf(),
+  ]);
+  const [data, setData] = useState<LogRecord[] | WorkflowTaskResult[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [drawerVisible, setDrawerVisible] = useState(false);
+  const [selectedConversation, setSelectedConversation] = useState<LogRecord | null>(null);
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const [workflowDrawerVisible, setWorkflowDrawerVisible] = useState(false);
+  const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowTaskResult | null>(null);
+  const [selectedWorkflowDetails, setSelectedWorkflowDetails] = useState<WorkflowExecutionDetailItem[]>([]);
+  const [workflowDetailLoading, setWorkflowDetailLoading] = useState(false);
+  const [total, setTotal] = useState(0);
+  const [pagination, setPagination] = useState({
+    current: 1,
+    pageSize: 10,
+  });
+  const [selectedChannels, setSelectedChannels] = useState<string[]>([]);
+  const [botType, setBotType] = useState<number | null>(null);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState<string>('trigger');
+  const [workflowLogsData, setWorkflowLogsData] = useState<LogRecord[]>([]);
+  const [workflowLogsTotal, setWorkflowLogsTotal] = useState(0);
+  const [workflowLogsPagination, setWorkflowLogsPagination] = useState({
+    current: 1,
+    pageSize: 10,
+  });
+  const [expandedExecutionNodes, setExpandedExecutionNodes] = useState<string[]>([]);
+  const searchParams = useSearchParams();
+  const botId = searchParams ? searchParams.get('id') : null;
+
+  const toggleExecutionNode = (nodeKey: string) => {
+    setExpandedExecutionNodes((prev) => (
+      prev.includes(nodeKey)
+        ? prev.filter((key) => key !== nodeKey)
+        : [...prev, nodeKey]
+    ));
+  };
+
+  useEffect(() => {
+    setExpandedExecutionNodes([]);
+  }, [selectedWorkflow?.id, workflowDrawerVisible]);
+
+  // Fetch bot details and set bot type
+  const fetchBotData = useCallback(async () => {
+    try {
+      const botDetail = await fetchBotDetail(botId);
+      setBotType(botDetail.bot_type);
+    } catch (error) {
+      console.error('Failed to fetch bot details:', error);
+    }
+  }, [botId]);
+
+  // Fetch logs data for regular bots (bot_type !== 3)
+  const fetchLogsData = useCallback(async (searchText = '', dates: number[] = [], page = 1, pageSize = 10, selectedChannels: string[] = []) => {
+    setLoading(true);
+    try {
+      const params: any = { bot_id: botId, page, page_size: pageSize };
+      if (searchText) params.search = searchText;
+      if (dates && dates[0] && dates[1]) {
+        params.start_time = new Date(dates[0]).toISOString();
+        params.end_time = new Date(dates[1]).toISOString();
+      }
+      if (selectedChannels.length > 0) params.channel_type = selectedChannels.join(',');
+
+      const res = await fetchLogs(params);
+      setData(res.items.map((item: any, index: number) => ({
+        key: index.toString(),
+        title: item.title,
+        createdTime: item.created_at,
+        updatedTime: item.updated_at,
+        user: item.username,
+        channel: item.channel_type,
+        count: Math.ceil(item.count / 2),
+        ids: item.ids,
+      })));
+      setTotal(res.count);
+    } catch (error) {
+      console.error(`${t('common.fetchFailed')}:`, error);
+    }
+    setLoading(false);
+  }, [botId]);
+
+  // Fetch workflow task results for bot type 3
+  const fetchWorkflowData = useCallback(async (dates: number[] = [], page = 1, pageSize = 10) => {
+    setLoading(true);
+    try {
+      const params: any = {
+        bot_id: botId,
+        page,
+        page_size: pageSize
+      };
+
+      if (dates && dates[0] && dates[1]) {
+        params.start_time = new Date(dates[0]).toISOString();
+        params.end_time = new Date(dates[1]).toISOString();
+      }
+
+      const res = await fetchWorkflowTaskResult(params);
+      setData((res?.items || []).map((item: any, index: number) => {
+        const executionDuration = item.execution_duration ?? item.duration_ms ?? 0;
+
+        return {
+          key: index.toString(),
+          id: item.id,
+          run_time: item.run_time,
+          status: item.status,
+          input_data: item.input_data,
+          output_data: item.output_data,
+          last_output: item.last_output,
+          execute_type: item.execute_type,
+          bot_work_flow: item.bot_work_flow,
+          execution_duration: Number(executionDuration) || 0,
+          error_log: item.error_log || '',
+          execution_id: item.execution_id || '',
+        };
+      }));
+      setTotal(res.count);
+    } catch (error) {
+      console.error(`${t('common.fetchFailed')}:`, error);
+    }
+    setLoading(false);
+  }, [botId, fetchWorkflowTaskResult, t]);
+
+  // Fetch workflow conversation logs for bot type 3
+  const fetchWorkflowLogsData = useCallback(async (dates: number[] = [], page = 1, pageSize = 10) => {
+    setLoading(true);
+    try {
+      const params: any = {
+        bot_id: botId,
+        page,
+        page_size: pageSize
+      };
+
+      if (dates && dates[0] && dates[1]) {
+        params.start_time = new Date(dates[0]).toISOString();
+        params.end_time = new Date(dates[1]).toISOString();
+      }
+
+      const res = await fetchWorkflowLogs(params);
+      setWorkflowLogsData((res?.items || []).map((item: any, index: number) => ({
+        key: index.toString(),
+        title: item.title,
+        createdTime: item.created_at,
+        updatedTime: item.updated_at,
+        user: item.user_id,
+        channel: item.entry_type,
+        count: item.count,
+        ids: item.ids,
+      })));
+      setWorkflowLogsTotal(res.count || 0);
+    } catch (error) {
+      console.error(`${t('common.fetchFailed')}:`, error);
+    }
+    setLoading(false);
+  }, [botId, fetchWorkflowLogs, t]);
+
+  useEffect(() => {
+    const initializeComponent = async () => {
+      await fetchBotData();
+      setInitialLoading(false);
+    };
+
+    initializeComponent();
+  }, [fetchBotData]);
+
+  useEffect(() => {
+    if (botType !== null) {
+      if (botType === 3) {
+        if (activeTab === 'trigger') {
+          fetchWorkflowData(dates, pagination.current, pagination.pageSize);
+        } else {
+          fetchWorkflowLogsData(dates, workflowLogsPagination.current, workflowLogsPagination.pageSize);
+        }
+      } else {
+        fetchLogsData(searchText, dates, pagination.current, pagination.pageSize, selectedChannels);
+
+        const fetchChannelsData = async () => {
+          try {
+            const data = await fetchChannels(botId);
+            setChannels(data.map((channel: any) => ({ id: channel.id, name: channel.name })));
+          } catch (error) {
+            console.error(`${t('common.fetchFailed')}:`, error);
+          }
+        };
+        fetchChannelsData();
+      }
+    }
+  }, [botType, botId, dates, pagination.current, pagination.pageSize, activeTab, workflowLogsPagination.current, workflowLogsPagination.pageSize]);
+
+  const handleSearch = (value: string) => {
+    setSearchText(value);
+    setSelectedChannels([]);
+    setPagination({ ...pagination, current: 1 });
+    if (botType !== 3) {
+      fetchLogsData(value, dates, 1, pagination.pageSize, []);
+    }
+  };
+
+  const handleDetailClick = async (record: LogRecord) => {
+    setSelectedConversation(record);
+    setDrawerVisible(true);
+    setConversationLoading(true);
+
+    try {
+      const data = await fetchLogDetails(post, record?.ids || []);
+      const conversation = await createConversation(data);
+      setSelectedConversation({
+        ...record,
+        conversation,
+      });
+    } catch (error) {
+      console.error(`${t('common.fetchFailed')}:`, error);
+    } finally {
+      setConversationLoading(false);
+    }
+  };
+
+  const handleWorkflowDetailClick = async (record: WorkflowTaskResult) => {
+    setSelectedWorkflow(record);
+    setSelectedWorkflowDetails([]);
+    setWorkflowDrawerVisible(true);
+
+    if (record.execution_id) {
+      setWorkflowDetailLoading(true);
+      try {
+        const [outputDataResult, executionDetailResult] = await Promise.allSettled([
+          fetchExecutionOutputData({
+            execution_id: record.execution_id,
+            id: record.id,
+          }),
+          fetchExecutionDetail(record.execution_id),
+        ]);
+
+        const outputData = outputDataResult.status === 'fulfilled' ? outputDataResult.value : record.output_data;
+        const executionDetails = executionDetailResult.status === 'fulfilled' ? executionDetailResult.value : [];
+
+        setSelectedWorkflow({
+          ...record,
+          output_data: outputData,
+        });
+
+        setSelectedWorkflowDetails(executionDetails);
+
+        if (outputDataResult.status === 'rejected') {
+          console.error('Failed to fetch workflow execution output data:', outputDataResult.reason);
+        }
+
+        if (executionDetailResult.status === 'rejected') {
+          console.error('Failed to fetch workflow execution detail:', executionDetailResult.reason);
+        }
+      } catch (error) {
+        console.error('Failed to fetch workflow execution detail:', error);
+      } finally {
+        setWorkflowDetailLoading(false);
+      }
+    }
+  };
+
+  const renderJsonData = (data: any) => {
+    if (!data) return '-';
+    if (typeof data === 'object') {
+      return <pre className="bg-(--color-fill-1) p-2 rounded text-xs overflow-auto max-h-60">{JSON.stringify(data, null, 2)}</pre>;
+    }
+    return String(data);
+  };
+
+  const parseJsonIfString = (value: any) => {
+    if (typeof value !== 'string') return value;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  };
+
+  const getBrowserSteps = (value: any): string[] => {
+    const parsed = parseJsonIfString(value);
+    if (parsed && typeof parsed === 'object') {
+      const steps = (parsed as any).browser_steps || (parsed as any).browserSteps;
+      if (Array.isArray(steps)) return steps.map(step => String(step));
+    }
+    return [];
+  };
+
+  const stripBrowserSteps = (value: any) => {
+    const parsed = parseJsonIfString(value);
+    if (parsed && typeof parsed === 'object') {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { browser_steps, browserSteps, ...rest } = parsed as any;
+      return rest;
+    }
+    return value;
+  };
+
+  const getNodeStatus = (value: any) => {
+    const parsed = parseJsonIfString(value);
+    if (parsed && typeof parsed === 'object') {
+      const status = (parsed as any).status || (parsed as any).node_status;
+      if (typeof status === 'string' && status) {
+        return status.toLowerCase();
+      }
+    }
+    return '';
+  };
+
+  const getNodeErrorMessage = (value: any) => {
+    const parsed = parseJsonIfString(value);
+    if (parsed && typeof parsed === 'object') {
+      const errorMessage = (parsed as any).error
+        || (parsed as any).error_message
+        || (parsed as any).message
+        || (parsed as any).reason;
+      if (typeof errorMessage === 'string' && errorMessage) {
+        return errorMessage;
+      }
+    }
+    return '';
+  };
+
+  const normalizeNodeStatus = (status?: string | null) => {
+    if (!status) return 'pending';
+    if (status === 'success') return 'completed';
+    if (status === 'fail') return 'failed';
+    return status;
+  };
+
+  const renderNodeStatusTag = (status?: string | null) => {
+    const normalizedStatus = normalizeNodeStatus(status);
+
+    if (normalizedStatus === 'failed') {
+      return <Tag color="error">{t('studio.logs.table.statusFailed')}</Tag>;
+    }
+
+    if (normalizedStatus === 'completed') {
+      return <Tag color="success">{t('studio.logs.table.statusSuccess')}</Tag>;
+    }
+
+    if (normalizedStatus === 'running') {
+      return <Tag color="processing">{t('studio.logs.table.statusRunning')}</Tag>;
+    }
+
+    return <Tag>{t('chatflow.preview.pending')}</Tag>;
+  };
+
+  const renderWorkflowTimeline = () => {
+    if (!selectedWorkflow?.output_data && selectedWorkflowDetails.length === 0) return null;
+
+    const outputEntries = selectedWorkflow?.output_data && typeof selectedWorkflow.output_data === 'object'
+      ? Object.entries(selectedWorkflow.output_data as Record<string, any>)
+      : [];
+
+    const detailMap = new Map(selectedWorkflowDetails.map((item) => [item.node_id, item]));
+    const nodes = outputEntries.map(([key, value]: [string, any]) => {
+      const detail = detailMap.get(key);
+      const outputStatus = getNodeStatus(value.output);
+      const nodeStatus = normalizeNodeStatus(detail?.status || outputStatus);
+      const errorMessage = detail?.error_message || getNodeErrorMessage(value.output);
+
+      return {
+        id: key,
+        name: value.name || detail?.node_name || key,
+        type: value.type || detail?.node_type,
+        index: value.index ?? detail?.node_index ?? 0,
+        input_data: value.input_data ?? detail?.input_data,
+        output: value.output ?? detail?.output_data,
+        status: nodeStatus,
+        error_message: errorMessage,
+      };
+    });
+
+    selectedWorkflowDetails.forEach((detail) => {
+      if (nodes.some((node) => node.id === detail.node_id)) {
+        return;
+      }
+
+      nodes.push({
+        id: detail.node_id,
+        name: detail.node_name || detail.node_id,
+        type: detail.node_type,
+        index: detail.node_index ?? 0,
+        input_data: detail.input_data,
+        output: detail.output_data,
+        status: normalizeNodeStatus(detail.status),
+        error_message: detail.error_message || '',
+      });
+    });
+
+    nodes.sort((a, b) => a.index - b.index);
+
+    return (
+      <Timeline
+        items={nodes.map((node, idx) => {
+          const browserSteps = getBrowserSteps(node.output);
+          const executionPanelKey = `${node.id}-execution-process`;
+          const isExecutionExpanded = expandedExecutionNodes.includes(executionPanelKey);
+          const isFailed = node.status === 'failed';
+
+          return {
+            color: isFailed ? 'red' : idx === nodes.length - 1 ? 'green' : 'blue',
+            children: (
+              <div className={`pb-4 ${isFailed ? 'rounded-2xl border border-red-200 bg-red-50/60 p-4' : ''}`}>
+                <div className="font-medium text-base mb-2">
+                  {node.name}
+                  <Tag className="ml-2" color="blue">{node.type}</Tag>
+                  <span className="ml-2">{renderNodeStatusTag(node.status)}</span>
+                </div>
+                <div className="space-y-3">
+                  {isFailed && node.error_message && (
+                    <div className="rounded-2xl border border-red-200 bg-red-100/70 px-4 py-3">
+                      <div className="text-sm font-semibold text-red-600">{t('studio.logs.errorInfo')}</div>
+                      <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-red-500">{node.error_message}</div>
+                    </div>
+                  )}
+                  <div>
+                    <div className="text-gray-500 text-sm mb-1">{t('studio.logs.inputData')}:</div>
+                    {renderJsonData(node.input_data)}
+                  </div>
+                  {browserSteps.length > 0 && (
+                    <div>
+                      <div
+                        className="bg-(--color-bg) overflow-hidden rounded-2xl border shadow-sm"
+                        style={{ borderColor: 'var(--color-border-1)' }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => toggleExecutionNode(executionPanelKey)}
+                          className="w-full px-4 py-2.5 text-left transition-colors hover:bg-(--color-fill-1)"
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-500">
+                              <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+                              </svg>
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="text-(--color-text-1) text-sm font-semibold">
+                                {t('studio.logs.executionProcess', '执行过程（{count} 个步骤）', { count: browserSteps.length })}
+                              </div>
+                            </div>
+                            <RightOutlined
+                              className={`text-(--color-text-3) text-xs transition-transform duration-200 ${isExecutionExpanded ? 'rotate-90' : ''}`}
+                            />
+                          </div>
+                        </button>
+
+                        {isExecutionExpanded && (
+                          <div className="border-(--color-border-1) border-t px-4 pb-4 pt-3">
+                            <div className="space-y-2">
+                              {browserSteps.map((step, stepIndex) => (
+                                <div key={`${node.id}-step-${stepIndex}`} className="flex items-start gap-3 pl-2">
+                                  <span className="mt-3 inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-blue-500 px-1 text-[10px] font-semibold leading-none text-white shadow-sm">
+                                    {stepIndex + 1}
+                                  </span>
+                                  <div
+                                    className={`min-w-0 flex-1 rounded-2xl border px-4 py-3 text-sm leading-6 ${
+                                      stepIndex % 2 === 0
+                                        ? 'bg-(--color-fill-2)'
+                                        : 'bg-(--color-fill-1)'
+                                    }`}
+                                    style={{ borderColor: 'var(--color-border-1)' }}
+                                  >
+                                    {step}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  <div>
+                    <div className="text-gray-500 text-sm mb-1">{t('studio.logs.outputData')}:</div>
+                    {renderJsonData(stripBrowserSteps(node.output))}
+                  </div>
+                </div>
+              </div>
+            )
+          };
+        })}
+      />
+    );
+  };
+
+  const handleTableChange = (page: number, pageSize?: number) => {
+    const newPagination = {
+      current: page,
+      pageSize: pageSize || pagination.pageSize,
+    };
+    setPagination(newPagination);
+
+    if (botType === 3 && activeTab === 'trigger') {
+      fetchWorkflowData(dates, newPagination.current, newPagination.pageSize);
+    } else {
+      fetchLogsData(searchText, dates, newPagination.current, newPagination.pageSize, selectedChannels);
+    }
+  };
+
+  const handleWorkflowLogsTableChange = (page: number, pageSize?: number) => {
+    const newPagination = {
+      current: page,
+      pageSize: pageSize || workflowLogsPagination.pageSize,
+    };
+    setWorkflowLogsPagination(newPagination);
+    fetchWorkflowLogsData(dates, newPagination.current, newPagination.pageSize);
+  };
+
+  const handleRefresh = () => {
+    if (botType === 3) {
+      if (activeTab === 'trigger') {
+        fetchWorkflowData(dates, pagination.current, pagination.pageSize);
+      } else {
+        fetchWorkflowLogsData(dates, workflowLogsPagination.current, workflowLogsPagination.pageSize);
+      }
+    } else {
+      fetchLogsData(searchText, dates, pagination.current, pagination.pageSize, selectedChannels);
+    }
+  };
+
+  const handleChannelFilterChange = (channels: string[]) => {
+    setSelectedChannels(channels);
+    setPagination({ ...pagination, current: 1 });
+    if (botType !== 3) {
+      fetchLogsData(searchText, dates, 1, pagination.pageSize, channels);
+    }
+  };
+
+  const handleDateChange = (value: number[]) => {
+    setDates(value);
+    setSelectedChannels([]);
+    setPagination({ ...pagination, current: 1 });
+    setWorkflowLogsPagination({ ...workflowLogsPagination, current: 1 });
+
+    if (botType === 3) {
+      if (activeTab === 'trigger') {
+        fetchWorkflowData(value, 1, pagination.pageSize);
+      } else {
+        fetchWorkflowLogsData(value, 1, workflowLogsPagination.pageSize);
+      }
+    } else {
+      fetchLogsData(searchText, value, 1, pagination.pageSize, []);
+    }
+  };
+
+  const handleTabChange = (key: string) => {
+    setActiveTab(key);
+  };
+
+  const channelFilters = channels.map(channel => ({ text: channel.name, value: channel.name }));
+
+  // Columns for regular logs (bot_type !== 3)
+  const logColumns: ColumnType<LogRecord>[] = [
+    {
+      title: t('studio.logs.table.title'),
+      dataIndex: 'title',
+      key: 'title',
+      render: (text) => (
+        <Tooltip title={text}>
+          <div className="line-clamp-3">{text}</div>
+        </Tooltip>
+      ),
+    },
+    {
+      title: t('studio.logs.table.createdTime'),
+      dataIndex: 'createdTime',
+      key: 'createdTime',
+      render: (text) => convertToLocalizedTime(text),
+    },
+    {
+      title: t('studio.logs.table.updatedTime'),
+      dataIndex: 'updatedTime',
+      key: 'updatedTime',
+      render: (text) => convertToLocalizedTime(text),
+    },
+    {
+      title: t('studio.logs.table.user'),
+      dataIndex: 'user',
+      key: 'user',
+    },
+    {
+      title: t('studio.logs.table.channel'),
+      dataIndex: 'channel',
+      key: 'channel',
+      filters: channelFilters,
+      filteredValue: selectedChannels,
+      onFilter: (value) => !!value,
+      filterMultiple: true,
+    },
+    {
+      title: t('studio.logs.table.count'),
+      dataIndex: 'count',
+      key: 'count',
+    },
+    {
+      title: t('common.actions'),
+      key: 'actions',
+      render: (text: any, record: LogRecord) => (
+        <Button type="link" onClick={() => handleDetailClick(record)}>
+          {t('studio.logs.table.detail')}
+        </Button>
+      ),
+    },
+  ];
+
+  // Columns for workflow task results (bot_type === 3)
+  const workflowColumns: ColumnType<WorkflowTaskResult>[] = [
+    {
+      title: t('studio.logs.table.runTime'),
+      dataIndex: 'run_time',
+      key: 'run_time',
+      render: (text) => convertToLocalizedTime(text),
+    },
+    {
+      title: t('studio.logs.table.executeType'),
+      dataIndex: 'execute_type',
+      key: 'execute_type',
+      render: (text) => {
+        if (!text) return '-';
+        return (
+          <Tag color={text === 'restful' ? 'blue' : 'green'}>
+            {text === 'restful' ? 'RESTful' : text.toUpperCase()}
+          </Tag>
+        );
+      },
+    },
+    {
+      title: t('studio.logs.table.status'),
+      dataIndex: 'status',
+      key: 'status',
+      render: (status, record) => {
+        const statusText = status === 'success'
+          ? t('studio.logs.table.statusSuccess')
+          : (status === 'failed' || status === 'fail')
+            ? t('studio.logs.table.statusFailed')
+            : status === 'interrupted'
+              ? t('studio.logs.table.statusInterrupted')
+              : status === 'interrupt_requested'
+                ? t('studio.logs.table.statusInterruptRequested')
+                : t('studio.logs.table.statusRunning');
+
+        const statusColor = status === 'success'
+          ? 'green'
+          : (status === 'failed' || status === 'fail')
+            ? 'red'
+            : status === 'interrupted'
+              ? 'default'
+              : 'orange';
+
+        if ((status === 'failed' || status === 'fail') && record.error_log) {
+          return (
+            <Tooltip title={<pre className="max-w-md whitespace-pre-wrap">{record.error_log}</pre>}>
+              <Tag color={statusColor}>{statusText}</Tag>
+            </Tooltip>
+          );
+        }
+
+        return <Tag color={statusColor}>{statusText}</Tag>;
+      },
+    },
+    {
+      title: t('studio.logs.table.executionDuration'),
+      dataIndex: 'execution_duration',
+      key: 'execution_duration',
+      render: (duration) => formatDurationMs(duration, t),
+    },
+    {
+      title: t('common.actions'),
+      key: 'actions',
+      render: (text: any, record: WorkflowTaskResult) => (
+        <Button type="link" onClick={() => handleWorkflowDetailClick(record)}>
+          {t('studio.logs.table.detail')}
+        </Button>
+      ),
+    },
+  ];
+
+  return (
+    <div className='h-full flex flex-col'>
+      <div className='mb-5'>
+        <div className='flex justify-between items-center'>
+          {botType === 3 && (
+            <Segmented
+              value={activeTab}
+              onChange={handleTabChange}
+              options={[
+                { label: t('studio.logs.triggerLogs'), value: 'trigger' },
+                { label: t('studio.logs.conversationLogs'), value: 'conversation' },
+              ]}
+            />
+          )}
+          {botType !== 3 && <div />}
+          <div className='flex space-x-4'>
+            <Search
+              placeholder={`${t('studio.logs.searchUser')}...`}
+              allowClear
+              onSearch={handleSearch}
+              enterButton
+              className='w-60'
+            />
+            <Tooltip className='mr-2' title={t('common.refresh')}>
+              <Button icon={<SyncOutlined />} onClick={handleRefresh} />
+            </Tooltip>
+            <TimeSelector
+              onlyTimeSelect
+              defaultValue={{
+                selectValue: 1440,
+                rangePickerVaule: null
+              }}
+              onChange={handleDateChange}
+            />
+          </div>
+        </div>
+      </div>
+      <div className='grow'>
+        {initialLoading || loading ? (
+          <div className='w-full flex items-center justify-center min-h-72'>
+            <Spin size="large" />
+          </div>
+        ) : (
+          <>
+            {botType === 3 ? (
+              <>
+                {activeTab === 'trigger' ? (
+                  <CustomTable<WorkflowTaskResult>
+                    size="middle"
+                    dataSource={data as WorkflowTaskResult[]}
+                    columns={workflowColumns}
+                    pagination={{
+                      current: pagination.current,
+                      pageSize: pagination.pageSize,
+                      total: total,
+                      showSizeChanger: true,
+                      showQuickJumper: true,
+                      onChange: handleTableChange,
+                    }}
+                  />
+                ) : (
+                  <CustomTable<LogRecord>
+                    size="middle"
+                    dataSource={workflowLogsData}
+                    columns={logColumns}
+                    pagination={{
+                      current: workflowLogsPagination.current,
+                      pageSize: workflowLogsPagination.pageSize,
+                      total: workflowLogsTotal,
+                      showSizeChanger: true,
+                      showQuickJumper: true,
+                      onChange: handleWorkflowLogsTableChange,
+                    }}
+                  />
+                )}
+              </>
+            ) : (
+              <CustomTable<LogRecord>
+                size="middle"
+                dataSource={data as LogRecord[]}
+                columns={logColumns}
+                pagination={{
+                  current: pagination.current,
+                  pageSize: pagination.pageSize,
+                  total: total,
+                  showSizeChanger: true,
+                  showQuickJumper: true,
+                  onChange: handleTableChange,
+                }}
+                scroll={{ y: 'calc(100vh - 370px)' }}
+                onChange={(pagination, filters) => {
+                  handleChannelFilterChange(filters.channel as string[]);
+                }}
+              />
+            )}
+          </>
+        )}
+      </div>
+      <Drawer
+        title={selectedConversation && (
+          <div className="flex items-center">
+            <span>{selectedConversation.user}</span>
+            <Tag color="blue" className='ml-4' icon={<ClockCircleOutlined />}>{selectedConversation.count} {t('studio.logs.records')}</Tag>
+          </div>
+        )}
+        open={drawerVisible}
+        onClose={() => setDrawerVisible(false)}
+        width={680}
+      >
+        {conversationLoading ? (
+          <div className='flex justify-center items-center w-full h-full'>
+            <Spin />
+          </div>
+        ) : (
+          selectedConversation && selectedConversation.conversation && (
+            <ProChatComponent
+              initialChats={selectedConversation.conversation}
+              conversationId={selectedConversation.ids || []}
+              count={selectedConversation.count}
+            />
+          )
+        )}
+      </Drawer>
+      <Drawer
+        title={t('studio.logs.workflowDetail')}
+        open={workflowDrawerVisible}
+        onClose={() => setWorkflowDrawerVisible(false)}
+        width={720}
+      >
+        {workflowDetailLoading ? (
+          <div className='flex justify-center items-center w-full h-full min-h-48'>
+            <Spin />
+          </div>
+        ) : (
+          <div>
+            {renderWorkflowTimeline()}
+          </div>
+        )}
+      </Drawer>
+    </div>
+  );
+};
+
+export default StudioLogsPage;

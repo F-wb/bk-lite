@@ -1,0 +1,679 @@
+# -- coding: utf-8 --
+# @File: collect.py
+# @Time: 2025/2/27 14:00
+# @Author: windyzhao
+import re
+
+from django.db.models import Count, Q
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from apps.cmdb.collection.physical_server_protocol import (
+    PHYSICAL_SERVER_MODEL_ID,
+    PHYSICAL_SERVER_PROTOCOLS,
+    normalize_physical_server_protocol,
+    resolve_physical_server_plugin_id,
+)
+from apps.cmdb.constants.constants import PERMISSION_TASK, CollectDriverTypes, CollectPluginTypes, CollectRunStatusType
+from apps.cmdb.filters.collect_filters import CollectModelFilter, OidModelFilter
+from apps.cmdb.language.service import apply_collect_tree_translations
+from apps.cmdb.models.collect_model import ENCRYPTED_PREFIX, CollectModels, OidMapping
+from apps.cmdb.node_configs.config_factory import NodeParamsFactory
+from apps.cmdb.permissions.inst_task_permission import InstanceTaskPermission
+from apps.cmdb.serializers.collect_serializer import (
+    COLLECT_RESULT_PAYLOAD_FIELDS,
+    CollectModelDetailSerializer,
+    CollectModelLIstSerializer,
+    CollectModelSerializer,
+    OidModelSerializer,
+)
+from apps.cmdb.services.collect_credential_contract import API_SECRET_MASK
+from apps.cmdb.services.collect_document import get_collect_model_document
+from apps.cmdb.services.collect_object_tree import get_collect_obj_tree
+from apps.cmdb.services.collect_service import CollectModelService
+from apps.cmdb.services.instance_identity import optional_inst_uuid
+from apps.cmdb.services.network_config_file_policy import get_supported_brand_options
+from apps.cmdb.utils.base import get_current_team_from_request
+from apps.core.decorators.api_permission import HasPermission
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.logger import cmdb_logger as logger
+from apps.core.utils.permission_utils import get_permission_rules
+from apps.core.utils.team_utils import get_current_team
+from apps.core.utils.viewset_utils import AuthViewSet
+from apps.core.utils.web_utils import WebUtils
+from apps.rpc.node_mgmt import NodeMgmt
+from apps.system_mgmt.utils.group_utils import GroupUtils
+from config.drf.pagination import CustomPageNumberPagination
+from config.drf.viewsets import ModelViewSet
+
+
+class CollectModelViewSet(AuthViewSet):
+    # 节点管理同步任务由专用对账状态机维护。普通采集 API 即使拿到可枚举 ID，
+    # 也不能读取、修改、删除或绕过配置版本 fencing 手工执行这些系统任务。
+    queryset = CollectModels.objects.filter(is_system=False)
+    serializer_class = CollectModelSerializer
+    ordering_fields = ["updated_at"]
+    ordering = ["-updated_at"]
+    filterset_class = CollectModelFilter
+    pagination_class = CustomPageNumberPagination
+    permission_classes = [InstanceTaskPermission]
+    permission_key = PERMISSION_TASK
+    permission_scoped_actions = {
+        "list",
+        "retrieve",
+        "update",
+        "partial_update",
+        "destroy",
+        "info",
+        "exec_task",
+        "task_overview",
+    }
+
+    @staticmethod
+    def apply_visibility_filter(queryset):
+        return queryset.filter(is_visible=True, is_system=False)
+
+    @staticmethod
+    def _include_result_data(request):
+        query_params = getattr(request, "query_params", {})
+        return str(query_params.get("include_result_data", "")).lower() in {"1", "true"}
+
+    @HasPermission("auto_collection-View")
+    @action(methods=["get"], detail=False, url_path="network_config_file_supported_brands")
+    def network_config_file_supported_brands(self, request):
+        return Response({"items": get_supported_brand_options(getattr(request.user, "locale", None))})
+
+    @staticmethod
+    def _parse_positive_int(value, field_name, default):
+        if value in (None, ""):
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field_name} 必须是整数")
+        if parsed < 1:
+            raise ValueError(f"{field_name} 必须大于等于 1")
+        return parsed
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        request = getattr(self, "request", None)
+        action = getattr(self, "action", None)
+        if action == "retrieve" and not self._include_result_data(request):
+            queryset = queryset.defer(*COLLECT_RESULT_PAYLOAD_FIELDS)
+        if request is not None and action in self.permission_scoped_actions:
+            queryset = self.get_queryset_by_permission(request, queryset)
+        if action in {"list", "task_status", "collect_task_names"}:
+            queryset = self.apply_visibility_filter(queryset)
+        return queryset
+
+    def _get_authorized_task(self, request, task_id):
+        queryset = self.get_queryset_by_permission(request, self.queryset.all())
+        return get_object_or_404(queryset, id=task_id)
+
+    _CLOUD_SECRET_FIELD_NAMES = (
+        "accessKey",
+        "accessSecret",
+        "access_key",
+        "access_secret",
+        "secret_id",
+        "secret_key",
+    )
+
+    @staticmethod
+    def _blank_cloud_secret(value):
+        if not isinstance(value, str):
+            return value in (None, "")
+        return value.strip() in ("", API_SECRET_MASK)
+
+    @classmethod
+    def _pop_region_task_id(cls, params):
+        task_id = params.pop("task_id", None) or params.pop("taskId", None)
+        if isinstance(task_id, (list, tuple)):
+            task_id = task_id[0] if task_id else None
+        return task_id or None
+
+    def _page_region_secrets(self, params):
+        access_key = params.get("access_key") or params.get("accessKey") or params.get("secret_id")
+        access_secret = params.get("access_secret") or params.get("accessSecret") or params.get("secret_key")
+        if self._blank_cloud_secret(access_key) or self._blank_cloud_secret(access_secret):
+            return None
+        if str(access_key).startswith(ENCRYPTED_PREFIX) or str(access_secret).startswith(ENCRYPTED_PREFIX):
+            return None
+        return {
+            "access_key": access_key,
+            "access_secret": access_secret,
+            "accessKey": access_key,
+            "accessSecret": access_secret,
+        }
+
+    def _decrypt_region_credential(self, raw_credential):
+        def decrypt_item(item):
+            if not isinstance(item, dict):
+                return item
+            decrypted = dict(item)
+            for key, value in list(decrypted.items()):
+                if not isinstance(value, str) or not value:
+                    continue
+                if key in self._CLOUD_SECRET_FIELD_NAMES or value.startswith(ENCRYPTED_PREFIX):
+                    decrypted[key] = CollectModels.decrypt_password(value)
+            return decrypted
+
+        if isinstance(raw_credential, list):
+            return [decrypt_item(item) for item in raw_credential]
+        return decrypt_item(raw_credential)
+
+    def _build_region_query_credential(self, request, params, task_id=None):
+        from types import SimpleNamespace
+
+        from apps.cmdb.services.collect_vault_resolver import resolve_task_credential_pool
+
+        credential = dict(params)
+        model_id = (credential.get("model_id") or "").split("_account", 1)[0]
+        credential["model_id"] = model_id
+
+        driver_type = credential.get("driver_type")
+        instance = self._get_authorized_task(request, task_id) if task_id else None
+        vault_id = credential.pop("vault_credential_id", None)
+        page_secrets = None if vault_id else self._page_region_secrets(credential)
+        if vault_id or (
+            instance
+            and any(
+                item.get("credential_source") == "vault"
+                for item in (instance.decrypt_credentials if isinstance(instance.decrypt_credentials, list) else [instance.decrypt_credentials or {}])
+            )
+            and not page_secrets
+        ):
+            if not vault_id:
+                raw_pool = instance.decrypt_credentials or []
+                raw_pool = raw_pool if isinstance(raw_pool, list) else [raw_pool]
+                vault_item = next((item for item in raw_pool if item.get("credential_source") == "vault"), None)
+                if not vault_item:
+                    raise BaseAppException("已保存任务没有可用的已有凭据！")
+            else:
+                vault_item = {"credential_source": "vault", "vault_credential_id": vault_id}
+            vault_item = {
+                **vault_item,
+                "vault_actor_context": {
+                    "username": request.user.username,
+                    "domain": request.user.domain,
+                    "current_team": get_current_team_from_request(request),
+                },
+            }
+            driver_type = instance.driver_type if instance else (driver_type or "protocol")
+            candidate = SimpleNamespace(
+                model_id=instance.model_id if instance else (params.get("model_id") or model_id),
+                driver_type=driver_type,
+                params=getattr(instance, "params", {}) if instance else {},
+                decrypt_credentials=[vault_item],
+            )
+            raw_credential = resolve_task_credential_pool(candidate)
+        elif page_secrets:
+            raw_credential = page_secrets
+        elif instance:
+            raw_credential = self._decrypt_region_credential(instance.decrypt_credentials or instance.credential or {})
+            driver_type = instance.driver_type
+        else:
+            raw_credential = {key: value for key, value in credential.items() if not self._blank_cloud_secret(value)}
+
+        params_cls = NodeParamsFactory.get_params_class(model_id, driver_type)
+        credential.update(params_cls.build_region_credential(raw_credential))
+        if self._blank_cloud_secret(credential.get("secret_id")):
+            fallback_key = credential.get("access_key") or credential.get("accessKey")
+            if page_secrets:
+                fallback_key = fallback_key or page_secrets.get("access_key")
+            if not self._blank_cloud_secret(fallback_key):
+                credential["secret_id"] = fallback_key
+        if isinstance(credential.get("secret_id"), str) and credential["secret_id"].startswith(ENCRYPTED_PREFIX):
+            credential["secret_id"] = CollectModels.decrypt_password(credential["secret_id"])
+        if isinstance(credential.get("secret_key"), str) and credential["secret_key"].startswith(ENCRYPTED_PREFIX):
+            credential["secret_key"] = CollectModels.decrypt_password(credential["secret_key"])
+        for field in ("credential_source", "vault_type_key", "vault_actor_context"):
+            credential.pop(field, None)
+        return credential
+
+    @HasPermission("auto_collection-View")
+    @action(methods=["get"], detail=False, url_path="collect_model_tree")
+    def tree(self, request, *args, **kwargs):
+        data = apply_collect_tree_translations(get_collect_obj_tree(with_credential_types=True), request.user.locale)
+        return WebUtils.response_success(data)
+
+    @HasPermission("auto_collection-View")
+    @action(methods=["get"], detail=False, url_path="collect_task_names")
+    def collect_task_names(self, request, *args, **kwargs):
+        # Given 实例页需要直接拼接采集任务详情链接，When 返回任务列表，Then 提供 id/name/plugin/category。
+        queryset = CollectModels.objects.all()
+        # Given 页面受组织与实例权限控制，When 查询任务名，Then 先应用对象权限过滤。
+        queryset = self.get_queryset_by_permission(request, queryset)
+        queryset = self.apply_visibility_filter(queryset).order_by("id")
+        task_list = queryset.values(
+            "id",
+            "name",
+            "model_id",
+            "driver_type",
+            "params__collection_protocol",
+        )
+        collect_obj_tree = apply_collect_tree_translations(get_collect_obj_tree(), request.user.locale)
+        plugin_meta_map = {
+            str(child.get("id")): {
+                "category": str(item.get("id")),
+                "category_name": item.get("name"),
+                "plugin_name": child.get("name"),
+            }
+            for item in collect_obj_tree
+            for child in item.get("children", [])
+            if child.get("id")
+        }
+
+        def resolve_plugin_id(item):
+            return resolve_physical_server_plugin_id(
+                item["model_id"],
+                item.get("driver_type"),
+                item.get("params__collection_protocol"),
+            )
+
+        data = []
+        for item in task_list:
+            plugin_id = resolve_plugin_id(item)
+            plugin_meta = plugin_meta_map.get(plugin_id, {})
+            data.append(
+                {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "plugin": plugin_id,
+                    "category": plugin_meta.get("category"),
+                    "plugin_name": plugin_meta.get("plugin_name"),
+                    "category_name": plugin_meta.get("category_name"),
+                }
+            )
+        return WebUtils.response_success(data)
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return CollectModelLIstSerializer
+        if self.action == "retrieve" and not self._include_result_data(getattr(self, "request", None)):
+            return CollectModelDetailSerializer
+        return super().get_serializer_class()
+
+    @HasPermission("auto_collection-View")
+    def list(self, request, *args, **kwargs):
+        return super(CollectModelViewSet, self).list(request, *args, **kwargs)
+
+    def get_queryset_by_permission(self, request, queryset, permission_key=None):
+        current_team = get_current_team_from_request(request, required=False)
+        if not current_team:
+            return queryset.filter(id=0)
+        include_children = request.COOKIES.get("include_children", "0") == "1"
+        if include_children:
+            query_groups = GroupUtils.get_group_with_descendants(current_team)
+        else:
+            query_groups = [current_team]
+        if not query_groups:
+            query_groups = [current_team]
+
+        team_query = Q()
+        for team_id in query_groups:
+            team_query = team_query | Q(team__contains=[team_id]) | Q(team__contains=[str(team_id)])
+        base_queryset = queryset.filter(team_query)
+        permission_key = permission_key or getattr(self, "permission_key", None)
+        if not permission_key:
+            return base_queryset
+
+        # 实例级/团队级任务裁剪在 include_children 时同样必须执行：
+        # 否则勾选"包含子组织"会跳过裁剪、直接返回子树全部任务，造成子组织采集任务越权
+        # 查看/执行（issue #3037）。allowed_teams 已与 query_groups（子树）取交，天然按授权收口。
+        app_name = self._get_app_name()
+        current_team = get_current_team(request, "0")
+        permission_data = get_permission_rules(request.user, current_team, app_name, permission_key, include_children)
+        if not isinstance(permission_data, dict) or not permission_data:
+            return base_queryset
+        instance_ids = [i["id"] for i in permission_data.get("instance", []) if isinstance(i, dict) and "id" in i]
+        team_entries = permission_data.get("team", [])
+        allowed_teams = set()
+        for team_entry in team_entries:
+            if isinstance(team_entry, dict) and "id" in team_entry:
+                allowed_teams.add(team_entry["id"])
+            elif isinstance(team_entry, int):
+                allowed_teams.add(team_entry)
+        allowed_teams &= set(query_groups)
+        allowed_team_query = Q()
+        for team_id in allowed_teams:
+            allowed_team_query = allowed_team_query | Q(team__contains=[team_id]) | Q(team__contains=[str(team_id)])
+        if instance_ids:
+            if allowed_teams:
+                return base_queryset.filter(Q(id__in=instance_ids) | allowed_team_query)
+            return base_queryset.filter(id__in=instance_ids)
+        if allowed_teams:
+            return base_queryset.filter(allowed_team_query)
+        return base_queryset
+
+    @HasPermission("auto_collection-Add")
+    def create(self, request, *args, **kwargs):
+        data = CollectModelService.create(request, self)
+        return WebUtils.response_success(data)
+
+    @HasPermission("auto_collection-Edit")
+    def update(self, request, *args, **kwargs):
+        data = CollectModelService.update(request, self)
+        return WebUtils.response_success(data)
+
+    @HasPermission("auto_collection-Delete")
+    def destroy(self, request, *args, **kwargs):
+        data = CollectModelService.destroy(request, self)
+        return WebUtils.response_success(data)
+
+    @action(methods=["GET"], detail=True)
+    @HasPermission("auto_collection-View")
+    def info(self, request, *args, **kwargs):
+        instance = self.get_object()
+        return WebUtils.response_success(instance.info)
+
+    @HasPermission("auto_collection-Execute")
+    @action(methods=["POST"], detail=True)
+    def exec_task(self, request, *args, **kwargs):
+        instance = self.get_object()
+        user = request.user
+        current_team = get_current_team_from_request(request)
+        include_children = request.COOKIES.get("include_children", "0") == "1"
+        has_permission = self.get_has_permission(user, instance, current_team, include_children=include_children)
+        if not has_permission:
+            raise BaseAppException("您没有操作该采集任务的权限！")
+        result = CollectModelService.exec_task(instance=instance, operator=request.user.username)
+        return result
+
+    @HasPermission("auto_collection-Execute")
+    @action(methods=["POST"], detail=False, url_path="pc_test_connection")
+    def pc_test_connection(self, request, *args, **kwargs):
+        """PC 连接测试：未落库表单经 HTTP debug 端点直连 Stargazer，不写 CMDB。
+
+        编辑场景掩码凭据按 task_id 解密（需对象权限），秘密只在转发 body 内存中传递。
+        """
+        from types import SimpleNamespace
+
+        from apps.cmdb.services.collect_tool_service import MASKED_PASSWORD
+        from apps.cmdb.services.collect_vault_resolver import resolve_task_credential_pool
+        from apps.cmdb.services.pc_connection_test import PCConnectionTestService
+
+        payload = dict(request.data or {})
+        task_id = payload.pop("task_id", None)
+        if task_id:
+            instance = get_object_or_404(self.queryset, id=task_id)
+            if instance.model_id != "pc":
+                raise BaseAppException("仅 PC 发现任务支持凭据掩码解密")
+            user = request.user
+            current_team = get_current_team_from_request(request)
+            include_children = request.COOKIES.get("include_children", "0") == "1"
+            has_permission = self.get_has_permission(user, instance, current_team, include_children=include_children)
+            if not has_permission:
+                raise BaseAppException("您没有操作该采集任务的权限！")
+            credential = dict(payload.get("credential") or {})
+            decrypted = instance.decrypt_credentials or {}
+            if isinstance(decrypted, list):
+                decrypted = decrypted[0] if decrypted else {}
+            # 前端任务序列化掩码为 ******，调试工具掩码为 ••••••，两种占位符都识别
+            masked_sentinels = {MASKED_PASSWORD, "******"}
+            for field in PCConnectionTestService.SECRET_FIELDS:
+                if credential.get(field) in masked_sentinels:
+                    if field not in decrypted:
+                        raise BaseAppException(f"无法从原任务获取字段 {field} 的凭据")
+                    credential[field] = decrypted[field]
+            payload["credential"] = credential
+        credential = dict(payload.get("credential") or {})
+        if credential.get("credential_source") == "vault":
+            credential["vault_actor_context"] = {
+                "username": request.user.username,
+                "domain": request.user.domain,
+                "current_team": get_current_team_from_request(request),
+            }
+            candidate = SimpleNamespace(
+                model_id="pc",
+                driver_type=CollectDriverTypes.JOB,
+                params={"os_type": payload.get("os_type")},
+                decrypt_credentials=[credential],
+            )
+            payload["credential"] = resolve_task_credential_pool(candidate)[0]
+        result = PCConnectionTestService.test_connection(payload)
+        return WebUtils.response_success(result)
+
+    @action(methods=["GET"], detail=False)
+    @HasPermission("auto_collection-View")
+    def nodes(self, request, *args, **kwargs):
+        """
+        获取所有节点
+        """
+        params = request.GET.dict()
+        try:
+            page = self._parse_positive_int(params.get("page", 1), field_name="page", default=1)
+            page_size = self._parse_positive_int(params.get("page_size", 10), field_name="page_size", default=10)
+        except ValueError as err:
+            return WebUtils.response_error(error_message=str(err), status_code=status.HTTP_400_BAD_REQUEST)
+
+        query_data = {
+            "page": page,
+            "page_size": page_size,
+            "name": params.get("name", ""),
+            "permission_data": {
+                "username": request.user.username,
+                "domain": request.user.domain,
+                "current_team": get_current_team(request),
+            },
+            "is_container": True,
+        }
+        node = NodeMgmt()
+        data = node.node_list(query_data)
+        return WebUtils.response_success(data)
+
+    @action(methods=["GET"], detail=False)
+    @HasPermission("auto_collection-View")
+    def model_instances(self, requests, *args, **kwargs):
+        """
+        获取此模型下发过任务的实例
+        """
+        params = requests.GET.dict()
+        task_type = params["task_type"]
+        queryset = self.get_queryset_by_permission(requests, self.queryset.all())
+        # 云对象可以重复选择不做过滤
+        instances = queryset.filter(
+            ~Q(instances=[]),
+            ~Q(task_type=CollectPluginTypes.CLOUD),
+            task_type=task_type,
+        ).values_list("instances", flat=True)
+        result = []
+        for instance in instances:
+            if not isinstance(instance, list) or not instance:
+                continue
+            instance_data = instance[0]
+            if not isinstance(instance_data, dict):
+                continue
+            instance_id = optional_inst_uuid(instance_data.get("inst_uuid"))
+            instance_name = instance_data.get("inst_name")
+            if instance_id is None or instance_name is None:
+                if instance_data.get("_id") is not None and instance_id is None:
+                    logger.warning(
+                        "[CollectModel] 跳过缺少合法 inst_uuid 的存量任务目标 task_type=%s",
+                        task_type,
+                    )
+                continue
+            result.append({"id": instance_id, "inst_name": instance_name})
+        return WebUtils.response_success(result)
+
+    @action(methods=["POST"], detail=False)
+    @HasPermission("auto_collection-View")
+    def list_regions(self, requests, *args, **kwargs):
+        """
+        查询云的所有区域
+        TODO 看看未来需不需要使用实例的endpoint和认证信息，目前先使用公共接口，后续如果有需要再调整
+        "host": "ecs.private-cloud.example.com"
+        """
+        params = dict(requests.data)
+        cloud_id = requests.data["cloud_id"]
+        cloud_list = NodeMgmt().cloud_region_list()
+        cloud_id_map = {i["id"]: i["name"] for i in cloud_list}
+        cloud_name = cloud_id_map.get(cloud_id)
+        if not cloud_name:
+            return WebUtils.response_error(error_message="cloud_id 不存在", status_code=400)
+        task_id = self._pop_region_task_id(params)
+        credential = self._build_region_query_credential(requests, params, task_id=task_id)
+        model_id = credential.get("model_id")
+        if (
+            model_id in {"qcloud", "aliyun", "hwcloud"}
+            and self._blank_cloud_secret(credential.get("secret_id"))
+            and self._blank_cloud_secret(credential.get("accessKey") or credential.get("access_key"))
+        ):
+            logger.info(
+                "event=list_regions_missing_secret model_id=%s has_task_id=%s request_fields=%s",
+                model_id,
+                bool(task_id),
+                ",".join(sorted(str(key) for key in params.keys())),
+            )
+            if task_id:
+                return WebUtils.response_error(
+                    error_message="已保存任务中没有可用的云访问密钥，请重新填写 SecretId 和 SecretKey",
+                    status_code=400,
+                )
+            return WebUtils.response_error(error_message="缺少云访问密钥，请重新填写或打开已保存的任务后再刷新区域", status_code=400)
+        result = CollectModelService.list_regions(credential, cloud_name=cloud_name)
+        if result.get("success"):
+            return WebUtils.response_success(result.get("result", []))
+        return WebUtils.response_error(error_message=result.get("message", "获取区域失败"), status_code=400)
+
+    @HasPermission("auto_collection-View")
+    @action(methods=["get"], detail=False, url_path="task_status")
+    def task_status(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        filter_queryset = self.get_queryset_by_permission(request=request, queryset=queryset)
+        filter_queryset = self.apply_visibility_filter(filter_queryset)
+        status_rows = filter_queryset.values(
+            "model_id",
+            "driver_type",
+            "exec_status",
+            "params__collection_protocol",
+        ).annotate(total=Count("id"))
+        data = {}
+
+        def increment(status_key, exec_status, total=1):
+            if status_key not in data:
+                data[status_key] = {"success": 0, "failed": 0, "running": 0, "partial_success": 0}
+            if exec_status == CollectRunStatusType.SUCCESS:
+                data[status_key]["success"] += total
+            elif exec_status == CollectRunStatusType.ERROR:
+                data[status_key]["failed"] += total
+            elif exec_status == CollectRunStatusType.RUNNING:
+                data[status_key]["running"] += total
+            elif exec_status == CollectRunStatusType.PARTIAL_SUCCESS:
+                data[status_key]["partial_success"] += total
+
+        for model_data in status_rows:
+            driver_type = model_data.get("driver_type") or ""
+            status_key = f"{model_data['model_id']}__{driver_type}" if driver_type else model_data["model_id"]
+            increment(status_key, model_data["exec_status"], model_data["total"])
+
+            if model_data["model_id"] == PHYSICAL_SERVER_MODEL_ID and driver_type == CollectDriverTypes.PROTOCOL:
+                protocol = normalize_physical_server_protocol(model_data.get("params__collection_protocol"))
+                if protocol in PHYSICAL_SERVER_PROTOCOLS:
+                    increment(f"{status_key}__{protocol}", model_data["exec_status"], model_data["total"])
+        return WebUtils.response_success(data)
+
+    @HasPermission("auto_collection-View")
+    @action(methods=["get"], detail=False, url_path="task_overview")
+    def task_overview(self, request, *args, **kwargs):
+        # 采集任务页面顶部概览卡片所需的聚合统计；零数据库变更，全部从已有字段计算。
+        queryset = self.get_queryset()
+        filter_queryset = self.get_queryset_by_permission(request=request, queryset=queryset)
+        filter_queryset = self.apply_visibility_filter(filter_queryset).only(
+            "model_id",
+            "exec_status",
+            "exec_time",
+        )
+
+        total = normal = error = partial = 0
+        recent_sync_at = None
+        covered_models = set()
+
+        for task in filter_queryset:
+            total += 1
+            if task.model_id:
+                covered_models.add(task.model_id)
+
+            if task.exec_status == CollectRunStatusType.SUCCESS:
+                normal += 1
+            elif task.exec_status == CollectRunStatusType.ERROR:
+                error += 1
+            elif task.exec_status == CollectRunStatusType.PARTIAL_SUCCESS:
+                partial += 1
+
+            if task.exec_time is not None and (recent_sync_at is None or task.exec_time > recent_sync_at):
+                recent_sync_at = task.exec_time
+
+        data = {
+            "total": total,
+            "normal": normal,
+            "error": error,
+            "partial": partial,
+            "recent_sync_at": recent_sync_at.isoformat() if recent_sync_at else None,
+            "covered_models": len(covered_models),
+        }
+        return WebUtils.response_success(data)
+
+    @HasPermission("auto_collection-View")
+    @action(methods=["get"], detail=False, url_path="collect_model_doc")
+    def model_doc(self, request, *args, **kwargs):
+        model_id = (request.GET.get("id") or "").strip()
+        if not model_id:
+            return WebUtils.response_error(error_message="id 不能为空", status_code=400)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", model_id):
+            return WebUtils.response_error(error_message="id 参数非法", status_code=400)
+
+        return WebUtils.response_success(get_collect_model_document(model_id, request.user.locale))
+
+
+class OidModelViewSet(ModelViewSet):
+    queryset = OidMapping.objects.all()
+    serializer_class = OidModelSerializer
+    ordering_fields = ["updated_at"]
+    ordering = ["-updated_at"]
+    filterset_class = OidModelFilter
+    pagination_class = CustomPageNumberPagination
+
+    @HasPermission("soid_library-View")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @HasPermission("soid_library-Add")
+    def create(self, request, *args, **kwargs):
+        raw_oid = request.data.get("oid")
+        oid = (raw_oid or "").strip() if isinstance(raw_oid, str) else ""
+        if not oid:
+            return WebUtils.response_error(error_message="oid 不能为空", status_code=status.HTTP_400_BAD_REQUEST)
+        if raw_oid != oid:
+            return WebUtils.response_error(
+                error_message="oid 不允许包含首尾空格",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if OidMapping.objects.filter(oid=oid).exists():
+            return JsonResponse({"data": [], "result": False, "message": "OID已存在！"})
+
+        return super().create(request, *args, **kwargs)
+
+    @HasPermission("soid_library-Edit")
+    def update(self, request, *args, **kwargs):
+        raw_oid = request.data.get("oid")
+        oid = (raw_oid or "").strip() if isinstance(raw_oid, str) else ""
+        if not oid:
+            return WebUtils.response_error(error_message="oid 不能为空", status_code=status.HTTP_400_BAD_REQUEST)
+        if raw_oid != oid:
+            return WebUtils.response_error(
+                error_message="oid 不允许包含首尾空格",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if OidMapping.objects.filter(~Q(id=self.get_object().id), oid=oid).exists():
+            return JsonResponse({"data": [], "result": False, "message": "OId已存在！"})
+
+        return super().update(request, *args, **kwargs)
+
+    @HasPermission("soid_library-Delete")
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)

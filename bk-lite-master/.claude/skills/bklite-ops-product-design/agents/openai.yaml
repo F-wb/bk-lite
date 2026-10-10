@@ -1,0 +1,5 @@
+interface:
+  display_name: "BK-Lite Ops Product Design"
+  short_description: "Design and review BK-Lite operations product capabilities"
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,501 @@
+'use client';
+
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
+import { usePathname, useRouter } from 'next/navigation';
+import { getSession, signIn, signOut } from 'next-auth/react';
+import { Button, Toast } from 'antd-mobile';
+import { MobileAppLoading } from '@/components/mobile-feedback';
+import {
+  AuthContextType,
+  AuthLoginCredentials,
+  AuthLoginResult,
+} from '@/types/auth';
+import { LoginUserInfo } from '@/types/user';
+import { useLocale } from '@/context/locale';
+import {
+  clearAuthData,
+  getToken,
+  getUserInfoFromStorage,
+  initSecureStorage,
+  saveToken,
+  saveUserInfo,
+} from '@/utils/secureStorage';
+import { authLogin, authLogout, getLoginInfo } from '@/api/auth';
+import {
+  setRuntimeAuthToken,
+  setUnauthorizedHandler,
+  UnauthorizedRequestError,
+} from '@/api/request';
+import {
+  clearRejectedH5Session,
+  loginWithH5Session,
+  logoutH5Session,
+  restoreH5Session,
+} from '@/auth/h5Auth';
+import { clearCurrentTeamCookie, getCurrentTeamCookie, getIncludeChildrenCookie, setCurrentTeamCookie, setIncludeChildrenCookie, syncCurrentTeamCookie } from '@/utils/teamCookie';
+import { clearCachedAccountOverview } from '@/utils/accountOverviewCache';
+import {
+  buildOrganizationScope,
+  buildSelectableGroupTree,
+  findGroupById,
+  resolveGroupName,
+  type OrganizationGroup,
+} from '@/utils/organization';
+import { isTauriApp } from '@/utils/tauriFetch';
+import { useTranslation } from '@/utils/i18n';
+import { clearConversationSessionCache } from '@/utils/conversationCache';
+import { conversationManager } from '@/context/conversation';
+import { clearMobileViewCache } from '@/navigation/mobile-view-cache';
+
+const AuthContext = createContext<AuthContextType | null>(null);
+
+class RejectedSessionError extends Error {
+  constructor() {
+    super('Backend rejected the authenticated session');
+    this.name = 'RejectedSessionError';
+  }
+}
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) throw new Error('useAuth must be used within AuthProvider');
+  return context;
+};
+
+function emptyOrganizationState() {
+  return {
+    currentTeamId: null as string | null,
+    currentTeamName: '',
+    includeChildren: false,
+    groupTree: [] as OrganizationGroup[],
+  };
+}
+
+function resolveOrganizationState(nextUserInfo: LoginUserInfo | null) {
+  if (!nextUserInfo) return emptyOrganizationState();
+
+  syncCurrentTeamCookie(nextUserInfo);
+  const groupTree = buildSelectableGroupTree(
+    nextUserInfo.group_tree,
+    nextUserInfo.group_list,
+    nextUserInfo.is_superuser,
+  );
+  const currentTeamId = getCurrentTeamCookie();
+  return {
+    currentTeamId,
+    currentTeamName: resolveGroupName(groupTree, currentTeamId, nextUserInfo.group_list),
+    includeChildren: getIncludeChildrenCookie(),
+    groupTree,
+  };
+}
+
+function normalizeUserInfo(
+  token: string,
+  data: Record<string, unknown>,
+  baseUserInfo: LoginUserInfo | null,
+): LoginUserInfo {
+  return {
+    ...(baseUserInfo || {}),
+    ...data,
+    id: Number(data.id ?? data.user_id ?? baseUserInfo?.id ?? 0),
+    username: String(data.username ?? baseUserInfo?.username ?? ''),
+    display_name: String(data.display_name ?? baseUserInfo?.display_name ?? ''),
+    domain: String(data.domain ?? baseUserInfo?.domain ?? ''),
+    locale: String(data.locale ?? baseUserInfo?.locale ?? 'zh-CN'),
+    timezone: String(data.timezone ?? baseUserInfo?.timezone ?? 'Asia/Shanghai'),
+    token,
+    temporary_pwd: false,
+    enable_otp: false,
+    qrcode: false,
+  };
+}
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [token, setToken] = useState<string | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [initializationError, setInitializationError] = useState(false);
+  const [initializationAttempt, setInitializationAttempt] = useState(0);
+  const [userInfo, setUserInfo] = useState<LoginUserInfo | null>(null);
+  const [currentTeamId, setCurrentTeamId] = useState<string | null>(null);
+  const [currentTeamName, setCurrentTeamName] = useState('');
+  const [includeChildren, setIncludeChildren] = useState(false);
+  const [groupTree, setGroupTree] = useState<OrganizationGroup[]>([]);
+  const router = useRouter();
+  const pathname = usePathname();
+  const { setLocale } = useLocale();
+  const { t } = useTranslation();
+
+  const publicPaths = ['/login', '/register', '/forgot-password'];
+  const isPublicPath = Boolean(pathname && publicPaths.includes(pathname));
+
+  const resetLocalState = useCallback(async () => {
+    let storageCleared = true;
+    try {
+      await clearAuthData();
+    } catch (error) {
+      storageCleared = false;
+      console.error('Failed to clear persisted authentication data:', error);
+    } finally {
+      clearConversationSessionCache();
+      clearMobileViewCache();
+      clearCachedAccountOverview();
+      conversationManager.clearAll();
+      clearCurrentTeamCookie();
+      setRuntimeAuthToken(isTauriApp() ? undefined : null);
+      setToken(null);
+      setIsAuthenticated(false);
+      setUserInfo(null);
+      setCurrentTeamId(null);
+      setCurrentTeamName('');
+      setIncludeChildren(false);
+      setGroupTree([]);
+    }
+    return storageCleared;
+  }, []);
+
+  const establishAuthenticatedState = useCallback(async (
+    nextToken: string,
+    baseUserInfo: LoginUserInfo | null,
+    persistToken: boolean,
+  ) => {
+    // The freshly issued token must be used to validate the session before it
+    // has been persisted into secure storage.
+    setRuntimeAuthToken(nextToken);
+    const response = await getLoginInfo();
+    if (!response?.result || !response.data) {
+      throw new RejectedSessionError();
+    }
+
+    const completeUserInfo = normalizeUserInfo(
+      nextToken,
+      response.data,
+      baseUserInfo,
+    );
+    if (persistToken) {
+      await saveToken(nextToken);
+    }
+    await saveUserInfo(completeUserInfo);
+    const organization = resolveOrganizationState(completeUserInfo);
+
+    setToken(nextToken);
+    setIsAuthenticated(true);
+    setUserInfo(completeUserInfo);
+    setCurrentTeamId(organization.currentTeamId);
+    setCurrentTeamName(organization.currentTeamName);
+    setIncludeChildren(organization.includeChildren);
+    setGroupTree(organization.groupTree);
+    setRuntimeAuthToken(persistToken ? undefined : nextToken);
+    if (completeUserInfo.locale) {
+      setLocale(completeUserInfo.locale);
+    }
+
+    return completeUserInfo;
+  }, [setLocale]);
+
+  const navigateAfterLogin = useCallback(() => {
+    router.replace('/');
+  }, [router]);
+
+  const clearH5Session = useCallback(async () => {
+    const result = await logoutH5Session({
+      federatedLogout: async () => {
+        const response = await fetch('/api/auth/federated-logout', {
+          method: 'POST',
+          credentials: 'include',
+        });
+        return { ok: response.ok };
+      },
+      signOut: (options) => signOut(options),
+    });
+    return result.backendLogoutAccepted;
+  }, []);
+
+  const clearRejectedSession = useCallback(async () => {
+    if (isTauriApp()) {
+      await resetLocalState();
+      return;
+    }
+
+    await clearRejectedH5Session({
+      clearSession: clearH5Session,
+      resetLocalState,
+    });
+  }, [clearH5Session, resetLocalState]);
+
+  const handleUnauthorized = useCallback(async () => {
+    if (!isTauriApp()) {
+      await clearH5Session();
+    }
+    await resetLocalState();
+    router.replace('/login');
+  }, [clearH5Session, resetLocalState, router]);
+
+  useEffect(() => {
+    setUnauthorizedHandler(handleUnauthorized);
+    return () => setUnauthorizedHandler(null);
+  }, [handleUnauthorized]);
+
+  useEffect(() => {
+    let active = true;
+
+    const initializeAuth = async () => {
+      setIsInitializing(true);
+      setInitializationError(false);
+
+      try {
+        await initSecureStorage();
+
+        if (isTauriApp()) {
+          setRuntimeAuthToken(undefined);
+          const localToken = await getToken();
+          const localUserInfo = await getUserInfoFromStorage();
+          if (!localToken) {
+            clearCurrentTeamCookie();
+          } else {
+            await establishAuthenticatedState(localToken, localUserInfo, true);
+          }
+          return;
+        }
+
+        await clearAuthData();
+        setRuntimeAuthToken(null);
+        const sessionToken = await restoreH5Session({
+          getSession,
+          clearSession: clearH5Session,
+        });
+        if (!sessionToken) {
+          clearCurrentTeamCookie();
+          return;
+        }
+
+        await establishAuthenticatedState(sessionToken, null, false);
+      } catch (error) {
+        if (error instanceof RejectedSessionError) {
+          await clearRejectedSession();
+        } else if (error instanceof UnauthorizedRequestError) {
+          await resetLocalState();
+        } else {
+          console.error('认证初始化错误:', error);
+          if (active) {
+            setInitializationError(true);
+          }
+        }
+      } finally {
+        if (active) setIsInitializing(false);
+      }
+    };
+
+    void initializeAuth();
+    return () => {
+      active = false;
+    };
+  }, [clearH5Session, clearRejectedSession, establishAuthenticatedState, initializationAttempt, resetLocalState]);
+
+  useEffect(() => {
+    if (isInitializing || initializationError) return;
+    if (isAuthenticated && pathname === '/login') {
+      navigateAfterLogin();
+      return;
+    }
+    if (!isAuthenticated && !isPublicPath && pathname) {
+      router.replace('/login');
+    }
+  }, [
+    initializationError,
+    isAuthenticated,
+    isInitializing,
+    isPublicPath,
+    navigateAfterLogin,
+    pathname,
+    router,
+  ]);
+
+  const login = async (credentials: AuthLoginCredentials): Promise<AuthLoginResult> => {
+    if (isInitializing) {
+      return {
+        status: 'service-unavailable',
+      };
+    }
+
+    setIsLoading(true);
+    try {
+      if (!isTauriApp()) {
+        const result = await loginWithH5Session(credentials, {
+          signIn: (provider, options) => signIn(provider, options),
+          getSession,
+        });
+        if (result.status !== 'success') {
+          if (
+            result.status === 'otp-required'
+            || result.status === 'password-reset-required'
+          ) {
+            await clearH5Session();
+          }
+          return result;
+        }
+
+        await establishAuthenticatedState(result.token, null, false);
+        navigateAfterLogin();
+        return { status: 'success' };
+      }
+
+      const response = await authLogin(credentials);
+      if (!response?.result || !response.data) {
+        return {
+          status: 'invalid-credentials',
+          message: response?.message,
+        };
+      }
+
+      const userData = response.data as LoginUserInfo & { require_otp?: boolean };
+      if (userData.require_otp || userData.enable_otp) {
+        return { status: 'otp-required' };
+      }
+      if (userData.temporary_pwd) {
+        if (userData.token) await authLogout(userData.token).catch(() => undefined);
+        return { status: 'password-reset-required' };
+      }
+      if (!userData.token) return { status: 'invalid-credentials' };
+
+      await establishAuthenticatedState(userData.token, userData, true);
+      navigateAfterLogin();
+      return { status: 'success' };
+    } catch (error) {
+      console.error('Login error:', error);
+      if (error instanceof RejectedSessionError) {
+        await clearRejectedSession();
+      } else {
+        await resetLocalState();
+      }
+      return {
+        status: 'service-unavailable',
+      };
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const updateUserInfo = async (updates: Partial<LoginUserInfo>) => {
+    if (!userInfo) return;
+    const updatedUserInfo = { ...userInfo, ...updates };
+    setUserInfo(updatedUserInfo);
+    await saveUserInfo(updatedUserInfo);
+    const organization = resolveOrganizationState(updatedUserInfo);
+    setCurrentTeamId(organization.currentTeamId);
+    setCurrentTeamName(organization.currentTeamName);
+    setIncludeChildren(organization.includeChildren);
+    setGroupTree(organization.groupTree);
+  };
+
+  const applyOrganizationScope = useCallback((next: {
+    teamId: string;
+    teamName?: string;
+    includeChildren: boolean;
+  }) => {
+    const nextName = next.teamName
+      || resolveGroupName(groupTree, next.teamId)
+      || currentTeamName;
+    const unchanged = next.teamId === currentTeamId && next.includeChildren === includeChildren;
+    if (unchanged) return false;
+    if (next.teamId !== currentTeamId && !findGroupById(groupTree, next.teamId)) {
+      return false;
+    }
+
+    setCurrentTeamCookie(next.teamId);
+    setIncludeChildrenCookie(next.includeChildren);
+    setCurrentTeamId(next.teamId);
+    setCurrentTeamName(nextName);
+    setIncludeChildren(next.includeChildren);
+    conversationManager.clearAll();
+    return true;
+  }, [currentTeamId, currentTeamName, groupTree, includeChildren]);
+
+  const organizationScope = useMemo(
+    () => buildOrganizationScope(userInfo?.id, currentTeamId, includeChildren),
+    [currentTeamId, includeChildren, userInfo?.id],
+  );
+
+  const logout = async () => {
+    setIsLoading(true);
+    try {
+      let backendLogoutAccepted = true;
+      if (isTauriApp()) {
+        if (token) await authLogout(token);
+      } else {
+        backendLogoutAccepted = await clearH5Session();
+      }
+      if (!backendLogoutAccepted) {
+        Toast.show({ content: t('login.logoutIncomplete'), icon: 'fail' });
+      }
+    } catch (error) {
+      console.error('退出登录过程中发生错误:', error);
+      Toast.show({ content: t('login.logoutIncomplete'), icon: 'fail' });
+    } finally {
+      const storageCleared = await resetLocalState();
+      if (!storageCleared) {
+        Toast.show({ content: t('login.logoutIncomplete'), icon: 'fail' });
+      }
+      setIsLoading(false);
+      router.replace('/login');
+    }
+  };
+
+  if (initializationError && !isPublicPath) {
+    return (
+      <div className="flex min-h-dvh flex-col items-center justify-center gap-3 bg-[var(--color-background-body)] px-6 text-center">
+        <p className="text-sm text-[var(--color-text-secondary)]">
+          {t('login.serviceUnavailable')}
+        </p>
+        <Button
+          color="primary"
+          onClick={() => setInitializationAttempt((value) => value + 1)}
+        >
+          {t('common.retry')}
+        </Button>
+      </div>
+    );
+  }
+
+  // 含 /login：避免已登录刷新时先闪登录表再跳转。
+  if (isInitializing || (isAuthenticated && pathname === '/login')) {
+    return <MobileAppLoading label={t('common.loading')} />;
+  }
+
+  if (!isAuthenticated && !isPublicPath) {
+    return <MobileAppLoading label={t('common.loading')} />;
+  }
+
+  return (
+    <AuthContext.Provider
+      value={{
+        token,
+        isAuthenticated,
+        isLoading,
+        isInitializing,
+        userInfo,
+        currentTeamId,
+        currentTeamName,
+        includeChildren,
+        groupTree,
+        organizationScope,
+        applyOrganizationScope,
+        login,
+        logout,
+        updateUserInfo,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+export default AuthProvider;

@@ -1,0 +1,365 @@
+'use client';
+import './register-group-pilot';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
+import { Input, Button, Popconfirm, Space, Tag } from 'antd';
+import { PlusOutlined } from '@ant-design/icons';
+import useApiClient from '@/utils/request';
+import useMonitorApi from '@/app/monitor/api';
+import useIntegrationApi from '@/app/monitor/api/integration';
+import { useTranslation } from '@/utils/i18n';
+import {
+  ColumnItem,
+  TreeItem,
+  ModalRef,
+  Organization,
+  Pagination,
+  ObjectItem,
+  TableDataItem
+} from '@/app/monitor/types';
+import { RuleInfo } from '@/app/monitor/types/integration';
+import CustomTable from '@/components/custom-table';
+import RuleModal from './ruleModal';
+import { useCommon } from '@/app/monitor/context/common';
+import TreeSelector from '@/app/monitor/components/treeSelector';
+import DeleteRule from './deleteRuleModal';
+import { showGroupName } from '@/app/monitor/utils/common';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import Permission from '@/components/permission';
+import { cloneDeep } from 'lodash';
+import ResizableSidebar from '@/app/monitor/components/resizableSidebar';
+import { useMonitorObjectQuery } from '@/app/monitor/hooks/useMonitorObjectQuery';
+import {
+  resolveMonitorObjectQueryId,
+  resolveMonitorObjectTreeKey
+} from '@/app/monitor/utils/monitorObjectQuery';
+
+const GroupPage = () => {
+  const { isLoading } = useApiClient();
+  const { getMonitorObject } = useMonitorApi();
+  const { getInstanceGroupRule } = useIntegrationApi();
+  const { t } = useTranslation();
+  const commonContext = useCommon();
+  const authList = useRef(commonContext?.authOrganizations || []);
+  const organizationList: Organization[] = authList.current;
+  const ruleRef = useRef<ModalRef>(null);
+  const deleteModalRef = useRef<ModalRef>(null);
+  const ruleAbortControllerRef = useRef<AbortController | null>(null);
+  const ruleRequestIdRef = useRef<number>(0);
+  const [pagination, setPagination] = useState<Pagination>({
+    current: 1,
+    total: 0,
+    pageSize: 20
+  });
+  const [ruleLoading, setRuleLoading] = useState<boolean>(false);
+  const [treeLoading, setTreeLoading] = useState<boolean>(false);
+  const [treeData, setTreeData] = useState<TreeItem[]>([]);
+  const [ruleList, setRuleList] = useState<RuleInfo[]>([]);
+  const [searchText, setSearchText] = useState<string>('');
+  const [objects, setObjects] = useState<ObjectItem[]>([]);
+  const [objectId, setObjectId] = useState<React.Key>('');
+  const [defaultSelectObj, setDefaultSelectObj] = useState<React.Key>('');
+  const { syncObjectId, searchParams } = useMonitorObjectQuery();
+
+  const columns = useMemo(() => {
+    const columnItems: ColumnItem[] = [
+      {
+        title: t('monitor.integrations.ruleName'),
+        dataIndex: 'name',
+        key: 'name'
+      },
+      {
+        title: t('monitor.integrations.objectType'),
+        dataIndex: 'monitor_object',
+        key: 'monitor_object',
+        width: 180,
+        render: (_, { monitor_object }) => (
+          <Tag color="blue" className="max-w-full p-0">
+            <EllipsisWithTooltip
+              className="w-full px-2 overflow-hidden text-ellipsis whitespace-nowrap"
+              text={getObjectTypeName(monitor_object)}
+            />
+          </Tag>
+        )
+      },
+      {
+        title: t('monitor.integrations.ruleDescription'),
+        dataIndex: 'rule',
+        key: 'rule',
+        render: (_, record: any) => {
+          const count = record.rule?.filter?.length || 0;
+          return (
+            <>
+              {t('monitor.integrations.exactMatch')}
+              {count}
+              {t('monitor.integrations.rulesCount')}
+            </>
+          );
+        }
+      },
+      {
+        title: t('monitor.group'),
+        dataIndex: 'organizations',
+        key: 'organizations',
+        render: (_, { organizations }) => (
+          <EllipsisWithTooltip
+            className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
+            text={showGroupName(organizations, organizationList)}
+          />
+        )
+      },
+      {
+        title: t('common.action'),
+        key: 'action',
+        dataIndex: 'action',
+        width: 150,
+        fixed: 'right',
+        render: (_, record: TableDataItem) => (
+          <Space>
+            <Permission
+              requiredPermissions={['Edit']}
+              instPermissions={record.permission}
+            >
+              <Button type="link" onClick={() => openRuleModal('edit', record)}>
+                {t('common.edit')}
+              </Button>
+            </Permission>
+            <Permission
+              requiredPermissions={['Delete']}
+              instPermissions={record.permission}
+            >
+              <Popconfirm
+                title={t('common.deleteTitle')}
+                description={t('monitor.integrations.deleteRuleTips')}
+                okText={t('common.confirm')}
+                cancelText={t('common.cancel')}
+                onConfirm={() => showDeleteConfirm(record as RuleInfo)}
+              >
+                <Button type="link">{t('common.delete')}</Button>
+              </Popconfirm>
+            </Permission>
+          </Space>
+        )
+      }
+    ];
+    return columnItems;
+  }, [objects, objectId, t, organizationList]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      getObjects();
+    }
+  }, [isLoading]);
+
+  useEffect(() => {
+    if (objectId) {
+      getRuleList(objectId);
+    }
+  }, [objectId, pagination.current, pagination.pageSize]);
+
+  useEffect(() => {
+    return () => {
+      cancelAllRequests();
+    };
+  }, []);
+
+  const cancelAllRequests = () => {
+    ruleAbortControllerRef.current?.abort();
+  };
+
+  const handleObjectChange = (id: string) => {
+    cancelAllRequests();
+    setRuleList([]);
+    setObjectId(id);
+    syncObjectId(id);
+    setPagination((prev) => ({
+      ...prev,
+      current: 1
+    }));
+  };
+
+  const openRuleModal = (type: string, row = {}) => {
+    const title: string = t(
+      type === 'add'
+        ? 'monitor.integrations.addRule'
+        : 'monitor.integrations.editRule'
+    );
+    ruleRef.current?.showModal({
+      title,
+      type,
+      form: row
+    });
+  };
+
+  const handleTableChange = (pagination: any) => {
+    setPagination(pagination);
+  };
+
+  const getRuleList = async (objectId: React.Key, type?: string) => {
+    ruleAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    ruleAbortControllerRef.current = abortController;
+    const currentRequestId = ++ruleRequestIdRef.current;
+    try {
+      setRuleLoading(type !== 'timer');
+      const params: any = {
+        monitor_object_id: objectId === 'all' ? '' : objectId,
+        page: pagination.current,
+        page_size: pagination.pageSize,
+        name: type === 'clear' ? '' : searchText
+      };
+      const data = await getInstanceGroupRule(params, {
+        signal: abortController.signal
+      });
+      if (currentRequestId !== ruleRequestIdRef.current) return;
+      setRuleList(data?.items || []);
+      setPagination((prev: Pagination) => ({
+        ...prev,
+        total: data?.count || 0
+      }));
+    } finally {
+      if (currentRequestId === ruleRequestIdRef.current) {
+        setRuleLoading(false);
+      }
+    }
+  };
+
+  const getObjects = async (type?: string) => {
+    try {
+      setTreeLoading(type !== 'timer');
+      const params = {
+        name: ''
+      };
+      const data = await getMonitorObject(params);
+      setObjects(data);
+      const _treeData = getTreeData(cloneDeep(data));
+      setTreeData(_treeData);
+      setDefaultSelectObj(
+        resolveMonitorObjectTreeKey(
+          data,
+          resolveMonitorObjectQueryId({
+            searchParams,
+            objects: data,
+            allowAll: true,
+            fallback: 'all'
+          }),
+          'all'
+        )
+      );
+    } finally {
+      setTreeLoading(false);
+    }
+  };
+
+  const getTreeData = (data: ObjectItem[]): TreeItem[] => {
+    const groupedData = data.reduce(
+      (acc, item) => {
+        if (!acc[item.type]) {
+          acc[item.type] = {
+            title: item.display_type || '--',
+            key: item.type,
+            children: []
+          };
+        }
+        acc[item.type].children.push({
+          title: item.display_name || '--',
+          key: item.id,
+          icon: item.icon,
+          children: []
+        });
+        return acc;
+      },
+      {} as Record<string, TreeItem>
+    );
+    return [
+      {
+        title: t('common.all'),
+        key: 'all',
+        children: []
+      },
+      ...Object.values(groupedData)
+    ];
+  };
+
+  const operateRule = () => {
+    getRuleList(objectId);
+  };
+
+  const getObjectTypeName = (monitorObjectId: number) => {
+    const obj = objects.find((item) => item.id === monitorObjectId);
+    if (!obj) return '--';
+    return `${obj.display_type || '--'}/${obj.display_name || '--'}`;
+  };
+
+  const showDeleteConfirm = (row: RuleInfo) => {
+    deleteModalRef.current?.showModal({
+      title: t('common.prompt'),
+      form: row as Record<string, unknown>,
+      type: 'delete'
+    });
+  };
+
+  const clearText = () => {
+    setSearchText('');
+    getRuleList(objectId, 'clear');
+  };
+
+  return (
+    <div className="flex h-full min-h-0 w-full min-w-0 gap-2.5 overflow-hidden">
+      <ResizableSidebar collapseStorageKey="monitor.integration.group.sidebarCollapsed">
+        <div className="flex h-full min-h-0 w-full flex-col overflow-y-auto overflow-x-hidden bg-[var(--color-bg-1)] px-2.5 py-5">
+          <TreeSelector
+            showAllMenu
+            data={treeData}
+            defaultSelectedKey={defaultSelectObj as string}
+            onNodeSelect={handleObjectChange}
+            loading={treeLoading}
+          />
+        </div>
+      </ResizableSidebar>
+      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[var(--color-bg-1)] p-5">
+        <div className="mb-4 flex min-w-0 shrink-0 items-center justify-between gap-3">
+          <Input
+            allowClear
+            className="w-full max-w-[320px] min-w-0"
+            placeholder={t('monitor.integrations.searchRuleName')}
+            value={searchText}
+            onChange={(e) => setSearchText(e.target.value)}
+            onPressEnter={operateRule}
+            onClear={clearText}
+          />
+          <Permission requiredPermissions={['Add']}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => openRuleModal('add')}
+              disabled={objectId === 'all'}
+            >
+              {t('common.add')}
+            </Button>
+          </Permission>
+        </div>
+        <div className="min-h-0 min-w-0 flex-1">
+          <CustomTable
+            scroll={{ x: 'max-content' }}
+            columns={columns}
+            dataSource={ruleList}
+            pagination={pagination}
+            loading={ruleLoading}
+            rowKey="id"
+            onChange={handleTableChange}
+          />
+        </div>
+      </div>
+      <RuleModal
+        ref={ruleRef}
+        monitorObject={objectId}
+        groupList={organizationList}
+        objects={objects}
+        onSuccess={operateRule}
+      />
+      <DeleteRule ref={deleteModalRef} onSuccess={operateRule} />
+    </div>
+  );
+};
+
+export default GroupPage;

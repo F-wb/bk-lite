@@ -1,0 +1,45 @@
+nats:
+  servers:
+    - nats://127.0.0.1:4222
+  username: ${NATS_USERNAME}
+  password: ${NATS_PASSWORD}
+  protocol: nats
+  tls_ca_file: ${NATS_TLS_CA_FILE}
+  instance_id: default
+  connect_timeout: 5
+
+runtime:
+  max_workers: 4
+  callback_timeout: 10
+  work_dir: /var/lib/ansible-executor/work
+  state_db_path: /var/lib/ansible-executor/task_state.db
+  # 终态行（success/failed/callback_failed）单独保留期；回调仍 pending 的行不会删。
+  terminal_task_retention_seconds: 86400
+  terminal_task_purge_interval_seconds: 300
+
+security:
+  # Callback subjects are NATS request targets used by the executor to report task results.
+  # Keep this list narrow; append deployment-specific callback prefixes only after review.
+  allowed_callback_subjects:
+    - job.ansible_task_callback
+    - default_stargazer.host_remote.callback
+  # Stream subjects are publish targets used for line-by-line command output.
+  allowed_stream_subjects:
+    - job.stream.>
+    - executor.stream.>
+    - bk.ans_exec.stream.>
+
+jetstream:
+  namespace: bk.ans_exec
+  # stream: BK_ANS_EXEC_TASKS
+  # subject_prefix: bk.ans_exec.tasks
+  # durable: ansible-executor-default
+  max_deliver: 5
+  ack_wait: 300
+  # 注意：配置 backoff 后，JetStream 的实际 ack deadline 取 backoff[0]
+  backoff: [5, 15, 30, 60]
+  dlq_subject: bk.ans_exec.tasks.dlq
+
+# Optional:
+# - You can still inject secrets from sidecar environment variables.
+# - Example: password: ${NATS_PASSWORD}

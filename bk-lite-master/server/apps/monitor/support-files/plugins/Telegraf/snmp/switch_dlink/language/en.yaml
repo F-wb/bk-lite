@@ -1,0 +1,68 @@
+Switch D-Link SNMP:
+  name: D-Link (Telegraf)
+  desc: "SNMP monitoring template for D-Link switch. It reports uptime, CPU utilization, memory utilization and interface traffic (enterprise PEN 171), plus temperature sensors, fan and power-supply state on DGS-1250 series (DLINKSW-ENTITY-EXT-MIB)."
+monitor_object:
+  Switch: Switch
+monitor_object_type:
+  Network Device: Network Equipment
+monitor_object_metric:
+  Switch:
+    snmp_uptime:
+      name: System Uptime
+      desc: This metric indicates the uptime of the device since the last restart.
+        By monitoring the uptime, network administrators can understand the stability
+        and reliability of the device and identify potential reboot or failure issues.
+    device_cpu_usage:
+      name: CPU Utilization
+      desc: This metric reports the five-minute CPU utilization of the D-Link
+        DGS/DXS switch (agentCPUutilizationIn5min) as a 0-100 percentage. Sustained
+        high CPU usage can indicate control-plane overload, forwarding instability,
+        or attack traffic.
+    device_cpu_usage_5s:
+      name: CPU Utilization (5s)
+      desc: This metric reports the five-second CPU utilization of the D-Link
+        DGS/DXS switch (agentCPUutilizationIn5sec) as a 0-100 percentage.
+    device_cpu_usage_1min:
+      name: CPU Utilization (1min)
+      desc: This metric reports the one-minute CPU utilization of the D-Link
+        DGS/DXS switch (agentCPUutilizationIn1min) as a 0-100 percentage.
+    device_memory_total:
+      name: Memory Total
+      desc: This metric reports the total DRAM of the D-Link DGS/DXS switch in
+        bytes (agentDRAMutilizationTotalDRAM, converted from kilobytes). Rows are
+        indexed by unitID (0 = local device).
+    device_memory_used:
+      name: Memory Used
+      desc: This metric reports the used DRAM of the D-Link DGS/DXS switch in
+        bytes (agentDRAMutilizationUsedDRAM, converted from kilobytes). Rows are
+        indexed by unitID (0 = local device).
+    device_memory_usage:
+      name: Memory Utilization
+      desc: This metric reports DRAM utilization of the D-Link DGS/DXS switch
+        (agentDRAMutilization) as a 0-100 percentage. High memory usage may indicate
+        leaks, oversized MAC/ARP tables, or insufficient capacity.
+    device_temperature_celsius:
+      name: Temperature
+      desc: This metric reports the temperature reading of each hardware sensor on
+        the device, in degrees Celsius. Abnormally high temperatures may indicate
+        fan failure, blocked airflow, or excessive ambient heat, and can trigger thermal
+        protection or hardware damage if left unaddressed.
+    device_fan_state:
+      name: Fan Status
+      desc: This metric reports the operational state of each DGS-1250 cooling fan.
+        1 means normal (ok). 2 means abnormal (fault). A value of 2 indicates a cooling
+        fault that can quickly lead to overheating and should be investigated immediately.
+    device_psu_state:
+      name: Power Supply Status
+      desc: This metric reports the operational state of each DGS-1250 power supply.
+        1 means normal (inOperation or empty). 2 means abnormal (failed). A value of
+        2 signals a power hardware fault; on devices with redundant PSUs a single
+        failure may not cause an outage but removes redundancy and must be remediated
+        promptly.
+monitor_object_metric_group:
+  Switch:
+    CPU: CPU
+    Memory: Memory
+    Base: Base
+    Temperature: Temperature
+    Hardware Status: Hardware Status

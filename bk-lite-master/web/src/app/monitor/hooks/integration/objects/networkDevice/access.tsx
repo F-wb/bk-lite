@@ -1,0 +1,82 @@
+export const useAccessConfig = () => {
+  return {
+    instance_type: 'access',
+    dashboardDisplay: [
+      {
+        indexId: 'device_total_outgoing_traffic',
+        displayType: 'single',
+        sortIndex: 0,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '15%'
+        }
+      },
+      {
+        indexId: 'snmp_uptime',
+        displayType: 'lineChart',
+        sortIndex: 1,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '40%'
+        }
+      },
+      {
+        indexId: 'device_total_incoming_traffic',
+        displayType: 'lineChart',
+        sortIndex: 2,
+        displayDimension: [],
+        style: {
+          height: '200px',
+          width: '40%'
+        }
+      },
+      {
+        indexId: 'interfaces',
+        displayType: 'multipleIndexsTable',
+        sortIndex: 3,
+        displayDimension: [
+          'ifOperStatus',
+          'ifHighSpeed',
+          'ifHCInOctets',
+          'ifHCOutOctets'
+        ],
+        style: {
+          height: '400px',
+          width: '100%'
+        }
+      }
+    ],
+    groupIds: {
+      list: ['instance_id'],
+      default: ['instance_id']
+    },
+    collectTypes: {
+      'Access BDCOM SNMP': 'snmp_bdcom',
+      'Access GWD SNMP': 'snmp_gwd',
+      'Access V-SOL SNMP': 'snmp_vsolution',
+      'Access ARRIS Cadant SNMP': 'snmp_arris',
+      'Access Calix E5 SNMP': 'snmp_calix_e5',
+      'Access FiberHome OLT SNMP': 'snmp_fiberhome_olt',
+      'Access Huawei OLT SNMP': 'snmp_huawei_olt',
+      'Access Zhone DZS SNMP': 'snmp_zhone',
+      'Access UTStarcom SNMP': 'snmp_utstarcom',
+      'Access Nokia ISAM SNMP': 'snmp_nokia_isam',
+      'Access Raisecom SNMP': 'snmp_raisecom',
+      'Access PacketFront SNMP': 'snmp_packetfront',
+      'Access Furukawa OLT SNMP': 'snmp_furukawa_olt',
+      'Access C-Data SNMP': 'snmp_cdata',
+      'Access Casa Systems SNMP': 'snmp_casa',
+      'Access Loop Telecom SNMP': 'snmp_loop_telecom',
+      'Access Topvision SNMP': 'snmp_topvision',
+      'Access ZTE OLT SNMP': 'snmp_zte_olt',
+      'Access Icotera SNMP': 'snmp_icotera',
+      'Access Nateks SNMP': 'snmp_nateks',
+      'Access Harmonic SNMP': 'snmp_harmonic',
+      'Access RAD SNMP': 'snmp_rad',
+      'Access Intelbras OLT SNMP': 'snmp_intelbras_olt',
+      'Access Teleste SNMP': 'snmp_teleste'
+    }
+  };
+};

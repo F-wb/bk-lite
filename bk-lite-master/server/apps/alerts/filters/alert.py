@@ -1,0 +1,158 @@
+# -- coding: utf-8 --
+import json
+
+from django.db.models import Q
+from django_filters import CharFilter, FilterSet
+from rest_framework.exceptions import ValidationError
+
+from apps.alerts.constants.constants import AlertStatus
+from apps.alerts.models.models import Alert
+from apps.alerts.utils.enrichment import enrichment_orm_lookups, is_enrichment_path
+from apps.alerts.utils.i18n import alerts_message
+
+
+class AlertModelFilter(FilterSet):
+    """
+    exact	精确匹配（默认值）	alert_id=123 → 只匹配 alert_id 为 "123" 的记录
+    icontains	包含匹配（不区分大小写）	name="test" → 匹配包含 "test" 的所有记录
+    contains	包含匹配（区分大小写）	同上，但区分大小写
+    startswith	以...开头	匹配以指定字符串开头的记录
+    endswith	以...结尾	匹配以指定字符串结尾的记录
+    gt	大于	数值比较
+    lt	小于	数值比较
+    in	在列表中	匹配列表中的任意值
+    """
+
+    # inst_id = NumberFilter(field_name="inst_id", lookup_expr="exact", label="实例ID")
+    title = CharFilter(field_name="title", lookup_expr="icontains", label="名称")
+    content = CharFilter(field_name="content", lookup_expr="icontains", label="内容")
+    alert_id = CharFilter(field_name="alert_id", lookup_expr="exact", label="告警ID")
+    activate = CharFilter(method="filter_activate", label="是否查询历史告警")
+    my_alert = CharFilter(method="filter_my_alert", label="我的告警")
+    level = CharFilter(method="filter_level", label="告警级别")
+    status = CharFilter(method="filter_status", label="告警状态")
+    source_name = CharFilter(method="filter_source_name", label="集成源")
+    source_names = CharFilter(method="filter_source_names", label="集成源名称集合")
+    push_source_ids = CharFilter(method="filter_push_source_ids", label="监控源")
+    created_at_after = CharFilter(field_name="created_at", lookup_expr="gte", label="创建时间（起始）")
+    created_at_before = CharFilter(field_name="created_at", lookup_expr="lte", label="创建时间（结束）")
+    incident_id = CharFilter(field_name="incident__id", lookup_expr="exact", label="事故ID")
+    has_incident = CharFilter(method="filter_incident", label="是否有事故")
+    rule_id = CharFilter(field_name="rule_id", label="是否有事故")
+    resource_type = CharFilter(field_name="resource_type", lookup_expr="exact", label="资源类型")
+    resource_id = CharFilter(field_name="resource_id", lookup_expr="exact", label="资源ID")
+    enrichment_key = CharFilter(method="filter_enrichment", label="丰富字段路径")
+    enrichment_value = CharFilter(method="filter_enrichment_value", label="丰富字段值")
+
+    class Meta:
+        model = Alert
+        fields = [
+            "title",
+            "content",
+            "alert_id",
+            "activate",
+            "my_alert",
+            "level",
+            "status",
+            "source_name",
+            "source_names",
+            "push_source_ids",
+            "created_at_after",
+            "created_at_before",
+            "incident_id",
+            "rule_id",
+            "resource_type",
+            "resource_id",
+            "enrichment_key",
+            "enrichment_value",
+        ]
+
+    def filter_enrichment(self, qs, field_name, value):
+        """enrichment_key 与 enrichment_value 成对使用，路径例 enrichment.cmdb.owner。"""
+        if not value:
+            return qs
+        if not is_enrichment_path(value):
+            return qs.none()
+        expected = self.data.get("enrichment_value")
+        current_lookup, legacy_lookup = enrichment_orm_lookups(value)
+        if expected in (None, ""):
+            return qs.filter(Q(**{f"{current_lookup}__isnull": False}) | Q(**{f"{legacy_lookup}__isnull": False}))
+        return qs.filter(Q(**{current_lookup: expected}) | Q(**{legacy_lookup: expected}))
+
+    @staticmethod
+    def filter_enrichment_value(qs, field_name, value):
+        # 实际过滤由 enrichment_key 一次完成，避免 django-filter 重复叠加。
+        return qs
+
+    @staticmethod
+    def filter_activate(qs, field_name, value):
+        """查询类型"""
+        return qs.exclude(status__in=AlertStatus.CLOSED_STATUS)
+
+    def filter_my_alert(self, qs, field_name, value):
+        """查询我的告警：按当前处理人精确成员匹配，不把用户名当 JSON 子串。"""
+        from apps.alerts.utils.permission_scope import apply_operator_scope
+
+        if str(value or "").strip().lower() not in {"1", "true", "yes"}:
+            return qs
+        username = getattr(getattr(self.request, "user", None), "username", None)
+        return apply_operator_scope(qs, username)
+
+    def filter_level(self, qs, field_name, value):
+        """支持多选的告警级别过滤"""
+        if value:
+            # 支持逗号分隔的多个值
+            levels = [level.strip() for level in value.split(",")]
+            return qs.filter(level__in=levels)
+        return qs
+
+    def filter_status(self, qs, field_name, value):
+        """支持多选的告警状态过滤"""
+        if value:
+            # 支持逗号分隔的多个值
+            statuses = [status.strip() for status in value.split(",")]
+            return qs.filter(status__in=statuses)
+        return qs
+
+    def filter_source_name(self, qs, field_name, value):
+        """支持多选的集成源过滤"""
+        if value:
+            # 支持逗号分隔的多个值
+            source_names = [source.strip() for source in value.split(",")]
+            return qs.filter(source_name__in=source_names)
+        return qs
+
+    def filter_source_names(self, qs, field_name, value):
+        from apps.alerts.utils.rule_catalog import validate_rules_for_serializer
+        from apps.alerts.utils.typed_rules import rules_q
+
+        try:
+            names = json.loads(value)
+        except (ValueError, TypeError) as error:
+            message = alerts_message(getattr(self, "request", None), "error.source_names_must_be_json_array")
+            raise ValidationError({"source_names": message}) from error
+        rules = [[{"key": "source_names", "operator": "any_of", "value": names}]]
+        validate_rules_for_serializer(rules, "assignment")
+        return qs.filter(rules_q(rules, "assignment"))
+
+    def filter_push_source_ids(self, qs, field_name, value):
+        from apps.alerts.utils.monitor_source_rules import MonitorSourceRuleMatcher
+        from apps.alerts.utils.rule_catalog import validate_rules_for_serializer
+
+        try:
+            ids = json.loads(value)
+        except (ValueError, TypeError) as error:
+            message = alerts_message(getattr(self, "request", None), "error.push_source_ids_must_be_json_array")
+            raise ValidationError({"push_source_ids": message}) from error
+        rules = [[{"key": "push_source_ids", "operator": "any_of", "value": ids}]]
+        validate_rules_for_serializer(rules, "assignment")
+        pks = MonitorSourceRuleMatcher({}, source_field="push_source_ids").filter_queryset(qs, rules)
+        return qs.filter(pk__in=pks)
+
+    def filter_incident(self, qs, field_name, value):
+        """过滤是否有事故"""
+        if value.lower() == "true":
+            return qs.filter(incident__isnull=False)
+        elif value.lower() == "false":
+            return qs.filter(incident__isnull=True)
+        return qs

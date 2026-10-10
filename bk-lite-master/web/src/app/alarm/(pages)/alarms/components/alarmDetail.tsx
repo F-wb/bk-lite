@@ -1,0 +1,701 @@
+'use client';
+
+import BaseInfo from './baseInfo';
+import EventTable from '@/app/alarm/components/eventTable';
+import ActionTimeline from './actionTimeline';
+import AlarmAction from './alarmAction';
+import { canManuallyTriggerAlertAction } from '@/app/alarm/utils/alertActionAccess';
+import Icon from '@/components/icon';
+import DeclareIncident from './declareIncident';
+import RelatedAlertsPanel from './relatedAlertsPanel';
+import { useTranslation } from '@/utils/i18n';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
+import { useAlarmApi } from '@/app/alarm/api/alarms';
+import { useSettingApi } from '@/app/alarm/api/settings';
+import { useCommon } from '@/app/alarm/context/common';
+import { useStateMap, useNotifiedStateMap } from '@/app/alarm/constants/alarm';
+import { useAiPageContext } from '@/components/ai-page-context';
+import {
+  ALARM_DETAIL_EVENT_LIMIT,
+  buildAlarmDetailPageContext,
+} from './alarmDetail.context';
+import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import CompactEmptyState from '@/components/compact-empty-state';
+import {
+  Drawer,
+  Button,
+  Tag,
+  Tabs,
+  Timeline,
+  Tooltip,
+  message,
+  Spin,
+} from 'antd';
+import {
+  StateMap,
+  EventItem,
+  AlarmTableDataItem,
+} from '@/app/alarm/types/alarms';
+import { CopyOutlined, ClockCircleOutlined } from '@ant-design/icons';
+import React, {
+  useState,
+  forwardRef,
+  useImperativeHandle,
+  useEffect,
+  useMemo,
+  useRef,
+} from 'react';
+import {
+  ModalRef,
+  ModalConfig,
+  TabItem,
+  Pagination,
+  TimeLineItem,
+} from '@/app/alarm/types/types';
+import {
+  AlarmObjectSwitcher,
+  PublicWidgetPane,
+  useAlarmPublicWidgets,
+} from '@/app/alarm/components/public-widget-pane';
+import {
+  readAlarmLogAlertId,
+  readAlarmServiceId,
+} from '@/app/alarm/utils/alarmSnapshotObjects';
+import { buildAlarmApmReplayWindow } from '@/app/alarm/utils/alarmApmReplayWindow';
+const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
+  ({ handleAction, readonly = false }, ref) => {
+    const STATE_MAP = useStateMap();
+    const notifiedState = useNotifiedStateMap();
+    const { levelList, levelMap } = useCommon();
+    const { t } = useTranslation();
+    const { convertToLocalizedTime, timeZone } = useLocalizedTime();
+    const { getEventList } = useAlarmApi();
+    const { getLogList } = useSettingApi();
+    const [groupVisible, setGroupVisible] = useState<boolean>(false);
+    const [formData, setFormData] = useState<AlarmTableDataItem | any>({});
+    const [title, setTitle] = useState<string>('');
+    const [activeTab, setActiveTab] = useState<string>('baseInfo');
+    const [recordLoading, setRecordLoading] = useState<boolean>(false);
+    const [eventLoading, setEventLoading] = useState<boolean>(false);
+    const [eventList, setEventList] = useState<EventItem[]>([]);
+    const eventRequestIdRef = useRef(0);
+    const [timeLineData, setTimeLineData] = useState<TimeLineItem[]>([]);
+    const timelineRef = useRef<HTMLDivElement>(null);
+    const isFetchingRef = useRef<boolean>(false);
+    const [pagination, setPagination] = useState<Pagination>({
+      current: 1,
+      total: 0,
+      pageSize: 100,
+    });
+    const isBaseInfo = activeTab === 'baseInfo';
+    const isEventTab = activeTab === 'event';
+    const publicWidgets = useAlarmPublicWidgets({
+      monitorObjects: groupVisible ? formData.monitor_objects : undefined,
+      includeActionRecords: true,
+      activeTab,
+      logAlertId: groupVisible ? readAlarmLogAlertId(formData) : '',
+      serviceId: groupVisible ? readAlarmServiceId(formData) : '',
+    });
+    const [objectKey, setObjectKey] = useState('0');
+    const currentObject =
+      publicWidgets.objects.find((item) => item.key === objectKey) ||
+      publicWidgets.objects[0];
+    const apmReplayWindow = useMemo(
+      () =>
+        buildAlarmApmReplayWindow(
+          groupVisible
+            ? {
+              first_event_time: formData.first_event_time,
+              last_event_time: formData.last_event_time,
+              created_at: formData.created_at,
+            }
+            : undefined,
+          new Date(),
+          timeZone,
+        ),
+      [
+        groupVisible,
+        formData.first_event_time,
+        formData.last_event_time,
+        formData.created_at,
+        timeZone,
+      ],
+    );
+    const tabList: TabItem[] = publicWidgets.tabs;
+    const renderObjectSwitcher = () =>
+      publicWidgets.showObjectSwitcher ? (
+        <AlarmObjectSwitcher
+          objects={publicWidgets.objects}
+          value={currentObject?.key || '0'}
+          onChange={setObjectKey}
+        />
+      ) : null;
+
+    useEffect(() => {
+      if (!publicWidgets.objects.some((item) => item.key === objectKey)) {
+        setObjectKey(publicWidgets.objects[0]?.key || '0');
+      }
+    }, [objectKey, publicWidgets.objects]);
+
+    const getEventListData = async (params: any) => {
+      const requestId = ++eventRequestIdRef.current;
+      setEventLoading(true);
+      try {
+        const { items, count } = await getEventList({
+          ...params,
+          page: pagination.current,
+          page_size: pagination.pageSize,
+        });
+        if (requestId !== eventRequestIdRef.current) return;
+        setEventList(items || []);
+        setPagination((prev) => ({ ...prev, total: count }));
+      } finally {
+        if (requestId === eventRequestIdRef.current) {
+          setEventLoading(false);
+        }
+      }
+    };
+
+    const prefetchEvents = async (alertId?: number | string) => {
+      if (!alertId) return;
+      const requestId = ++eventRequestIdRef.current;
+      setEventLoading(true);
+      try {
+        const { items, count } = await getEventList({
+          alert_id: alertId,
+          page: 1,
+          page_size: ALARM_DETAIL_EVENT_LIMIT,
+        });
+        if (requestId !== eventRequestIdRef.current) return;
+        setEventList(items || []);
+        setPagination((prev) => ({
+          ...prev,
+          current: 1,
+          total: count || 0,
+        }));
+      } catch {
+        if (requestId !== eventRequestIdRef.current) return;
+        setEventList([]);
+      } finally {
+        if (requestId === eventRequestIdRef.current) {
+          setEventLoading(false);
+        }
+      }
+    };
+
+    useEffect(() => {
+      if (activeTab !== 'event' || !groupVisible || !formData.id) {
+        return;
+      }
+      getEventListData({ alert_id: formData.id });
+    }, [
+      pagination.current,
+      pagination.pageSize,
+      activeTab,
+      groupVisible,
+      formData.id,
+    ]);
+
+    useImperativeHandle(ref, () => ({
+      showModal: ({
+        title,
+        form,
+        defaultTab = 'baseInfo',
+      }: {
+        title: string;
+        form: AlarmTableDataItem;
+        defaultTab?: string;
+      }) => {
+        eventRequestIdRef.current += 1;
+        setEventList([]);
+        // formData 先于 visible：避免并发撕裂下先开窗却无锚点时间。
+        setFormData(form);
+        setTitle(title);
+        setGroupVisible(true);
+        setActiveTab(defaultTab);
+        setPagination((prev) => ({ ...prev, current: 1, total: 0 }));
+        prefetchEvents(form?.id);
+      },
+    }));
+
+    useEffect(() => {
+      if (groupVisible) {
+        getLogTableData();
+      }
+    }, [formData, groupVisible, activeTab]);
+
+    useEffect(() => {
+      if (formData?.id) {
+        getLogTableData();
+      }
+    }, [pagination.current, pagination.pageSize]);
+
+    useEffect(() => {
+      if (!recordLoading) {
+        isFetchingRef.current = false;
+      }
+    }, [recordLoading]);
+
+    const getLogTableData = async () => {
+      setRecordLoading(true);
+      try {
+        const data: any = await getLogList({
+          target_id: formData.alert_id,
+          page_size: 10000,
+          page: 1,
+        });
+        const _timelineData = (data.items || []).map((item: any) => ({
+          color: 'blue',
+          children: (
+            <div className="flex px-4 text-sm">
+              <span className="w-[160px]">
+                {item.created_at
+                  ? convertToLocalizedTime(item.created_at)
+                  : '--'}
+              </span>
+              <span className="w-[160px]">{item.operator_object || '--'}</span>
+              <span className="w-[120px]">{item.operator || '--'}</span>
+              <EllipsisWithTooltip
+                className="flex-1 whitespace-nowrap overflow-hidden text-ellipsis mr-[6px]"
+                text={item.overview || '--'}
+              ></EllipsisWithTooltip>
+            </div>
+          ),
+        }));
+        const headerItem = {
+          color: 'blue',
+          children: (
+            <div className="flex px-4 text-sm font-semibold">
+              <span className="w-[160px]">{t('alarmCommon.time')}</span>
+              <span className="w-[160px]">{t('alarmCommon.action')}</span>
+              <span className="w-[120px]">{t('alarmCommon.operator')}</span>
+              <span className="flex-1">
+                {t('settings.operationLog.summary')}
+              </span>
+            </div>
+          ),
+        };
+        setTimeLineData([headerItem, ..._timelineData]);
+      } finally {
+        setRecordLoading(false);
+      }
+    };
+
+    const loadMore = () => {
+      if (pagination.current * pagination.pageSize < pagination.total) {
+        isFetchingRef.current = true;
+        setPagination((prev) => ({
+          ...prev,
+          current: prev.current + 1,
+        }));
+      }
+    };
+
+    const handleScroll = () => {
+      if (!timelineRef.current) return;
+      const { scrollTop, scrollHeight, clientHeight } = timelineRef.current;
+      if (
+        scrollTop + clientHeight >= scrollHeight - 10 &&
+        !recordLoading &&
+        !isFetchingRef.current
+      ) {
+        loadMore();
+      }
+    };
+
+    const handleCancel = () => {
+      eventRequestIdRef.current += 1;
+      setGroupVisible(false);
+      setActiveTab('baseInfo');
+      setTimeLineData([]);
+      setEventList([]);
+      setFormData({});
+    };
+
+    const changeTab = (val: string) => {
+      setActiveTab(val);
+      setTimeLineData([]);
+      setPagination({
+        current: 1,
+        total: 0,
+        pageSize: 20,
+      });
+      setRecordLoading(false);
+    };
+
+    const copyToClipboard = (text: string) => {
+      navigator.clipboard.writeText(text);
+      message.success(t('alarmCommon.copied'));
+    };
+
+    const detailContextLabels = useMemo(
+      () => ({
+        level: (value?: string | number) =>
+          levelList.find((item) => item.level_id === Number(value))
+            ?.level_display_name || String(value ?? '--'),
+        state: (value?: string) =>
+          STATE_MAP[value as keyof StateMap] || value || '--',
+        formatTime: (value?: string) =>
+          value ? convertToLocalizedTime(value) : '--',
+        notifyStatus: (value?: string) =>
+          notifiedState[value as keyof typeof notifiedState] || value || '--',
+        objects: (form: Record<string, any>) => {
+          if (!Array.isArray(form.monitor_objects) || !form.monitor_objects.length) {
+            return String(form.resource_name || '');
+          }
+          return form.monitor_objects
+            .map((item: { resource_type?: string; resource_name?: string }) =>
+              `${item.resource_type || '--'}: ${item.resource_name || '--'}`,
+            )
+            .join('；');
+        },
+      }),
+      [STATE_MAP, convertToLocalizedTime, levelList, notifiedState],
+    );
+
+    useAiPageContext(
+      () =>
+        buildAlarmDetailPageContext({
+          visible: groupVisible,
+          eventLoading,
+          formData,
+          eventData: eventList,
+          eventTotal: pagination.total,
+          labels: detailContextLabels,
+        }),
+      [
+        groupVisible,
+        eventLoading,
+        formData,
+        eventList,
+        pagination.total,
+        detailContextLabels,
+      ],
+    );
+
+    return (
+      <Drawer
+        title={
+          <div className="flex min-w-0 items-center">
+            <span className="shrink-0">{t('alarms.alertDetail')} </span>
+            <EllipsisWithTooltip
+              className="min-w-0 truncate text-sm text-[var(--color-text-2)]"
+              text={`-${title}`}
+            />
+          </div>
+        }
+        open={groupVisible}
+        width={820}
+        onClose={handleCancel}
+        destroyOnClose
+        maskClosable={false}
+        footer={
+          <div>
+            <Button onClick={handleCancel}>{t('common.close')}</Button>
+          </div>
+        }
+        classNames={{
+          body: 'flex min-h-0 flex-col overflow-hidden',
+        }}
+      >
+        <div className="shrink-0">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <Tag className="shrink-0" color={levelMap[formData.level] as string}>
+                <div className="flex items-center">
+                  <Icon
+                    type={
+                      levelList.find(
+                        (item) => item.level_id === Number(formData.level)
+                      )?.icon || ''
+                    }
+                    className="mr-1 text-sm"
+                  />
+                  {levelList.find(
+                    (item) => item.level_id === Number(formData.level)
+                  )?.level_display_name || '--'}
+                </div>
+              </Tag>
+              <EllipsisWithTooltip
+                className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-semibold"
+                text={formData.content || '--'}
+              />
+            </div>
+            {!readonly && (
+              <div className="flex shrink-0 items-center gap-2">
+                {!formData.incident_name && (
+                  <DeclareIncident
+                    rowData={[formData]}
+                    buttonSize="small"
+                    onSuccess={() => {
+                      handleAction();
+                      setGroupVisible(false);
+                    }}
+                  />
+                )}
+                <AlarmAction
+                  rowData={[formData]}
+                  btnSize="small"
+                  displayMode="dropdown"
+                  onAction={() => {
+                    // 修复：原 onAction 里还调 handleCancel()，会让用户点完执行动作时
+                    // 右侧 Drawer 被关闭，妨碍继续操作；现在保留刷新、不再关闭 Drawer。
+                    handleAction?.();
+                  }}
+                />
+              </div>
+            )}
+          </div>
+          <ul className="flex mt-[10px] mb-[14px] space-x-2">
+            <li>
+              <Tag>{STATE_MAP[formData.status as keyof StateMap] || '--'}</Tag>
+            </li>
+            <li className="flex items-center space-x-1">
+              <Tag>
+                <Tooltip
+                  title={formData.alert_id}
+                  styles={{
+                    body: {
+                      minWidth: 'fit-content',
+                      whiteSpace: 'nowrap',
+                    },
+                  }}
+                >
+                  <span className="mr-2">ID</span>
+                  {formData.alert_id?.slice(-6) || '--'}
+                </Tooltip>
+                <CopyOutlined
+                  className="cursor-pointer ml-2"
+                  onClick={() => copyToClipboard(formData.alert_id || '')}
+                />
+              </Tag>
+            </li>
+            <li>
+              <Tag>
+                <ClockCircleOutlined className="mr-[4px]" />
+                {formData.duration}
+              </Tag>
+            </li>
+            <li>
+              <Tag>
+                {formData.first_event_time && formData.last_event_time && (
+                  <span>
+                    {formData.first_event_time
+                      ? convertToLocalizedTime(formData.first_event_time)
+                      : ''}
+                    <span className="ml-[2px] mr-[2px]">-</span>
+                    {formData.last_event_time
+                      ? convertToLocalizedTime(formData.last_event_time)
+                      : ''}
+                  </span>
+                )}
+              </Tag>
+            </li>
+          </ul>
+        </div>
+        <Tabs
+          className="shrink-0"
+          activeKey={activeTab}
+          items={tabList}
+          onChange={changeTab}
+        />
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          {isBaseInfo && (
+            <div className="min-h-0 flex-1 overflow-auto">
+              <div className="flex flex-col gap-4">
+                <BaseInfo detail={formData} />
+                <RelatedAlertsPanel alert={formData} onRefresh={handleAction} />
+              </div>
+            </div>
+          )}
+          {isEventTab && (
+            <div className="min-h-0 flex-1 overflow-auto pt-[10px]">
+              <EventTable
+                dataSource={eventList}
+                loading={eventLoading}
+                pagination={pagination}
+                tableScrollY="calc(100vh - 410px)"
+                onChange={(pag) =>
+                  setPagination((prev) => ({
+                    ...prev,
+                    current: pag.current ?? prev.current,
+                    pageSize: pag.pageSize ?? prev.pageSize,
+                  }))
+                }
+              />
+            </div>
+          )}
+
+          {activeTab === 'timeline' && (
+            <div className="min-h-0 flex-1 overflow-auto">
+              <Spin spinning={recordLoading}>
+                {timeLineData.length > 1 ? (
+                  <div
+                    className="pt-[10px]"
+                    style={{ height: 'calc(100vh - 330px)', overflowY: 'auto' }}
+                    ref={timelineRef}
+                    onScroll={handleScroll}
+                  >
+                    <Timeline items={timeLineData} />
+                  </div>
+                ) : (
+                  <CompactEmptyState description={t('common.noData')} />
+                )}
+              </Spin>
+            </div>
+          )}
+          {publicWidgets.alertRawLog.visible && (
+            <div
+              className={
+                activeTab === 'alertRawLog'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                active={publicWidgets.alertRawLog.active}
+                loadWidget={publicWidgets.alertRawLog.loadWidget}
+                identifier={readAlarmLogAlertId(formData)}
+                identifierProp="logAlertId"
+              />
+            </div>
+          )}
+          {publicWidgets.monitorView.visible && (
+            <div
+              className={
+                activeTab === 'monitorView'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                active={publicWidgets.monitorView.active}
+                loadWidget={publicWidgets.monitorView.loadWidget}
+                identifier={currentObject?.monitorId || ''}
+                identifierProp="monitorId"
+                toolbarStart={renderObjectSwitcher()}
+              />
+            </div>
+          )}
+          {publicWidgets.relatedTopology.visible && (
+            <div
+              className={
+                activeTab === 'relatedTopology'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                active={publicWidgets.relatedTopology.active}
+                loadWidget={publicWidgets.relatedTopology.loadWidget}
+                identifier={currentObject?.instUuid || ''}
+                identifierProp="instUuid"
+                toolbarStart={renderObjectSwitcher()}
+              />
+            </div>
+          )}
+          {publicWidgets.assetInfo.visible && (
+            <div
+              className={
+                activeTab === 'assetInfo'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                active={publicWidgets.assetInfo.active}
+                loadWidget={publicWidgets.assetInfo.loadWidget}
+                identifier={currentObject?.instUuid || ''}
+                identifierProp="instUuid"
+                toolbarStart={renderObjectSwitcher()}
+              />
+            </div>
+          )}
+          {publicWidgets.assetChange.visible && (
+            <div
+              className={
+                activeTab === 'assetChange'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                active={publicWidgets.assetChange.active}
+                loadWidget={publicWidgets.assetChange.loadWidget}
+                identifier={currentObject?.instUuid || ''}
+                identifierProp="instUuid"
+                toolbarStart={renderObjectSwitcher()}
+              />
+            </div>
+          )}
+          {publicWidgets.nodeStatus.visible && (
+            <div
+              className={
+                activeTab === 'nodeStatus'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                active={publicWidgets.nodeStatus.active}
+                loadWidget={publicWidgets.nodeStatus.loadWidget}
+                identifier={currentObject?.nodeId || ''}
+                identifierProp="nodeId"
+                toolbarStart={renderObjectSwitcher()}
+              />
+            </div>
+          )}
+          {publicWidgets.serviceOverview.visible && (
+            <div
+              className={
+                activeTab === 'serviceOverview'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                key={`svc-overview-${formData.id}-${apmReplayWindow?.startedAt || ''}-${apmReplayWindow?.endedAt || ''}`}
+                active={publicWidgets.serviceOverview.active}
+                loadWidget={publicWidgets.serviceOverview.loadWidget}
+                identifier={readAlarmServiceId(formData)}
+                identifierProp="serviceId"
+                startedAt={apmReplayWindow?.startedAt}
+                endedAt={apmReplayWindow?.endedAt}
+              />
+            </div>
+          )}
+          {publicWidgets.callChain.visible && (
+            <div
+              className={
+                activeTab === 'callChain'
+                  ? 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                  : 'hidden'
+              }
+            >
+              <PublicWidgetPane
+                key={`call-chain-${formData.id}-${apmReplayWindow?.startedAt || ''}-${apmReplayWindow?.endedAt || ''}`}
+                active={publicWidgets.callChain.active}
+                loadWidget={publicWidgets.callChain.loadWidget}
+                identifier={readAlarmServiceId(formData)}
+                identifierProp="serviceId"
+                startedAt={apmReplayWindow?.startedAt}
+                endedAt={apmReplayWindow?.endedAt}
+              />
+            </div>
+          )}
+          {activeTab === 'actionRecords' && (
+            <div className="min-h-0 flex-1 overflow-auto">
+              <ActionTimeline
+                alertId={formData.alert_id || ''}
+                allowRerun={!readonly && canManuallyTriggerAlertAction(formData.status)}
+              />
+            </div>
+          )}
+        </div>
+      </Drawer>
+    );
+  }
+);
+
+AlertDetail.displayName = 'alertDetail';
+export default AlertDetail;

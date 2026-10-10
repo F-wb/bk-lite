@@ -1,0 +1,112 @@
+import { ThresholdField, FilterItem } from '@/app/monitor/types';
+
+export interface CardItem {
+  icon?: string;
+  title: string;
+  tag?: string;
+  description?: string;
+  value: string | number;
+}
+
+export interface SelectCardProps {
+  data: CardItem[];
+  value?: (string | number)[];
+  onChange?: (value: (string | number)[]) => void;
+  cardWidth?: number;
+  showCheckbox?: boolean;
+}
+
+export interface PluginItem {
+  id: number;
+  name: string;
+  description: string;
+  display_name?: string;
+  monitor_object: number[];
+  display_description?: string;
+  [key: string]: unknown;
+}
+
+export interface SourceFeild {
+  type: string;
+  values: Array<string | number>;
+}
+
+export interface StrategyFields {
+  name?: string;
+  calculation_unit?: string;
+  threshold_unit?: string;
+  metric_unit?: string;
+  organizations?: string[];
+  source?: SourceFeild;
+  collect_type?: string | number;
+  schedule?: {
+    type: string;
+    value: number;
+  };
+  period?: {
+    type: string;
+    value: number;
+  };
+  group_algorithm?: string;
+  algorithm?: string;
+  threshold: ThresholdField[];
+  trigger_count?: number;
+  recovery_condition?: number;
+  no_data_period?: {
+    type: string;
+    value: number;
+  };
+  no_data_recovery_period?: {
+    type: string;
+    value: number;
+  };
+  no_data_level?: string;
+  notice?: boolean;
+  notice_type?: string;
+  notice_type_ids?: number[];
+  notice_users?: string[];
+  handlers?: Array<string | number>;
+  monitor_object?: number;
+  id?: number;
+  group_by?: string[];
+  enable_alerts?: string[];
+  query_condition?: { query?: string } & (
+    | {
+        type: 'metric';
+        metric_id?: number;
+        filter?: FilterItem[];
+      }
+    | {
+        type: 'pmq';
+      }
+    | {
+        type: 'formula';
+        result_name: string;
+        expression: string;
+        queries: Array<{
+          ref: string;
+          metric_id: number;
+          filter?: FilterItem[];
+          group_algorithm: string;
+          group_by: string[];
+        }>;
+      }
+  );
+  [key: string]: unknown;
+}
+
+export interface FiltersConfig {
+  level: string[];
+  state: string[];
+}
+
+export interface UnitMap {
+  [key: string]: number;
+}
+
+export interface ChannelItem {
+  channel_type: string;
+  id: number;
+  name: string;
+  description?: string;
+}

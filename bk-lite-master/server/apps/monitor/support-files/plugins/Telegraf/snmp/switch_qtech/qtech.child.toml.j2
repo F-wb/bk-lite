@@ -1,0 +1,108 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 2
+    community = "{{ community }}"
+    timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+    agents = ["udp://{{ ip }}:{{ port }}"]
+    version = 3
+    timeout = "{{ timeout }}s"
+    sec_name = "{{ sec_name }}"
+    sec_level = "{{ sec_level }}"
+    auth_protocol = "{{ auth_protocol }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+    priv_protocol = "{{ priv_protocol }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp_qtech"
+        config_type = "qtech"
+        brand = "qtech"
+    # ---- System ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+    # ---- Interfaces (generic IF-MIB, auto-walked column names) ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.1"
+        name = "ifIndex"
+        is_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.2.2.1.2"
+        name = "ifDescr"
+        is_tag = true
+    # ---- 64-bit IF-MIB HC traffic counters (ifXTable, wrap-safe on high-speed ports) ----
+    # 待现网核验：ifHCInOctets 1.3.6.1.2.1.31.1.1.1.6 / ifHCOutOctets ...1.10，按 ifIndex 与上表接口行对齐。
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.6"
+        name = "ifHCInOctets"
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.2.1.31.1.1.1.10"
+        name = "ifHCOutOctets"
+    # ---- QTech CPU（QTECH-MIB switchCpuUsage，标量 Integer32 0-100）----
+    # 顶层 field GET 必须带实例 .0；禁止 table.field（标量 GET-NEXT 会走到空子树）。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.27514.100.1.11.10.0"
+        name = "device_cpu_usage"
+    # ---- QTech 内存（QTECH-MIB switchMemoryBusy/Size，标量，bytes）----
+    # used …27514.100.1.11.7.0 / total …11.6.0。利用率按 used/total 计算。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.27514.100.1.11.7.0"
+        name = "device_memory_used"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.27514.100.1.11.6.0"
+        name = "device_memory_total"
+    # ---- QTech 机箱温度（QTECH-MIB switchTemperature，标量 °C）----
+    # 整机 testpoint 单值，无 per-sensor descr。
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.4.1.27514.100.1.11.9.0"
+        name = "device_temperature_celsius"
+    # ---- QTech 风扇（QTECH-MIB sysFanStatus，表列，禁止 .0）----
+    # 无独立 descr 名列。枚举：0 normal / 1 abnormal。下方 processors.enum 归一 0→1，其余→2。
+    [[inputs.snmp.table]]
+        name = "device_fan"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.27514.100.1.12.1.3"
+        name = "state"
+    # ---- QTech 电源（QTECH-MIB sysPowerStatus，表列，禁止 .0）----
+    # 无独立 descr 名列。枚举：0 normal / 1 abnormal / 2 not available。下方 processors.enum 归一 0→1，其余→2。
+    [[inputs.snmp.table]]
+        name = "device_psu"
+        inherit_tags = ["source"]
+        index_as_tag = true
+    [[inputs.snmp.table.field]]
+        oid = "1.3.6.1.4.1.27514.100.1.7.1.5"
+        name = "state"
+
+# ---- 风扇状态归一：0=normal→1(正常)，其余→2(异常)。共享盘 device_fan_state 约定 1=正常,>1=异常。----
+[[processors.enum]]
+    namepass = ["device_fan"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "0" = 1
+# ---- 电源状态归一：0=normal→1(正常)，其余(1 abnormal / 2 not available)→2(异常)。----
+[[processors.enum]]
+    namepass = ["device_psu"]
+    [[processors.enum.mapping]]
+        field = "state"
+        default = 2
+        [processors.enum.mapping.value_mappings]
+            "0" = 1

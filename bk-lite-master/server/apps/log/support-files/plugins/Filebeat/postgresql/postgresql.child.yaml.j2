@@ -1,0 +1,18 @@
+# ================================== PostgreSQL Module 配置 ==================================
+- module: postgresql
+
+  # ================================== Log 配置 ==================================
+  log:
+    enabled: {{ log_enabled | default(true) | lower }}
+    {% if log_paths %}
+    var.paths:
+      {% for path in log_paths %}
+      - "{{ path }}"
+      {% endfor %}
+    {% endif %}
+    input:
+      fields:
+        collector: "Filebeat"
+        collect_type: "postgresql"
+        instance_id: "{{ instance_id }}"
+      fields_under_root: {{ fields_under_root | default(true) | lower }}

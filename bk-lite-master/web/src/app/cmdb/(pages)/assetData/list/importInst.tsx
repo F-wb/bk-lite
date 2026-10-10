@@ -1,0 +1,202 @@
+'use client';
+
+import React, {
+  useState,
+  forwardRef,
+  useImperativeHandle,
+  useRef,
+} from 'react';
+import { Alert, Button, message, Modal, Progress, Upload } from 'antd';
+import OperateModal from '@/components/operate-modal';
+import { useTranslation } from '@/utils/i18n';
+import { useTransferApi } from '@/app/cmdb/api/transfer';
+import type { TransferTask } from '@/app/cmdb/types/transfer';
+import type { UploadFile, UploadProps } from 'antd';
+import { InboxOutlined } from '@ant-design/icons';
+import axios from 'axios';
+import { useAuth } from '@/context/auth';
+import { useSession } from 'next-auth/react';
+import { downloadImportTemplate } from './importTemplateDownload';
+
+interface FieldModalProps {
+  canSubmit: boolean;
+  onSubmitted: (task: TransferTask) => void;
+}
+
+interface FieldConfig {
+  subTitle: string;
+  title: string;
+  model_id: string;
+}
+
+export interface FieldModalRef {
+  showModal: (info: FieldConfig) => void;
+}
+
+const ImportInst = forwardRef<FieldModalRef, FieldModalProps>(
+  ({ onSubmitted, canSubmit }, ref) => {
+    const [groupVisible, setGroupVisible] = useState<boolean>(false);
+    const [confirmLoading, setConfirmLoading] = useState<boolean>(false);
+    const [exportDisabled, setExportDisabled] = useState<boolean>(false);
+    const [subTitle, setSubTitle] = useState<string>('');
+    const [title, setTitle] = useState<string>('');
+    const [modelId, setModelId] = useState<string>('');
+    const [fileList, setFileList] = useState<UploadFile[]>([]);
+    const { t } = useTranslation();
+    const transferApi = useTransferApi();
+    const submissionKey = useRef('');
+    const [uploadProgress, setUploadProgress] = useState(0);
+    const { Dragger } = Upload;
+    const authContext = useAuth();
+    const { data: session } = useSession();
+    const token = authContext?.token || (session?.user as any)?.token || null;
+    const tokenRef = useRef(token);
+    tokenRef.current = token;
+
+    useImperativeHandle(ref, () => ({
+      showModal: ({ subTitle, title, model_id }) => {
+        // 开启弹窗的交互
+        setGroupVisible(true);
+        setSubTitle(subTitle);
+        setTitle(title);
+        setModelId(model_id);
+        setFileList([]);
+        submissionKey.current = crypto.randomUUID();
+        setUploadProgress(0);
+      },
+    }));
+
+    const handleSubmit = () => {
+      operateAttr();
+    };
+
+    const exportTemplate = async () => {
+      try {
+        setExportDisabled(true);
+        const response = await axios({
+          url: `/api/proxy/cmdb/api/instance/${modelId}/download_template/`, // 替换为你的导出数据的API端点
+          method: 'GET',
+          responseType: 'blob', // 确保响应类型为blob
+          headers: {
+            Authorization: `Bearer ${tokenRef.current}`,
+          },
+        });
+        // 创建一个Blob对象
+        const blob = new Blob([response.data], {
+          type: response.headers['content-type'] as string,
+        });
+        downloadImportTemplate(blob, `${modelId}导入模板.xlsx`);
+      } catch (error: any) {
+        message.error(error.message);
+      } finally {
+        setExportDisabled(false);
+      }
+    };
+
+    const handleChange: UploadProps['onChange'] = ({ fileList }) => {
+      setFileList(fileList);
+      submissionKey.current = crypto.randomUUID();
+      setUploadProgress(0);
+    };
+
+    const operateAttr = async () => {
+      const file = fileList[0]?.originFileObj;
+      if (!file) return;
+      try {
+        setConfirmLoading(true);
+        const task = await transferApi.importFile(modelId, file, submissionKey.current, setUploadProgress);
+        message.success(t('Transfer.accepted'));
+        onSubmitted(task);
+        handleCancel();
+      } catch (error: any) {
+        // 后端校验失败返回的多行明细可能很长，用 Modal 展示比 message.error 更可读
+        const detail = error?.message || t('common.importFailed');
+        Modal.error({
+          title: t('common.importFailed'),
+          width: 640,
+          content: (
+            <pre
+              style={{
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                maxHeight: 360,
+                overflow: 'auto',
+                margin: 0,
+                fontFamily: 'inherit',
+              }}
+            >
+              {detail}
+            </pre>
+          ),
+        });
+      } finally {
+        setConfirmLoading(false);
+      }
+    };
+
+    const handleCancel = () => {
+      setGroupVisible(false);
+    };
+
+    return (
+      <div>
+        <OperateModal
+          title={title}
+          subTitle={subTitle}
+          visible={groupVisible}
+          onCancel={handleCancel}
+          footer={
+            <div>
+              <Button
+                className="mr-[10px]"
+                type="primary"
+                loading={confirmLoading}
+                disabled={!fileList.length || !canSubmit}
+                onClick={handleSubmit}
+              >
+                {t('Transfer.submitImport')}
+              </Button>
+              <Button onClick={handleCancel}>{t('common.cancel')}</Button>
+            </div>
+          }
+        >
+          <div>
+            {!canSubmit && <Alert type="info" showIcon message={t('Transfer.activeHint')} className="mb-4" />}
+            <Dragger
+              disabled={confirmLoading}
+              beforeUpload={(file) => {
+                if (!file.name.toLowerCase().endsWith('.xlsx') || file.size > 20 * 1024 * 1024) {
+                  message.error(t('Transfer.fileLimit'));
+                  return Upload.LIST_IGNORE;
+                }
+                return false;
+              }}
+              onChange={handleChange}
+              fileList={fileList}
+              accept=".xlsx"
+              maxCount={1}
+              className="w-full"
+            >
+              <p className="ant-upload-drag-icon">
+                <InboxOutlined />
+              </p>
+              <p className="ant-upload-text">{t('uploadAction')}</p>
+              <p className="ant-upload-hint">{t('Transfer.fileLimit')}</p>
+            </Dragger>
+            {confirmLoading && <Progress percent={uploadProgress} status="active" />}
+            <Button
+              disabled={exportDisabled}
+              className="mt-[10px]"
+              type="link"
+              onClick={exportTemplate}
+            >
+              {t('exportTemplate')}
+            </Button>
+          </div>
+        </OperateModal>
+      </div>
+    );
+  }
+);
+ImportInst.displayName = 'importInst';
+export default ImportInst;

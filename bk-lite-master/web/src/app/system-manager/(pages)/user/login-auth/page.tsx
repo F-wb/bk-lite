@@ -1,0 +1,634 @@
+// Route: /system-manager/user/login-auth
+'use client';
+
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  Button,
+  Form,
+  Input,
+  message,
+  Popconfirm,
+  Select,
+  Space,
+  Switch,
+  Tag,
+  Tooltip,
+} from 'antd';
+import CustomTable from '@/components/custom-table';
+import SystemManagerFillTable from '@/app/system-manager/components/system-manager-fill-table';
+import Icon from '@/components/icon';
+import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import OperateModal from '@/components/operate-modal';
+import PermissionWrapper from '@/components/permission';
+import TopSection from '@/components/top-section';
+import SystemManagerWorkbenchShell, {
+  SystemManagerWorkbenchPanel,
+} from '@/app/system-manager/components/system-manager-workbench-shell';
+import IconFontSelector from '@/app/system-manager/components/user/IconFontSelector';
+import { useIntegrationCenterApi } from '@/app/system-manager/api/integration-center';
+import {
+  useLoginAuthApi,
+  type LoginAuthBindingPayload,
+  type AvailableInstance,
+  type LoginAuthBinding,
+} from '@/app/system-manager/api/login-auth';
+import type { ProviderManifest } from '@/app/system-manager/types/integration-center';
+import { useTranslation } from '@/utils/i18n';
+import { formatIntegrationInstanceDisplayName } from '@/app/system-manager/utils/integrationCenter';
+import { ColumnItem } from '@/types';
+import {
+  buildLoginAuthBindingPayload,
+  getLoginAuthUnavailableEditingInstance,
+  resolveLoginAuthDefaultExternalField,
+  getLoginAuthInstanceNotFoundContent,
+  resolveLoginAuthProviderKey,
+  resolveLoginAuthTemplate,
+  isBuiltinLoginAuthBinding,
+  shouldShowLoginAuthUnmatchedUserAction,
+} from '@/app/system-manager/utils/loginAuthFormUtils';
+
+const LoginAuthPage: React.FC = () => {
+  const { t } = useTranslation();
+  const {
+    getLoginAuthBindings,
+    createLoginAuthBinding,
+    updateLoginAuthBinding,
+    deleteLoginAuthBinding,
+    getAvailableInstances,
+  } = useLoginAuthApi();
+  const { getProviders } = useIntegrationCenterApi();
+  const [form] = Form.useForm();
+
+  const [bindings, setBindings] = useState<LoginAuthBinding[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [sorting, setSorting] = useState(false);
+  const [modalVisible, setModalVisible] = useState(false);
+  const [modalLoading, setModalLoading] = useState(false);
+  const [editingBinding, setEditingBinding] = useState<LoginAuthBinding | null>(null);
+  const [selectedIcon, setSelectedIcon] = useState<string>('');
+  const [availableInstances, setAvailableInstances] = useState<AvailableInstance[]>([]);
+  const [availableInstancesLoading, setAvailableInstancesLoading] = useState(false);
+  const [providers, setProviders] = useState<ProviderManifest[]>([]);
+  const [unmatchedAction, setUnmatchedAction] = useState<string>('deny');
+  const watchedIntegrationInstance = Form.useWatch('integration_instance', form);
+  const [pagination, setPagination] = useState({
+    current: 1,
+    total: 0,
+    pageSize: 10,
+  });
+  const fetchBindings = async (page = pagination.current, pageSize = pagination.pageSize) => {
+    try {
+      setLoading(true);
+      const { count, items } = await getLoginAuthBindings({
+        page,
+        page_size: pageSize,
+      });
+      setPagination((prev) => ({
+        ...prev,
+        current: page,
+        pageSize,
+        total: count,
+      }));
+      setBindings(items);
+    } catch {
+      message.error(t('common.fetchFailed'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchAvailableInstances = async () => {
+    setAvailableInstancesLoading(true);
+    try {
+      const data = await getAvailableInstances();
+      const nextInstances = data || [];
+      setAvailableInstances(nextInstances);
+    } catch {
+      setAvailableInstances([]);
+    } finally {
+      setAvailableInstancesLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchBindings();
+    fetchAvailableInstances();
+    void getProviders().then(setProviders).catch(() => setProviders([]));
+  }, []);
+
+  const isBuiltinBinding = (binding: LoginAuthBinding) => isBuiltinLoginAuthBinding(binding.provider_key);
+  const editingBuiltinBinding = editingBinding ? isBuiltinBinding(editingBinding) : false;
+  const currentProviderKey = useMemo(
+    () => resolveLoginAuthProviderKey(watchedIntegrationInstance, availableInstances, editingBinding),
+    [availableInstances, editingBinding, watchedIntegrationInstance],
+  );
+  const showUnmatchedUserAction = shouldShowLoginAuthUnmatchedUserAction(currentProviderKey);
+  const unavailableEditingInstance = useMemo(
+    () => getLoginAuthUnavailableEditingInstance(availableInstances, editingBinding),
+    [availableInstances, editingBinding],
+  );
+  const integrationInstanceOptions = useMemo(() => {
+    const availableOptions = availableInstances.map((instance) => ({
+      value: instance.id,
+      label: formatIntegrationInstanceDisplayName(instance),
+    }));
+    if (!unavailableEditingInstance) {
+      return availableOptions;
+    }
+
+    return [{
+      value: unavailableEditingInstance.id,
+      label: `${formatIntegrationInstanceDisplayName(unavailableEditingInstance)} (${t('system.user.loginAuthPage.currentInstanceUnavailable')})`,
+      disabled: true,
+    }, ...availableOptions];
+  }, [availableInstances, t, unavailableEditingInstance]);
+  const resolvedTemplate = useMemo(
+    () => resolveLoginAuthTemplate(watchedIntegrationInstance, availableInstances, providers),
+    [availableInstances, providers, watchedIntegrationInstance],
+  );
+
+  const handleRefresh = async () => {
+    try {
+      setRefreshing(true);
+      await Promise.all([fetchBindings(), fetchAvailableInstances()]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const handleTableChange = (page: number, pageSize: number) => {
+    fetchBindings(page, pageSize);
+  };
+
+  const reorderBindingsWithPageOrder = (items: LoginAuthBinding[]) => {
+    const baseOrder = (pagination.current - 1) * pagination.pageSize + 1;
+    return items.map((item, index) => ({
+      ...item,
+      order: baseOrder + index,
+    }));
+  };
+
+  const handleRowDragEnd = async (
+    targetTableData: LoginAuthBinding[] | undefined,
+  ) => {
+    if (!targetTableData) return;
+
+    const reorderedBindings = reorderBindingsWithPageOrder(targetTableData);
+    const previousOrderMap = new Map(bindings.map((item) => [item.id, item.order]));
+    const changedBindings = reorderedBindings.filter((item) => item.order !== previousOrderMap.get(item.id));
+    if (changedBindings.length === 0) return;
+
+    const previousBindings = bindings;
+    setBindings(reorderedBindings);
+    setSorting(true);
+
+    try {
+      await Promise.all(
+        changedBindings.map((item) =>
+          updateLoginAuthBinding(item.id, { order: item.order })
+        )
+      );
+      await fetchBindings();
+    } catch {
+      setBindings(previousBindings);
+      message.error(t('common.saveFailed'));
+    } finally {
+      setSorting(false);
+    }
+  };
+
+  const handleAdd = () => {
+    setEditingBinding(null);
+    setSelectedIcon('');
+    setUnmatchedAction('deny');
+    form.resetFields();
+    form.setFieldsValue({
+      icon: '',
+      platform_field: 'username',
+    });
+    fetchAvailableInstances();
+    setModalVisible(true);
+  };
+
+  const handleEdit = (record: LoginAuthBinding) => {
+    setEditingBinding(record);
+    setSelectedIcon(record.icon || '');
+    setUnmatchedAction(record.unmatched_user_action);
+    form.setFieldsValue({
+      name: record.name,
+      integration_instance: record.integration_instance,
+      icon: record.icon,
+      description: record.description,
+      external_field: record.external_field,
+      platform_field: record.platform_field,
+      unmatched_user_action: record.unmatched_user_action,
+      default_group_name: record.default_group_name,
+    });
+    fetchAvailableInstances();
+    setModalVisible(true);
+  };
+
+  const handleToggleEnabled = async (record: LoginAuthBinding, checked: boolean) => {
+    if (isBuiltinBinding(record)) return;
+    try {
+      await updateLoginAuthBinding(record.id, { enabled: checked });
+      setBindings(prev =>
+        prev.map(b => (b.id === record.id ? { ...b, enabled: checked } : b))
+      );
+    } catch {
+      message.error(t('common.operationFailed'));
+    }
+  };
+
+  const handleDelete = async (record: LoginAuthBinding) => {
+    try {
+      await deleteLoginAuthBinding(record.id);
+      message.success(t('common.delSuccess'));
+      await fetchBindings();
+    } catch {
+      message.error(t('common.delFailed'));
+    }
+  };
+
+  const handleModalOk = async () => {
+    try {
+      const values = await form.validateFields();
+      setModalLoading(true);
+      if (editingBinding) {
+        const payload: Partial<LoginAuthBindingPayload> = editingBuiltinBinding
+          ? {
+            name: values.name.trim(),
+            icon: values.icon || '',
+            description: values.description || '',
+          }
+          : {
+            ...buildLoginAuthBindingPayload(values, currentProviderKey),
+          };
+        const updated = await updateLoginAuthBinding(editingBinding.id, payload);
+        setBindings(prev =>
+          prev.map(b => (b.id === editingBinding.id ? { ...b, ...updated } : b))
+        );
+        message.success(t('common.saveSuccess'));
+      } else {
+        const payload: LoginAuthBindingPayload = buildLoginAuthBindingPayload(values, currentProviderKey);
+        await createLoginAuthBinding(payload);
+        message.success(t('common.addSuccess'));
+        await fetchBindings();
+      }
+      setModalVisible(false);
+    } catch (e) {
+      if (e && typeof e === 'object' && 'errorFields' in e) return;
+      message.error(t('common.operationFailed'));
+    } finally {
+      setModalLoading(false);
+    }
+  };
+
+  const handleModalCancel = () => {
+    if (modalLoading) return;
+    setModalVisible(false);
+  };
+
+  const handleIconChange = (iconName: string) => {
+    setSelectedIcon(iconName);
+    form.setFieldValue('icon', iconName);
+  };
+
+  const handleIntegrationInstanceChange = (instanceId: number) => {
+    const providerKey = availableInstances.find((item) => item.id === instanceId)?.provider_key || '';
+    const template = resolveLoginAuthTemplate(instanceId, availableInstances, providers);
+    const nextIcon = providerKey;
+    const nextExternalField = resolveLoginAuthDefaultExternalField(template);
+    // 微信登录认证默认开启"未匹配时创建用户",首次登录创建组织弹窗
+    // (init_user_set) 所需的 OpsPilotGuest 组由后端 fallback 兜底,
+    // 前端不再自动填充,UI 也不展示默认组名输入框。
+    const nextUnmatchedAction = providerKey === 'wechat' ? 'create' : 'deny';
+    setSelectedIcon(nextIcon);
+    setUnmatchedAction(nextUnmatchedAction);
+    // Select onChange 同步写其它 Form 字段会触发 antd「circular references」警告
+    queueMicrotask(() => {
+      form.setFieldValue('icon', nextIcon);
+      form.setFieldValue('external_field', nextExternalField);
+      form.setFieldValue('unmatched_user_action', nextUnmatchedAction);
+      if (nextUnmatchedAction !== 'create') {
+        form.setFieldValue('default_group_name', '');
+      }
+    });
+  };
+
+  const handleUnmatchedActionChange = (value: string) => {
+    setUnmatchedAction(value);
+    if (value !== 'create') {
+      form.setFieldValue('default_group_name', '');
+    }
+  };
+
+  const columns: ColumnItem[] = [
+    {
+      key: 'name',
+      title: t('system.user.loginAuthPage.name'),
+      dataIndex: 'name',
+      render: (_, record) => {
+        return (
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-[var(--color-fill-1)] text-[var(--color-primary)]">
+              {record.icon ? <Icon type={record.icon} className="text-lg" /> : null}
+            </div>
+            <div className="min-w-0">
+              <p className="text-[var(--color-text-1)]">{record.name}</p>
+              <span className="text-xs text-[var(--color-text-3)]">{t(`system.user.loginAuthPage.currentOrder`)}：{record.order}</span>
+            </div>
+          </div>
+        )
+      }
+    },
+    {
+      key: 'integration_instance_name',
+      title: t('system.user.loginAuthPage.integratedSystems'),
+      dataIndex: 'integration_instance_name',
+      render: (_, record) => {
+        const dependencyStatus = record.dependency_status;
+        return (
+          <div className="flex items-center gap-2">
+            <span>
+              {record.provider_key && record.provider_key !== 'bk_lite_builtin'
+                ? `${record.integration_instance_name} / ${record.provider_name || record.provider_key}`
+                : record.integration_instance_name}
+            </span>
+            {dependencyStatus?.available === false ? (
+              <Tooltip title={t(`system.user.loginAuthPage.dependencyReason.${dependencyStatus.reason}`)}>
+                <Tag color="warning">{t('system.user.loginAuthPage.dependencyPaused')}</Tag>
+              </Tooltip>
+            ) : null}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'description',
+      title: t('system.user.loginAuthPage.description'),
+      dataIndex: 'description',
+      ellipsis: true,
+    },
+    {
+      key: 'enabled',
+      title: t('system.user.loginAuthPage.enabled'),
+      dataIndex: 'enabled',
+      render: (enabled: boolean, record) => (
+        <Switch
+          size="small"
+          checked={isBuiltinBinding(record) ? true : enabled}
+          disabled={isBuiltinBinding(record)}
+          onChange={checked => handleToggleEnabled(record, checked)}
+        />
+      ),
+    },
+    {
+      title: t('common.actions'),
+      key: 'actions',
+      dataIndex: 'actions',
+      fixed: 'right',
+      render: (_, record) => {
+        const builtin = isBuiltinBinding(record);
+        return (
+          <Space>
+            <PermissionWrapper requiredPermissions={['Edit']}>
+              <Button
+                type="link"
+                size="small"
+                icon={<EditOutlined />}
+                disabled={builtin}
+                onClick={builtin ? undefined : () => handleEdit(record)}
+              >
+                {t('common.edit')}
+              </Button>
+            </PermissionWrapper>
+            <PermissionWrapper requiredPermissions={['Delete']}>
+              {builtin ? (
+                <Button
+                  type="link"
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined />}
+                  disabled
+                >
+                  {t('common.delete')}
+                </Button>
+              ) : (
+                <Popconfirm
+                  title={t('system.user.loginAuthPage.deleteConfirm')}
+                  onConfirm={() => handleDelete(record)}
+                >
+                  <Button type="link" size="small" danger icon={<DeleteOutlined />}>
+                    {t('common.delete')}
+                  </Button>
+                </Popconfirm>
+              )}
+            </PermissionWrapper>
+          </Space>
+        );
+      },
+    },
+  ];
+
+  return (
+    <>
+      <SystemManagerWorkbenchShell
+        header={(
+          <TopSection
+            title={t('system.user.loginAuth')}
+            content={t('system.user.loginAuthPage.pageDesc')}
+          />
+        )}
+        right={(
+          <SystemManagerWorkbenchPanel bodyClassName="flex min-h-0 flex-col p-4">
+            <div className="mb-4 flex flex-wrap items-center justify-end gap-2">
+              <Button icon={<ReloadOutlined />} onClick={handleRefresh} loading={refreshing}>
+                {t('common.refresh')}
+              </Button>
+              <PermissionWrapper requiredPermissions={['Add']}>
+                <Button type="primary" icon={<PlusOutlined />} onClick={handleAdd}>
+                  {t('common.new')}
+                </Button>
+              </PermissionWrapper>
+            </div>
+            <SystemManagerFillTable>
+              <CustomTable
+                rowKey="id"
+                loading={loading || sorting}
+                columns={columns}
+                dataSource={bindings}
+                rowDraggable
+                onRowDragEnd={(targetTableData) => handleRowDragEnd(targetTableData as LoginAuthBinding[] | undefined)}
+                pagination={{
+                  current: pagination.current,
+                  total: pagination.total,
+                  pageSize: pagination.pageSize,
+                  showSizeChanger: true,
+                  onChange: handleTableChange,
+                }}
+              />
+            </SystemManagerFillTable>
+          </SystemManagerWorkbenchPanel>
+        )}
+      />
+
+      <OperateModal
+        title={editingBinding ? t('common.edit') : t('common.add')}
+        open={modalVisible}
+        onOk={handleModalOk}
+        onCancel={handleModalCancel}
+        confirmLoading={modalLoading}
+        width={600}
+      >
+        <Form form={form} layout="vertical">
+          <div className="mb-6">
+            <div className="mb-2 text-[16px] font-semibold text-[var(--color-text-1)]">
+              {t('system.user.loginAuthPage.basicInfoTitle')}
+            </div>
+            <div className="mb-5 text-[13px] text-[var(--color-text-3)]">
+              {t('system.user.loginAuthPage.basicInfoDesc')}
+            </div>
+            <Form.Item
+              name="name"
+              label={t('system.user.loginAuthPage.name')}
+              rules={[{ required: true, whitespace: true }]}
+            >
+              <Input placeholder={t('system.user.loginAuthPage.namePlaceholder')} />
+            </Form.Item>
+            {editingBuiltinBinding ? (
+              <Form.Item label={t('system.user.loginAuthPage.integratedSystems')}>
+                <Input value={editingBinding.integration_instance_name} disabled />
+              </Form.Item>
+            ) : (
+              <Form.Item
+                name="integration_instance"
+                label={t('system.user.loginAuthPage.integratedSystems')}
+                rules={[{ required: true }]}
+              >
+                <Select
+                  placeholder={t('system.user.loginAuthPage.integrationInstancePlaceholder')}
+                  loading={availableInstancesLoading}
+                  notFoundContent={getLoginAuthInstanceNotFoundContent({
+                    loading: availableInstancesLoading,
+                    hasAvailableInstances: availableInstances.length > 0,
+                    loadingText: t('common.loading'),
+                    emptyText: t('system.user.loginAuthPage.noAvailableIntegrationInstances'),
+                  })}
+                  options={integrationInstanceOptions}
+                  onChange={handleIntegrationInstanceChange}
+                />
+              </Form.Item>
+            )}
+            <Form.Item
+              label={t(`system.user.loginAuthPage.icon`)}
+              name="icon"
+              layout='horizontal'
+              rules={[{ required: true, whitespace: true }]}
+            >
+              <div className="flex justify-start items-center">
+                <IconFontSelector
+                  value={selectedIcon}
+                  onChange={handleIconChange}
+                  variant="square"
+                />
+              </div>
+            </Form.Item>
+
+            <Form.Item
+              name="description"
+              label={t('system.user.loginAuthPage.description')}
+            >
+              <Input.TextArea rows={3} placeholder={t('system.user.loginAuthPage.descriptionPlaceholder')} />
+            </Form.Item>
+          </div>
+
+          {!editingBuiltinBinding ? (
+            <div className="border-t border-[var(--color-border-1)] pt-6">
+              <div className="mb-2 text-[16px] font-semibold text-[var(--color-text-1)]">
+                {t('system.user.loginAuthPage.accountMatchingTitle')}
+              </div>
+              <div className="mb-5 text-[13px] text-[var(--color-text-3)]">
+                {t('system.user.loginAuthPage.accountMatchingDesc')}
+              </div>
+              <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-4">
+                <div className="mb-4 font-semibold text-[var(--color-text-1)]">
+                  {t('system.user.loginAuthPage.fieldMappingTitle')}
+                </div>
+                <div className="grid grid-cols-[minmax(0,1fr)_24px_minmax(0,1fr)] gap-x-4 gap-y-3 text-[13px] text-[var(--color-text-3)]">
+                  <div>{t('system.user.loginAuthPage.platformField')}</div>
+                  <div />
+                  <div>{t('system.user.loginAuthPage.externalField')}</div>
+                </div>
+                <div className="mt-3 grid grid-cols-[minmax(0,1fr)_24px_minmax(0,1fr)] gap-x-4 gap-y-3">
+                  <Form.Item
+                    name="platform_field"
+                    rules={[{ required: true }]}
+                    className="mb-0"
+                  >
+                    <Select
+                      options={[
+                        { value: 'username', label: t('system.user.loginAuthPage.platformUsername') },
+                        { value: 'phone', label: t('system.user.loginAuthPage.platformPhone') },
+                        { value: 'email', label: t('system.user.loginAuthPage.platformEmail') },
+                      ]}
+                    />
+                  </Form.Item>
+                  <div className="flex h-10 items-center justify-center text-lg text-[var(--color-primary)]">
+                    =
+                  </div>
+                  <Form.Item
+                    name="external_field"
+                    rules={[{ required: true, whitespace: true }]}
+                    className="mb-0"
+                  >
+                    <Input placeholder={t('system.user.loginAuthPage.externalFieldPlaceholder')} />
+                  </Form.Item>
+                </div>
+                <div className="mt-3 text-[12px] text-[var(--color-text-3)]">
+                  {t('system.user.loginAuthPage.fieldMappingDesc')}
+                </div>
+                {resolvedTemplate?.available_external_fields && resolvedTemplate.available_external_fields.length > 0 ? (
+                  <div className="mt-2 text-[12px] text-[var(--color-text-3)]">
+                    {t('system.user.loginAuthPage.externalFieldsHint')}
+                    {resolvedTemplate.available_external_fields.join(' / ')}
+                  </div>
+                ) : null}
+              </div>
+              {showUnmatchedUserAction ? (
+                <>
+                  <Form.Item
+                    name="unmatched_user_action"
+                    label={t('system.user.loginAuthPage.unmatchedUserAction')}
+                    initialValue="deny"
+                    className="mt-5"
+                  >
+                    <Select
+                      options={[
+                        { value: 'deny', label: t('system.user.loginAuthPage.actionDeny') },
+                        { value: 'create', label: t('system.user.loginAuthPage.actionCreate') },
+                      ]}
+                      onChange={handleUnmatchedActionChange}
+                    />
+                  </Form.Item>
+                  {unmatchedAction === 'create' && currentProviderKey !== 'wechat' && (
+                    <Form.Item
+                      name="default_group_name"
+                      label={t('system.user.loginAuthPage.defaultGroupName')}
+                      rules={[{ required: true, whitespace: true }]}
+                    >
+                      <Input placeholder={t('system.user.loginAuthPage.defaultGroupNamePlaceholder')} />
+                    </Form.Item>
+                  )}
+                </>
+              ) : null}
+            </div>
+          ) : null}
+        </Form>
+      </OperateModal>
+    </>
+  );
+};
+
+export default LoginAuthPage;

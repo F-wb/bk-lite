@@ -1,0 +1,462 @@
+.chatflowEditor {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg);
+  border-radius: 8px;
+  overflow: hidden;
+
+  /* ReactFlow global style overrides */
+  :global(.react-flow__node) {
+    cursor: pointer;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+  }
+
+  :global(.react-flow__edge) {
+    stroke-width: 3;
+  }
+
+  :global(.react-flow__edge:hover) {
+    stroke: var(--color-primary);
+    stroke-width: 4;
+  }
+
+  :global(.react-flow__edge.selected) {
+    stroke: var(--color-primary);
+    stroke-width: 4;
+  }
+
+  :global(.react-flow__edge-path) {
+    stroke: var(--color-border-3);
+    stroke-dasharray: 6 6;
+    transition: stroke 0.2s ease, stroke-dasharray 0.2s ease, opacity 0.2s ease;
+  }
+
+  :global(.edge-status-pending) :global(.react-flow__edge-path) {
+    stroke: #d0d5dd !important;
+    stroke-dasharray: 7 7;
+    opacity: 0.9;
+  }
+
+  :global(.edge-status-running) :global(.react-flow__edge-path) {
+    stroke: #12b76a !important;
+    stroke-dasharray: 10 6;
+    stroke-linecap: round;
+    animation: flowAnimation 0.85s linear infinite;
+  }
+
+  :global(.edge-status-completed) :global(.react-flow__edge-path) {
+    stroke: #12b76a !important;
+    stroke-dasharray: none;
+    opacity: 1;
+  }
+
+  :global(.edge-status-failed) :global(.react-flow__edge-path) {
+    stroke: #f04438 !important;
+    stroke-dasharray: 9 7;
+    opacity: 1;
+  }
+
+  :global(.react-flow__connection-line) {
+    stroke: var(--color-primary);
+    stroke-width: 3;
+    stroke-dasharray: 8, 4;
+  }
+
+  :global(.react-flow__controls) {
+    background: var(--color-bg-1);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    bottom: 40px !important;
+    left: 12px !important;
+  }
+
+  :global(.react-flow__controls button) {
+    background: var(--color-bg-1) !important;
+    border: 1px solid var(--color-border) !important;
+    color: var(--color-text) !important;
+  }
+
+  :global(.react-flow__controls button:hover) {
+    background: var(--color-bg-2) !important;
+  }
+
+  :global(.react-flow__minimap) {
+    background: var(--color-bg-1) !important;
+    border: 1px solid var(--color-border) !important;
+    border-radius: 4px !important;
+    bottom: 12px !important;
+    right: 12px !important;
+    width: 180px !important;
+    height: 120px !important;
+    z-index: 5 !important;
+    overflow: hidden !important;
+  }
+
+  /* Minimap internal node styles */
+  :global(.react-flow__minimap-node) {
+    fill: var(--color-primary) !important;
+    stroke: var(--color-border) !important;
+    stroke-width: 1 !important;
+    opacity: 0.8 !important;
+  }
+
+  /* Minimap viewport area styles - critical fix */
+  :global(.react-flow__minimap-mask) {
+    fill: rgba(240, 240, 240, 0.7) !important;
+    stroke-width: 2 !important;
+    stroke-dasharray: none !important;
+    opacity: 1 !important;
+  }
+
+  /* Minimap viewport description area - ensure proper display of current visible area */
+  :global(.react-flow__minimap-describe) {
+    fill: rgba(255, 255, 255, 0.1) !important;
+    stroke-width: 2 !important;
+    stroke-opacity: 1 !important;
+    stroke-dasharray: 5,3 !important;
+  }
+
+  /* Minimap SVG container */
+  :global(.react-flow__minimap svg) {
+    width: 100% !important;
+    height: 100% !important;
+    display: block !important;
+  }
+
+  :global(.react-flow__background) {
+    background: var(--color-bg);
+  }
+
+  :global(.react-flow__attribution) {
+    display: none !important;
+    color: var(--color-text-4);
+    font-size: 10px;
+    background: var(--color-bg-1);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--color-border);
+  }
+
+  /* Connection handle styles - adjusted to 10px */
+  :global(.react-flow__handle) {
+    width: 10px !important;
+    height: 10px !important;
+    border: 2px solid white !important;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15) !important;
+    transition: all 0.15s ease !important;
+    cursor: crosshair !important;
+    pointer-events: all !important;
+  }
+
+  :global(.react-flow__handle::before) {
+    content: '' !important;
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    transform: translate(-50%, -50%) !important;
+    width: 24px !important;
+    height: 24px !important;
+    border-radius: 50% !important;
+    background: transparent !important;
+  }
+
+  :global(.react-flow__handle:hover) {
+    width: 16px !important;
+    height: 16px !important;
+    box-shadow: 0 0 0 4px rgba(24, 144, 255, 0.3), 0 3px 8px rgba(0, 0, 0, 0.25) !important;
+  }
+
+  :global(.react-flow__handle-left) {
+    left: -8px !important;
+    z-index: 999 !important;
+  }
+
+  :global(.react-flow__handle-left:hover) {
+    left: -11px !important;
+  }
+
+  :global(.react-flow__handle-right) {
+    right: -8px !important;
+    z-index: 500 !important;
+  }
+
+  :global(.react-flow__handle-right:hover) {
+    right: -11px !important;
+  }
+
+  // 多输出 Handle 需要自定义垂直位置
+  :global(.react-flow__handle[id^="output-"]) {
+    width: 12px !important;
+    height: 12px !important;
+    right: -6px !important;
+  }
+
+  :global(.react-flow__handle[id^="output-"]:hover) {
+    width: 18px !important;
+    height: 18px !important;
+    right: -9px !important;
+  }
+
+  /* Connection flow animation - rightward flow */
+  @keyframes flowAnimation {
+    0% {
+      stroke-dashoffset: 0;
+    }
+    100% {
+      stroke-dashoffset: -12;
+    }
+  }
+}
+
+.flowContainer {
+  flex: 1;
+  position: relative;
+  background: var(--color-bg);
+}
+
+.nodeContainer {
+  background: var(--color-bg-1);
+  border: 2px solid var(--color-border);
+  border-radius: 8px;
+  width: 240px;
+  min-height: 120px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  transition: all 0.2s ease;
+  position: relative;
+  z-index: 0;
+  overflow: visible;
+
+  &:hover {
+    border-color: var(--color-primary);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  }
+
+  &.selected {
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+  }
+
+  &.nodeCompleted {
+    border-color: #12b76a;
+    background: linear-gradient(180deg, rgba(236, 253, 243, 0.88) 0%, rgba(255, 255, 255, 0.96) 100%);
+    box-shadow: 0 0 0 2px rgba(18, 183, 106, 0.12);
+  }
+
+  &.nodeFailed {
+    border-color: #f04438;
+    background: linear-gradient(180deg, rgba(254, 242, 242, 0.9) 0%, rgba(255, 255, 255, 0.96) 100%);
+    box-shadow: 0 0 0 2px rgba(240, 68, 56, 0.12);
+  }
+
+  &.nodeRunning {
+    border-color: #12b76a;
+    box-shadow: 0 0 0 2px rgba(18, 183, 106, 0.14);
+    animation: nodePulse 1.25s ease-in-out infinite;
+  }
+
+  &.nodePending {
+    border-color: #d0d5dd;
+    box-shadow: none;
+  }
+
+  &.nodeCompleted,
+  &.nodeFailed,
+  &.nodeRunning,
+  &.nodePending {
+    .nodeHeader {
+      background: transparent;
+    }
+
+    .nodeConfigInfo {
+      background: rgba(255, 255, 255, 0.72);
+    }
+  }
+}
+
+@keyframes nodePulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(18, 183, 106, 0.18);
+  }
+
+  70% {
+    box-shadow: 0 0 0 7px rgba(18, 183, 106, 0);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(18, 183, 106, 0);
+  }
+}
+
+.nodeHeader {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  background: var(--color-fill-1);
+  border-bottom: 1px solid var(--color-border);
+  border-radius: 6px 6px 0 0;
+
+  .nodeIcon {
+    font-size: 16px;
+    margin-right: 8px;
+    color: var(--color-primary);
+    flex-shrink: 0; // Prevent icon compression
+  }
+
+  .nodeTitle {
+    font-weight: 500;
+    font-size: 14px;
+    color: var(--color-text);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    flex: 1; // Take remaining space
+    line-height: 1.4;
+  }
+}
+
+.nodeContent {
+  padding: 12px;
+
+  .nodeExecutionMeta {
+    margin-bottom: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text-2);
+  }
+
+  .nodeConfigInfo {
+    font-size: 12px;
+    color: var(--color-text-3);
+    padding: 8px 10px;
+    background: var(--color-fill-1);
+    border-radius: 4px;
+    min-height: 32px;
+    display: flex;
+    align-items: flex-start;
+    line-height: 1.4;
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: break-all;
+    hyphens: auto;
+    max-width: 100%;
+
+    &:empty {
+      display: none;
+    }
+  }
+
+  .nodeDescription {
+    margin: 8px 0 0 0;
+    font-size: 12px;
+    color: var(--color-text-3);
+    line-height: 1.4;
+
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+  }
+}
+
+.nodeStatusBadge {
+  margin-left: 8px;
+  display: inline-flex;
+  width: 17px;
+  height: 17px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  flex-shrink: 0;
+  border: 1px solid #d0d5dd;
+  color: #98a2b3;
+  background: #ffffff;
+  font-size: 11px;
+
+  &[data-status='running'] {
+    border-color: #12b76a;
+    color: #ffffff;
+    background: #12b76a;
+    box-shadow: 0 0 0 4px rgba(18, 183, 106, 0.14);
+  }
+
+  &[data-status='completed'] {
+    border-color: #12b76a;
+    color: #ffffff;
+    background: #12b76a;
+  }
+
+  &[data-status='failed'] {
+    border-color: #f04438;
+    color: #ffffff;
+    background: #f04438;
+  }
+
+  &[data-status='pending'] {
+    border-color: #d0d5dd;
+    color: transparent;
+    background: #ffffff;
+  }
+}
+
+.statusIconHollow {
+  display: inline-flex;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid #98a2b3;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.handle {
+  width: 8px;
+  height: 8px;
+  background: var(--color-primary);
+  border: 2px solid var(--color-bg-1);
+
+  &:hover {
+    background: var(--color-primary-hover);
+    transform: scale(1.2);
+  }
+}
+
+.nodeLibraryItem {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--color-bg-1);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  cursor: grab;
+  transition: all 0.2s ease;
+  margin-bottom: 8px;
+
+  &:hover {
+    border-color: var(--color-primary);
+    background: var(--color-primary-bg);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  }
+
+  &:active {
+    cursor: grabbing;
+    transform: translateY(0);
+  }
+}
+
+.nodeLibraryIcon {
+  font-size: 16px;
+  margin-right: 8px;
+  color: var(--color-primary);
+}
+
+.nodeLibraryLabel {
+  font-size: 14px;
+  color: var(--color-text);
+  font-weight: 500;
+}

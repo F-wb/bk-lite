@@ -1,0 +1,924 @@
+'use client';
+
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Pagination, Spin, Select, Segmented } from 'antd';
+import TimeSelector from '@/components/time-selector';
+import Collapse from '@/components/collapse';
+import useApiClient from '@/utils/request';
+import useMonitorApi from '@/app/monitor/api';
+import {
+  TableDataItem,
+  TimeSelectorDefaultValue,
+  TimeValuesProps,
+  MetricItem,
+  IndexViewItem,
+} from '@/app/monitor/types';
+import { ViewModalProps } from '@/app/monitor/types/view';
+import { SearchParams } from '@/app/monitor/types/search';
+import { useTranslation } from '@/utils/i18n';
+import { renderChart } from '@/app/monitor/utils/common';
+import { calculateQueryStep } from '@/app/monitor/utils/queryStep';
+import { attachGapIntervals, buildGapDetectionParams } from '@/app/monitor/utils/gapIntervals';
+import dayjs, { Dayjs } from 'dayjs';
+import { INIT_VIEW_MODAL_FORM } from '@/app/monitor/constants/view';
+import LazyMetricItem from '@/app/monitor/components/metric-views/lazyMetricItem';
+import { createMetricQueryWindow } from '@/app/monitor/components/metric-views/queryWindow';
+import {
+  filterMetricGroupsByIds,
+  useMetricSelectOptions,
+} from '@/app/monitor/components/metricSelectOptions';
+import { buildSearchTimeQueryParams } from '@/app/monitor/utils/searchTimeQuery';
+import {
+  isHostMonitorObject,
+  isHostProcessMetricsTab,
+  resolveHostProcessMetricsTarget,
+  resolveProcessNameFromInstance,
+  withHostProcessMetricsTab
+} from '@/app/monitor/dashboards/objects/host/host-process-metrics-tab';
+import {
+  MAX_CONCURRENT_REQUESTS,
+  releaseMetricRequestSlot,
+  runMetricRangeQuery,
+  waitForAvailableMetricSlot,
+} from './metricRequestSlot';
+
+const MonitorView: React.FC<ViewModalProps> = ({
+  monitorObject,
+  monitorName,
+  plugins,
+  form = INIT_VIEW_MODAL_FORM,
+  preferredMetricKey,
+}) => {
+  const { isLoading } = useApiClient();
+  const { post } = useApiClient();
+  const { getMetricsGroup, getMonitorMetrics, getMonitorObject, getMonitorPlugin, getInstanceList } =
+    useMonitorApi();
+  const { t } = useTranslation();
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const metricSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [metricIds, setMetricIds] = useState<number[]>([]);
+  const [timeValues, setTimeValues] = useState<TimeValuesProps>({
+    timeRange: [],
+    originValue: 15,
+  });
+  const [activeQueryWindow, setActiveQueryWindow] = useState(() =>
+    createMetricQueryWindow({ timeRange: [], originValue: 15 })
+  );
+  const activeQueryWindowRef = useRef(activeQueryWindow);
+  const [timeDefaultValue, setTimeDefaultValue] =
+    useState<TimeSelectorDefaultValue>({
+      selectValue: 15,
+      rangePickerVaule: null,
+    });
+  const [frequence, setFrequence] = useState<number>(0);
+  const [metricData, setMetricData] = useState<IndexViewItem[]>([]);
+  const [originMetricData, setOriginMetricData] = useState<IndexViewItem[]>([]);
+  const [metricPage, setMetricPage] = useState(1);
+  const [metricCount, setMetricCount] = useState(0);
+  const [metricKeyword, setMetricKeyword] = useState('');
+  const [activeTab, setActiveTab] = useState<string>('');
+  const [tabOptions, setTabOptions] = useState(plugins);
+  const [processObjectId, setProcessObjectId] = useState('');
+  const [processPluginId, setProcessPluginId] = useState('');
+  const [processFilterNames, setProcessFilterNames] = useState<string[]>([]);
+  const [processFilterOptions, setProcessFilterOptions] = useState<
+    { label: string; value: string }[]
+  >([]);
+  const [processFilterLoading, setProcessFilterLoading] = useState(false);
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+  const metricSelect = useMetricSelectOptions(originMetricData);
+  const [loadedMetricIds, setLoadedMetricIds] = useState<Set<number>>(
+    new Set()
+  );
+  const [loadingMetricIds, setLoadingMetricIds] = useState<Set<number>>(
+    new Set()
+  );
+  const [resetCounter, setResetCounter] = useState<number>(0);
+  const [needsRefreshOnExpand, setNeedsRefreshOnExpand] =
+    useState<boolean>(false);
+
+  const [cancelledMetricIds, setCancelledMetricIds] = useState<Set<number>>(
+    new Set()
+  );
+  // 跟踪当前可视区域内的指标
+  const [visibleMetricIds, setVisibleMetricIds] = useState<Set<number>>(
+    new Set()
+  );
+
+  // 请求并发控制：与指标详情页一致，排队而非取消最早请求。
+  const activeRequestsRef = useRef<Map<number, AbortController>>(new Map());
+  const metricCatalogAbortRef = useRef<AbortController | null>(null);
+  const requestGenerationRef = useRef(0);
+  const visibleMetricIdsRef = useRef<Set<number>>(new Set());
+  const metricDataRef = useRef<IndexViewItem[]>([]);
+
+  visibleMetricIdsRef.current = visibleMetricIds;
+  metricDataRef.current = metricData;
+
+  const isProcessMetricsView = isHostProcessMetricsTab(activeTab);
+  const hostLogicalId = String(form?.instance_id_values?.[0] || '').trim();
+  const instanceOperatingSystem = String(
+    (form as { operating_system?: string })?.operating_system || ''
+  )
+    .trim()
+    .toLowerCase();
+
+  const isMetricVisibleForInstanceOs = (metric: MetricItem) => {
+    const allowed = metric.view_config?.os;
+    if (!Array.isArray(allowed) || allowed.length === 0) return true;
+    if (!instanceOperatingSystem) return true;
+    return allowed.includes(instanceOperatingSystem);
+  };
+
+  const snapshotActiveQueryWindow = () => {
+    const nextQueryWindow = createMetricQueryWindow(timeValues);
+    activeQueryWindowRef.current = nextQueryWindow;
+    setActiveQueryWindow(nextQueryWindow);
+  };
+
+  const cancelAllRequests = () => {
+    const cancelledIds = Array.from(activeRequestsRef.current.keys());
+
+    activeRequestsRef.current.forEach((abortController) => {
+      abortController.abort();
+    });
+    activeRequestsRef.current.clear();
+    requestGenerationRef.current += 1;
+
+    setCancelledMetricIds((prev) => {
+      const newSet = new Set(prev);
+      cancelledIds.forEach((id) => newSet.add(id));
+      return newSet;
+    });
+
+    setLoadingMetricIds(new Set());
+  };
+
+  useEffect(() => {
+    if (isLoading) {
+      return;
+    }
+    if (!form?.instance_id_values.length) {
+      return;
+    }
+
+    let active = true;
+    const bootstrap = async () => {
+      let nextOptions = plugins;
+      let nextProcessObjectId = '';
+      let nextProcessPluginId = '';
+      if (isHostMonitorObject(monitorName)) {
+        const target = await resolveHostProcessMetricsTarget({
+          getMonitorObject,
+          getMonitorPlugin
+        });
+        if (target) {
+          nextProcessObjectId = target.processObjectId;
+          nextProcessPluginId = target.processPluginId;
+          nextOptions = withHostProcessMetricsTab(
+            plugins,
+            true,
+            target.processPluginLabel
+          );
+        }
+      }
+      if (!active) return;
+      setProcessObjectId(nextProcessObjectId);
+      setProcessPluginId(nextProcessPluginId);
+      setTabOptions(nextOptions);
+
+      const _activeTab = nextOptions[0]?.value || '';
+      setActiveTab(_activeTab);
+      if (!_activeTab) {
+        setMetricData([]);
+        setOriginMetricData([]);
+        setLoading(false);
+        return;
+      }
+      setNeedsRefreshOnExpand(true);
+      getInitData(_activeTab, {
+        processObjectId: nextProcessObjectId,
+        processPluginId: nextProcessPluginId
+      });
+    };
+
+    void bootstrap();
+    return () => {
+      active = false;
+    };
+  }, [isLoading, form, plugins, monitorName]);
+
+  useEffect(() => {
+    clearTimer();
+    if (frequence > 0) {
+      timerRef.current = setInterval(() => {
+        handleSearch('timer');
+      }, frequence);
+    }
+    return () => clearTimer();
+  }, [frequence, timeValues, metricIds.join(','), activeTab]);
+
+  useEffect(() => {
+    handleSearch('refresh');
+  }, [timeValues]);
+
+  // 组件卸载时取消所有请求
+  useEffect(() => {
+    return () => {
+      cancelAllRequests();
+      metricCatalogAbortRef.current?.abort();
+      clearTimer();
+      if (metricSearchTimerRef.current) {
+        clearTimeout(metricSearchTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isProcessMetricsView || !processObjectId || !hostLogicalId) {
+      setProcessFilterOptions([]);
+      return;
+    }
+    let active = true;
+    setProcessFilterNames([]);
+    const loadProcessOptions = async () => {
+      setProcessFilterLoading(true);
+      try {
+        const data = await getInstanceList(processObjectId, {
+          page_size: -1,
+          vm_params: { instance_id: hostLogicalId },
+        });
+        if (!active) return;
+        const options: { label: string; value: string }[] = [];
+        const seen = new Set<string>();
+        (data?.results || []).forEach((item: any) => {
+          const name = resolveProcessNameFromInstance(item);
+          if (!name || seen.has(name)) return;
+          seen.add(name);
+          options.push({ label: name, value: name });
+        });
+        options.sort((a, b) => a.label.localeCompare(b.label));
+        setProcessFilterOptions(options);
+      } catch {
+        if (active) setProcessFilterOptions([]);
+      } finally {
+        if (active) setProcessFilterLoading(false);
+      }
+    };
+    loadProcessOptions();
+    return () => {
+      active = false;
+    };
+  }, [isProcessMetricsView, processObjectId, hostLogicalId]);
+
+  const onTabChange = (val: string) => {
+    if (metricSearchTimerRef.current) {
+      clearTimeout(metricSearchTimerRef.current);
+    }
+    setActiveTab(val);
+    setMetricIds([]);
+    setMetricPage(1);
+    setMetricKeyword('');
+    setProcessFilterNames([]);
+    cancelAllRequests();
+    setResetCounter((prev) => prev + 1);
+    setNeedsRefreshOnExpand(true);
+    setVisibleMetricIds(new Set());
+
+    // 切换tab时重新初始化（需要重新获取该tab下的数据）
+    getInitData(val, undefined, 1, '');
+  };
+
+  // 初始化数据，包括分组和指标列表（只在弹窗时调用一次）
+  const getInitData = async (
+    tab: string,
+    processTarget?: { processObjectId: string; processPluginId: string },
+    page = 1,
+    keyword = ''
+  ) => {
+    const processOid = processTarget?.processObjectId || processObjectId;
+    const processPid = processTarget?.processPluginId || processPluginId;
+    const processTab = isHostProcessMetricsTab(tab);
+    if (processTab && (!processOid || !processPid)) {
+      setMetricData([]);
+      setOriginMetricData([]);
+      setLoading(false);
+      return;
+    }
+    const params = {
+      monitor_object_id: String(processTab ? processOid : monitorObject),
+      monitor_plugin_id: processTab ? processPid : tab,
+      page,
+      ...(keyword.trim() ? { keyword: keyword.trim() } : {})
+    };
+    metricCatalogAbortRef.current?.abort();
+    const abortController = new AbortController();
+    metricCatalogAbortRef.current = abortController;
+    const config = { signal: abortController.signal };
+    setLoading(true);
+    try {
+      const res = await Promise.all([
+        getMetricsGroup(params, config),
+        getMonitorMetrics(params, config)
+      ]);
+      if (abortController.signal.aborted) return;
+      const groupData: IndexViewItem[] = (
+        res[1].metric_groups || res[0].items
+      ).map((item) => ({
+        ...item,
+        id: Number(item.id),
+        isLoading: false,
+        child: [],
+      }));
+      res[1].items.forEach((metric: MetricItem) => {
+        if (!isMetricVisibleForInstanceOs(metric)) return;
+        const target = groupData.find((item) => item.id === metric.metric_group);
+        if (target) {
+          target.child.push({ ...metric, viewData: [] });
+        }
+      });
+      const nextGroups = groupData.filter((item) => !!item.child?.length);
+      setMetricCount(res[1].count);
+      setMetricData(nextGroups);
+      setOriginMetricData(nextGroups);
+      setExpandedIds(new Set(nextGroups.map((group) => group.id)));
+      setLoadedMetricIds(new Set());
+      setLoadingMetricIds(new Set());
+      setCancelledMetricIds(new Set());
+      setVisibleMetricIds(new Set());
+    } catch {
+      if (!abortController.signal.aborted) {
+        setMetricData([]);
+        setOriginMetricData([]);
+      }
+    } finally {
+      if (metricCatalogAbortRef.current === abortController) {
+        setLoading(false);
+      }
+    }
+  };
+
+  // 清空所有指标数据，但保留分组结构，并根据当前筛选状态决定显示内容
+  const clearAllMetricData = () => {
+    const clearedData = filterMetricGroupsByIds(originMetricData, metricIds);
+
+    setMetricData(clearedData);
+    setExpandedIds((prev) => {
+      if (prev.size > 0) {
+        const kept = new Set<number>(
+          clearedData
+            .map((group) => group.id)
+            .filter((id): id is number => typeof id === 'number' && prev.has(id))
+        );
+        if (kept.size > 0) {
+          return kept;
+        }
+      }
+      return new Set<number>(
+        clearedData
+          .map((group) => group.id)
+          .filter((id): id is number => typeof id === 'number')
+      );
+    });
+    setLoadedMetricIds(new Set());
+    setLoadingMetricIds(new Set());
+    setCancelledMetricIds(new Set());
+    setVisibleMetricIds(new Set());
+  };
+
+  const getParams = (item: MetricItem) => {
+    const processView = isHostProcessMetricsTab(activeTab);
+    const params: SearchParams = {
+      monitor_object_id: processView ? processObjectId : monitorObject,
+      metric_id: item.id,
+      instance_ids: processView ? undefined : [String(form.instance_id)],
+      scope: processView
+        ? {
+          type: 'host_process',
+          host_monitor_object_id: monitorObject,
+          host_instance_id: form.instance_id,
+          process_names: processFilterNames,
+        }
+        : undefined,
+      source_unit: item.unit || '',
+    };
+    params.card_budget = true;
+    const queryWindow = activeQueryWindowRef.current;
+    if (queryWindow) {
+      params.start = queryWindow.startMs;
+      params.end = queryWindow.endMs;
+      params.step = calculateQueryStep(
+        params.start,
+        params.end,
+        (form as { interval?: unknown })?.interval
+      );
+    }
+    return buildGapDetectionParams(params, (form as { interval?: unknown })?.interval);
+  };
+
+  const fetchSingleMetricData = async (
+    metric: MetricItem,
+    options?: { force?: boolean }
+  ) => {
+    if (
+      !options?.force &&
+      loadedMetricIds.has(metric.id) &&
+      !cancelledMetricIds.has(metric.id)
+    ) {
+      return;
+    }
+    if (!options?.force && loadingMetricIds.has(metric.id)) {
+      return;
+    }
+    // 实例未就绪时不进入并发队列，避免受控查询 instance_ids 为空刷屏。
+    if (!String(form?.instance_id || '').trim()) {
+      return;
+    }
+    const isCancelledRequest = cancelledMetricIds.has(metric.id);
+    if (isCancelledRequest) {
+      setCancelledMetricIds((prev) => {
+        const newSet = new Set(prev);
+        newSet.delete(metric.id);
+        return newSet;
+      });
+    }
+    const generation = requestGenerationRef.current;
+    setLoadingMetricIds((prev) => new Set(prev).add(metric.id));
+    const canOccupy = await waitForAvailableMetricSlot(
+      activeRequestsRef.current,
+      () => generation === requestGenerationRef.current,
+      { maxConcurrent: MAX_CONCURRENT_REQUESTS }
+    );
+    if (!canOccupy) {
+      setLoadingMetricIds((prev) => {
+        const newSet = new Set(prev);
+        newSet.delete(metric.id);
+        return newSet;
+      });
+      return;
+    }
+    const previousController = activeRequestsRef.current.get(metric.id);
+    if (previousController) {
+      previousController.abort();
+      releaseMetricRequestSlot(
+        activeRequestsRef.current,
+        metric.id,
+        previousController
+      );
+    }
+    const abortController = new AbortController();
+    await runMetricRangeQuery({
+      slots: activeRequestsRef.current,
+      metricId: metric.id,
+      controller: abortController,
+      postQuery: async () => {
+        const params = getParams(metric);
+        return post(
+          `/monitor/api/metrics_instance/query_by_metric_range/`,
+          params,
+          {
+            signal: abortController.signal,
+            // 全量指标并行展开时由卡片空态承接失败，避免同类 400 刷 toast。
+            suppressErrorNotification: true,
+          },
+        );
+      },
+      handleResponse: (response) => {
+        try {
+          const instanceRow = [
+            {
+              instance_id_values: form.instance_id_values,
+              instance_name: form.instance_name,
+              instance_id_keys: isHostProcessMetricsTab(activeTab)
+                ? ['instance_id']
+                : metric?.instance_id_keys || [],
+              dimensions: metric?.dimensions || [],
+              title: metric?.display_name || '--',
+            },
+          ];
+          const chartData = response?.data?.result || [];
+          const displayUnit = response?.data?.unit || '';
+          const seriesBudget = response?.data?.series_budget;
+          const viewData = attachGapIntervals(
+            renderChart(chartData, instanceRow),
+            response?.data?.gaps || []
+          );
+          setMetricData((prevData) => {
+            const updatedData = prevData.map((group) => ({
+              ...group,
+              child: (group.child || []).map((item) =>
+                item.id === metric.id
+                  ? {
+                    ...item,
+                    displayUnit,
+                    viewData,
+                    seriesBudget,
+                  }
+                  : item
+              ),
+            }));
+            return updatedData;
+          });
+          // 同时更新originMetricData，保持数据同步
+          setOriginMetricData((prevData) => {
+            const updatedData = prevData.map((group) => ({
+              ...group,
+              child: (group.child || []).map((item) =>
+                item.id === metric.id
+                  ? {
+                    ...item,
+                    displayUnit,
+                    viewData,
+                    seriesBudget,
+                  }
+                  : item
+              ),
+            }));
+            return updatedData;
+          });
+          setLoadedMetricIds((prev) => {
+            const newSet = new Set(prev).add(metric.id);
+            return newSet;
+          });
+          setCancelledMetricIds((prev) => {
+            if (prev.has(metric.id)) {
+              const newSet = new Set(prev);
+              newSet.delete(metric.id);
+              return newSet;
+            }
+            return prev;
+          });
+          if (needsRefreshOnExpand) {
+            setNeedsRefreshOnExpand(false);
+          }
+        } catch (error: unknown) {
+          const name =
+            error && typeof error === 'object' && 'name' in error
+              ? (error as { name: unknown }).name
+              : '';
+          if (name === 'CancelledError') {
+            setCancelledMetricIds((prev) => {
+              const newSet = new Set(prev);
+              newSet.add(metric.id);
+              return newSet;
+            });
+          }
+        }
+      },
+      onSettled: (released) => {
+        // 仅当前请求仍占用该指标槽时清理 loading/loaded，避免 force 刷新时被中止的旧请求清掉新请求状态。
+        if (!released) {
+          return;
+        }
+        setLoadingMetricIds((prev) => {
+          const newSet = new Set(prev);
+          newSet.delete(metric.id);
+          return newSet;
+        });
+        if (abortController.signal.aborted) {
+          setLoadedMetricIds((prev) => {
+            const newSet = new Set(prev);
+            newSet.delete(metric.id);
+            return newSet;
+          });
+        }
+      },
+    });
+  };
+
+  const onTimeChange = (val: number[], originValue: number | null) => {
+    setTimeValues({
+      timeRange: val,
+      originValue,
+    });
+  };
+
+  const clearTimer = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+  };
+
+  const onFrequenceChange = (val: number) => {
+    setFrequence(val);
+  };
+
+  const onRefresh = () => {
+    setNeedsRefreshOnExpand(true);
+    handleSearch('refresh');
+  };
+
+  const handleSearch = (type: string) => {
+    if (type === 'refresh') {
+      snapshotActiveQueryWindow();
+      cancelAllRequests();
+      setResetCounter((prev) => prev + 1);
+      setNeedsRefreshOnExpand(true);
+      clearAllMetricData();
+      return;
+    }
+    if (type === 'timer') {
+      snapshotActiveQueryWindow();
+      const visibleIds = Array.from(visibleMetricIdsRef.current);
+      if (!visibleIds.length) {
+        return;
+      }
+      const visibleIdSet = new Set(visibleIds);
+      metricDataRef.current.forEach((group) => {
+        (group.child || []).forEach((metric: MetricItem) => {
+          if (visibleIdSet.has(metric.id)) {
+            void fetchSingleMetricData(metric, { force: true });
+          }
+        });
+      });
+    }
+  };
+
+  const handleMetricIdChange = (val: number[]) => {
+    const nextIds = val || [];
+    setMetricIds(nextIds);
+
+    cancelAllRequests();
+    setLoadedMetricIds(new Set());
+    setLoadingMetricIds(new Set());
+    setVisibleMetricIds(new Set());
+    setResetCounter((prev) => prev + 1);
+    setNeedsRefreshOnExpand(true);
+
+    const filteredData = filterMetricGroupsByIds(originMetricData, nextIds);
+    setMetricData(filteredData);
+    if (!nextIds.length) {
+      // 切换回全部时，同步清空 origin，让后续刷新重新请求
+      setOriginMetricData(filteredData);
+    }
+    setExpandedIds(
+      new Set(
+        filteredData
+          .map((group: IndexViewItem) => group.id)
+          .filter((id): id is number => typeof id === 'number')
+      )
+    );
+  };
+
+  const preferredMetricKeyRef = useRef(preferredMetricKey);
+  preferredMetricKeyRef.current = preferredMetricKey;
+  const appliedPreferredMetricRef = useRef('');
+  useEffect(() => {
+    const key = preferredMetricKeyRef.current?.trim();
+    if (!key || !originMetricData.length) return;
+    if (appliedPreferredMetricRef.current === key) return;
+    const matches: number[] = [];
+    originMetricData.forEach((group) => {
+      (group.child || []).forEach((metric: MetricItem) => {
+        if (metric.name === key || String(metric.id) === key) {
+          matches.push(metric.id);
+        }
+      });
+    });
+    if (!matches.length) return;
+    appliedPreferredMetricRef.current = key;
+    handleMetricIdChange(matches);
+  }, [originMetricData]);
+
+  const handleMetricKeywordChange = (value: string) => {
+    setMetricKeyword(value);
+    if (metricSearchTimerRef.current) {
+      clearTimeout(metricSearchTimerRef.current);
+    }
+    metricSearchTimerRef.current = setTimeout(() => {
+      setMetricPage(1);
+      setMetricIds([]);
+      cancelAllRequests();
+      getInitData(activeTab, undefined, 1, value);
+    }, 300);
+  };
+
+  const handleMetricPageChange = (page: number) => {
+    setMetricPage(page);
+    setMetricIds([]);
+    cancelAllRequests();
+    setResetCounter((prev) => prev + 1);
+    getInitData(activeTab, undefined, page, metricKeyword);
+  };
+
+  const handleProcessFilterChange = (names: string[]) => {
+    setProcessFilterNames(names);
+    cancelAllRequests();
+    setLoadedMetricIds(new Set());
+    setLoadingMetricIds(new Set());
+    setVisibleMetricIds(new Set());
+    setResetCounter((prev) => prev + 1);
+    setNeedsRefreshOnExpand(true);
+    clearAllMetricData();
+  };
+
+  const handleMetricVisible = useCallback(
+    (metric: MetricItem) => {
+      fetchSingleMetricData(metric);
+    },
+    [
+      loadedMetricIds,
+      loadingMetricIds,
+      cancelledMetricIds,
+      fetchSingleMetricData,
+    ]
+  );
+
+  // 处理指标可视性变化
+  const handleVisibilityChange = useCallback(
+    (metricId: number, isVisible: boolean) => {
+      setVisibleMetricIds((prev) => {
+        const newSet = new Set(prev);
+        if (isVisible) {
+          newSet.add(metricId);
+        } else {
+          newSet.delete(metricId);
+        }
+        return newSet;
+      });
+    },
+    []
+  );
+
+  const toggleGroup = (expanded: boolean, groupId: number) => {
+    if (expanded) {
+      setExpandedIds((prev) => new Set(prev).add(groupId));
+
+      if (needsRefreshOnExpand) {
+        const groupMetrics =
+          metricData.find((group) => group.id === groupId)?.child || [];
+        setLoadedMetricIds((prev) => {
+          const newSet = new Set(prev);
+          groupMetrics.forEach((metric) => newSet.delete(metric.id));
+          return newSet;
+        });
+
+        setMetricData((prevData) =>
+          prevData.map((group) =>
+            group.id === groupId
+              ? {
+                ...group,
+                child: (group.child || []).map((item) => ({
+                  ...item,
+                  viewData: [],
+                })),
+              }
+              : group
+          )
+        );
+      }
+    } else {
+      setExpandedIds((prev) => {
+        const newSet = new Set(prev);
+        newSet.delete(groupId);
+        return newSet;
+      });
+    }
+  };
+
+  const onXRangeChange = (arr: [Dayjs, Dayjs]) => {
+    // 取消所有正在进行的请求
+    cancelAllRequests();
+    setResetCounter((prev) => prev + 1);
+    setNeedsRefreshOnExpand(true);
+
+    // 清空所有指标数据，但保留分组结构和当前筛选状态
+    clearAllMetricData();
+
+    setTimeDefaultValue((pre) => ({
+      ...pre,
+      rangePickerVaule: arr,
+      selectValue: 0,
+    }));
+    const _times = arr.map((item) => dayjs(item).valueOf());
+    setTimeValues({
+      timeRange: _times,
+      originValue: 0,
+    });
+  };
+
+  const linkToSearch = (row: TableDataItem) => {
+    const processTab = isHostProcessMetricsTab(activeTab);
+    const _row = {
+      monitor_object: String(
+        processTab ? processObjectId || monitorObject : monitorObject
+      ),
+      plugin_id: processTab ? processPluginId || activeTab : activeTab,
+      instance_id: form?.instance_id || '',
+      metric_id: row.id ? String(row.id) : row.name,
+      ...buildSearchTimeQueryParams(timeValues),
+    };
+    const queryString = new URLSearchParams(_row).toString();
+    const url = `/monitor/search?${queryString}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
+  const linkToPolicy = (row: TableDataItem) => {
+    const _row = {
+      monitorName: monitorName,
+      monitorObjId: String(monitorObject),
+      instanceId: form?.instance_id || '',
+      metricId: row.name,
+      type: 'add',
+    };
+    const queryString = new URLSearchParams(_row).toString();
+    const url = `/monitor/event/strategy/detail?${queryString}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
+  return (
+    <div>
+      <div className="flex justify-between mb-[15px] gap-3">
+        <div className="flex flex-wrap gap-2 min-w-0">
+          <Select
+            className="min-w-[250px] max-w-[360px]"
+            mode="multiple"
+            maxTagCount="responsive"
+            placeholder={t('common.searchPlaceHolder')}
+            value={metricIds}
+            allowClear
+            {...metricSelect.selectSearchProps}
+            options={metricSelect.options}
+            onSearch={handleMetricKeywordChange}
+            onChange={handleMetricIdChange}
+          />
+          {isProcessMetricsView ? (
+            <Select
+              className="min-w-[220px] max-w-[360px]"
+              mode="multiple"
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              maxTagCount="responsive"
+              loading={processFilterLoading}
+              placeholder={t('monitor.views.filterProcessPlaceholder')}
+              value={processFilterNames}
+              options={processFilterOptions}
+              onChange={handleProcessFilterChange}
+              aria-label={t('monitor.views.filterProcess')}
+            />
+          ) : null}
+        </div>
+        <TimeSelector
+          defaultValue={timeDefaultValue}
+          onChange={onTimeChange}
+          onFrequenceChange={onFrequenceChange}
+          onRefresh={onRefresh}
+        />
+      </div>
+      <Segmented
+        className="mb-[20px]"
+        value={activeTab}
+        options={tabOptions}
+        onChange={onTabChange}
+      />
+      <div className="groupList">
+        <Spin spinning={loading}>
+          {metricData.map((metricItem) => (
+            <Spin className="w-full" key={metricItem.id} spinning={false}>
+              <Collapse
+                className="mb-[10px]"
+                title={metricItem.display_name || ''}
+                isOpen={expandedIds.has(metricItem.id)}
+                onToggle={(expanded) => toggleGroup(expanded, metricItem.id)}
+              >
+                <div className="flex flex-wrap justify-between">
+                  {(metricItem.child || []).map((item) => (
+                    <LazyMetricItem
+                      key={`${item.id}-${resetCounter}`}
+                      item={item}
+                      isLoading={loadingMetricIds.has(item.id)}
+                      onVisible={handleMetricVisible}
+                      onSearchClick={linkToSearch}
+                      onPolicyClick={linkToPolicy}
+                      onXRangeChange={onXRangeChange}
+                      resetKey={resetCounter}
+                      isLoaded={loadedMetricIds.has(item.id)}
+                      isCancelled={cancelledMetricIds.has(item.id)}
+                      onVisibilityChange={handleVisibilityChange}
+                      isInViewport={visibleMetricIds.has(item.id)}
+                      xAxisDomain={activeQueryWindow?.xAxisDomain}
+                    />
+                  ))}
+                </div>
+              </Collapse>
+            </Spin>
+          ))}
+        </Spin>
+      </div>
+      {metricCount > 100 && (
+        <div className="mt-4 flex justify-end">
+          <Pagination
+            current={metricPage}
+            pageSize={100}
+            showSizeChanger={false}
+            total={metricCount}
+            onChange={handleMetricPageChange}
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default MonitorView;

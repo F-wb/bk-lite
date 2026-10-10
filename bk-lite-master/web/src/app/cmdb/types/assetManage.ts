@@ -1,0 +1,485 @@
+import React from 'react';
+export interface GroupItem {
+  classification_name: string;
+  classification_id: string;
+  count: number;
+  list: ModelItem[];
+  is_visible?: boolean;
+  order?: number;
+  [key: string]: any;
+}
+
+export interface ModelItem {
+  model_id: string;
+  classification_id: string;
+  model_name: string;
+  icn: string;
+  app_topo_layer?: 'system' | 'service' | 'host' | 'appService' | 'infrastructure' | 'none';
+  organization?: number;
+  group?: number | number[];
+  is_visible?: boolean;
+  order_id?: number;
+  [key: string]: any;
+}
+
+export interface GroupFieldType {
+  classification_id?: string;
+  classification_name?: string;
+  _id?: string | number;
+}
+
+export interface GroupConfig {
+  type: string;
+  groupInfo: GroupFieldType;
+  subTitle: string;
+  title: string;
+}
+
+export interface ModelConfig {
+  type: string;
+  modelForm?: Partial<ModelItem>;
+  subTitle: string;
+  title: string;
+}
+
+export interface ClassificationItem {
+  classification_name: string;
+  classification_id: string;
+  [key: string]: any;
+}
+
+export interface AssoTypeItem {
+  asst_id: string;
+  asst_name: string;
+  [key: string]: any;
+}
+
+export interface AssoFieldType {
+  asst_id: string;
+  src_model_id: string;
+  src_model_name?: string;
+  src_model_icn?: string;
+  dst_model_id: string;
+  dst_model_name?: string;
+  dst_model_icn?: string;
+  mapping: string;
+  _id?: string;
+  [key: string]: unknown;
+}
+
+export interface AttrFieldType {
+  model_id?: string;
+  attr_id: string;
+  attr_name: string;
+  attr_type: string;
+  is_only?: boolean;
+  unique_display_type?: UniqueDisplayType;
+  is_required: boolean;
+  editable: boolean;
+  option: AttrOption;
+  attr_group?: string;
+  isEdit?: boolean;
+  children?: AttrFieldType[];
+  user_prompt?: string;
+  enum_rule_type?: EnumRuleType;
+  public_library_id?: string | null;
+  enum_select_mode?: 'single' | 'multiple';
+  default_value?: string[];
+  governance?: AttrGovernance;
+  [key: string]: unknown;
+}
+
+export interface ModelIconItem {
+  icn: string | undefined;
+  model_id: string | undefined;
+  [key: string]: unknown;
+}
+export interface ColumnItem {
+  title: string;
+  dataIndex: string;
+  key: string;
+  render?: (_: unknown, record: any) => React.ReactElement;
+  [key: string]: any;
+}
+export interface UserItem {
+  id: string;
+  username: string;
+  [key: string]: unknown;
+}
+export interface SubGroupItem {
+  value?: string;
+  label?: string;
+  children?: Array<SubGroupItem>;
+}
+export interface Organization {
+  id: string;
+  name: string;
+  value?: string;
+  children: Array<SubGroupItem>;
+  [key: string]: unknown;
+}
+
+export interface OriginSubGroupItem {
+  id: string;
+  name: string;
+  parentId: string;
+  subGroupCount: number;
+  subGroups: Array<OriginSubGroupItem>;
+}
+export interface OriginOrganization {
+  id: string;
+  name: string;
+  subGroupCount: number;
+  subGroups: Array<OriginSubGroupItem>;
+  [key: string]: unknown;
+}
+
+export interface AssetDataFieldProps {
+  propertyList: AttrFieldType[];
+  userList: UserItem[];
+  instDetail: InstDetail;
+  onsuccessEdit?: () => void;
+  onSubscribe?: () => void;
+  readOnly?: boolean;
+}
+
+export interface InstDetail {
+  inst_name?: string;
+  organization?: string;
+  [permission: string]: any;
+}
+
+export interface EnumList {
+  id: string | number;
+  name: string;
+}
+
+// 字符串类型的 option
+export interface StrAttrOption {
+  validation_type: 'unrestricted' | 'ipv4' | 'ipv6' | 'email' | 'mobile_phone' | 'url' | 'json' | 'custom';
+  custom_regex: string;
+  widget_type: 'single_line' | 'multi_line';
+}
+
+// 时间类型的 option
+export interface TimeAttrOption {
+  display_format: 'datetime' | 'date';
+}
+
+// 数字类型的 option
+export interface IntAttrOption {
+  min_value: string | number;
+  max_value: string | number;
+}
+
+export interface TableColumnSpec {
+  column_id: string;
+  column_name: string;
+  column_type: 'str' | 'number';
+  order: number;
+  is_row_key?: boolean;
+}
+
+export type TableAttrOption = TableColumnSpec[];
+
+export interface TagOptionItem {
+  key: string;
+  value: string;
+}
+
+export interface TagAttrOption {
+  mode: 'free' | 'strict';
+  options: TagOptionItem[];
+}
+
+// 属性字段最小结构（用于工具函数）
+export interface AttrLike {
+  attr_type: string;
+  option: unknown;
+  is_required?: boolean;
+}
+
+// 属性 option 联合类型
+export type AttrOption = EnumList[] | StrAttrOption | TimeAttrOption | IntAttrOption | TableAttrOption | TagAttrOption | Record<string, unknown>;
+
+export interface CredentialListItem {
+  classification_name: string;
+  classification_id: string;
+  list: CredentialChildItem[];
+}
+
+export interface CredentialChildItem {
+  model_id: string;
+  model_name: string;
+  assoModelIds: string[];
+  attrs: AttrFieldType[];
+}
+
+export interface AssoInstItem {
+  key: string;
+  label: string;
+  model_asst_id: string;
+  children: React.ReactElement;
+  [key: string]: unknown;
+}
+
+export interface AssoDetailItem {
+  asst_id: string;
+  src_model_id: string;
+  src_model_name?: string;
+  src_model_icn?: string;
+  model_asst_id: string;
+  dst_model_id: string;
+  dst_model_name?: string;
+  dst_model_icn?: string;
+  inst_list: InstDetail[];
+  [key: string]: unknown;
+}
+
+export interface CrentialsAssoInstItem {
+  key: string;
+  label: string;
+  children: React.ReactElement;
+  inst_list: CrentialsAssoDetailItem[];
+  [key: string]: unknown;
+}
+
+export interface CrentialsAssoDetailItem {
+  credential_type: string;
+  name?: string;
+  inst_uuid?: string;
+  _id?: number | string | undefined;
+  inst_asst_id?: number | string | undefined;
+  src_inst_uuid?: string;
+  dst_inst_uuid?: string;
+  model_asst_id?: string;
+  [key: string]: unknown;
+}
+
+export interface AssoListRef {
+  expandAll: (isExpand: boolean) => void;
+  showRelateModal: () => void;
+}
+
+export interface ListItem {
+  name: string;
+  id: string | number;
+  [key: string]: unknown;
+}
+
+export interface RelationListInstItem {
+  id: string;
+  src_inst_uuid: string;
+  dst_inst_uuid: string;
+  model_asst_id: string;
+}
+
+export interface RelationInstanceConfig {
+  model_id: string;
+  list: RelationListInstItem[];
+  title: string;
+  instUuid: string;
+}
+export interface RelationInstanceRef {
+  showModal: (config: RelationInstanceConfig) => void;
+}
+
+export interface FieldConfig {
+  type: string;
+  attrList: FullInfoGroupItem[]; // 属性列表，分组数据
+  formInfo: any;
+  subTitle: string;
+  title: string;
+  model_id: string;
+  list: Array<any>;
+  source?: 'create' | 'copy' | 'edit' | 'batchEdit';
+  lockedAttrIds?: string[];
+  hideAssociate?: boolean;
+}
+
+export interface FieldModalRef {
+  showModal: (config: FieldConfig) => void;
+}
+
+// 属性分组相关类型
+export interface AttrGroup {
+  id: number;
+  model_id: string;
+  group_name: string;
+  display_name?: string;
+  order: number;
+  is_collapsed: boolean;
+  description: string;
+  attr_orders: any[];
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AttrItem {
+  attr_id: string;
+  attr_name: string;
+  attr_type: string;
+  is_required: boolean;
+  editable: boolean;
+  is_only: boolean;
+  governance?: AttrGovernance;
+  unique_display_type?: UniqueDisplayType;
+  group_id?: string;
+  order?: number;
+}
+
+export type UniqueDisplayType = 'none' | 'single' | 'joint'
+
+export type AttrGovernanceFreshness = '' | 'timely' | 'occasional' | 'stable';
+
+export interface AttrGovernance {
+  key_attribute: boolean;
+  freshness: AttrGovernanceFreshness;
+}
+
+export interface ModelUniqueRuleItem {
+  rule_id: string;
+  order: number;
+  field_ids: string[];
+  field_names: string[];
+}
+
+export interface UniqueRuleFieldMeta {
+  attr_id: string;
+  attr_name: string;
+  attr_type: string;
+  is_required: boolean;
+  selectable: boolean;
+  disabled_reason: string;
+}
+
+export interface UniqueRuleListResponse {
+  rules: ModelUniqueRuleItem[];
+  candidate_fields: UniqueRuleFieldMeta[];
+}
+
+export interface UniqueRulePayload {
+  field_ids: string[];
+}
+
+export interface AutoAssociationRuleMatchPair {
+  src_field_id: string;
+  dst_field_id: string;
+}
+
+export interface AutoAssociationRuleConfig {
+  enabled: boolean;
+  match_pairs: AutoAssociationRuleMatchPair[];
+  updated_by: string;
+  updated_at: string;
+}
+
+export interface AutoAssociationRuleAssociationItem {
+  model_asst_id: string;
+  src_model_id: string;
+  dst_model_id: string;
+  asst_id?: string;
+  asst_name?: string;
+  mapping: string;
+}
+
+export interface ModelAutoAssociationRuleItem extends AutoAssociationRuleAssociationItem {
+  _id?: string | number;
+  rule_id: string;
+  auto_relation_rule: AutoAssociationRuleConfig;
+  [key: string]: unknown;
+}
+
+export interface AutoAssociationRuleFormAssociationItem extends AutoAssociationRuleAssociationItem {
+  current_side: 'src' | 'dst';
+  form_source_model_id: string;
+  form_source_model_name?: string;
+  form_target_model_id: string;
+  form_target_model_name?: string;
+}
+
+export interface AutoAssociationRulePayload {
+  model_asst_id?: string;
+  rule_id?: string;
+  enabled: boolean;
+  match_pairs: AutoAssociationRuleMatchPair[];
+}
+
+export type ModelAutoAssociationRuleListResponse = ModelAutoAssociationRuleItem[];
+
+// 获取模型完整信息接口相关类型
+export interface FullInfoAttrItem {
+  attr_id: string;
+  attr_name: string;
+  attr_type: string;
+  option: AttrOption;
+  attr_group: string;
+  is_only: boolean;
+  editable: boolean;
+  is_required: boolean;
+  is_pre: boolean;
+  user_prompt?: string;
+  enum_rule_type?: EnumRuleType;
+  public_library_id?: string | null;
+  enum_select_mode?: 'single' | 'multiple';
+  default_value?: string[];
+  [key: string]: unknown;
+}
+
+export interface FullInfoGroupItem {
+  id: number;
+  group_name: string;
+  display_name?: string;
+  order: number;
+  is_collapsed: boolean;
+  description: string;
+  attrs: FullInfoAttrItem[];
+  attrs_count: number;
+  can_move_up: boolean;
+  can_move_down: boolean;
+  can_delete: boolean;
+}
+
+export interface FullInfoUniqueRuleItem {
+  rule_id: string;
+  order: number;
+  field_ids: string[];
+}
+
+export interface ModelFullInfo {
+  model_id: string;
+  model_name: string;
+  groups: FullInfoGroupItem[];
+  unique_rules?: FullInfoUniqueRuleItem[];
+  total_groups: number;
+  total_attrs: number;
+}
+
+export interface ModelFullInfoResponse {
+  data: ModelFullInfo;
+  result: boolean;
+  message: string;
+}
+
+export type EnumRuleType = 'custom' | 'public_library';
+
+export interface PublicEnumOption {
+  id: string;
+  name: string;
+}
+
+export interface PublicEnumLibraryItem {
+  library_id: string;
+  name: string;
+  team: (string | number)[];
+  options: PublicEnumOption[];
+  editable: boolean;
+}
+
+export interface LibraryReferenceItem {
+  model_id: string;
+  model_name: string;
+  attr_id: string;
+  attr_name: string;
+}

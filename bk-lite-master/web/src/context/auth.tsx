@@ -1,0 +1,675 @@
+'use client';
+
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import axios from 'axios';
+import { useSession, signIn } from 'next-auth/react';
+import type { Session } from 'next-auth';
+import { useRouter, usePathname } from 'next/navigation';
+import { App, Spin } from 'antd';
+import { useLocale } from '@/context/locale';
+import { useThemeMode } from '@/theme';
+import { useTranslation } from '@/utils/i18n';
+import { saveAuthToken } from '@/utils/crossDomainAuth';
+import SigninClient from '@/app/(core)/auth/signin/SigninClient';
+import { AUTH_POPUP_SUCCESS_MESSAGE } from '@/utils/authRedirect';
+import {
+  createSessionExpiredRequestError,
+  emitSessionExpired,
+  isAuthPath,
+  isSessionExpiredState,
+  latchSessionExpired,
+  releaseSessionExpiryConfirmation,
+  resetSessionExpiredState,
+  SESSION_EXPIRED_EVENT,
+  shouldTriggerSessionExpiry,
+} from '@/utils/sessionExpiry';
+import { forceLogoutAndRedirect } from '@/utils/forceLogout';
+import { isDashboardExecutionRenderRoute } from '@/app/routeScope';
+import {
+  publishAuthRecovery,
+  subscribeAuthRecovery,
+  type AuthRecoveryEvent,
+} from '@/utils/authRecoveryChannel';
+import {
+  confirmAuthStillValid,
+  fetchRecoveredAuth,
+  getAuthUserIdentity,
+  recoverAuthWithRetry,
+} from '@/utils/authRecovery';
+
+// Type assertion helper for session
+type ExtendedSession = Session & {
+  user: {
+    id: string;
+    username?: string;
+    token?: string;
+    locale?: string;
+    timezone?: string;
+    name?: string | null;
+    email?: string | null;
+    image?: string | null;
+  }
+};
+
+interface AuthContextType {
+  token: string | null;
+  isAuthenticated: boolean;
+  isCheckingAuth: boolean;
+}
+
+const AuthContext = createContext<AuthContextType | null>(null);
+
+const modalSigninErrors: Record<string | 'default', string> = {
+  default: 'Unable to sign in.',
+};
+
+const hasValidSession = (session: Session | null): session is ExtendedSession => {
+  const extendedSession = session as ExtendedSession | null;
+  return Boolean(
+    extendedSession?.user
+    && (extendedSession.user.id || extendedSession.user.username),
+  );
+};
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const { data: session, status } = useSession();
+  const extendedSession = session as unknown as ExtendedSession | null;
+  const { mode } = useThemeMode();
+  const { message } = App.useApp();
+  const [token, setToken] = useState<string | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [isCheckingAuth, setIsCheckingAuth] = useState<boolean>(true);
+  const [hasCheckedExistingAuth, setHasCheckedExistingAuth] = useState<boolean>(false);
+  const [isAutoSigningIn, setIsAutoSigningIn] = useState<boolean>(false);
+  const [isCheckingExistingAuth, setIsCheckingExistingAuth] = useState<boolean>(false);
+  const [sessionExpiredOpen, setSessionExpiredOpen] = useState<boolean>(false);
+  const [isProtectedContentReady, setIsProtectedContentReady] = useState<boolean>(false);
+  const router = useRouter();
+  const pathname = usePathname();
+  const { setLocale } = useLocale();
+  const { t } = useTranslation();
+
+  const authPaths = ['/auth/signin', '/auth/signout', '/auth/callback', '/auth/signin/login-auth-result'];
+  const isCurrentAuthPath = isAuthPath(pathname);
+  const isDashboardRenderRoute = isDashboardExecutionRenderRoute(pathname);
+  const isSessionValid = hasValidSession(extendedSession);
+  const authenticatedSessionIdentityRef = useRef<string | null>(null);
+  const pageUserIdentityRef = useRef<string | null>(null);
+  const expectedRecoveryUserIdentityRef = useRef<string | null>(null);
+  const pendingRecoveryRef = useRef<boolean>(false);
+  const sessionExpiredOpenRef = useRef<boolean>(false);
+  const recoveryPromiseRef = useRef<Promise<boolean> | null>(null);
+  const recoveryEpochRef = useRef(0);
+  const recoveryAbortRef = useRef<AbortController | null>(null);
+  const handledRecoveryEventIdsRef = useRef<Set<string>>(new Set());
+  const isProtectedContentReadyRef = useRef<boolean>(false);
+  const startupAuthCheckIdentityRef = useRef<string | null>(null);
+  authenticatedSessionIdentityRef.current = token || (
+    status === 'authenticated' && isSessionValid
+      ? String(extendedSession.user.token || extendedSession.user.id || extendedSession.user.username)
+      : null
+  );
+  if (status === 'authenticated' && isSessionValid) {
+    pageUserIdentityRef.current ??= getAuthUserIdentity(extendedSession.user);
+  }
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const nativeFetch = window.fetch.bind(window);
+    const axiosRequestSessionIdentities = new WeakMap<object, string | null>();
+    const shouldTriggerForSession = (
+      input: RequestInfo | URL | string | null | undefined,
+      requestSessionIdentity: string | null,
+    ) => (
+      shouldTriggerSessionExpiry(
+        input,
+        authenticatedSessionIdentityRef.current,
+        requestSessionIdentity,
+      )
+    );
+
+    window.fetch = async (input, init) => {
+      const requestSessionIdentity = authenticatedSessionIdentityRef.current;
+
+      if (shouldTriggerForSession(input, requestSessionIdentity) && isSessionExpiredState()) {
+        throw createSessionExpiredRequestError();
+      }
+
+      const response = await nativeFetch(input, init);
+
+      if (response.status === 460 && shouldTriggerForSession(input, requestSessionIdentity)) {
+        void forceLogoutAndRedirect();
+      }
+
+      if (response.status === 401 && shouldTriggerForSession(input, requestSessionIdentity)) {
+        emitSessionExpired({ reason: 'global-fetch-session-expired', status: 401 });
+      }
+
+      return response;
+    };
+
+    const axiosRequestInterceptor = axios.interceptors.request.use((config) => {
+      const requestSessionIdentity = authenticatedSessionIdentityRef.current;
+      axiosRequestSessionIdentities.set(config, requestSessionIdentity);
+
+      if (shouldTriggerForSession(config.url, requestSessionIdentity) && isSessionExpiredState()) {
+        return Promise.reject(createSessionExpiredRequestError());
+      }
+
+      return config;
+    });
+
+    const axiosResponseInterceptor = axios.interceptors.response.use(
+      (response) => {
+        const requestSessionIdentity = axiosRequestSessionIdentities.get(response.config) ?? null;
+
+        if (response.status === 460 && shouldTriggerForSession(response.config.url, requestSessionIdentity)) {
+          void forceLogoutAndRedirect();
+        }
+
+        if (response.status === 401 && shouldTriggerForSession(response.config.url, requestSessionIdentity)) {
+          emitSessionExpired({ reason: 'global-axios-session-expired', status: 401 });
+        }
+
+        return response;
+      },
+      (error) => {
+        const requestSessionIdentity = error.config
+          ? axiosRequestSessionIdentities.get(error.config) ?? null
+          : null;
+
+        if (axios.isAxiosError(error) && error.response?.status === 460 && shouldTriggerForSession(error.config?.url, requestSessionIdentity)) {
+          void forceLogoutAndRedirect();
+        }
+
+        if (axios.isAxiosError(error) && error.response?.status === 401 && shouldTriggerForSession(error.config?.url, requestSessionIdentity)) {
+          emitSessionExpired({ reason: 'global-axios-session-expired', status: 401 });
+        }
+
+        return Promise.reject(error);
+      }
+    );
+
+    return () => {
+      window.fetch = nativeFetch;
+      axios.interceptors.request.eject(axiosRequestInterceptor);
+      axios.interceptors.response.eject(axiosResponseInterceptor);
+    };
+  }, []);
+
+  // Check existing authentication using get_bk_settings API
+  const checkExistingAuthentication = async () => {
+    try {
+      setIsCheckingExistingAuth(true);
+
+      const response = await fetch('/api/proxy/core/api/get_bk_settings/', {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          "Pragma": "no-cache",
+        },
+        credentials: 'include',
+      });
+
+      const responseData = await response.json();
+
+      if (response.ok && responseData.result && responseData.data) {
+        // Try different paths to find user data
+        const userData = responseData.data.user;
+
+        // Check if we have valid user information
+        if (userData && (userData.username || userData.id)) {
+          setIsAutoSigningIn(true);
+
+          const userDataForAuth = {
+            id: userData.id,
+            username: userData.username,
+            token: userData.token,
+            locale: userData.locale || 'en',
+            timezone: userData.timezone || 'Asia/Shanghai',
+            temporary_pwd: userData.temporary_pwd || false,
+            enable_otp: userData.enable_otp || false,
+            qrcode: userData.qrcode || false,
+          };
+
+          // Save auth token if available
+          if (userData.token) {
+            saveAuthToken({
+              id: userDataForAuth.id,
+              username: userDataForAuth.username || '',
+              token: userData.token,
+              locale: userDataForAuth.locale,
+              timezone: userDataForAuth.timezone,
+              temporary_pwd: userDataForAuth.temporary_pwd,
+              enable_otp: userDataForAuth.enable_otp,
+              qrcode: userDataForAuth.qrcode,
+            });
+          }
+
+          // Auto sign in with existing authentication
+          const result = await signIn("credentials", {
+            redirect: false,
+            username: userDataForAuth.username,
+            password: '',
+            skipValidation: 'true',
+            userData: JSON.stringify(userDataForAuth),
+          });
+
+          if (result?.ok) {
+            setTimeout(() => {
+              setIsAutoSigningIn(false);
+            }, 1000);
+            return true;
+          } else if (result?.error) {
+            console.error('Auto SignIn error:', result.error);
+            setIsAutoSigningIn(false);
+          }
+        } else {
+          console.log('No valid user information in response');
+        }
+      } else {
+        console.log('No existing authentication found or API call failed');
+      }
+    } catch (error) {
+      console.error("Error checking existing authentication:", error);
+    } finally {
+      setIsCheckingExistingAuth(false);
+    }
+
+    setIsAutoSigningIn(false);
+    return false;
+  };
+
+  // Initial authentication check on app start
+  useEffect(() => {
+    const performInitialAuthCheck = async () => {
+      // Only check once and skip for auth pages
+      if (hasCheckedExistingAuth || isCurrentAuthPath || isDashboardRenderRoute) {
+        if (isDashboardRenderRoute) {
+          setHasCheckedExistingAuth(true);
+        }
+        setIsCheckingAuth(false);
+        return;
+      }
+
+      setHasCheckedExistingAuth(true);
+
+      // Always check for existing authentication first, regardless of current session status
+      // This ensures we don't miss existing auth when session loads quickly
+      const hasExistingAuth = await checkExistingAuthentication();
+
+      if (!hasExistingAuth) {
+        // Only stop checking if we're sure there's no existing auth AND session is loaded
+        if (status !== 'loading') {
+          setIsCheckingAuth(false);
+        }
+      }
+      // If existing auth found, let the session effect handle the rest
+    };
+
+    performInitialAuthCheck();
+  }, [hasCheckedExistingAuth, isCurrentAuthPath, isDashboardRenderRoute, pathname]);
+
+  const recoverAuthenticatedSession = useCallback((
+    event?: AuthRecoveryEvent,
+    options?: { replaceInflight?: boolean; confirmOnly?: boolean },
+  ) => {
+    if (event && handledRecoveryEventIdsRef.current.has(event.eventId)) {
+      return recoveryPromiseRef.current ?? Promise.resolve(true);
+    }
+
+    if (event) {
+      handledRecoveryEventIdsRef.current.add(event.eventId);
+      expectedRecoveryUserIdentityRef.current ??= pageUserIdentityRef.current;
+      pendingRecoveryRef.current = true;
+    }
+
+    if (recoveryPromiseRef.current && !options?.replaceInflight) {
+      return recoveryPromiseRef.current;
+    }
+
+    if (options?.replaceInflight) {
+      recoveryAbortRef.current?.abort();
+    }
+
+    const recoveryEpoch = recoveryEpochRef.current + 1;
+    recoveryEpochRef.current = recoveryEpoch;
+    const abortController = new AbortController();
+    recoveryAbortRef.current = abortController;
+    const confirmOnly = options?.confirmOnly === true;
+
+    const recoveryPromise = (async () => {
+      try {
+        const checkAuth = () => fetchRecoveredAuth(fetch, abortController.signal);
+        const recoveryResult = await (
+          confirmOnly
+            ? confirmAuthStillValid(
+              expectedRecoveryUserIdentityRef.current,
+              checkAuth,
+            )
+            : recoverAuthWithRetry(
+              expectedRecoveryUserIdentityRef.current,
+              checkAuth,
+            )
+        );
+        if (
+          abortController.signal.aborted
+          || recoveryEpoch !== recoveryEpochRef.current
+        ) {
+          return false;
+        }
+        if (recoveryResult.status !== 'recovered') {
+          if (recoveryResult.status === 'account-changed') {
+            pendingRecoveryRef.current = false;
+          }
+          return false;
+        }
+
+        const recoveredUser = recoveryResult.user;
+        const shouldShowRecoveryMessage = sessionExpiredOpenRef.current;
+        setToken(recoveredUser.token);
+        setIsAuthenticated(true);
+        isProtectedContentReadyRef.current = true;
+        setIsProtectedContentReady(true);
+        resetSessionExpiredState();
+        pendingRecoveryRef.current = false;
+        sessionExpiredOpenRef.current = false;
+        expectedRecoveryUserIdentityRef.current = null;
+        setSessionExpiredOpen(false);
+        setIsCheckingAuth(false);
+
+        if (shouldShowRecoveryMessage && document.visibilityState !== 'hidden') {
+          message.success(t('common.reloginSuccess'));
+        }
+        return true;
+      } catch (error) {
+        console.error('Failed to recover authenticated session:', error);
+        return false;
+      } finally {
+        if (recoveryPromiseRef.current === recoveryPromise) {
+          recoveryPromiseRef.current = null;
+        }
+      }
+    })();
+
+    recoveryPromiseRef.current = recoveryPromise;
+    return recoveryPromise;
+  }, [message, t]);
+
+  useEffect(() => {
+    const openSessionExpiredOverlay = () => {
+      latchSessionExpired();
+      sessionExpiredOpenRef.current = true;
+      setSessionExpiredOpen(true);
+      setIsCheckingAuth(false);
+    };
+
+    const handleSessionExpired = () => {
+      if (isCurrentAuthPath || isDashboardRenderRoute) {
+        releaseSessionExpiryConfirmation();
+        return;
+      }
+
+      expectedRecoveryUserIdentityRef.current ??= pageUserIdentityRef.current;
+      pendingRecoveryRef.current = true;
+
+      if (!isProtectedContentReadyRef.current) {
+        openSessionExpiredOverlay();
+        return;
+      }
+
+      const recovery = recoverAuthenticatedSession(undefined, { confirmOnly: true });
+      const confirmEpoch = recoveryEpochRef.current;
+      void recovery.then((recovered) => {
+        if (recovered || confirmEpoch !== recoveryEpochRef.current) {
+          return;
+        }
+        if (
+          isAuthPath(window.location.pathname)
+          || isDashboardExecutionRenderRoute(window.location.pathname)
+        ) {
+          releaseSessionExpiryConfirmation();
+          return;
+        }
+        openSessionExpiredOverlay();
+      });
+    };
+
+    window.addEventListener(SESSION_EXPIRED_EVENT, handleSessionExpired as EventListener);
+
+    return () => {
+      window.removeEventListener(SESSION_EXPIRED_EVENT, handleSessionExpired as EventListener);
+    };
+  }, [isCurrentAuthPath, isDashboardRenderRoute, recoverAuthenticatedSession]);
+
+  useEffect(() => subscribeAuthRecovery((event) => {
+    void recoverAuthenticatedSession(event);
+  }), [recoverAuthenticatedSession]);
+
+  useEffect(() => {
+    const retryPendingRecovery = () => {
+      if (pendingRecoveryRef.current && document.visibilityState !== 'hidden') {
+        void recoverAuthenticatedSession();
+      }
+    };
+
+    window.addEventListener('focus', retryPendingRecovery);
+    document.addEventListener('visibilitychange', retryPendingRecovery);
+    return () => {
+      window.removeEventListener('focus', retryPendingRecovery);
+      document.removeEventListener('visibilitychange', retryPendingRecovery);
+    };
+  }, [recoverAuthenticatedSession]);
+
+  const handleReloginSuccess = useCallback(() => {
+    const event = publishAuthRecovery();
+    void recoverAuthenticatedSession(event, { replaceInflight: true });
+  }, [recoverAuthenticatedSession]);
+
+  useEffect(() => {
+    const handleAuthPopupMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+
+      if (event.data?.type !== AUTH_POPUP_SUCCESS_MESSAGE) {
+        return;
+      }
+
+      handleReloginSuccess();
+    };
+
+    window.addEventListener('message', handleAuthPopupMessage);
+
+    return () => {
+      window.removeEventListener('message', handleAuthPopupMessage);
+    };
+  }, [handleReloginSuccess]);
+
+  // Process session changes
+  useEffect(() => {
+    // If session is loading or auto signing in, do nothing
+    if (status === 'loading' || isAutoSigningIn) {
+      return;
+    }
+
+    // If we haven't checked existing auth yet, wait
+    if (!hasCheckedExistingAuth) {
+      return;
+    }
+
+    // If the existing authentication check is in progress (API request pending), wait for it to complete
+    if (isCheckingExistingAuth) {
+      return;
+    }
+
+    // If current path is auth-related page, allow access
+    if (isCurrentAuthPath) {
+      setIsCheckingAuth(false);
+      return;
+    }
+
+    // If no valid session, redirect to login page
+    if (status === 'unauthenticated' || !isSessionValid) {
+      if (sessionExpiredOpen || token) {
+        setIsAuthenticated(Boolean(token));
+        setIsCheckingAuth(false);
+        return;
+      }
+
+      startupAuthCheckIdentityRef.current = null;
+      setToken(null);
+      setIsAuthenticated(false);
+      setIsCheckingAuth(false);
+
+      // Render Session 路由由 Chromium 先换票再建会话，禁止踢去普通登录页
+      if (isDashboardRenderRoute) {
+        return;
+      }
+
+      // Only redirect if:
+      // 1. Not currently auto signing in
+      // 2. Not on auth pages
+      // 3. Have completed the initial auth check
+      // 4. Not currently checking existing auth (新增条件)
+      if (pathname && !authPaths.includes(pathname) && !isAutoSigningIn && hasCheckedExistingAuth && !isCheckingExistingAuth) {
+        if (sessionExpiredOpen) {
+          setIsCheckingAuth(false);
+        } else {
+          const currentUrl = typeof window !== 'undefined' ? window.location.href : pathname;
+          router.push(`/auth/signin?callbackUrl=${encodeURIComponent(currentUrl)}`);
+        }
+      }
+      return;
+    }
+
+    if (isSessionValid) {
+      if (isDashboardRenderRoute) {
+        setToken(extendedSession.user?.token || extendedSession.user?.id || null);
+        setIsAuthenticated(true);
+        setIsCheckingAuth(false);
+      } else if (!isProtectedContentReadyRef.current) {
+        const sessionUserIdentity = getAuthUserIdentity(extendedSession.user);
+
+        if (
+          sessionUserIdentity
+          && startupAuthCheckIdentityRef.current !== sessionUserIdentity
+        ) {
+          startupAuthCheckIdentityRef.current = sessionUserIdentity;
+          expectedRecoveryUserIdentityRef.current = sessionUserIdentity;
+          pendingRecoveryRef.current = true;
+          setIsCheckingAuth(true);
+
+          const recovery = recoverAuthenticatedSession();
+          const startupEpoch = recoveryEpochRef.current;
+          void recovery.then((recovered) => {
+            if (
+              recovered
+              || isProtectedContentReadyRef.current
+              || startupEpoch !== recoveryEpochRef.current
+            ) {
+              return;
+            }
+
+            latchSessionExpired();
+            pendingRecoveryRef.current = true;
+            sessionExpiredOpenRef.current = true;
+            setSessionExpiredOpen(true);
+            setIsCheckingAuth(false);
+          });
+        }
+      }
+
+      const userLocale = extendedSession.user?.locale || 'en';
+      const userTimezone = extendedSession.user?.timezone || 'Asia/Shanghai';
+      const savedLocale = localStorage.getItem('locale') || 'en';
+      if (userLocale !== savedLocale) {
+        setLocale(userLocale);
+      }
+      localStorage.setItem('locale', userLocale);
+      localStorage.setItem('timezone', userTimezone);
+    }
+  }, [status, session, pathname, setLocale, router, isAutoSigningIn, hasCheckedExistingAuth, isCheckingExistingAuth, isCurrentAuthPath, isDashboardRenderRoute, sessionExpiredOpen, token, recoverAuthenticatedSession]);
+
+  // Show loading state until authentication state is determined
+  const shouldHoldProtectedContent = (
+    !isCurrentAuthPath
+    && !isDashboardRenderRoute
+    && !isProtectedContentReady
+  );
+  if ((
+    (status === 'loading' && !isAuthenticated)
+    || isCheckingAuth
+    || isAutoSigningIn
+    || isCheckingExistingAuth
+    || (shouldHoldProtectedContent && !sessionExpiredOpen)
+  ) && pathname && !authPaths.includes(pathname)) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-center">
+          <Spin size="large" />
+          <p className="mt-4 text-gray-600">
+            {isAutoSigningIn ? 'Auto signing in...' :
+            isCheckingExistingAuth ? 'Checking existing authentication...' :
+            isCheckingAuth ? 'Checking Authentication...' : 'Loading...'}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <AuthContext.Provider value={{ token, isAuthenticated, isCheckingAuth }}>
+      {!shouldHoldProtectedContent && children}
+      {sessionExpiredOpen && !isCurrentAuthPath && !isDashboardRenderRoute && (
+        <div
+          className="fixed inset-0 z-1200 flex items-center justify-center bg-[rgba(15,23,42,0.52)] px-4 py-8"
+          style={{ backdropFilter: 'blur(4px)' }}
+        >
+          <div
+            className="relative w-full overflow-hidden rounded-[16px] border"
+            style={{
+              maxWidth: 420,
+              borderColor: mode === 'dark' ? 'var(--color-border-1)' : '#DBE3EC',
+              background: mode === 'dark' ? 'var(--bg-color-2)' : '#FFFFFF',
+              boxShadow: mode === 'dark' ? '0 18px 42px rgba(0,0,0,0.42)' : '0 10px 28px rgba(15,23,42,0.10)',
+            }}
+          >
+            <div className="relative px-6 pb-5 pt-6">
+              <div className="mb-5">
+                <div className="max-w-[388px]">
+                  <div className="text-[24px] leading-[1.18] font-bold text-(--color-text-1)">
+                    {t('common.sessionExpiredTitle')}
+                  </div>
+
+                  <div className="mt-2 text-[13px] leading-[1.65] text-(--color-text-2)">
+                    {t('common.sessionExpiredDescription')}
+                  </div>
+                </div>
+              </div>
+              <SigninClient
+                mode="modal"
+                signinErrors={modalSigninErrors}
+                onAuthenticated={handleReloginSuccess}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </AuthContext.Provider>
+  );
+};
+
+export default AuthProvider;

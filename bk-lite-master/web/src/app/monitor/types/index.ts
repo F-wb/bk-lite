@@ -1,0 +1,395 @@
+import React from 'react';
+import { Dayjs } from 'dayjs';
+import { InterfaceTableItem } from './view';
+
+export interface ColumnItem {
+  title: string;
+  dataIndex: string;
+  key: string;
+  render?: (_: unknown, record: TableDataItem) => React.ReactElement;
+  [key: string]: unknown;
+}
+
+export interface ListItem {
+  title?: string;
+  label?: string;
+  name?: string;
+  display_name?: string;
+  id?: string | number;
+  value?: string | number;
+  color?: string;
+}
+
+export interface ModalConfig {
+  type: string;
+  form: Record<string, any>;
+  subTitle?: string;
+  title: string;
+  [key: string]: any;
+  onSuccess?: (...args: any[]) => void;
+}
+
+export interface UnitListItem {
+  description: string;
+  display_unit: string;
+  is_standalone: boolean;
+  system: string;
+  unit_id: string;
+  unit_name: string;
+  category: string;
+  [key: string]: any;
+}
+
+export interface ModalRef {
+  showModal: (config: ModalConfig) => void;
+}
+
+export interface CascaderItem {
+  label: string;
+  value: string | number;
+  children: CascaderItem[];
+}
+
+export interface TreeItem {
+  title: React.ReactElement | string;
+  key: string | number;
+  label?: string;
+  // 叶子节点可选:对象图标名(后端 icon 字段)与实例计数;由 treeSelector 渲染为图标+计数徽标。
+  // 不传则按纯文本渲染(向后兼容既有调用方)。
+  icon?: string;
+  count?: number;
+  children: TreeItem[];
+}
+
+export interface UserItem {
+  id: string;
+  username: string;
+  display_name?: string;
+  [key: string]: unknown;
+}
+
+export interface Organization {
+  id: string;
+  name: string;
+  label?: string;
+  value?: string;
+  children: Array<SubGroupItem>;
+  [key: string]: unknown;
+}
+
+export interface SubGroupItem {
+  value?: string;
+  label?: string;
+  children?: Array<SubGroupItem>;
+}
+
+export interface OriginSubGroupItem {
+  id: string;
+  name: string;
+  parentId: string;
+  subGroupCount: number;
+  subGroups: Array<OriginSubGroupItem>;
+}
+
+export interface OrganizationNode {
+  id: string;
+  name: string;
+  subGroups?: OrganizationNode[];
+}
+
+export interface UnitItem {
+  label: string;
+  value?: string;
+  unit?: string;
+  children?: UnitItem[];
+}
+
+export interface GroupedUnitItem {
+  label: string;
+  value: string;
+  unit: string;
+}
+
+export interface GroupedUnitList {
+  label: string;
+  children: GroupedUnitItem[];
+}
+
+export interface OriginOrganization {
+  id: string;
+  name: string;
+  subGroupCount: number;
+  subGroups: Array<OriginSubGroupItem>;
+  [key: string]: unknown;
+}
+export interface TabItem {
+  key: string;
+  label: string;
+  name?: string;
+  children?: React.ReactElement | string;
+}
+
+export interface ChartData {
+  time: number;
+  value1?: number;
+  value2?: number;
+  gapIntervals?: GapInterval[];
+  seriesMetrics?: Record<string, Record<string, string>>;
+  details?: Record<
+    string,
+    Array<{ name: string; label: string; value: string }>
+  >;
+  [key: string]: unknown;
+}
+
+export interface GapInterval {
+  start: number;
+  end: number;
+  duration?: number;
+  align?: 'exact';
+  series?: Array<{
+    metric?: Record<string, string>;
+    missing_points?: number;
+  }>;
+}
+
+export interface SegmentedItem {
+  label: string;
+  value: string | number;
+}
+
+export interface Pagination {
+  current: number;
+  total: number;
+  pageSize: number;
+}
+
+export interface TableDataItem {
+  id?: number | string;
+  [key: string]: any;
+}
+
+export interface TimeSelectorDefaultValue {
+  selectValue: number | null;
+  rangePickerVaule: [Dayjs, Dayjs] | null;
+}
+
+export interface TimeLineItem {
+  color: string;
+  children: React.ReactElement;
+}
+
+export interface ViewQueryKeyValuePairs {
+  keys: string[];
+  values: string[];
+}
+
+export interface ModalProps {
+  onSuccess: () => void;
+}
+
+export interface HexagonData {
+  name: string;
+  description: React.ReactNode | string;
+  fill: string;
+  aiName?: string;
+  aiValue?: string;
+}
+
+export interface TimeValuesProps {
+  timeRange: number[];
+  originValue: number | null;
+}
+
+export interface InstanceParam {
+  page?: number;
+  page_size?: number;
+  add_metrics?: boolean;
+  monitor_plugin_id?: React.Key;
+  name?: string;
+  /** 精确匹配存储键；用于回填已选实例展示名 */
+  instance_id?: string;
+  /**
+   * 批量精确匹配存储键（JSON 数组字符串由 API 层序列化）。
+   * 用于已选资产回填，避免逐实例并发打满后端连接。
+   */
+  instance_id_in?: string[];
+  vm_params?: any;
+  /** 视图列表服务端排序列（time / column_key / plugin::metric） */
+  ordering?: string;
+  /** asc | desc */
+  order?: 'asc' | 'desc';
+  /** 超级用户未归属目录，替换当前组织列表 */
+  unassigned?: boolean;
+}
+
+export interface GroupInfo {
+  name?: string;
+  description?: string;
+  id?: number | string;
+}
+
+export interface ObjectItem {
+  id: number;
+  name: string;
+  template_id?: string;
+  template_type?: string;
+  is_custom?: boolean;
+  is_built_in?: boolean;
+  is_pre?: boolean;
+  is_visible?: boolean;
+  parent?: number | null;
+  level?: 'base' | 'derivative';
+  type: string;
+  plugin_name?: string;
+  plugin_id?: number;
+  parent_monitor_object?: number | string | null;
+  parent_monitor_object_name?: string;
+  parent_monitor_object_display_name?: string;
+  parent_monitor_object_icon?: string;
+  parent_object_display_name?: string;
+  display_description?: string;
+  description: string;
+  display_name?: string;
+  collector?: string;
+  collect_type?: string;
+  pack_version?: string;
+  stale_instance_count?: number;
+  display_type?: string;
+  icon?: string;
+  instance_count?: number;
+  display_fields?: {
+    column_key?: string;
+    name: string;
+    type?: 'metric' | 'field';
+    role?: 'resource_ip' | 'namespace';
+    sort_order: number;
+    variable_id?: string;
+    metrics: { plugin: string; metric: string; field?: string }[];
+  }[];
+  instance_summary_columns?: {
+    fact: string;
+    title: string;
+    order?: number;
+  }[];
+  options?: ObjectItem[];
+  label?: string;
+  value?: string;
+  [key: string]: unknown;
+}
+
+export interface IntegrationItem {
+  label: string;
+  value: string;
+  list: ObjectItem[];
+  name?: string;
+  [key: string]: unknown;
+}
+
+export interface Dimension {
+  name: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface ChartProps {
+  instance_id?: string;
+  showInstName?: boolean;
+  instance_id_keys: string[];
+  instance_id_values: string[];
+  instance_name: string;
+  title: string;
+  dimensions: Dimension[];
+  [key: string]: unknown;
+}
+
+export interface MetricItem {
+  id: number;
+  metric_group: number;
+  metric_object: number;
+  name: string;
+  monitor_plugin_name?: string;
+  type: string;
+  display_name?: string;
+  display_description?: string;
+  instance_id_keys?: string[];
+  dimensions: Dimension[];
+  query?: string;
+  view_query?: string;
+  view_config?: {
+    mode?: 'top' | 'bottom' | 'limited';
+    limit?: number;
+    os?: string[];
+  };
+  unit?: string;
+  displayType?: string;
+  description?: string;
+  is_ifmib?: boolean;
+  viewData?: ChartData[] | InterfaceTableItem[];
+  displayUnit?: string;
+  seriesBudget?: {
+    truncated: boolean;
+    limit: number;
+    applied?: boolean;
+  };
+  style?: {
+    width: string;
+    height: string;
+  };
+  [key: string]: unknown;
+}
+
+export interface IndexViewItem {
+  name?: string;
+  display_name?: string;
+  id: number;
+  isLoading?: boolean;
+  child?: any[];
+}
+
+export interface ThresholdField {
+  level: string;
+  method: string;
+  value: number | null;
+}
+
+export interface FilterItem {
+  logic?: 'and' | 'or' | null;
+  name: string | null;
+  method: string | null;
+  value: string;
+}
+
+export interface ChartDataItem {
+  metric: Record<string, string>;
+  values: [number, string][];
+  [key: string]: any;
+}
+
+export interface LevelMap {
+  critical: string;
+  error: string;
+  warning: string;
+  [key: string]: unknown;
+}
+
+export interface StateMap {
+  new: string;
+  recovered: string;
+  closed: string;
+  [key: string]: any;
+}
+
+export interface NodeWorkload {
+  created_by_kind: string;
+  created_by_name: string;
+}
+
+export interface TreeSortData {
+  type: string;
+  object_list: string[];
+}
+
+export interface ObjectIconMap {
+  [key: string]: string;
+}

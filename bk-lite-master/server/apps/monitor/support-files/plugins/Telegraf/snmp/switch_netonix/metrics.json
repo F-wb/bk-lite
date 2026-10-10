@@ -1,0 +1,165 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_netonix",
+  "plugin": "Switch Netonix SNMP",
+  "plugin_desc": "SNMP monitoring template for Netonix switch. It reports uptime, temperature sensors, fan speed, voltage sensors, total power consumption, DC/DC input current and efficiency, and interface traffic (enterprise PEN 46242). The MIB has no CPU or memory objects.",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='switch', collect_type='snmp_netonix'}) by (instance_id)",
+  "name": "Switch",
+  "icon": "mm-switch_交换机",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='switch'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "device_temperature_celsius",
+    "device_power_used"
+  ],
+  "metrics": [
+    {
+      "metric_group": "Temperature",
+      "name": "device_temperature_celsius",
+      "query": "device_temperature_celsius{instance_type='switch', __$labels__}",
+      "display_name": "Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [
+        {
+          "name": "sensor",
+          "description": "Temperature sensor description"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric reports each temperature sensor of the Netonix switch in degrees Celsius (NETONIX-SWITCH-MIB tempTable temp), labelled by tempDescription. High temperatures can indicate cooling failure or airflow obstruction and risk thermal shutdown."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_fan_speed",
+      "query": "device_fan_speed{instance_type='switch', __$labels__}",
+      "display_name": "Fan Speed",
+      "data_type": "Number",
+      "unit": "counts",
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "Fan index"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Speed of each fan of the Netonix switch (NETONIX-SWITCH-MIB fanTable fanSpeed), one series per fan. Abnormally low or zero speed may indicate a stalled fan."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_voltage_volts",
+      "query": "device_voltage_volts{instance_type='switch', __$labels__}",
+      "display_name": "Voltage",
+      "data_type": "Number",
+      "unit": "volts",
+      "dimensions": [
+        {
+          "name": "sensor",
+          "description": "Voltage sensor description"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Reading of each voltage sensor of the Netonix switch in volts (NETONIX-SWITCH-MIB voltageTable voltage, reported in hundredths of a volt and divided by 100 at collection), labelled by voltageDescription."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_power_used",
+      "query": "max(snmp_device_power_used{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "Power Consumption",
+      "data_type": "Number",
+      "unit": "watts",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Total power consumed by the Netonix switch in watts, including PoE output (NETONIX-SWITCH-MIB totalPowerConsumption scalar, reported in tenths of a watt and divided by 10 at collection)."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_input_current_amps",
+      "query": "max(snmp_device_input_current_amps{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "DC/DC Input Current",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "DC/DC input current of the Netonix switch in amps (NETONIX-SWITCH-MIB dcdcInputCurrent scalar, reported in tenths of an amp and divided by 10 at collection)."
+    },
+    {
+      "metric_group": "Hardware Status",
+      "name": "device_dcdc_efficiency",
+      "query": "max(snmp_device_dcdc_efficiency{instance_type='switch', __$labels__}) by (instance_id)",
+      "display_name": "DC/DC Efficiency",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "DC/DC power supply efficiency of the Netonix switch in percent (NETONIX-SWITCH-MIB dcdcEfficiency scalar)."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCInOctets",
+      "query": "rate(interface_ifHCInOctets{instance_type='switch', __$labels__}[5m])",
+      "display_name": "Interface Incoming Traffic Rate",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the average rate of bytes received over the past 5 minutes, measured in bytes per second, from the 64-bit IF-MIB ifHCInOctets counter (ifXTable). The 64-bit counter avoids the rapid wrap of the 32-bit ifInOctets on high-speed switch ports, keeping the rate accurate."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCOutOctets",
+      "query": "rate(interface_ifHCOutOctets{instance_type='switch', __$labels__}[5m])",
+      "display_name": "Interface Outgoing Traffic Rate",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric calculates the average rate of bytes sent over the past 5 minutes, measured in bytes per second, from the 64-bit IF-MIB ifHCOutOctets counter (ifXTable). The 64-bit counter avoids the rapid wrap of the 32-bit ifOutOctets on high-speed switch ports, keeping the rate accurate."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='switch', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
+    }
+  ]
+}

@@ -1,0 +1,727 @@
+import json
+import sys
+import time
+import zipfile
+
+import pytest
+from core.config import ServiceConfig
+from service import ansible_runner
+from service.ansible_runner import (
+    AdhocRequest,
+    PlaybookRequest,
+    _build_host_credentials_inventory,
+    _quote_inventory_value,
+    _redact_cli_command,
+    _safe_extract_zip,
+    _safe_workspace_path,
+    build_adhoc_command,
+    encode_adhoc_module_args,
+    parse_ansible_output_per_host,
+    parse_playbook_recap,
+    prepare_adhoc_execution,
+    prepare_playbook_execution,
+    prepare_windows_script_execution,
+    run_command,
+    to_adhoc_request,
+)
+
+
+def test_redact_cli_command_hides_extra_vars_values():
+    command = ["ansible-playbook", "playbook.yml", "--extra-vars", '{"bklite_session_url":"secret"}']
+
+    assert _redact_cli_command(command) == ["ansible-playbook", "playbook.yml", "--extra-vars", "***"]
+    assert command[-1] != "***"
+
+
+def test_encode_adhoc_module_args_json_wraps_raw_heredoc_with_unbalanced_quotes():
+    command = "/usr/bin/ksh -c '. /dev/stdin' <<'STARGAZER_AIX_COLLECT_EOF'\nawk '{print $1}'\nSTARGAZER_AIX_COLLECT_EOF\n"
+
+    encoded = encode_adhoc_module_args("raw", command)
+
+    parsed = json.loads(encoded)
+    assert parsed["_raw_params"] == command
+    assert encode_adhoc_module_args("raw", encoded) == encoded
+    assert encode_adhoc_module_args("shell", command) == command
+
+
+def test_build_adhoc_command_passes_raw_module_args_as_json():
+    command = "LC_ALL=C LANG=C /usr/bin/ksh <<'EOF'\n'unbalanced\nEOF\n"
+    cmd = build_adhoc_command(
+        AdhocRequest(
+            inventory="/tmp/inventory.ini",
+            hosts="all",
+            module="raw",
+            module_args=command,
+        )
+    )
+
+    args_index = cmd.index("-a")
+    encoded = cmd[args_index + 1]
+    assert json.loads(encoded)["_raw_params"] == command
+
+
+def test_to_adhoc_request_accepts_windows_stream_type():
+    request = to_adhoc_request(
+        {
+            "inventory": "localhost,",
+            "module": "win_shell",
+            "stream_remote_output": True,
+            "stream_remote_type": "PowerShell",
+        }
+    )
+
+    assert request.stream_remote_output is True
+    assert request.stream_remote_type == "powershell"
+
+
+def test_to_adhoc_request_rejects_unknown_windows_stream_type():
+    with pytest.raises(ValueError, match="stream_remote_type must be bat or powershell"):
+        to_adhoc_request({"inventory": "localhost,", "stream_remote_type": "python"})
+
+
+def test_safe_workspace_path_rejects_parent_escape(tmp_path):
+    with pytest.raises(ValueError):
+        _safe_workspace_path(tmp_path, "../evil.txt", "file name")
+
+
+def test_safe_extract_zip_rejects_symlink(tmp_path):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("link.txt")
+        info.create_system = 3
+        info.external_attr = 0o120777 << 16
+        archive.writestr(info, "target.txt")
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        with pytest.raises(ValueError):
+            _safe_extract_zip(archive, tmp_path / "workspace")
+
+
+def test_safe_extract_zip_allows_regular_files(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("nested/file.txt", "hello")
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        _safe_extract_zip(archive, workspace)
+
+    assert (workspace / "nested" / "file.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_safe_extract_zip_rejects_too_many_members(tmp_path, monkeypatch):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "1")
+        archive.writestr("two.txt", "2")
+
+    monkeypatch.setattr(ansible_runner, "PLAYBOOK_ARCHIVE_MAX_MEMBERS", 1)
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        with pytest.raises(ValueError, match="too many files"):
+            _safe_extract_zip(archive, tmp_path / "workspace")
+
+
+def test_safe_extract_zip_rejects_oversized_member(tmp_path, monkeypatch):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("large.txt", "abcdef")
+
+    monkeypatch.setattr(ansible_runner, "PLAYBOOK_ARCHIVE_MAX_MEMBER_SIZE_BYTES", 5)
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        with pytest.raises(ValueError, match="exceeds size limit"):
+            _safe_extract_zip(archive, tmp_path / "workspace")
+
+
+def test_safe_extract_zip_rejects_oversized_expanded_total(tmp_path, monkeypatch):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "1234")
+        archive.writestr("two.txt", "5678")
+
+    monkeypatch.setattr(ansible_runner, "PLAYBOOK_ARCHIVE_MAX_EXPANDED_SIZE_BYTES", 7)
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        with pytest.raises(ValueError, match="expanded size exceeds limit"):
+            _safe_extract_zip(archive, tmp_path / "workspace")
+
+
+@pytest.mark.asyncio
+async def test_prepare_playbook_execution_rejects_unsafe_zip_member(tmp_path, monkeypatch):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("../outside.yml", "- hosts: all\n")
+        archive.writestr("playbook.yml", "- hosts: all\n")
+
+    async def fake_download(config, workspace, bucket_name, file_item):
+        return str(archive_path)
+
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ansible_runner, "download_object_to_workspace", fake_download)
+
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_path="playbook.yml",
+        inventory_content="[all]\n127.0.0.1 ansible_connection=local\n",
+        files=[{"name": "payload.zip", "file_key": "payload.zip", "bucket_name": "bucket"}],
+    )
+
+    with pytest.raises(ValueError, match="zip member"):
+        await prepare_playbook_execution(config, request)
+
+
+@pytest.mark.asyncio
+async def test_prepare_playbook_execution_rejects_ambiguous_zip_playbook_entry(tmp_path, monkeypatch):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("alpha/playbook.yml", "- hosts: all\n")
+        archive.writestr("beta/playbook.yml", "- hosts: all\n")
+
+    async def fake_download(config, workspace, bucket_name, file_item):
+        return str(archive_path)
+
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ansible_runner, "download_object_to_workspace", fake_download)
+
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_path="playbook.yml",
+        inventory_content="[all]\n127.0.0.1 ansible_connection=local\n",
+        files=[{"name": "payload.zip", "file_key": "payload.zip", "bucket_name": "bucket"}],
+    )
+
+    with pytest.raises(ValueError, match="多个入口文件"):
+        await prepare_playbook_execution(config, request)
+
+
+@pytest.mark.asyncio
+async def test_prepare_playbook_execution_prefers_exact_zip_playbook_path(tmp_path, monkeypatch):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("bundle/playbook.yml", "- hosts: all\n")
+        archive.writestr("bundle/nested/playbook.yml", "- hosts: all\n")
+
+    async def fake_download(config, workspace, bucket_name, file_item):
+        return str(archive_path)
+
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ansible_runner, "download_object_to_workspace", fake_download)
+
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_path="bundle/nested/playbook.yml",
+        inventory_content="[all]\n127.0.0.1 ansible_connection=local\n",
+        files=[{"name": "payload.zip", "file_key": "payload.zip", "bucket_name": "bucket"}],
+    )
+
+    _, workspace, prepared_request = await prepare_playbook_execution(config, request)
+
+    assert prepared_request.playbook_path == str(workspace / "bundle" / "nested" / "playbook.yml")
+
+
+@pytest.mark.asyncio
+async def test_prepare_playbook_execution_rejects_missing_explicit_zip_playbook_path(tmp_path, monkeypatch):
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("other/playbook.yml", "- hosts: all\n")
+
+    async def fake_download(config, workspace, bucket_name, file_item):
+        return str(archive_path)
+
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ansible_runner, "download_object_to_workspace", fake_download)
+
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_path="bundle/playbook.yml",
+        inventory_content="[all]\n127.0.0.1 ansible_connection=local\n",
+        files=[{"name": "payload.zip", "file_key": "payload.zip", "bucket_name": "bucket"}],
+    )
+
+    with pytest.raises(ValueError, match="ZIP 解压后未找到入口文件: bundle/playbook.yml"):
+        await prepare_playbook_execution(config, request)
+
+
+@pytest.mark.asyncio
+async def test_prepare_playbook_execution_keeps_extra_vars_out_of_process_arguments(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_content="- hosts: all\n  gather_facts: false\n  tasks: []\n",
+        inventory_content="[all]\n127.0.0.1 ansible_connection=local\n",
+        extra_vars={"bklite_session_url": "https://server.example/session/secret"},
+        task_id="secret-extra-vars",
+    )
+
+    command, workspace, _ = await prepare_playbook_execution(config, request)
+
+    assert not any("session/secret" in argument for argument in command)
+    extra_vars_reference = command[command.index("--extra-vars") + 1]
+    assert extra_vars_reference.startswith("@")
+    extra_vars_path = workspace / extra_vars_reference.removeprefix("@")
+    assert json.loads(extra_vars_path.read_text(encoding="utf-8"))["bklite_session_url"].endswith("/secret")
+    assert extra_vars_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_run_command_returns_untruncated_output_for_small_payload():
+    code, output, output_meta = await run_command(
+        [sys.executable, "-c", "print('hello world')"],
+        timeout=10,
+        max_output_bytes=128,
+    )
+
+    assert code == 0
+    assert output.strip() == "hello world"
+    assert output_meta["truncated"] is False
+    assert output_meta["output_bytes_total"] == output_meta["output_bytes_retained"]
+
+
+@pytest.mark.asyncio
+async def test_run_command_truncates_oversized_output():
+    code, output, output_meta = await run_command(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 2048)"],
+        timeout=10,
+        max_output_bytes=128,
+    )
+
+    assert code == 0
+    assert len(output) == 128
+    assert output_meta["truncated"] is True
+    assert output_meta["output_bytes_total"] == 2048
+    assert output_meta["output_bytes_retained"] == 128
+    assert output_meta["output_max_bytes"] == 128
+
+
+@pytest.mark.asyncio
+async def test_run_command_keeps_ansible_output_when_process_hangs_after_stdout_closes():
+    """真实子进程：输出已关闭但进程不退出（模拟 SSH ControlPersist 收尾挂起）。
+
+    回归：流式日志已推送成功结果时，不得因 wait 超时清空输出并丢终态。
+    """
+    published: list[str] = []
+
+    async def publisher(_subject: str, payload: bytes) -> None:
+        published.append(json.loads(payload.decode("utf-8"))["line"])
+
+    script = "\n".join(
+        [
+            "import os, sys, time",
+            "print('10.11.27.53 | CHANGED | rc=0 >>')",
+            "print('/etc/profile.d/lang.sh:行19: 警告:setlocale: LC_CTYPE: 无法改变区域选项 (C.UTF-8)')",
+            "print('hello world')",
+            'print("Shared connection to 10.11.27.53 closed.")',
+            "sys.stdout.flush()",
+            "sys.stderr.flush()",
+            "os.close(1)",
+            "os.close(2)",
+            "time.sleep(100)",
+        ]
+    )
+    started = time.monotonic()
+    code, output, _meta = await run_command(
+        [sys.executable, "-c", script],
+        timeout=10,
+        stream_publish=publisher,
+        stream_log_topic="job.stream.55.ansible",
+        execution_id="55",
+    )
+    elapsed = time.monotonic() - started
+
+    assert code == 0
+    assert "hello world" in output
+    assert "10.11.27.53 | CHANGED | rc=0 >>" in output
+    assert "command timed out" not in output
+    assert any("hello world" in line for line in published)
+    assert elapsed < 8
+
+
+@pytest.mark.asyncio
+async def test_run_command_true_timeout_still_returns_124_when_stdout_never_closes():
+    started = time.monotonic()
+    code, output, _meta = await run_command(
+        [sys.executable, "-c", "import time; print('partial', flush=True); time.sleep(100)"],
+        timeout=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert code == 124
+    assert output == "command timed out"
+    assert elapsed < 3
+
+
+def test_parse_playbook_recap_keeps_opening_brace_from_ok_line():
+    output = """
+PLAY [all] *********************************************************************
+
+TASK [debug] *******************************************************************
+ok: [10.10.41.149] => {
+    "msg": "Hello from playbook template"
+}
+
+PLAY RECAP *********************************************************************
+10.10.41.149 : ok=1 changed=0 unreachable=0 failed=0 skipped=0 rescued=0 ignored=0
+""".strip()
+
+    result = parse_playbook_recap(output)
+
+    assert result == [
+        {
+            "host": "10.10.41.149",
+            "status": "success",
+            "raw_status": "SUCCESS",
+            "stdout": "Hello from playbook template",
+            "stderr": "",
+            "exit_code": 0,
+            "error_message": "",
+        }
+    ]
+
+
+def test_parse_ansible_output_per_host_keeps_structured_result_when_output_is_truncated():
+    output = """[WARNING]: Platform linux on host 10.10.41.149 is using the discovered Python
+10.10.41.149 | CHANGED | rc=0 >>
+xx
+xx
+""".strip()
+
+    result = parse_ansible_output_per_host(output, output_truncated=True)
+
+    assert result == [
+        {
+            "host": "10.10.41.149",
+            "status": "success",
+            "raw_status": "CHANGED",
+            "stdout": "[WARNING]: Platform linux on host 10.10.41.149 is using the discovered Python\nxx\nxx",
+            "stderr": "",
+            "exit_code": 0,
+            "error_message": "",
+            "output_truncated": True,
+        }
+    ]
+
+
+def test_quote_inventory_value_quotes_hash_to_avoid_ini_comment_truncation():
+    # ansible 的 ini inventory 用 shlex.split(comments=True)，未加引号的 '#'
+    # 会被当行内注释，导致 '#' 及其后内容被丢弃（密码被静默截断）。
+    assert _quote_inventory_value("CW@roger1117!@#") == '"CW@roger1117!@#"'
+
+
+def test_quote_inventory_value_quotes_semicolon():
+    assert _quote_inventory_value("pa;ss") == '"pa;ss"'
+
+
+def test_quote_inventory_value_plain_value_unquoted():
+    assert _quote_inventory_value("simplepass123") == "simplepass123"
+
+
+def test_host_credentials_inventory_password_with_hash_survives_shlex_parsing(tmp_path):
+    import shlex
+
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.11.27.147",
+                "user": "root",
+                "password": "CW@roger1117!@#",
+                "connection": "ssh",
+                "port": 22,
+            }
+        ],
+    )
+    host_line = inventory.strip().splitlines()[-1]
+    tokens = shlex.split(host_line, comments=True)
+
+    assert "ansible_password=CW@roger1117!@#" in tokens
+    # 行内 '#' 之后的连接参数不能被注释吃掉
+    assert "ansible_connection=ssh" in tokens
+
+
+def test_host_credentials_inventory_uses_configured_known_hosts_for_password_ssh(tmp_path, monkeypatch):
+    known_hosts_file = tmp_path / "known_hosts"
+    known_hosts_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", str(known_hosts_file))
+
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+                "port": 22,
+            }
+        ],
+    )
+
+    assert "StrictHostKeyChecking=yes" in inventory
+    assert f"UserKnownHostsFile={known_hosts_file}" in inventory
+    assert "StrictHostKeyChecking=no" not in inventory
+    assert "UserKnownHostsFile=/dev/null" not in inventory
+
+
+def test_host_credentials_inventory_rejects_missing_configured_known_hosts(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", str(tmp_path / "missing-known-hosts"))
+
+    with pytest.raises(ValueError, match=r"SSH_KNOWN_HOSTS_FILE.*FileNotFoundError"):
+        _build_host_credentials_inventory(
+            tmp_path,
+            [{"host": "10.0.0.8", "user": "root", "password": "credential", "connection": "ssh"}],
+        )
+
+
+def test_host_credentials_inventory_rejects_unreadable_configured_known_hosts(tmp_path, monkeypatch):
+    known_hosts_file = tmp_path / "known_hosts"
+    known_hosts_file.write_text("", encoding="utf-8")
+    original_open = type(known_hosts_file).open
+
+    def denied_open(path, *args, **kwargs):
+        if path == known_hosts_file:
+            raise PermissionError("denied by test")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", str(known_hosts_file))
+    monkeypatch.setattr(type(known_hosts_file), "open", denied_open)
+
+    with pytest.raises(ValueError, match=r"SSH_KNOWN_HOSTS_FILE.*PermissionError"):
+        _build_host_credentials_inventory(
+            tmp_path,
+            [{"host": "10.0.0.8", "user": "root", "password": "credential", "connection": "ssh"}],
+        )
+
+
+def test_host_credentials_inventory_explicit_ssh_args_override_configured_known_hosts(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", "/etc/ansible-executor/known_hosts")
+    explicit_args = "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/custom/known_hosts"
+
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+                "ssh_common_args": explicit_args,
+            }
+        ],
+    )
+
+    assert "StrictHostKeyChecking=accept-new" in inventory
+    assert "UserKnownHostsFile=/custom/known_hosts" in inventory
+    assert "UserKnownHostsFile=/etc/ansible-executor/known_hosts" not in inventory
+
+
+def test_host_credentials_inventory_warns_when_password_ssh_keeps_legacy_host_key_policy(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("SSH_KNOWN_HOSTS_FILE", raising=False)
+
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8\nforged-audit-entry",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+            },
+            {
+                "host": "10.0.0.9",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+            },
+        ],
+    )
+
+    assert "StrictHostKeyChecking=no" in inventory
+    assert "UserKnownHostsFile=/dev/null" in inventory
+    assert caplog.text.count("password SSH host key verification is disabled") == 1
+    assert "host_count=2" in caplog.text
+    assert "forged-audit-entry" not in caplog.text
+    assert "credential" not in caplog.text
+
+
+def test_host_credentials_inventory_can_disable_winrm_certificate_validation(tmp_path):
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8",
+                "user": "Administrator",
+                "password": "credential",
+                "connection": "winrm",
+                "port": 5986,
+                "winrm_scheme": "https",
+                "winrm_transport": "ntlm",
+                "winrm_cert_validation": False,
+            }
+        ],
+    )
+
+    assert "ansible_winrm_server_cert_validation=ignore" in inventory
+
+
+def test_host_credentials_inventory_sets_winrm_timeouts_and_disables_pipelining(tmp_path):
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8",
+                "user": "Administrator",
+                "password": "credential",
+                "connection": "winrm",
+                "port": 5986,
+                "winrm_scheme": "https",
+                "winrm_transport": "ntlm",
+            }
+        ],
+    )
+
+    assert "ansible_winrm_operation_timeout_sec=60" in inventory
+    assert "ansible_winrm_read_timeout_sec=70" in inventory
+    assert "ansible_winrm_connection_timeout=60" in inventory
+    assert "ansible_pipelining=False" in inventory
+
+
+def test_prepare_adhoc_execution_restricts_credential_inventory_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    _, workspace = prepare_adhoc_execution(
+        AdhocRequest(
+            host_credentials=[{"host": "10.0.0.8", "user": "Administrator", "password": "secret"}],
+            module="ping",
+            task_id="restricted-adhoc-inventory",
+        )
+    )
+
+    assert (workspace / "inventory.ini").stat().st_mode & 0o777 == 0o600
+
+
+def test_prepare_windows_powershell_execution_uses_restricted_file_and_cleanup_playbook(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    script = "Write-Output '中文'\nWrite-Output '{{ remains script text }}'"
+
+    command, workspace = prepare_windows_script_execution(
+        AdhocRequest(
+            host_credentials=[
+                {
+                    "host": "10.0.0.8",
+                    "user": "Administrator",
+                    "password": "secret",
+                    "connection": "winrm",
+                }
+            ],
+            module="win_shell",
+            module_args=script,
+            stream_remote_type="powershell",
+            task_id="windows-script-file",
+        )
+    )
+
+    script_path = workspace / "job-script.ps1"
+    assert script_path.read_bytes() == b"\xef\xbb\xbf" + script.encode("utf-8")
+    assert script_path.stat().st_mode & 0o777 == 0o600
+    assert script not in " ".join(command)
+
+    playbook_path = workspace / "playbook.yml"
+    playbook_text = playbook_path.read_text(encoding="utf-8")
+    playbook = ansible_runner.yaml.safe_load(playbook_text)
+    assert script not in playbook_text
+    assert command[command.index("playbook") + 2] == str(playbook_path)
+
+    tasks = playbook[0]["tasks"]
+    assert tasks[0]["ansible.windows.win_tempfile"] == {"state": "file", "prefix": "bklite-job-", "suffix": ".ps1"}
+    assert tasks[0]["register"] == "bklite_script_temp"
+    execution_block = tasks[1]
+    assert execution_block["block"][0]["ansible.windows.win_copy"] == {
+        "src": str(script_path),
+        "dest": "{{ bklite_script_temp.path }}",
+        "force": True,
+    }
+    assert execution_block["block"][1]["ansible.windows.win_command"]["argv"] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "{{ bklite_script_temp.path }}",
+    ]
+    assert execution_block["always"][0]["ansible.windows.win_file"] == {
+        "path": "{{ bklite_script_temp.path }}",
+        "state": "absent",
+    }
+    assert execution_block["always"][0]["when"] == "bklite_script_temp.path is defined"
+
+
+def test_prepare_windows_script_execution_rejects_more_than_512_kib_before_creating_workspace(tmp_path, monkeypatch):
+    work_dir = tmp_path / "work"
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", work_dir)
+
+    with pytest.raises(ValueError, match=r"Windows script exceeds 512 KiB limit: 524289 bytes"):
+        prepare_windows_script_execution(
+            AdhocRequest(
+                inventory="localhost,",
+                module="win_shell",
+                module_args="x" * (512 * 1024 + 1),
+                stream_remote_type="powershell",
+                task_id="oversized-windows-script",
+            )
+        )
+
+    assert not work_dir.exists()
+
+
+def test_prepare_windows_bat_execution_converts_target_encoding_before_file_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    script = "@echo off\r\necho 中文\r\nexit /b 0"
+
+    command, workspace = prepare_windows_script_execution(
+        AdhocRequest(
+            inventory="windows-host,",
+            module="win_shell",
+            module_args=script,
+            stream_remote_type="bat",
+            task_id="windows-bat-file",
+        )
+    )
+
+    script_path = workspace / "job-script.cmd"
+    assert script_path.read_bytes() == script.encode("utf-8")
+    assert script_path.stat().st_mode & 0o777 == 0o600
+    assert script not in " ".join(command)
+
+    playbook = ansible_runner.yaml.safe_load((workspace / "playbook.yml").read_text(encoding="utf-8"))
+    tasks = playbook[0]["tasks"]
+    assert tasks[0]["ansible.windows.win_tempfile"] == {"state": "file", "prefix": "bklite-job-", "suffix": ".cmd"}
+    execution_tasks = tasks[1]["block"]
+    assert execution_tasks[0]["ansible.windows.win_copy"]["src"] == str(script_path)
+    conversion = execution_tasks[1]["ansible.windows.win_powershell"]
+    assert conversion["parameters"] == {"path": "{{ bklite_script_temp.path }}"}
+    assert "[Text.Encoding]::Default" in conversion["script"]
+    assert execution_tasks[2]["ansible.windows.win_command"]["argv"] == [
+        "cmd.exe",
+        "/d",
+        "/q",
+        "/c",
+        "{{ bklite_script_temp.path }}",
+    ]
+    assert tasks[1]["always"][0]["ansible.windows.win_file"]["state"] == "absent"
+
+
+@pytest.mark.asyncio
+async def test_prepare_playbook_execution_restricts_credential_inventory_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_content="- hosts: all\n  gather_facts: false\n  tasks: []\n",
+        host_credentials=[{"host": "10.0.0.8", "user": "Administrator", "password": "secret"}],
+        task_id="restricted-playbook-inventory",
+    )
+
+    _, workspace, _ = await prepare_playbook_execution(config, request)
+
+    assert (workspace / "inventory.ini").stat().st_mode & 0o777 == 0o600

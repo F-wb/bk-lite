@@ -1,0 +1,98 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_tripplite",
+  "plugin": "NetworkService Tripp Lite UPS PDU Environmental SNMP",
+  "plugin_desc": "Tripp Lite PRODUCTS UPS SNMP collection for appliances under Tripp Lite PEN 850. The shared SNMP floor supplies MIB-II uptime and IF-MIB 64-bit HC interface traffic. This child template adds PRODUCTS battery charge percent and output-line load percent. Shared CPU, memory, fan and power-health scalars are not claimed.",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='network_service', collect_type='snmp_tripplite'}) by (instance_id)",
+  "name": "NetworkService",
+  "icon": "mm-network_service_网络服务",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='network_service'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "network_service_tripplite_battery_capacity",
+    "network_service_tripplite_output_load"
+  ],
+  "metrics": [
+    {
+      "metric_group": "NetworkService",
+      "name": "network_service_tripplite_battery_capacity",
+      "query": "avg(network_service_tripplite_battery_capacity{instance_type='network_service', __$labels__}) by (instance_id)",
+      "display_name": "Tripp Lite Battery Charge",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "PRODUCTS estimated battery charge remaining as a percent of full charge."
+    },
+    {
+      "metric_group": "NetworkService",
+      "name": "network_service_tripplite_output_load",
+      "query": "avg(network_service_tripplite_output_load{instance_type='network_service', __$labels__}) by (instance_id)",
+      "display_name": "Tripp Lite Output Load",
+      "data_type": "Number",
+      "unit": "percent",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "PRODUCTS output-line load as a percent of UPS capacity."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCInOctets",
+      "query": "rate(interface_ifHCInOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Incoming Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Average inbound interface bytes per second over five minutes from the 64-bit IF-MIB ifHCInOctets counter."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCOutOctets",
+      "query": "rate(interface_ifHCOutOctets{instance_type='network_service', __$labels__}[5m])",
+      "display_name": "Interface Outgoing Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Average outbound interface bytes per second over five minutes from the 64-bit IF-MIB ifHCOutOctets counter."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='network_service', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Device uptime since the last restart, derived from sysUpTime."
+    }
+  ]
+}

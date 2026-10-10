@@ -1,0 +1,194 @@
+# -- coding: utf-8 --
+# @File: public_enum_library.py
+# @Time: 2026/3/9
+# @Author: windyzhao
+from rest_framework import status
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+
+from apps.cmdb.models.public_enum_library import PublicEnumLibrary
+from apps.cmdb.services import public_enum_library as library_service
+from apps.cmdb.utils.base import (
+    get_current_team_from_request,
+    get_organization_and_children_ids,
+)
+from apps.core.decorators.api_permission import HasPermission
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.utils.user_group import normalize_user_group_ids
+from apps.core.utils.viewset_utils import AuthViewSet
+from apps.core.utils.web_utils import WebUtils
+
+
+class PublicEnumLibraryViewSet(AuthViewSet):
+    queryset = PublicEnumLibrary.objects.all()
+    ORGANIZATION_FIELD = "team"
+
+    def _get_user_team(self, request) -> list:
+        return normalize_user_group_ids(
+            getattr(request.user, "group_list", []) or []
+        )
+
+    def _get_editable_team_scope(self, request) -> set[str]:
+        user_team = self._get_user_team(request)
+        current_team = get_current_team_from_request(request)
+
+        if str(current_team) not in {str(team) for team in user_team}:
+            raise PermissionDenied("无权访问该团队数据")
+
+        if request.COOKIES.get("include_children") == "1":
+            team = get_organization_and_children_ids(
+                tree_data=getattr(request.user, "group_tree", []),
+                target_id=current_team,
+            )
+            return {str(team_id) for team_id in (team or [current_team])}
+
+        return {str(current_team)}
+
+    def _validate_team_scope(
+        self, request, team, *, require_all: bool = False
+    ) -> None:
+        if (
+            getattr(request.user, "is_superuser", False)
+            or not team
+            or not isinstance(team, list)
+        ):
+            return
+
+        requested_team = {str(team_id) for team_id in team}
+        editable_team = self._get_editable_team_scope(request)
+        authorized = (
+            requested_team.issubset(editable_team)
+            if require_all
+            else bool(requested_team & editable_team)
+        )
+        if not authorized:
+            raise PermissionDenied("无权修改该组织的公共选项库")
+
+    def _validate_team_update_scope(
+        self, request, existing_team, requested_team
+    ) -> None:
+        if (
+            getattr(request.user, "is_superuser", False)
+            or not isinstance(requested_team, list)
+        ):
+            return
+        if not isinstance(existing_team, list):
+            raise PermissionDenied("公共选项库组织数据非法，禁止修改")
+        if existing_team and not requested_team:
+            raise PermissionDenied("无权将组织公共选项库改为全局库")
+
+        self._validate_team_scope(request, requested_team)
+        existing_team_ids = {str(team_id) for team_id in existing_team}
+        added_team = [
+            team_id
+            for team_id in requested_team
+            if str(team_id) not in existing_team_ids
+        ]
+        self._validate_team_scope(request, added_team, require_all=True)
+
+    @HasPermission("model_management-View")
+    def list(self, request):
+        current_team = get_current_team_from_request(request, required=False)
+        include_children = request.COOKIES.get("include_children") == "1"
+
+        if current_team and include_children:
+            team = get_organization_and_children_ids(
+                tree_data=request.user.group_tree, target_id=current_team
+            )
+            if not team:
+                team = [current_team]
+        elif current_team:
+            team = [current_team]
+        else:
+            team = self._get_user_team(request)
+
+        libraries = library_service.list_libraries(team=team)
+        return WebUtils.response_success(libraries)
+
+    @HasPermission("model_management-Edit Model")
+    def create(self, request):
+        payload = request.data
+        operator = request.user.username
+        try:
+            self._validate_team_scope(
+                request, payload.get("team"), require_all=True
+            )
+            result = library_service.create_library(payload, operator)
+            return WebUtils.response_success(result)
+        except BaseAppException as e:
+            return WebUtils.response_error(
+                str(e), status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+    @HasPermission("model_management-Edit Model")
+    def update(self, request, pk: str):
+        payload = request.data
+        operator = request.user.username
+        try:
+            authorize = None
+            if not getattr(request.user, "is_superuser", False):
+
+                def authorize(library):
+                    self._validate_team_scope(request, library.team)
+                    if "team" in payload:
+                        self._validate_team_update_scope(
+                            request, library.team, payload["team"]
+                        )
+
+            result = library_service.update_library(
+                pk, payload, operator, authorize=authorize
+            )
+            return WebUtils.response_success(result)
+        except BaseAppException as e:
+            if "不存在" in e.message:
+                return WebUtils.response_error(
+                    e.message, status_code=status.HTTP_404_NOT_FOUND
+                )
+            return WebUtils.response_error(
+                e.message, status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+    @HasPermission("model_management-Delete Model")
+    def destroy(self, request, pk: str):
+        operator = request.user.username
+        try:
+            authorize = None
+            if not getattr(request.user, "is_superuser", False):
+
+                def authorize(library):
+                    self._validate_team_scope(request, library.team)
+
+            library_service.delete_library(
+                pk, operator, authorize=authorize
+            )
+            return WebUtils.response_success({"message": "删除成功"})
+        except BaseAppException as e:
+            if "不存在" in e.message:
+                return WebUtils.response_error(
+                    e.message, status_code=status.HTTP_404_NOT_FOUND
+                )
+            if e.data and "references" in e.data:
+                return WebUtils.response_error(
+                    response_data="",
+                    error_message=e.message,
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            return WebUtils.response_error(
+                e.message, status_code=status.HTTP_400_BAD_REQUEST
+            )
+
+    @HasPermission("model_management-View")
+    @action(detail=True, methods=["get"], url_path="references")
+    def references(self, request, pk: str):
+        try:
+            library_service.get_library_or_raise(pk)
+            references = library_service.find_library_references(pk)
+            return WebUtils.response_success(references)
+        except BaseAppException as e:
+            if "不存在" in e.message:
+                return WebUtils.response_error(
+                    e.message, status_code=status.HTTP_404_NOT_FOUND
+                )
+            return WebUtils.response_error(
+                e.message, status_code=status.HTTP_400_BAD_REQUEST
+            )

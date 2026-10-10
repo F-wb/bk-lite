@@ -1,0 +1,570 @@
+'use client';
+
+import React, { useCallback, useState, useMemo, useRef, useEffect, forwardRef, useImperativeHandle } from 'react';
+import {
+  ReactFlow,
+  MiniMap,
+  Controls,
+  ControlButton,
+  Background,
+  useNodesState,
+  useEdgesState,
+  addEdge,
+  Connection,
+  BackgroundVariant,
+  ReactFlowProvider,
+  ConnectionMode,
+  type NodeTypes,
+} from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+import { useTranslation } from '@/utils/i18n';
+import NodeConfigDrawer from './NodeConfigDrawer';
+import ExecuteNodeDrawer from './ExecuteNodeDrawer';
+import styles from './ChatflowEditor.module.scss';
+import type { ChatflowEditorRef, ChatflowEditorProps, ChatflowNode } from './types';
+import { isChatflowNode } from './types';
+import {
+  TimeTriggerNode,
+  NatsTriggerNode,
+  RestfulApiNode,
+  OpenAIApiNode,
+  AgentsNode,
+  AgUiNode,
+  EmbeddedChatNode,
+  HttpRequestNode,
+  IfConditionNode,
+  IntentClassificationNode,
+  NotificationNode,
+  EnterpriseWechatNode,
+  EnterpriseWechatAibotNode,
+  DingtalkNode,
+  WechatOfficialNode,
+  WebChatNode,
+  MobileNode,
+  MemoryReadNode,
+  MemoryWriteNode,
+} from './nodes';
+import { useNodeExecution } from './hooks/useNodeExecution';
+import { useNodeDeletion } from './hooks/useNodeDeletion';
+import { useNodeDrop } from './hooks/useNodeDrop';
+import { useHelperLines } from './hooks/useHelperLines';
+import { useAutoLayout } from './hooks/useAutoLayout';
+import HelperLines from './HelperLines';
+import { PartitionOutlined, LockOutlined, UnlockOutlined } from '@ant-design/icons';
+import ExecutionPreviewPanel from './ExecutionPreviewPanel';
+
+const ChatflowEditor = forwardRef<ChatflowEditorRef, ChatflowEditorProps>(({ onSave, initialData, initialExecutionId, onExecutionStateChange }, ref) => {
+  const { t } = useTranslation();
+  const reactFlowWrapper = useRef<HTMLDivElement>(null as any);
+  const [reactFlowInstance, setReactFlowInstance] = useState<any>(null);
+  const [selectedNode, setSelectedNode] = useState<ChatflowNode | null>(null);
+  const [isConfigDrawerVisible, setIsConfigDrawerVisible] = useState(false);
+  const [selectedNodes, setSelectedNodes] = useState<any[]>([]);
+  const [selectedEdges, setSelectedEdges] = useState<any[]>([]);
+  const [viewport, setViewport] = useState({ x: 0, y: 0, zoom: 0.6 });
+  const [isInitialized, setIsInitialized] = useState(false);
+  const [isInteractive, setIsInteractive] = useState(true);
+  const lastSaveData = useRef<string>('');
+  const fitViewTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const intentRefreshTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const intentRestoreTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (fitViewTimerRef.current) clearTimeout(fitViewTimerRef.current);
+      if (intentRefreshTimerRef.current) clearTimeout(intentRefreshTimerRef.current);
+      if (intentRestoreTimerRef.current) clearTimeout(intentRestoreTimerRef.current);
+    };
+  }, []);
+
+  const [nodes, setNodes] = useNodesState(
+    initialData?.nodes && Array.isArray(initialData.nodes) ? initialData.nodes : []
+  );
+  const [edges, setEdges, onEdgesChange] = useEdgesState(
+    initialData?.edges && Array.isArray(initialData.edges) ? initialData.edges : []
+  );
+
+  const { helperLines, applyHelperLines } = useHelperLines();
+  const { getLayoutedElements } = useAutoLayout();
+
+  const onNodesChange = useCallback(
+    (changes: any) => {
+      setNodes((nds) => applyHelperLines(changes, nds));
+    },
+    [setNodes, applyHelperLines]
+  );
+
+  // 使用自定义 Hooks
+  const executionProps = useNodeExecution(t, initialExecutionId);
+  const { handleDeleteNode, handleKeyDown } = useNodeDeletion({
+    setNodes,
+    setEdges,
+    setSelectedNodes,
+    setSelectedEdges,
+    setIsConfigDrawerVisible,
+    selectedNodes,
+    selectedEdges,
+    t,
+  });
+  const { onDragOver, onDrop } = useNodeDrop({
+    reactFlowInstance,
+    setNodes,
+    edges,
+    onSave,
+    t,
+  });
+
+  const decoratedNodes = useMemo(() => (
+    nodes.map((node) => {
+      const resolvedExecutionStatus = normalizeExecutionStatus(executionProps.executionStatusMap[node.id]);
+
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          executionStatus: resolvedExecutionStatus,
+          showDisconnectAction: executionProps.executeNodeId === node.id && executionProps.hasActiveExecution,
+          executionDuration: executionProps.executionDurationMap[node.id],
+        },
+      };
+    })
+  ), [nodes, executionProps.executeNodeId, executionProps.executionDurationMap, executionProps.executionStatusMap, executionProps.hasActiveExecution]);
+
+  const decoratedEdges = useMemo(() => {
+    const hasExecutionState = Object.keys(executionProps.executionStatusMap).length > 0;
+    if (!hasExecutionState) {
+      return edges;
+    }
+
+    return edges.map((edge) => {
+      const targetStatus = normalizeExecutionStatus(executionProps.executionStatusMap[edge.target]);
+      const sourceStatus = normalizeExecutionStatus(executionProps.executionStatusMap[edge.source]);
+      const edgeStatus = targetStatus || (sourceStatus === 'failed' ? 'failed' : undefined);
+
+      if (!edgeStatus) {
+        return edge;
+      }
+
+      return {
+        ...edge,
+        className: `edge-status-${edgeStatus}`,
+        animated: edgeStatus === 'running',
+      };
+    });
+  }, [edges, executionProps.executionStatusMap]);
+
+  // Auto-save
+  useEffect(() => {
+    if (!isInitialized) {
+      setIsInitialized(true);
+      return;
+    }
+
+    if (isInitialized && onSave) {
+      const currentData = JSON.stringify({
+        nodes: nodes.map(n => ({ id: n.id, type: n.type, position: n.position, data: n.data })),
+        edges: edges.map(e => ({ id: e.id, source: e.source, target: e.target }))
+      });
+
+      if (currentData !== lastSaveData.current) {
+        // 同步触发 onSave,不要 setTimeout:
+        // 之前 100ms 延迟会导致"节点配置保存后立刻发布"路径拿不到最新 workflowData,
+        // 出现应用对话列表查不到,要再点开 web 应用节点保存一次才出现的时序竞态。
+        // onSave 本身是 React setState,不卡 UI;React 事件循环内同步执行也安全。
+        lastSaveData.current = currentData;
+        onSave(nodes, edges);
+      }
+    }
+  }, [nodes, edges, onSave, isInitialized]);
+
+  const clearCanvas = useCallback(() => {
+    setNodes([]);
+    setEdges([]);
+    setSelectedNode(null);
+    setSelectedNodes([]);
+    setSelectedEdges([]);
+    setIsConfigDrawerVisible(false);
+    lastSaveData.current = JSON.stringify({ nodes: [], edges: [] });
+  }, [setNodes, setEdges]);
+
+  useImperativeHandle(ref, () => ({
+    clearCanvas,
+    openExecutionPreview: executionProps.openPreviewPanel,
+    closeExecutionPreview: executionProps.closePreviewPanel,
+  }), [clearCanvas, executionProps.closePreviewPanel, executionProps.openPreviewPanel]);
+
+  useEffect(() => {
+    onExecutionStateChange?.({
+      summary: executionProps.executionSummary,
+      previewOpen: executionProps.isPreviewOpen,
+      latestExecutionId: executionProps.latestExecutionId,
+      openPreview: executionProps.openPreviewPanel,
+      closePreview: executionProps.closePreviewPanel,
+      stopExecution: executionProps.stopExecution,
+    });
+  }, [
+    executionProps.closePreviewPanel,
+    executionProps.executionSummary,
+    executionProps.isPreviewOpen,
+    executionProps.latestExecutionId,
+    executionProps.openPreviewPanel,
+    executionProps.stopExecution,
+    onExecutionStateChange,
+  ]);
+
+  function normalizeExecutionStatus(status?: string) {
+    if (status === 'success') {
+      return 'completed';
+    }
+
+    if (status === 'fail') {
+      return 'failed';
+    }
+
+    if (status === 'pending' || status === 'running' || status === 'completed' || status === 'failed') {
+      return status;
+    }
+
+    return undefined;
+  }
+
+  const handleAutoLayout = useCallback(
+    async (direction: 'LR' | 'TB') => {
+      const { nodes: layoutedNodes } = await getLayoutedElements(nodes, edges, { direction });
+      setNodes(layoutedNodes);
+
+      if (reactFlowInstance) {
+        if (fitViewTimerRef.current) clearTimeout(fitViewTimerRef.current);
+        fitViewTimerRef.current = setTimeout(() => {
+          reactFlowInstance.fitView({ padding: 0.2, duration: 400 });
+        }, 50);
+      }
+    },
+    [nodes, edges, getLayoutedElements, setNodes, reactFlowInstance]
+  );
+
+  const handleConfigNode = useCallback((nodeId: string) => {
+    const node = nodes.find(n => n.id === nodeId);
+    if (node && isChatflowNode(node)) {
+      setSelectedNode(node);
+      setIsConfigDrawerVisible(true);
+    }
+  }, [nodes]);
+
+  const deleteNodeRef = useRef(handleDeleteNode);
+  const configNodeRef = useRef(handleConfigNode);
+
+  useEffect(() => {
+    deleteNodeRef.current = handleDeleteNode;
+  }, [handleDeleteNode]);
+
+  useEffect(() => {
+    configNodeRef.current = handleConfigNode;
+  }, [handleConfigNode]);
+
+  const nodeTypes: NodeTypes = useMemo(() => {
+    const createNodeComponent = (Component: React.ComponentType<any>) => {
+      const NodeComponentWithProps = (props: any) => (
+        <Component
+          {...props}
+          executionStatus={props.data?.executionStatus}
+          showDisconnectAction={props.data?.showDisconnectAction}
+          executionDuration={props.data?.executionDuration}
+          onDelete={(...args: unknown[]) => deleteNodeRef.current?.apply(null, args as any)}
+          onConfig={(...args: unknown[]) => configNodeRef.current?.apply(null, args as any)}
+        />
+      );
+      NodeComponentWithProps.displayName = `NodeComponent(${Component.displayName || Component.name})`;
+      return NodeComponentWithProps;
+    };
+
+    return {
+      celery: createNodeComponent(TimeTriggerNode),
+      nats: createNodeComponent(NatsTriggerNode),
+      restful: createNodeComponent(RestfulApiNode),
+      openai: createNodeComponent(OpenAIApiNode),
+      agents: createNodeComponent(AgentsNode),
+      agui: createNodeComponent(AgUiNode),
+      embedded_chat: createNodeComponent(EmbeddedChatNode),
+      web_chat: createNodeComponent(WebChatNode),
+      mobile: createNodeComponent(MobileNode),
+      condition: createNodeComponent(IfConditionNode),
+      intent_classification: createNodeComponent(IntentClassificationNode),
+      http: createNodeComponent(HttpRequestNode),
+      notification: createNodeComponent(NotificationNode),
+      enterprise_wechat: createNodeComponent(EnterpriseWechatNode),
+      enterprise_wechat_aibot: createNodeComponent(EnterpriseWechatAibotNode),
+      dingtalk: createNodeComponent(DingtalkNode),
+      wechat_official: createNodeComponent(WechatOfficialNode),
+      memory_read: createNodeComponent(MemoryReadNode),
+      memory_write: createNodeComponent(MemoryWriteNode),
+    };
+  }, []);
+
+  const onInit = useCallback((instance: any) => {
+    setReactFlowInstance(instance);
+    setViewport(instance.getViewport());
+
+    if (initialData?.nodes && initialData.nodes.length > 0) {
+      if (fitViewTimerRef.current) clearTimeout(fitViewTimerRef.current);
+      fitViewTimerRef.current = setTimeout(() => {
+        instance.fitView({ padding: 0.2, duration: 400 });
+      }, 50);
+    }
+  }, [initialData]);
+
+  const onConnect = useCallback(
+    (params: Connection) => {
+      if (!params.source || !params.target) return;
+      if (params.source === params.target) return;
+
+      setEdges((eds) => addEdge(params, eds));
+    },
+    [setEdges]
+  );
+
+  const onConnectEnd = useCallback(
+    (event: MouseEvent | TouchEvent, connectionState: any) => {
+      if (!connectionState.isValid && connectionState.fromNode && reactFlowInstance) {
+        const targetIsPane = (event.target as HTMLElement)?.classList?.contains('react-flow__pane');
+        if (targetIsPane) return;
+
+        const { clientX, clientY } = 'changedTouches' in event ? event.changedTouches[0] : event;
+        const targetNode = document.elementFromPoint(clientX, clientY)?.closest('.react-flow__node');
+
+        if (targetNode) {
+          const targetNodeId = targetNode.getAttribute('data-id');
+          const sourceNodeId = connectionState.fromNode.id;
+
+          if (targetNodeId && targetNodeId !== sourceNodeId) {
+            const targetNodeData = nodes.find(n => n.id === targetNodeId);
+            const noInputTypes = ['celery', 'nats', 'restful', 'openai', 'agui', 'embedded_chat', 'web_chat', 'mobile', 'enterprise_wechat', 'enterprise_wechat_aibot', 'dingtalk', 'wechat_official'];
+            const nodeType = targetNodeData?.data?.type as string;
+            const hasInputHandle = nodeType && !noInputTypes.includes(nodeType);
+
+            if (hasInputHandle) {
+              const newEdge: Connection = {
+                source: sourceNodeId,
+                target: targetNodeId,
+                sourceHandle: connectionState.fromHandle?.id || null,
+                targetHandle: null,
+              };
+              setEdges((eds) => addEdge(newEdge, eds));
+            }
+          }
+        }
+      }
+    },
+    [reactFlowInstance, nodes, setEdges]
+  );
+
+  const onSelectionChange = useCallback((params: { nodes: any[]; edges: any[] }) => {
+    setSelectedNodes(params.nodes);
+    setSelectedEdges(params.edges);
+  }, []);
+
+  const handleSaveConfig = useCallback((nodeId: string, values: any) => {
+    const { name, ...config } = values;
+    let isIntentClassification = false;
+
+    setNodes((nds) => {
+      const targetNode = nds.find(n => n.id === nodeId);
+      isIntentClassification = targetNode?.data.type === 'intent_classification';
+
+      const updatedNodes = nds.map((node) => {
+        if (node.id === nodeId) {
+          // 为意图分类节点添加时间戳强制更新
+          const updatedData = {
+            ...node.data,
+            label: name || node.data.label,
+            config: { ...config },
+            // 添加时间戳确保 React 检测到变化
+            ...(node.data.type === 'intent_classification' ? { _timestamp: Date.now() } : {})
+          };
+
+          return {
+            ...node,
+            data: updatedData
+          };
+        }
+        return node;
+      });
+
+      // 如果是意图分类节点，更新相关的连线
+      if (targetNode?.data.type === 'intent_classification') {
+        const newIntents = config.intents || [];
+        const validIntentNames = new Set(newIntents.map((intent: any) => intent.name));
+
+        // 先清理无效的边（移除已删除意图的连线）
+        setEdges((eds) => {
+          return eds.filter(edge => {
+            if (edge.source === nodeId && edge.sourceHandle) {
+              // 检查 sourceHandle 是否在当前的 intent names 中
+              return validIntentNames.has(edge.sourceHandle);
+            }
+            return true;
+          });
+        });
+      }
+
+      // 立即触发 onSave 回调，同步更新上层状态
+      if (onSave) {
+        onSave(updatedNodes, edges);
+      }
+
+      return updatedNodes;
+    });
+
+    // 如果是意图分类节点，强制重新挂载来刷新连接点
+    if (isIntentClassification) {
+      if (intentRefreshTimerRef.current) clearTimeout(intentRefreshTimerRef.current);
+      intentRefreshTimerRef.current = setTimeout(() => {
+        setNodes((nds) => {
+          const targetNode = nds.find(n => n.id === nodeId);
+          if (!targetNode) return nds;
+
+          const filtered = nds.filter(n => n.id !== nodeId);
+
+          if (intentRestoreTimerRef.current) clearTimeout(intentRestoreTimerRef.current);
+          intentRestoreTimerRef.current = setTimeout(() => {
+            setNodes((current) => {
+              if (current.find(n => n.id === nodeId)) {
+                return current;
+              }
+              return [...current, targetNode];
+            });
+          }, 0);
+
+          return filtered;
+        });
+      }, 50);
+    }
+
+    setIsConfigDrawerVisible(false);
+  }, [setNodes, setEdges, edges, onSave, reactFlowInstance]);
+
+  useEffect(() => {
+    const flowContainer = reactFlowWrapper.current;
+    if (flowContainer) {
+      flowContainer.tabIndex = 0;
+      flowContainer.addEventListener('keydown', handleKeyDown);
+      return () => flowContainer.removeEventListener('keydown', handleKeyDown);
+    }
+  }, [handleKeyDown]);
+
+  return (
+    <div className={styles.chatflowEditor}>
+      <div
+        className={styles.flowContainer}
+        ref={reactFlowWrapper}
+        onFocus={() => reactFlowWrapper.current?.focus()}
+        style={{ outline: 'none' }}
+      >
+        <ReactFlowProvider>
+          <ReactFlow
+            nodes={decoratedNodes}
+            edges={decoratedEdges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            onConnectEnd={onConnectEnd}
+            onInit={onInit}
+            onDrop={(e) => onDrop(e, reactFlowWrapper)}
+            onDragOver={onDragOver}
+            onSelectionChange={onSelectionChange}
+            nodeTypes={nodeTypes}
+            defaultViewport={viewport}
+            onMove={(_, newViewport) => setViewport(newViewport)}
+            minZoom={0.1}
+            maxZoom={2}
+            attributionPosition="bottom-left"
+            fitView={false}
+            fitViewOptions={{ padding: 0.2, includeHiddenNodes: false }}
+            deleteKeyCode={null}
+            selectionKeyCode={null}
+            multiSelectionKeyCode={null}
+            connectionMode={ConnectionMode.Strict}
+            nodesDraggable={isInteractive}
+            nodesConnectable={isInteractive}
+            elementsSelectable={true}
+            zoomOnScroll={isInteractive}
+            panOnScroll={isInteractive}
+            panOnDrag={isInteractive}
+            zoomOnDoubleClick={isInteractive}
+            isValidConnection={(connection) => {
+              if (!connection.source || !connection.target) return false;
+              if (connection.source === connection.target) return false;
+              return true;
+            }}
+          >
+            <MiniMap
+              nodeColor="#1890ff"
+              nodeStrokeColor="#f0f0f0"
+              nodeStrokeWidth={1}
+              maskColor="rgba(255, 255, 255, 0.8)"
+              pannable
+              zoomable
+              ariaLabel="Flowchart minimap"
+            />
+            <Controls showInteractive={false}>
+              <ControlButton
+                onClick={() => setIsInteractive(!isInteractive)}
+                title={isInteractive ? t('chatflow.lock') : t('chatflow.unlock')}
+                className={!isInteractive ? 'react-flow__controls-interactive' : ''}
+              >
+                {isInteractive ? <UnlockOutlined /> : <LockOutlined />}
+              </ControlButton>
+              <ControlButton onClick={() => handleAutoLayout('LR')} title={t('chatflow.autoLayout')}>
+                <PartitionOutlined />
+              </ControlButton>
+            </Controls>
+            <Background variant={BackgroundVariant.Dots} gap={12} size={1} />
+            <HelperLines horizontal={helperLines.horizontal} vertical={helperLines.vertical} />
+          </ReactFlow>
+        </ReactFlowProvider>
+
+        <ExecutionPreviewPanel
+          open={executionProps.isPreviewOpen}
+          loading={executionProps.executionDetailLoading}
+          title={executionProps.executeNodeName ? `${t('chatflow.preview.logTitle')} · ${executionProps.executeNodeName}` : t('chatflow.preview.logTitle')}
+          executionId={executionProps.latestExecutionId}
+          streamingContent={executionProps.streamingContent || executionProps.executeResult?.content || ''}
+          rawExecutionData={executionProps.executeResult?.rawResponse}
+          items={executionProps.executionDetails}
+          workflowNodes={nodes}
+          workflowEdges={edges}
+          activeNodeId={executionProps.activeExecutionNodeId}
+          onClose={executionProps.closePreviewPanel}
+          approvalRequests={executionProps.approvalRequests}
+          token={executionProps.token || ''}
+          onApprovalDecision={executionProps.handleApprovalDecision}
+        />
+      </div>
+
+      <NodeConfigDrawer
+        visible={isConfigDrawerVisible}
+        node={selectedNode}
+        nodes={Array.isArray(nodes) ? nodes.filter(isChatflowNode) : []}
+        onClose={() => setIsConfigDrawerVisible(false)}
+        onSave={handleSaveConfig}
+        onDelete={handleDeleteNode}
+      />
+
+      <ExecuteNodeDrawer
+        visible={executionProps.isExecuteDrawerVisible}
+        nodeName={executionProps.executeNodeName || executionProps.executeNodeId}
+        message={executionProps.executeMessage}
+        loading={executionProps.executeLoading}
+        onMessageChange={executionProps.setExecuteMessage}
+        onExecute={executionProps.handleExecuteNode}
+        onClose={executionProps.handleCloseDrawer}
+        onStop={executionProps.stopExecution}
+      />
+    </div>
+  );
+});
+
+ChatflowEditor.displayName = 'ChatflowEditor';
+
+export default ChatflowEditor;
+export type { ChatflowNodeData, ChatflowEditorRef } from './types';

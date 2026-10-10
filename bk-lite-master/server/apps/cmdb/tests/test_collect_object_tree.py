@@ -1,0 +1,366 @@
+"""CMDB 采集对象树覆盖测试。
+
+对照 specs/capabilities/legacy-prd-cmdb-资产.md·自动采集：内置采集对象树合并企业版扩展、按 model_id 查询采集元数据。
+"""
+
+import pytest
+
+from apps.cmdb.collect.extensions import CollectEnterpriseExtension
+from apps.cmdb.constants.constants import CollectDriverTypes, CollectPluginTypes
+from apps.cmdb.services.collect_object_tree import (
+    _get_enterprise_collect_obj_tree,
+    _normalize_enterprise_children,
+    _normalize_enterprise_groups,
+    get_collect_obj_tree,
+    get_collect_object_meta,
+)
+
+
+def _patch_collect_extension(monkeypatch, collect_tree):
+    """把 collect 门面打补丁为返回给定采集树（模拟企业 provider）。"""
+    monkeypatch.setattr(
+        "apps.cmdb.services.collect_object_tree.get_collect_enterprise_extension",
+        lambda: CollectEnterpriseExtension(collect_tree=collect_tree),
+    )
+
+
+# --------------------------------------------------------------------------
+# normalize helpers
+# --------------------------------------------------------------------------
+
+
+def test_normalize_groups_variants():
+    assert _normalize_enterprise_groups([]) == []
+    assert _normalize_enterprise_groups({"id": "x"}) == [{"id": "x"}]
+    assert _normalize_enterprise_groups([{"id": "x"}]) == [{"id": "x"}]
+    assert _normalize_enterprise_groups("bad") == []
+    assert _normalize_enterprise_groups(None) == []
+
+
+def test_normalize_children_variants():
+    assert _normalize_enterprise_children([]) == []
+    assert _normalize_enterprise_children({"model_id": "a"}) == [{"model_id": "a"}]
+    assert _normalize_enterprise_children([{"model_id": "a"}]) == [{"model_id": "a"}]
+    assert _normalize_enterprise_children("bad") == []
+    assert _normalize_enterprise_children(None) == []
+
+
+# --------------------------------------------------------------------------
+# _get_enterprise_collect_obj_tree
+# --------------------------------------------------------------------------
+
+
+def test_get_enterprise_collect_obj_tree_missing(monkeypatch):
+    # 门面返回空契约（模拟无企业 provider）→ 返回 []
+    _patch_collect_extension(monkeypatch, [])
+    assert _get_enterprise_collect_obj_tree() == []
+
+
+def test_get_enterprise_collect_obj_tree_present(monkeypatch):
+    _patch_collect_extension(monkeypatch, [{"id": "x"}])
+    out = _get_enterprise_collect_obj_tree()
+    assert out == [{"id": "x"}]
+
+
+# --------------------------------------------------------------------------
+# get_collect_obj_tree
+# --------------------------------------------------------------------------
+
+
+def test_get_collect_obj_tree_no_enterprise(monkeypatch):
+    _patch_collect_extension(monkeypatch, [])
+    tree = get_collect_obj_tree()
+    assert isinstance(tree, list)
+    assert len(tree) > 0
+    model_ids = {child.get("model_id") for group in tree for child in group.get("children", [])}
+    assert "sangforhci" not in model_ids
+
+
+@pytest.mark.django_db
+def test_tree_returns_actual_builtin_credential_key_and_category(monkeypatch):
+    from apps.system_mgmt.models import CredentialType
+    from apps.system_mgmt.services.credential_builtin import BUILTIN_TYPES
+
+    _patch_collect_extension(monkeypatch, [])
+    CredentialType.objects.create(key="sql", name="用户名密码", is_builtin=True, categories=["host"], fields=BUILTIN_TYPES["sql"]["fields"])
+    CredentialType.objects.create(key="ssh", name="SSH", is_builtin=True, categories=["host"], fields=BUILTIN_TYPES["ssh"]["fields"])
+    CredentialType.objects.create(key="redfish", name="custom", is_builtin=False, categories=["host"])
+    CredentialType.objects.create(key="redfish_bmc", name="Redfish", is_builtin=True, categories=["host"], fields=BUILTIN_TYPES["redfish"]["fields"])
+    tree = get_collect_obj_tree(with_credential_types=True)
+    by_id = {child["id"]: child for group in tree for child in group.get("children", [])}
+    assert by_id["host"]["credential_category"] == "host"
+    assert by_id["host"]["credential_binding"] == "host/ssh"
+    assert by_id["host"]["credential_type_keys"] == ["ssh"]
+    assert by_id["physcial_server_redfish"]["credential_type_keys"] == ["redfish_bmc"]
+    assert by_id["ip_discovery"]["credential_type_keys"] == []
+    assert by_id["ip_discovery"]["credential_binding"] is None
+
+
+@pytest.mark.django_db
+def test_all_118_tree_entries_publish_their_credential_binding():
+    tree = get_collect_obj_tree(with_credential_types=True)
+    entries = [child for group in tree for child in group.get("children", [])]
+    assert len(entries) == 118
+    assert sum(bool(child["credential_binding"]) for child in entries) == 116
+    assert {child["id"] for child in entries if not child["credential_binding"]} == {"k8s_cluster", "ip_discovery"}
+
+
+def test_get_collect_obj_tree_host_group_uses_logical_host_name(monkeypatch):
+    _patch_collect_extension(monkeypatch, [])
+    tree = get_collect_obj_tree()
+
+    host_group = next((group for group in tree if group.get("id") == "host_manage"), None)
+    assert host_group is not None
+    assert host_group["name"] == "主机逻辑主机"
+
+
+def test_get_collect_obj_tree_skips_host_objects_merged_to_host(monkeypatch):
+    _patch_collect_extension(
+        monkeypatch,
+        [
+            {
+                "id": "host_manage",
+                "children": [
+                    {"id": "aix", "model_id": "aix"},
+                    {"id": "hpux", "model_id": "hpux"},
+                    {"id": "domestic_linux", "model_id": "domestic_linux"},
+                    {"id": "server_bmc", "model_id": "server_bmc"},
+                    {"id": "hmc", "model_id": "hmc"},
+                ],
+            }
+        ],
+    )
+    tree = get_collect_obj_tree()
+
+    host_group = next(group for group in tree if group.get("id") == "host_manage")
+    model_ids = {child.get("model_id") for child in host_group.get("children", [])}
+    assert "aix" not in model_ids
+    assert "hpux" not in model_ids
+    assert "domestic_linux" not in model_ids
+    assert "server_bmc" not in model_ids
+    assert "hmc" in model_ids
+
+
+def test_get_collect_obj_tree_includes_ipam_discovery(monkeypatch):
+    _patch_collect_extension(monkeypatch, [])
+    tree = get_collect_obj_tree()
+
+    ipam = next((group for group in tree if group.get("id") == "ipam"), None)
+    assert ipam is not None
+
+    discovery = next((child for child in ipam.get("children", []) if child.get("id") == "ip_discovery"), None)
+    assert discovery is not None
+    assert discovery["model_id"] == "ip"
+    assert discovery["task_type"] == CollectPluginTypes.IP
+    assert discovery["type"] == CollectDriverTypes.PROTOCOL
+    assert discovery["encrypted_fields"] == []
+
+
+def test_get_collect_obj_tree_exposes_separate_ipmi_and_redfish_plugins(monkeypatch):
+    _patch_collect_extension(monkeypatch, [])
+    tree = get_collect_obj_tree()
+    objects = {
+        child["id"]: child
+        for group in tree
+        for child in group.get("children", [])
+        if child.get("id") in {"physcial_server_ipmi", "physcial_server_redfish"}
+    }
+
+    assert objects["physcial_server_ipmi"]["model_id"] == "physcial_server"
+    assert objects["physcial_server_ipmi"]["credential_protocol"] == "ipmi"
+    assert objects["physcial_server_ipmi"]["credential_default_port"] == 623
+    assert objects["physcial_server_redfish"] == {
+        "id": "physcial_server_redfish",
+        "supports_host_discovery": False,
+        "model_id": "physcial_server",
+        "name": "【BETA】物理服务器 Redfish",
+        "task_type": CollectPluginTypes.PROTOCOL,
+        "type": CollectDriverTypes.PROTOCOL,
+        "credential_protocol": "redfish",
+        "credential_kind": "bmc_account",
+        "credential_default_port": 443,
+        "tag": ["REDFISH", "HTTPS", "BMC"],
+        "desc": "通过 Redfish HTTPS API 采集物理服务器基础身份信息",
+        "encrypted_fields": ["password"],
+    }
+
+
+def test_simple_collect_objects_expose_real_credential_protocol(monkeypatch):
+    _patch_collect_extension(monkeypatch, [])
+    tree = get_collect_obj_tree()
+    objects = {child["model_id"]: child for group in tree for child in group.get("children", []) if child.get("model_id")}
+
+    assert {key: objects["mysql"][key] for key in ("credential_protocol", "credential_kind", "credential_default_port")} == {
+        "credential_protocol": "mysql",
+        "credential_kind": "database_account",
+        "credential_default_port": 3306,
+    }
+    assert {key: objects["postgresql"][key] for key in ("credential_protocol", "credential_kind", "credential_default_port")} == {
+        "credential_protocol": "postgresql",
+        "credential_kind": "database_account",
+        "credential_default_port": 5432,
+    }
+    assert {key: objects["mssql"][key] for key in ("credential_protocol", "credential_kind", "credential_default_port")} == {
+        "credential_protocol": "sql_server",
+        "credential_kind": "database_account",
+        "credential_default_port": 1433,
+    }
+    assert objects["host"]["task_type"] == CollectPluginTypes.HOST
+    assert objects["host"]["credential_protocol"] == "ssh"
+    assert objects["host"]["credential_kind"] == "host_account"
+    assert objects["host"]["credential_default_port"] == 22
+    assert objects["redis"]["task_type"] == CollectPluginTypes.DB
+    assert objects["redis"]["credential_protocol"] == "ssh"
+    assert (
+        objects["aliyun_account"]["credential_protocol"],
+        objects["aliyun_account"]["credential_kind"],
+    ) == ("aliyun_openapi", "access_key")
+    assert (
+        objects["qcloud"]["credential_protocol"],
+        objects["qcloud"]["credential_kind"],
+    ) == ("tencentcloud_api", "secret_id_key")
+    assert (
+        objects["hwcloud"]["credential_protocol"],
+        objects["hwcloud"]["credential_kind"],
+    ) == ("huaweicloud_sdk", "ak_sk_project")
+    assert {key: objects["fusioninsight"][key] for key in ("credential_protocol", "credential_kind", "credential_default_port")} == {
+        "credential_protocol": "fusioninsight_https",
+        "credential_kind": "http_basic_account",
+        "credential_default_port": 443,
+    }
+    assert objects["fusioninsight"]["encrypted_fields"] == [
+        "accessKey",
+        "password",
+        "accessSecret",
+    ]
+    assert {key: objects["storage"][key] for key in ("credential_protocol", "credential_kind", "credential_default_port")} == {
+        "credential_protocol": "oceanstor_https",
+        "credential_kind": "platform_api_account",
+        "credential_default_port": 8088,
+    }
+    assert {key: objects["netapp_ontap"][key] for key in ("credential_protocol", "credential_kind", "credential_default_port")} == {
+        "credential_protocol": "netapp_ontap_https",
+        "credential_kind": "platform_api_account",
+        "credential_default_port": 443,
+    }
+    assert objects["storage"]["encrypted_fields"] == [
+        "accessKey",
+        "password",
+        "accessSecret",
+    ]
+    assert {key: objects["dell_unity"][key] for key in ("credential_protocol", "credential_kind", "credential_default_port")} == {
+        "credential_protocol": "dell_unity_https",
+        "credential_kind": "platform_api_account",
+        "credential_default_port": 443,
+    }
+    assert objects["dell_unity"]["encrypted_fields"] == [
+        "accessKey",
+        "password",
+        "accessSecret",
+    ]
+    assert objects["netapp_ontap"]["encrypted_fields"] == [
+        "accessKey",
+        "password",
+        "accessSecret",
+    ]
+
+
+def test_all_builtin_job_collect_objects_declare_ssh_credential_semantics(monkeypatch):
+    _patch_collect_extension(monkeypatch, [])
+    job_objects = [child for group in get_collect_obj_tree() for child in group.get("children", []) if child.get("type") == CollectDriverTypes.JOB]
+
+    assert job_objects
+    assert {
+        child["model_id"]
+        for child in job_objects
+        if (
+            child.get("credential_protocol"),
+            child.get("credential_kind"),
+            child.get("credential_default_port"),
+        )
+        != ("ssh", "host_account", 22)
+    } == set()
+
+
+def test_get_collect_obj_tree_merge_enterprise(monkeypatch):
+    base_tree = get_collect_obj_tree()
+    category_id = base_tree[0]["id"]
+    _patch_collect_extension(
+        monkeypatch,
+        [{"id": category_id, "children": [{"model_id": "_ent_new_model", "label": "企业新增"}]}],
+    )
+    merged = get_collect_obj_tree()
+    cat = next(c for c in merged if c["id"] == category_id)
+    assert any(c.get("model_id") == "_ent_new_model" for c in cat["children"])
+
+
+def test_get_collect_obj_tree_merge_replaces_duplicate(monkeypatch):
+    base_tree = get_collect_obj_tree()
+    cat = base_tree[0]
+    if not cat.get("children"):
+        pytest.skip("base category has no children")
+    existing_model_id = cat["children"][0].get("model_id")
+    if not existing_model_id:
+        pytest.skip("first child lacks model_id")
+    _patch_collect_extension(
+        monkeypatch,
+        {"id": cat["id"], "children": {"model_id": existing_model_id, "label": "替换"}},
+    )
+    merged = get_collect_obj_tree()
+    mcat = next(c for c in merged if c["id"] == cat["id"])
+    target = next(c for c in mcat["children"] if c.get("model_id") == existing_model_id)
+    assert target["label"] == "替换"
+
+
+def test_get_collect_obj_tree_skip_invalid_enterprise(monkeypatch):
+    _patch_collect_extension(
+        monkeypatch,
+        [
+            {},  # 无 id
+            {"id": "_absent_cat"},  # 不存在的分类
+        ],
+    )
+    tree = get_collect_obj_tree()
+    assert isinstance(tree, list)
+
+
+# --------------------------------------------------------------------------
+# get_collect_object_meta
+# --------------------------------------------------------------------------
+
+
+def test_get_collect_object_meta_found():
+    tree = get_collect_obj_tree()
+    first_child = None
+    for cat in tree:
+        for child in cat.get("children", []):
+            if child.get("model_id"):
+                first_child = child
+                break
+        if first_child:
+            break
+    if not first_child:
+        pytest.skip("no child with model_id in tree")
+    meta = get_collect_object_meta(first_child["model_id"])
+    assert meta.get("model_id") == first_child["model_id"]
+
+
+def test_get_collect_object_meta_missing():
+    assert get_collect_object_meta("_unknown_xyz_") == {}
+
+
+def test_get_collect_object_meta_driver_type_fallback():
+    # 当 driver_type 不匹配但有候选 → 返回 fallback
+    tree = get_collect_obj_tree()
+    target = None
+    for cat in tree:
+        for child in cat.get("children", []):
+            if child.get("model_id"):
+                target = child
+                break
+        if target:
+            break
+    if not target:
+        pytest.skip("tree empty")
+    meta = get_collect_object_meta(target["model_id"], driver_type="_nonexistent_driver_")
+    assert meta.get("model_id") == target["model_id"]

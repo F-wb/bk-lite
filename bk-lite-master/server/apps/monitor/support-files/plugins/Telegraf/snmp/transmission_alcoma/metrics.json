@@ -1,0 +1,126 @@
+{
+  "collector": "Telegraf",
+  "collect_type": "snmp_alcoma",
+  "plugin": "Transmission Alcoma SNMP",
+  "plugin_desc": "SNMP monitoring template for Alcoma transmission device. It reports uptime, temperature, and interface traffic, for microwave radio and wireless transmission devices (enterprise PEN 12140).",
+  "support_collect_detect": true,
+  "status_query": "any({instance_type='transmission', collect_type='snmp_alcoma'}) by (instance_id)",
+  "name": "Transmission",
+  "icon": "mm-alcoma_alcoma",
+  "type": "Network Device",
+  "description": "",
+  "default_metric": "any({instance_type='transmission'}) by (instance_id)",
+  "instance_id_keys": [
+    "instance_id"
+  ],
+  "supplementary_indicators": [
+    "snmp_uptime",
+    "temperature_celsius",
+    "rx_level_db",
+    "tx_power_db",
+    "snr_db"
+  ],
+  "metrics": [
+    {
+      "metric_group": "Temperature",
+      "name": "temperature_celsius",
+      "query": "max(temperature_celsius{instance_type='transmission', __$labels__} != -1) by (instance_id)",
+      "display_name": "Temperature",
+      "data_type": "Number",
+      "unit": "celsius",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Alcoma alMP radio temperature in degrees Celsius (alMPTemperature under PEN 12140). Offline units report -1 and those samples are skipped. High values may indicate RF hardware thermal stress, high ambient temperature or overloaded hardware."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "rx_level_db",
+      "query": "max(rx_level_db{instance_type='transmission', __$labels__} != -128) by (instance_id)",
+      "display_name": "Receive Level",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Alcoma alMP receive level in dB (alMPRX-Level under PEN 12140). Offline units report -128 and those samples are skipped. A dropping receive level is an early sign of path fade, antenna misalignment or radio degradation."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "tx_power_db",
+      "query": "max(tx_power_db{instance_type='transmission', __$labels__} != -128) by (instance_id)",
+      "display_name": "Transmit Power",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Alcoma alMP transmit power in dB (alMPTX-PWR under PEN 12140). Offline units report -128 and those samples are skipped. Unexpectedly low transmit power can indicate radio mute, hardware fault or configuration change."
+    },
+    {
+      "metric_group": "Radio",
+      "name": "snr_db",
+      "query": "max(snr_db{instance_type='transmission', __$labels__}) by (instance_id)",
+      "display_name": "SNR",
+      "data_type": "Number",
+      "unit": "none",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "Optional Alcoma alMP signal-to-noise ratio in dB (alMPSNR under PEN 12140). Some firmware omits this object; missing rows are skipped. A dropping SNR is an early sign of path fade or interference."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCInOctets",
+      "query": "rate(interface_ifHCInOctets{instance_type='transmission', __$labels__}[5m])",
+      "display_name": "Interface Incoming Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the average rate of bytes received over the past 5 minutes, based on the 64-bit ifHCInOctets counter which does not wrap on high-speed interfaces."
+    },
+    {
+      "metric_group": "Traffic",
+      "name": "interface_ifHCOutOctets",
+      "query": "rate(interface_ifHCOutOctets{instance_type='transmission', __$labels__}[5m])",
+      "display_name": "Interface Outgoing Traffic Rate (HC)",
+      "data_type": "Number",
+      "unit": "byteps",
+      "dimensions": [
+        {
+          "name": "ifDescr",
+          "description": "ifDescr"
+        }
+      ],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the average rate of bytes sent over the past 5 minutes, based on the 64-bit ifHCOutOctets counter which does not wrap on high-speed interfaces."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='transmission', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
+    }
+  ]
+}

@@ -1,0 +1,243 @@
+# -- coding: utf-8 --
+# @File: util.py
+# @Time: 2025/5/14 13:44
+# @Author: windyzhao
+import base64
+import hashlib
+import json
+import os
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple
+
+from apps.cmdb.utils.credential import Credential
+from apps.core.logger import alert_logger as logger
+from cryptography.fernet import InvalidToken
+from django.utils.crypto import get_random_string
+
+DEFAULT_AGGREGATION_WINDOW_SIZE_MINUTES = 10
+MAX_AGGREGATION_WINDOW_SIZE_MINUTES = 1440
+
+
+def gen_app_secret():
+    """生成app_secret方法"""
+    return get_random_string(32)
+
+
+def build_team_secret_payload(source_secret: str, team_id: str) -> str:
+    return json.dumps(
+        {
+            "source_secret": source_secret,
+            "team_id": str(team_id),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def encode_team_secret(source_secret: str, team_id: str) -> str:
+    credential = Credential()
+    payload = build_team_secret_payload(source_secret, team_id)
+    return credential.encrypt_data(payload)
+
+
+def decode_team_secret(team_secret: str) -> Optional[Dict[str, str]]:
+    if not team_secret:
+        return None
+
+    credential = Credential()
+    try:
+        payload = credential.decrypt_data(team_secret)
+    except InvalidToken:
+        return None
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+    source_secret = data.get("source_secret")
+    team_id = data.get("team_id")
+    if not source_secret or team_id in (None, ""):
+        return None
+    return {
+        "source_secret": str(source_secret),
+        "team_id": str(team_id),
+    }
+
+
+def catch_exception(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.exception("[AlertUtil] [catch_exception] method name:%s error", func.__name__)
+
+        return None
+
+    return wrapper
+
+
+def split_list(_list, count=100):
+    n = len(_list)
+    sublists = [_list[i: i + count] for i in range(0, n, count)]
+    return sublists
+
+
+def _parse_time_to_seconds(time_str: str) -> int:
+    """解析时间字符串为秒数"""
+    if time_str.endswith('min'):
+        return int(time_str[:-3]) * 60
+    elif time_str.endswith('h'):
+        return int(time_str[:-1]) * 3600
+    elif time_str.endswith('s'):
+        return int(time_str[:-1])
+    else:
+        return int(time_str) * 60  # 默认按分钟处理
+
+
+def _parse_time_to_minutes(time_str: str) -> int:
+    """解析时间字符串为分钟数"""
+    if time_str.endswith('min'):
+        return int(time_str[:-3])
+    elif time_str.endswith('h'):
+        return int(time_str[:-1]) * 60
+    else:
+        return int(time_str)  # 默认按分钟处理
+
+
+def image_to_base64(image_path, output_format="jpeg"):
+    """
+    将图片文件转换为Base64编码字符串
+
+    参数:
+        image_path (str): 图片文件路径
+        output_format (str): 输出格式，如 "jpeg", "png", "gif" 等
+
+    返回:
+        str: 格式为 "data:image/[format];base64,[encoded data]" 的字符串
+    """
+
+    # 检查文件是否存在
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(f"图片文件不存在: {image_path}")
+
+    # 确定文件扩展名
+    ext = os.path.splitext(image_path)[1].lower().replace(".", "")
+    if not ext:
+        ext = output_format.lower()
+
+    # 读取图片文件并编码
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+
+    # 返回前端可用的Data URL
+    return f"data:image/{ext};base64,{encoded_string}"
+
+
+def generate_instance_fingerprint(event_data: Dict[str, Any], fields: List = []) -> str:
+    """
+    生成实例指纹，用于标识唯一实例
+
+    Args:
+        event_data: 事件数据
+        fields: 用于生成指纹的字段列表，默认使用['item', 'resource_id', 'resource_type', 'alert_source']
+
+    Returns:
+        32位MD5哈希字符串作为实例指纹
+    """
+    fingerprint_data = {}
+
+    if not fields:
+        fields = ['item', 'resource_id', 'resource_type', 'alert_source']
+
+    for field in fields:
+        value = event_data.get(field)
+
+        # 处理None值和空字符串
+        if value is not None and str(value).strip():
+            fingerprint_data[field] = str(value).strip()
+        else:
+            # 为空值提供默认值，确保指纹的一致性
+            fingerprint_data[field] = 'unknown'
+            logger.debug("[AlertUtil] 字段 '%s' 为空，使用 'unknown' 作为默认值", field)
+
+    # 确保字段顺序一致
+    sorted_data = json.dumps(fingerprint_data, sort_keys=True, ensure_ascii=False)
+    fingerprint = hashlib.md5(sorted_data.encode('utf-8')).hexdigest()
+
+    return fingerprint
+
+
+def str_to_md5(input_str: str, encoding: str = 'utf-8') -> str:
+    """
+    将字符串转换为MD5哈希值（32位小写）
+
+    Args:
+        input_str: 需要转换的原始字符串
+        encoding: 字符串编码格式，默认utf-8
+
+    Returns:
+        32位小写的MD5哈希字符串
+    """
+    try:
+        # 1. 将字符串转为字节（MD5处理的是字节数据）
+        byte_data = input_str.encode(encoding)
+        # 2. 创建MD5对象并更新数据
+        md5_obj = hashlib.md5()
+        md5_obj.update(byte_data)
+        # 3. 获取16进制哈希值（32位）
+        md5_hex = md5_obj.hexdigest()
+        return md5_hex
+    except UnicodeEncodeError as e:
+        logger.warning(
+            "event=string_hash_encoding_failed encoding=%s error_type=%s",
+            encoding,
+            type(e).__name__,
+        )
+        return ""
+
+def window_size_to_int(window_size: str) -> int:
+    """
+    将窗口大小字符串转换为整数分钟数
+
+    Args:
+        window_size: 窗口大小字符串，如 "5min", "1h", "30s"
+
+    Returns:
+        int: 窗口大小对应的分钟数
+    """
+    if window_size.endswith('min'):
+        return int(window_size[:-3])
+    elif window_size.endswith('h'):
+        return int(window_size[:-1]) * 60
+    elif window_size.endswith('s'):
+        seconds = int(window_size[:-1])
+        return max(1, seconds // 60)  # 秒转分钟，最少1分钟
+    else:
+        raise ValueError(f"无法解析窗口大小: {window_size}")
+
+
+def parse_aggregation_window_size(
+    window_size: Any,
+    *,
+    default: int = DEFAULT_AGGREGATION_WINDOW_SIZE_MINUTES,
+    clamp: bool = False,
+) -> Tuple[int, Optional[str]]:
+    """解析聚合窗口大小，支持校验模式和运行时兜底模式。"""
+    if window_size is None:
+        return default, None
+
+    if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size <= 0:
+        if clamp:
+            return default, f"invalid:{window_size}"
+        raise ValueError("窗口大小必须为大于 0 的整数分钟。")
+
+    if window_size > MAX_AGGREGATION_WINDOW_SIZE_MINUTES:
+        if clamp:
+            return MAX_AGGREGATION_WINDOW_SIZE_MINUTES, f"clamped:{window_size}"
+        raise ValueError(
+            f"窗口大小不能超过 {MAX_AGGREGATION_WINDOW_SIZE_MINUTES} 分钟。"
+        )
+
+    return window_size, None

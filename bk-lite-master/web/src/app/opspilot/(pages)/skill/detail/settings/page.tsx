@@ -1,0 +1,1102 @@
+'use client';
+
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { Form, Input, Select, Switch, Button, InputNumber, message, Modal, Checkbox, Space, Tooltip } from 'antd';
+import { PlusOutlined, DeleteOutlined, SendOutlined, SearchOutlined, FullscreenOutlined, FullscreenExitOutlined } from '@ant-design/icons';
+import { useTranslation } from '@/utils/i18n';
+import { useSearchParams } from 'next/navigation';
+import CustomChatSSE from '@/app/opspilot/components/custom-chat-sse';
+import CompactEmptyState from '@/components/compact-empty-state';
+import OperateModal from '@/components/operate-modal';
+import PermissionWrapper from '@/components/permission';
+import GroupTreeSelect from '@/components/group-tree-select';
+import { SkillPackage, SkillPackageParam } from '@/app/opspilot/types/skill';
+import { SelectTool } from '@/app/opspilot/types/tool';
+import SkillMemorySettingsFields, {
+  SKILL_CAPABILITY_TRAILING_SLOT_CLASS,
+} from '@/app/opspilot/components/skill/skillMemorySettingsFields';
+import ToolSelector from '@/app/opspilot/components/skill/toolSelector';
+import { useMemoryApi, WorkflowMemorySpaceOption } from '@/app/opspilot/api/memory';
+import SkillPackageParamsModal, {
+  countFilledParams,
+  listMissingRequiredParams,
+  mergeDeclaredParams,
+  resolvePackageVariables,
+  withResolvedVariables,
+} from '@/app/opspilot/components/skill/skillPackageParamsModal';
+import EditablePasswordField from '@/components/dynamic-form/editPasswordField';
+import { useSkillApi } from '@/app/opspilot/api/skill';
+import { useWikiApi } from '@/app/opspilot/api/wiki';
+import { WikiKnowledgeBase } from '@/app/opspilot/types/wiki';
+import { useSkill } from '@/app/opspilot/context/skillContext';
+import { notifyWebchatAppsChanged } from '@/app/(core)/components/global-webchat/apps-changed';
+import { filterModelOption, getModelOptionText, renderModelOptionLabel } from '@/app/opspilot/utils/modelOption';
+import {
+  buildSkillSaveTools,
+  buildStudioRuntimeTools,
+  normalizeMonitorToolConfigs,
+} from '@/app/opspilot/utils/monitorToolConfig';
+import Icon from '@/components/icon';
+import OpsPilotStudioWorkbenchSkeleton from '@/app/opspilot/components/opspilot-studio-workbench-skeleton';
+import {
+  getSkillPackageKey as getPackageKey,
+  loadSkillSettingsAuxiliary,
+  mergeSkillPackageCatalog,
+} from '@/app/opspilot/utils/skillSettingsBootstrap';
+
+const { Option } = Select;
+const { TextArea } = Input;
+
+const getPackageRequiredTools = (pkg: SkillPackage) => pkg.required_tools || [];
+
+const SkillSettingsPage: React.FC = () => {
+  const [form] = Form.useForm();
+  const { t } = useTranslation();
+  const { fetchSkillDetail, fetchLlmModels, fetchSkillPackages, saveSkillDetail } = useSkillApi();
+  const { fetchKnowledgeBases } = useWikiApi();
+  const { fetchWorkflowMemorySpaces } = useMemoryApi();
+  const { refreshSkillInfo } = useSkill();
+  const searchParams = useSearchParams();
+  const id = searchParams ? searchParams.get('id') : null;
+  // 管理组织（group 字段）当前值：自动并入使用组织、且在使用组织里锁定不可删
+  const manageGroup: number[] = Form.useWatch('group', form) || [];
+  const selectedModelId = Form.useWatch('llmModel', form);
+  const wikiKbIds = Form.useWatch('wiki_knowledge_bases', form);
+  const hasWikiKb = Array.isArray(wikiKbIds) && wikiKbIds.length > 0;
+
+  const [initialMessages] = useState<any[]>([]); // 稳定的空数组引用
+
+  const [chatHistoryEnabled, setChatHistoryEnabled] = useState(true);
+  const [llmModels, setLlmModels] = useState<{ id: number, name: string, enabled: boolean, llm_model_type: string, vendor_name?: string }[]>([]);
+  const [formDataLoading, setFormDataLoading] = useState(true);
+  const [saveLoading, setSaveLoading] = useState(false);
+  const [quantity, setQuantity] = useState<number>(10);
+  const [selectedTools, setSelectedTools] = useState<SelectTool[]>([]);
+  const [skillPermissions, setSkillPermissions] = useState<string[]>([]);
+  const [guideValue, setGuideValue] = useState<string>('');
+  const [hasInvalidParamKeys, setHasInvalidParamKeys] = useState(false);
+  const [wikiKbs, setWikiKbs] = useState<WikiKnowledgeBase[]>([]);
+  const [memorySpaces, setMemorySpaces] = useState<WorkflowMemorySpaceOption[]>([]);
+  const [memorySpacesLoading, setMemorySpacesLoading] = useState(false);
+  const [availableSkillAssets, setAvailableSkillAssets] = useState<SkillPackage[]>([]);
+  const [selectedSkillAssetKeys, setSelectedSkillAssetKeys] = useState<string[]>([]);
+  const [isSkillPickerOpen, setIsSkillPickerOpen] = useState(false);
+  const [skillPickerKeyword, setSkillPickerKeyword] = useState('');
+  const [draftSkillAssetKeys, setDraftSkillAssetKeys] = useState<string[]>([]);
+  const [skillPackageParams, setSkillPackageParams] = useState<Record<string, SkillPackageParam[]>>({});
+  const [editingSkillPackage, setEditingSkillPackage] = useState<SkillPackage | null>(null);
+  const [pendingRemoveAsset, setPendingRemoveAsset] = useState<SkillPackage | null>(null);
+  const [isTestChatFullscreen, setIsTestChatFullscreen] = useState(false);
+
+  const currentModelName = useMemo(() => {
+    if (!selectedModelId) return '';
+    const m = llmModels.find((item) => item.id === selectedModelId);
+    return m ? m.name : '';
+  }, [selectedModelId, llmModels]);
+
+  const syncSkillParamsFromPrompt = useCallback((promptText: string) => {
+    const validRegex = /\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}/g;
+    const allBracketRegex = /\{\{(.+?)\}\}/g;
+    const keysInPrompt: string[] = [];
+    let match;
+    while ((match = validRegex.exec(promptText)) !== null) {
+      if (!keysInPrompt.includes(match[1])) {
+        keysInPrompt.push(match[1]);
+      }
+    }
+    // Detect invalid keys (e.g. Chinese characters)
+    const allKeys: string[] = [];
+    while ((match = allBracketRegex.exec(promptText)) !== null) {
+      allKeys.push(match[1]);
+    }
+    setHasInvalidParamKeys(allKeys.some((k) => !/^[a-zA-Z][a-zA-Z0-9_]*$/.test(k)));
+
+    const currentParams: { key: string; value: string; type: string }[] =
+      form.getFieldValue('skill_params') || [];
+    const existingMap = new Map(currentParams.map((p) => [p.key, p]));
+    const newParams = keysInPrompt.map((k) =>
+      existingMap.get(k) || { key: k, value: '', type: 'text' }
+    );
+    form.setFieldValue('skill_params', newParams);
+  }, [form]);
+
+  useEffect(() => {
+    const fetchFormData = async () => {
+      try {
+        const data = await fetchSkillDetail(id);
+        const stockGuideZh = '您好，请问有什么可以帮助您的吗？可以点击如下问题进行快速提问。\n[问题1]\n[问题2]';
+        const stockGuideEn = 'Hello, how can I help? Click a question below.\n[Question 1]\n[Question 2]';
+        const initialGuide = t('skill.form.guideDefault', stockGuideZh);
+        const savedGuide = typeof data.guide === 'string' ? data.guide : '';
+        const guide = !savedGuide || savedGuide === stockGuideZh || savedGuide === stockGuideEn
+          ? initialGuide
+          : savedGuide;
+        const stockPromptZh = '你是关于专业机器人，请按照以下要求进行回复\n1、请根据用户的问题，从知识库检索关联的知识进行总结回复\n2、请根据用户需求，从工具中选取适当的工具进行执行\n3、回复的语句请保证准确，不要杜撰\n4、请按照要点有条理的梳理答案';
+        const stockPromptEn = 'You are a professional assistant. Reply according to these rules:\n1. For the user\'s question, retrieve related knowledge from the knowledge base and summarize the answer.\n2. Based on the user\'s need, choose and run the appropriate tool.\n3. Keep the reply accurate. Do not make things up.\n4. Organize the answer in clear points.';
+        const localizedPrompt = t('skill.form.promptDefault', stockPromptZh);
+        const savedPrompt = typeof data.skill_prompt === 'string' ? data.skill_prompt.replace(/\r\n/g, '\n') : '';
+        const prompt = !savedPrompt || savedPrompt === stockPromptZh || savedPrompt === stockPromptEn
+          ? localizedPrompt
+          : savedPrompt;
+        form.setFieldsValue({
+          name: data.name,
+          group: data.team,
+          // 空数组不能用 ?? 回退；保证管理组织至少进入使用组织
+          usage_team: (Array.isArray(data.usage_team) && data.usage_team.length > 0)
+            ? data.usage_team
+            : (data.team || []),
+          introduction: data.introduction,
+          llmModel: data.llm_model,
+          prompt,
+          guide,
+          wiki_knowledge_bases: data.wiki_knowledge_bases || [],
+          force_wiki_grounded: data.force_wiki_grounded ?? false,
+          memory_space: data.memory_space || undefined,
+          memory_write_rounds: data.memory_write_rounds ?? 10,
+          skill_params: data.skill_params || [],
+        });
+        setGuideValue(guide);
+        setChatHistoryEnabled(data.enable_conversation_history ?? true);
+        setQuantity(data.conversation_window_size ?? 10);
+        setSelectedTools(normalizeMonitorToolConfigs((data.tools || []) as SelectTool[]));
+        const packages = (data.skill_packages || []) as SkillPackage[];
+        const resolvedPackages = packages.map(withResolvedVariables);
+        setSelectedSkillAssetKeys(resolvedPackages.map(getPackageKey));
+        setAvailableSkillAssets((prev) => mergeSkillPackageCatalog(prev, resolvedPackages));
+        setSkillPackageParams(data.skill_package_params || {});
+        setSkillPermissions(data.permissions || []);
+      } catch (error) {
+        console.error(t('common.fetchFailed'), error);
+      } finally {
+        setFormDataLoading(false);
+      }
+    };
+
+    const fetchInitialData = async () => {
+      if (!id) return;
+      void fetchFormData();
+      setMemorySpacesLoading(true);
+      fetchWorkflowMemorySpaces()
+        .then((items) => setMemorySpaces(Array.isArray(items) ? items : []))
+        .catch(() => setMemorySpaces([]))
+        .finally(() => setMemorySpacesLoading(false));
+      const { llmModels: llmModelsData, skillPackages, knowledgeBases } = await loadSkillSettingsAuxiliary({
+        fetchLlmModels,
+        fetchSkillPackages: () => fetchSkillPackages({ is_enabled: 1 }),
+        fetchKnowledgeBases,
+      });
+      setLlmModels(llmModelsData as { id: number; name: string; enabled: boolean; llm_model_type: string; vendor_name?: string; }[]);
+      setAvailableSkillAssets((prev) => mergeSkillPackageCatalog(skillPackages.map(withResolvedVariables), prev));
+      setWikiKbs(knowledgeBases);
+    };
+
+    fetchInitialData();
+  }, [id]);
+
+  useEffect(() => {
+    const current = (form.getFieldValue('usage_team') || []).map(Number).filter((n: number) => !Number.isNaN(n));
+    const manage = (manageGroup || []).map(Number).filter((n: number) => !Number.isNaN(n));
+    const merged = Array.from(new Set([...manage, ...current]));
+    if (JSON.stringify(merged) !== JSON.stringify(current)) {
+      form.setFieldsValue({ usage_team: merged });
+    }
+  }, [JSON.stringify(manageGroup)]);
+
+  useEffect(() => {
+    if (!hasWikiKb && form.getFieldValue('force_wiki_grounded')) {
+      form.setFieldValue('force_wiki_grounded', false);
+    }
+  }, [form, hasWikiKb]);
+
+  useEffect(() => {
+    if (!isTestChatFullscreen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsTestChatFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isTestChatFullscreen]);
+
+  const handleSave = async () => {
+    try {
+      const values = await form.validateFields();
+      const payload = {
+        name: values.name,
+        team: values.group,
+        usage_team: values.usage_team,
+        introduction: values.introduction,
+        llm_model: values.llmModel,
+        skill_prompt: values.prompt,
+        enable_conversation_history: chatHistoryEnabled,
+        conversation_window_size: chatHistoryEnabled ? quantity : undefined,
+        temperature: 1,
+        show_think: false,
+        guide: values.guide,
+        tools: buildSkillSaveTools(selectedTools),
+        enable_suggest: false,
+        enable_query_rewrite: false,
+        skill_params: (values.skill_params || []).filter((p: any) => p && p.key),
+        wiki_knowledge_bases: values.wiki_knowledge_bases || [],
+        force_wiki_grounded: !!values.force_wiki_grounded,
+        memory_space: values.memory_space || null,
+        memory_write_rounds: values.memory_write_rounds ?? 10,
+        skill_package_params: skillPackageParams,
+        skill_packages: effectiveSkillCapabilityProfiles.map((pkg) => ({
+          id: pkg.id,
+          package_id: pkg.package_id,
+          name: pkg.name,
+          version: pkg.version,
+          description: pkg.description,
+          category: pkg.category,
+          required_tools: pkg.required_tools || [],
+          triggers: pkg.triggers || [],
+        })),
+      };
+      setSaveLoading(true);
+      await saveSkillDetail(id, payload);
+      const missingOnSave = effectiveSkillCapabilityProfiles.flatMap((pkg) =>
+        listMissingRequiredParams(pkg, skillPackageParams[pkg.package_id]).map((name) => `${pkg.display_name || pkg.name} / ${name}`)
+      );
+      if (missingOnSave.length > 0) {
+        message.warning(t('skill.skillPackageParams.saveWarning', '以下技能包缺少必填变量，运行时将不可用：{names}', { names: missingOnSave.join('；') }));
+      } else {
+        message.success(t('common.saveSuccess'));
+      }
+      refreshSkillInfo();
+      notifyWebchatAppsChanged();
+    } catch (error) {
+      console.error(t('common.saveFailed'), error);
+    } finally {
+      setSaveLoading(false);
+    }
+  };
+
+  const handleSendMessage = async (userMessage: string, currentMessages: any[] = [], userMessageObj?: any): Promise<{
+    url: string;
+    payload: any;
+    interruptRequest?: {
+      enabled: boolean;
+      url: string;
+      reason?: string;
+    };
+  } | null> => {
+    try {
+      const values = await form.validateFields();
+
+      const chatHistory = chatHistoryEnabled && quantity
+        ? currentMessages.slice(-quantity).map(msg => ({
+          message: msg.content,
+          event: msg.role
+        }))
+        : [];
+
+      // Build user_message array with images and text
+      let userMessageArray: any[];
+      if (userMessageObj?.images && userMessageObj.images.length > 0) {
+        // Format: [{"type": "image_url", "image_url": "..."}, ..., {"type": "message", "message": "..."}]
+        userMessageArray = [
+          ...userMessageObj.images.map((img: any) => ({
+            type: 'image_url',
+            image_url: img.url
+          })),
+          {
+            type: 'message',
+            message: userMessage
+          }
+        ];
+      } else {
+        // No images, just text message
+        userMessageArray = [{
+          type: 'message',
+          message: userMessage
+        }];
+      }
+
+      const payload: any = {
+        user_message: userMessageArray,
+        llm_model: values.llmModel,
+        skill_prompt: values.prompt,
+        skill_name: values.name,
+        skill_id: id,
+        enable_suggest: false,
+        enable_query_rewrite: false,
+        skill_params: (values.skill_params || []).filter((p: any) => p && p.key),
+        skill_package_params: skillPackageParams,
+        skill_packages: effectiveSkillCapabilityProfiles.map((pkg) => ({
+          id: pkg.id,
+          package_id: pkg.package_id,
+          name: pkg.name,
+          version: pkg.version,
+          description: pkg.description,
+          category: pkg.category,
+          required_tools: pkg.required_tools || [],
+          triggers: pkg.triggers || [],
+        })),
+        chat_history: chatHistory,
+        conversation_window_size: chatHistoryEnabled ? quantity : undefined,
+        temperature: 1,
+        show_think: false,
+        tools: buildStudioRuntimeTools(selectedTools),
+        skill_type: 1,
+        group: values.group?.[0],
+      };
+
+      return {
+        url: '/api/proxy/opspilot/model_provider_mgmt/llm/execute_agui/',
+        payload,
+        interruptRequest: {
+          enabled: true,
+          url: '/api/proxy/opspilot/bot_mgmt/interrupt_chat_flow_execution/',
+          reason: 'user_manual'
+        }
+      };
+    } catch (error) {
+      // Display first error message when form validation fails
+      if (error && typeof error === 'object' && 'errorFields' in error) {
+        const errorFields = (error as any).errorFields;
+        if (errorFields && errorFields.length > 0) {
+          const firstError = errorFields[0];
+          message.error(firstError.errors[0]);
+        }
+      } else {
+        message.error(t('skill.formValidationFailed'));
+      }
+      return null;
+    }
+  };
+
+  const effectiveSkillCapabilityProfiles = useMemo(() => {
+    return selectedSkillAssetKeys
+      .map((key) => availableSkillAssets.find((pkg) => getPackageKey(pkg) === key))
+      .filter((asset): asset is SkillPackage => !!asset);
+  }, [availableSkillAssets, selectedSkillAssetKeys]);
+
+  const filteredAvailableSkillAssets = useMemo(() => {
+    const keyword = skillPickerKeyword.trim().toLowerCase();
+    if (!keyword) return availableSkillAssets;
+
+    return availableSkillAssets.filter((asset) => [
+      asset.display_name || asset.name,
+      asset.name,
+      asset.category,
+      asset.description_tr || asset.description,
+      asset.package_id,
+      ...(asset.triggers || []),
+      ...getPackageRequiredTools(asset),
+    ].join(' ').toLowerCase().includes(keyword));
+  }, [availableSkillAssets, skillPickerKeyword]);
+
+  const openSkillPicker = () => {
+    setDraftSkillAssetKeys(selectedSkillAssetKeys);
+    setSkillPickerKeyword('');
+    setIsSkillPickerOpen(true);
+  };
+
+  const handleConfirmSkillPicker = () => {
+    setSelectedSkillAssetKeys(draftSkillAssetKeys);
+    // 新挂载的包立刻按声明预填空行，避免打开弹窗时看起来像「0 个内置参数」
+    setSkillPackageParams((prev) => {
+      const next = { ...prev };
+      for (const key of draftSkillAssetKeys) {
+        const pkg = availableSkillAssets.find((item) => getPackageKey(item) === key);
+        if (!pkg?.package_id) continue;
+        const existing = next[pkg.package_id];
+        if (existing && existing.length > 0) continue;
+        const declared = resolvePackageVariables(pkg);
+        if (!declared.length) continue;
+        next[pkg.package_id] = mergeDeclaredParams(withResolvedVariables(pkg), existing || []);
+      }
+      return next;
+    });
+    setIsSkillPickerOpen(false);
+  };
+
+  const handleRemoveSkillAsset = (asset: SkillPackage) => {
+    if (countFilledParams(skillPackageParams[asset.package_id]) === 0) {
+      setSelectedSkillAssetKeys((prev) => prev.filter((key) => key !== getPackageKey(asset)));
+      if (asset.package_id) {
+        setSkillPackageParams((prev) => {
+          if (!(asset.package_id in prev)) return prev;
+          const next = { ...prev };
+          delete next[asset.package_id];
+          return next;
+        });
+      }
+      return;
+    }
+    setPendingRemoveAsset(asset);
+  };
+
+  const confirmRemoveSkillAsset = (dropParams: boolean) => {
+    if (!pendingRemoveAsset) return;
+    const assetKey = getPackageKey(pendingRemoveAsset);
+    const packageId = pendingRemoveAsset.package_id;
+    setSelectedSkillAssetKeys((prev) => prev.filter((key) => key !== assetKey));
+    if (dropParams && packageId) {
+      setSkillPackageParams((prev) => {
+        const next = { ...prev };
+        delete next[packageId];
+        return next;
+      });
+    }
+    setPendingRemoveAsset(null);
+  };
+
+  const toggleDraftSkillAsset = (assetKey: string, checked: boolean) => {
+    setDraftSkillAssetKeys((prev) => {
+      if (checked) {
+        return Array.from(new Set([...prev, assetKey]));
+      }
+      return prev.filter((key) => key !== assetKey);
+    });
+  };
+
+  const renderSkillPackageSelector = () => (
+    <div className="mt-4 border-t border-[var(--color-border-1)] pt-4">
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="text-[13px] font-medium text-[var(--color-text-1)]">{t('skill.settings.skillPackageSection')}</span>
+          {effectiveSkillCapabilityProfiles.length > 0 && (
+            <span className="inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-[var(--color-count-bg)] px-1.5 text-[11px] font-medium tabular-nums leading-none text-[var(--color-count)]">
+              {effectiveSkillCapabilityProfiles.length}
+            </span>
+          )}
+        </div>
+        <Button size="small" type="link" icon={<PlusOutlined />} onClick={openSkillPicker} className="px-0 text-xs">
+          {t('skill.settings.addSkillPackage')}
+        </Button>
+      </div>
+      <p className="mb-2.5 mt-0 text-xs text-[var(--color-text-3)]">{t('skill.settings.skillPackageHint')}</p>
+      {effectiveSkillCapabilityProfiles.length === 0 ? (
+        <div className="py-1 text-xs text-[var(--color-text-4)]">
+          {t('skill.settings.skillPackageEmpty')}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-2 pt-1">
+          {effectiveSkillCapabilityProfiles.map((asset) => {
+            const resolvedAsset = withResolvedVariables(asset);
+            const assetKey = getPackageKey(resolvedAsset);
+            const params = skillPackageParams[resolvedAsset.package_id] || [];
+            const missing = listMissingRequiredParams(resolvedAsset, params);
+            const filled = countFilledParams(params);
+            const declaredCount = resolvePackageVariables(resolvedAsset).length;
+            const hasIssue = missing.length > 0;
+            const hint = declaredCount > 0
+              ? t('skill.skillPackageParams.buttonHint', '技能包声明 {declared} 项，已配置 {filled} 项', { declared: declaredCount, filled })
+              : t('skill.skillPackageParams.buttonHintCustom', '自定义变量 {filled} 项', { filled });
+            return (
+              <div
+                key={assetKey}
+                className={`flex flex-col rounded-lg p-2.5 transition-all ${
+                  hasIssue
+                    ? 'border border-orange-300 bg-orange-50/40 dark:border-orange-800 dark:bg-orange-950/20'
+                    : 'bg-[var(--color-fill-1)]/70 hover:bg-[var(--color-fill-2)]'
+                }`}
+              >
+                <div className="flex w-full items-center justify-between">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-[var(--color-bg)] text-[var(--color-primary)] shadow-2xs">
+                      <Icon type="jinengpeixun" className="text-xs" />
+                    </span>
+                    <span className="truncate text-xs font-medium text-[var(--color-text-1)]" title={resolvedAsset.display_name || resolvedAsset.name}>
+                      {resolvedAsset.display_name || resolvedAsset.name}
+                    </span>
+                  </div>
+                  <div className="ml-2 flex shrink-0 items-center gap-1">
+                    <Button
+                      type={hasIssue ? 'primary' : 'link'}
+                      danger={hasIssue}
+                      size="small"
+                      className="h-6 px-1 text-[11px]"
+                      title={hasIssue ? t('skill.skillPackageParams.missingRequired', '缺少必填变量：{names}', { names: missing.join('、') }) : hint}
+                      onClick={() => setEditingSkillPackage(resolvedAsset)}
+                    >
+                      {hasIssue
+                        ? t('skill.skillPackageParams.buttonMissing', '缺 {count} 项', { count: missing.length })
+                        : t('skill.skillPackageParams.button', '变量 {count}', { count: filled })}
+                    </Button>
+                    <DeleteOutlined
+                      className="cursor-pointer p-1 text-xs text-[var(--color-text-4)] transition-colors hover:text-red-500"
+                      onClick={() => handleRemoveSkillAsset(asset)}
+                    />
+                  </div>
+                </div>
+                {hasIssue && (
+                  <div className="mt-1 text-[11px] text-orange-600 dark:text-orange-400 truncate" title={missing.join('、')}>
+                    {t('skill.skillPackageParams.missingRequired', '缺少必填变量：{names}', { names: missing.join('、') })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderSkillPickerModal = () => (
+    <OperateModal
+      title={t('skill.settings.selectSkillPackage')}
+      open={isSkillPickerOpen}
+      onCancel={() => setIsSkillPickerOpen(false)}
+      width={720}
+      footer={
+        <div className="flex w-full items-center justify-between">
+          <div className="text-xs text-[var(--color-text-3)]">
+            {t('skill.selectedCount')}{' '}
+            <span className="font-semibold tabular-nums text-[var(--color-text-1)]">
+              {draftSkillAssetKeys.length}
+            </span>
+          </div>
+          <Space>
+            <Button onClick={() => setIsSkillPickerOpen(false)}>{t('common.cancel')}</Button>
+            <Button type="primary" onClick={handleConfirmSkillPicker}>
+              {t('skill.settings.confirmSelection')}
+            </Button>
+          </Space>
+        </div>
+      }
+    >
+      <div className="mb-3.5 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-[var(--color-text-3)]">
+            {t('skill.settings.totalItems', '共 {count} 项', { count: filteredAvailableSkillAssets.length })}
+          </span>
+          {draftSkillAssetKeys.length > 0 && (
+            <span className="inline-flex h-5 items-center rounded-full bg-[var(--color-count-bg)] px-2 text-[11px] font-medium tabular-nums text-[var(--color-count)]">
+              {t('skill.settings.selectedItems', '已选 {count} 项', { count: draftSkillAssetKeys.length })}
+            </span>
+          )}
+        </div>
+        <Input
+          allowClear
+          className="w-64"
+          placeholder={t('skill.settings.searchPlaceholder')}
+          prefix={<SearchOutlined className="text-[var(--color-text-4)]" />}
+          value={skillPickerKeyword}
+          onChange={(event) => setSkillPickerKeyword(event.target.value)}
+        />
+      </div>
+
+      {filteredAvailableSkillAssets.length === 0 ? (
+        <div className="py-8">
+          <CompactEmptyState description={t('skill.settings.noMatch')} />
+        </div>
+      ) : (
+        <div className="grid max-h-[440px] grid-cols-1 gap-3 overflow-y-auto pr-1 sm:grid-cols-2">
+          {filteredAvailableSkillAssets.map((asset) => {
+            const assetKey = getPackageKey(asset);
+            const checked = draftSkillAssetKeys.includes(assetKey);
+            return (
+              <div
+                key={assetKey}
+                role="button"
+                tabIndex={0}
+                aria-pressed={checked}
+                className={`group relative flex flex-col justify-between rounded-lg border p-3.5 cursor-pointer transition-all duration-150 select-none ${
+                  checked
+                    ? 'border-[var(--color-primary)] bg-[var(--color-primary-bg-active)]/45 shadow-2xs'
+                    : 'border-[var(--color-border-1)] bg-[var(--color-bg)] hover:border-[var(--color-primary)]/40 hover:bg-[var(--color-fill-1)]/40'
+                }`}
+                onClick={() => toggleDraftSkillAsset(assetKey, !checked)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    toggleDraftSkillAsset(assetKey, !checked);
+                  }
+                }}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--color-fill-1)] text-[var(--color-primary)] transition-colors group-hover:bg-[var(--color-fill-2)]">
+                      <Icon type="jinengpeixun" className="text-xl" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <Tooltip title={asset.display_name || asset.name}>
+                        <div className="truncate text-[13px] font-semibold leading-snug text-[var(--color-text-1)]">
+                          {asset.display_name || asset.name}
+                        </div>
+                      </Tooltip>
+                      {asset.category && (
+                        <div className="mt-0.5 truncate text-[11px] text-[var(--color-text-4)]">
+                          {asset.category}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="shrink-0 pt-0.5" onClick={(event) => event.stopPropagation()}>
+                    <Checkbox
+                      checked={checked}
+                      onChange={(event) => toggleDraftSkillAsset(assetKey, event.target.checked)}
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-2 min-h-[36px]">
+                  <p className="line-clamp-2 text-xs leading-relaxed text-[var(--color-text-3)] m-0">
+                    {asset.description_tr || asset.description || t('skill.settings.noDescription')}
+                  </p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </OperateModal>
+  );
+
+  return (
+    <div className="relative h-full min-h-0 overflow-hidden">
+      {renderSkillPickerModal()}
+      <SkillPackageParamsModal
+        open={!!editingSkillPackage}
+        pkg={editingSkillPackage}
+        items={editingSkillPackage ? (skillPackageParams[editingSkillPackage.package_id] || []) : []}
+        onCancel={() => setEditingSkillPackage(null)}
+        onOk={(nextItems) => {
+          if (editingSkillPackage?.package_id) {
+            setSkillPackageParams((prev) => ({
+              ...prev,
+              [editingSkillPackage.package_id]: nextItems,
+            }));
+          }
+          setEditingSkillPackage(null);
+        }}
+      />
+      <Modal
+        title={t('skill.skillPackageParams.removeTitle')}
+        open={!!pendingRemoveAsset}
+        onCancel={() => setPendingRemoveAsset(null)}
+        footer={[
+          <Button key="cancel" onClick={() => setPendingRemoveAsset(null)}>
+            {t('common.cancel')}
+          </Button>,
+          <Button key="keep" onClick={() => confirmRemoveSkillAsset(false)}>
+            {t('skill.skillPackageParams.removeKeep')}
+          </Button>,
+          <Button key="drop" type="primary" danger onClick={() => confirmRemoveSkillAsset(true)}>
+            {t('skill.skillPackageParams.removeDrop')}
+          </Button>,
+        ]}
+      >
+        {pendingRemoveAsset && (
+          <p>
+            {t(
+              'skill.skillPackageParams.removeContent',
+              '确认从本智能体移除 {name}？该技能包下已配置 {count} 个变量。',
+              {
+                name: pendingRemoveAsset.name,
+                count: countFilledParams(skillPackageParams[pendingRemoveAsset.package_id]),
+              },
+            )}
+          </p>
+        )}
+      </Modal>
+
+      {formDataLoading ? (
+        <OpsPilotStudioWorkbenchSkeleton />
+      ) : (
+        <div className="flex h-full min-h-0 gap-3.5">
+          {/* 左栏：配置面板 */}
+          <div className="flex w-1/2 min-h-0 flex-col h-full overflow-hidden rounded-lg border border-[var(--color-border-1)] bg-[var(--color-bg)] shadow-2xs">
+            {/* 配置面板 Header */}
+            <div className="flex h-11 shrink-0 items-center justify-between border-b border-[var(--color-border-1)] px-4 bg-[var(--color-fill-1)]/60">
+              <div className="flex items-center gap-2">
+                <Icon type="shezhi" className="text-sm text-[var(--color-primary)]" />
+                <span className="text-[13px] font-semibold text-[var(--color-text-1)]">{t('skill.settings.menu')}</span>
+              </div>
+              {id && (
+                <span className="rounded bg-[var(--color-bg)] border border-[var(--color-border-1)] px-2 py-0.5 text-xs text-[var(--color-text-3)] font-mono">
+                  ID: {id}
+                </span>
+              )}
+            </div>
+
+            {/* 配置面板表单滚动区 */}
+            <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
+              <Form
+                form={form}
+                layout="horizontal"
+                labelAlign="right"
+                labelCol={{
+                  flex: '0 0 120px',
+                  style: { width: 120, minWidth: 120, maxWidth: 120, textAlign: 'right' },
+                }}
+                wrapperCol={{ flex: 1 }}
+                colon={false}
+                className="skill-settings-form [&_.ant-form-item]:mb-3.5 text-sm"
+              >
+                {/* 1. 基本信息 */}
+                <section className="mb-6">
+                  <div className="mb-3.5 flex items-center gap-2">
+                    <span className="h-3.5 w-1 rounded-full bg-[var(--color-primary)]" />
+                    <span className="text-[13px] font-semibold text-[var(--color-text-1)]">
+                      {t('skill.information')}
+                    </span>
+                  </div>
+
+                  <Form.Item
+                    label={t('common.name')}
+                    name="name"
+                    rules={[{ required: true, message: `${t('common.input')} ${t('common.name')}` }]}
+                  >
+                    <Input placeholder={t('common.name')} />
+                  </Form.Item>
+
+                  <Form.Item
+                    label={t('skill.form.manageGroup')}
+                    name="group"
+                    rules={[{ required: true, message: `${t('common.selectMsg')}${t('skill.form.manageGroup')}` }]}
+                  >
+                    <GroupTreeSelect placeholder={`${t('common.selectMsg')}${t('skill.form.manageGroup')}`} />
+                  </Form.Item>
+
+                  <Form.Item
+                    label={t('skill.form.usageGroup')}
+                    name="usage_team"
+                    tooltip={t('skill.form.usageGroupTip')}
+                    rules={[{ required: true, message: `${t('common.selectMsg')}${t('skill.form.usageGroup')}` }]}
+                  >
+                    <GroupTreeSelect
+                      placeholder={`${t('common.selectMsg')}${t('skill.form.usageGroup')}`}
+                      lockedValues={manageGroup}
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    label={t('skill.form.introduction')}
+                    name="introduction"
+                    rules={[{ required: true, message: `${t('common.input')} ${t('skill.form.introduction')}` }]}
+                  >
+                    <TextArea rows={3} placeholder={t('skill.form.introduction')} />
+                  </Form.Item>
+                </section>
+
+                {/* 2. 模型 */}
+                <section className="mb-6 border-t border-[var(--color-border-1)] pt-5">
+                  <div className="mb-3.5 flex items-center gap-2">
+                    <span className="h-3.5 w-1 rounded-full bg-[var(--color-primary)]" />
+                    <span className="text-[13px] font-semibold text-[var(--color-text-1)]">
+                      {t('skill.form.modelSection', '模型')}
+                    </span>
+                  </div>
+
+                  <Form.Item
+                    label={t('skill.form.llmModel')}
+                    name="llmModel"
+                    rules={[{ required: true, message: `${t('common.input')} ${t('skill.form.llmModel')}` }]}
+                  >
+                    <Select
+                      showSearch
+                      placeholder={`${t('common.selectMsg')}${t('skill.form.llmModel')}`}
+                      optionFilterProp="title"
+                      filterOption={filterModelOption}
+                    >
+                      {llmModels.map(model => (
+                        <Option key={model.id} value={model.id} disabled={!model.enabled} title={getModelOptionText(model)}>
+                          {renderModelOptionLabel(model)}
+                        </Option>
+                      ))}
+                    </Select>
+                  </Form.Item>
+                </section>
+
+                {/* 3. 提示与开场 */}
+                <section className="mb-6 border-t border-[var(--color-border-1)] pt-5">
+                  <div className="mb-3.5 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="h-3.5 w-1 rounded-full bg-[var(--color-primary)]" />
+                      <span className="text-[13px] font-semibold text-[var(--color-text-1)]">
+                        {t('skill.form.promptAndOpening', '提示与开场')}
+                      </span>
+                    </div>
+                    <span className="text-xs text-[var(--color-text-3)]">
+                      {t('skill.settings.paramSyntaxHintBefore')}{' '}
+                      <code className="font-mono text-[var(--color-primary)]">{'{{param}}'}</code>{' '}
+                      {t('skill.settings.paramSyntaxHintAfter')}
+                    </span>
+                  </div>
+
+                  <Form.Item
+                    label={t('skill.form.prompt')}
+                    name="prompt"
+                    tooltip={t('skill.form.promptTip')}
+                    extra={hasInvalidParamKeys ? <span className="text-orange-500 text-xs">{t('skill.skillParams.invalidKeyWarning')}</span> : undefined}
+                    rules={[{ required: true, message: `${t('common.input')} ${t('skill.form.prompt')}` }]}
+                    className="!mb-3"
+                  >
+                    <TextArea
+                      rows={5}
+                      className="font-mono text-xs"
+                      placeholder={t('skill.settings.guidePlaceholder')}
+                      onChange={(e) => syncSkillParamsFromPrompt(e.target.value)}
+                    />
+                  </Form.Item>
+
+                  <Form.Item label={t('skill.skillParams.title')} tooltip={t('skill.skillParams.tip')} className="!mb-3">
+                    <Form.List name="skill_params">
+                      {(fields) => (
+                        <>
+                          {fields.length === 0 ? (
+                            <div className="py-2 text-xs text-[var(--color-text-4)]">
+                              {t('skill.skillParams.emptyHint')}（{t('skill.skillParams.emptyExample')}）
+                            </div>
+                          ) : (
+                            <div className="space-y-2 pt-1">
+                              {fields.map(({ key, name, ...restField }) => (
+                                <div key={key} className="flex items-center gap-2 rounded-lg bg-[var(--color-fill-1)]/50 p-2">
+                                  <Form.Item
+                                    {...restField}
+                                    name={[name, 'key']}
+                                    className="!mb-0 w-32 shrink-0"
+                                    rules={[{ required: true, message: t('skill.skillParams.paramNamePlaceholder') }]}
+                                  >
+                                    <Input placeholder={t('skill.skillParams.paramNamePlaceholder')} disabled className="text-xs font-mono" />
+                                  </Form.Item>
+                                  <Form.Item
+                                    noStyle
+                                    shouldUpdate={(prev, cur) =>
+                                      prev?.skill_params?.[name]?.type !== cur?.skill_params?.[name]?.type
+                                    }
+                                  >
+                                    {() => {
+                                      const paramType = form.getFieldValue(['skill_params', name, 'type']) || 'text';
+                                      return (
+                                        <Form.Item
+                                          {...restField}
+                                          name={[name, 'value']}
+                                          className="!mb-0 flex-1"
+                                        >
+                                          {paramType === 'password' ? (
+                                            <EditablePasswordField
+                                              size="middle"
+                                              placeholder={t('skill.skillParams.paramValuePlaceholder')}
+                                            />
+                                          ) : (
+                                            <Input placeholder={t('skill.skillParams.paramValuePlaceholder')} className="text-xs" />
+                                          )}
+                                        </Form.Item>
+                                      );
+                                    }}
+                                  </Form.Item>
+                                  <Form.Item
+                                    {...restField}
+                                    name={[name, 'type']}
+                                    className="!mb-0 w-24 shrink-0"
+                                    initialValue="text"
+                                  >
+                                    <Select
+                                      size="middle"
+                                      onChange={() => {
+                                        form.setFieldValue(['skill_params', name, 'value'], '');
+                                      }}
+                                    >
+                                      <Option value="text">{t('skill.skillParams.text')}</Option>
+                                      <Option value="password">{t('skill.skillParams.password')}</Option>
+                                    </Select>
+                                  </Form.Item>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </Form.List>
+                  </Form.Item>
+
+                  <Form.Item
+                    label={t('skill.form.guide')}
+                    name="guide"
+                    tooltip={
+                      <>
+                        <div className="text-red-500 text-xs mt-1">{t('skill.form.guideNotSupportedInExternalApp')}</div>
+                        <div>{t('skill.form.guideTip')}</div>
+                      </>
+                    }
+                    extra={<span className="text-xs text-[var(--color-text-3)]">{t('skill.settings.guideExtra')}</span>}
+                    className="!mb-0"
+                  >
+                    <TextArea
+                      rows={3}
+                      className="text-xs font-mono"
+                      placeholder={t('skill.settings.guidePlaceholder')}
+                      onChange={(e) => setGuideValue(e.target.value)}
+                    />
+                  </Form.Item>
+                </section>
+
+                {/* 4. 能力拓展 */}
+                <section className="border-t border-[var(--color-border-1)] pt-5">
+                  <div className="mb-3.5 flex items-center gap-2">
+                    <span className="h-3.5 w-1 rounded-full bg-[var(--color-primary)]" />
+                    <span className="text-[13px] font-semibold text-[var(--color-text-1)]">
+                      {t('skill.capabilityExpand', '能力拓展')}
+                    </span>
+                  </div>
+
+                  <Form.Item label={t('wiki.title')} className="!mb-3.5">
+                    <div className="flex items-center gap-2">
+                      <Form.Item name="wiki_knowledge_bases" noStyle>
+                        <Select
+                          mode="multiple"
+                          allowClear
+                          showSearch
+                          optionFilterProp="label"
+                          placeholder={t('wiki.title')}
+                          className="min-w-0 flex-1"
+                          options={wikiKbs.map((kb) => ({ value: kb.id, label: kb.name }))}
+                        />
+                      </Form.Item>
+                      <div className={SKILL_CAPABILITY_TRAILING_SLOT_CLASS}>
+                        <Form.Item name="force_wiki_grounded" valuePropName="checked" noStyle>
+                          <Switch
+                            size="small"
+                            disabled={!hasWikiKb}
+                          />
+                        </Form.Item>
+                        <span
+                          className={`text-xs select-none ${
+                            hasWikiKb
+                              ? 'cursor-pointer text-[var(--color-text-2)] hover:text-[var(--color-text-1)]'
+                              : 'cursor-not-allowed text-[var(--color-text-4)]'
+                          }`}
+                          onClick={() => {
+                            if (hasWikiKb) {
+                              form.setFieldValue(
+                                'force_wiki_grounded',
+                                !form.getFieldValue('force_wiki_grounded')
+                              );
+                            }
+                          }}
+                        >
+                          {t('skill.form.forceWikiGrounded')}
+                        </span>
+                      </div>
+                    </div>
+                  </Form.Item>
+
+                  <SkillMemorySettingsFields spaces={memorySpaces} loading={memorySpacesLoading} />
+
+                  <Form.Item
+                    label={t('skill.chatHistory')}
+                    tooltip={t('skill.chatHistoryTip')}
+                    className="!mb-3.5"
+                  >
+                    <div className="flex h-8 items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <Switch
+                          size="small"
+                          checked={chatHistoryEnabled}
+                          onChange={setChatHistoryEnabled}
+                        />
+                        {chatHistoryEnabled ? (
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs text-[var(--color-text-3)]">
+                              {t('skill.chatHistoryEnabledPrefix')}
+                            </span>
+                            <InputNumber
+                              min={1}
+                              max={100}
+                              size="small"
+                              className="w-16"
+                              value={quantity}
+                              onChange={(value) => setQuantity(value ?? 1)}
+                            />
+                            <span className="text-xs text-[var(--color-text-3)]">
+                              {t('skill.chatHistoryEnabledSuffix')}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="text-xs text-[var(--color-text-4)]">
+                            {t('skill.chatHistoryDisabledHint')}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </Form.Item>
+
+                  {renderSkillPackageSelector()}
+
+                  <div className="mt-4 border-t border-[var(--color-border-1)] pt-4">
+                    <ToolSelector defaultTools={selectedTools} onChange={setSelectedTools} />
+                  </div>
+                </section>
+              </Form>
+            </div>
+
+            {/* 配置面板底部 Sticky Action Bar */}
+            <div className="flex h-12 shrink-0 items-center justify-between border-t border-[var(--color-border-1)] bg-[var(--color-bg)] px-5">
+              <span className="text-xs text-[var(--color-text-4)]">
+                {t('skill.settings.applyHint')}
+              </span>
+              <PermissionWrapper requiredPermissions={['Edit']} instPermissions={skillPermissions}>
+                <Button type="primary" onClick={handleSave} loading={saveLoading}>
+                  {t('common.save')}
+                </Button>
+              </PermissionWrapper>
+            </div>
+          </div>
+
+          {/* 右栏：调试与预览面板 */}
+          <div
+            className={
+              isTestChatFullscreen
+                ? 'fixed inset-0 z-[9999] bg-[var(--color-bg)] p-2.5'
+                : 'flex h-full min-h-0 w-1/2 flex-col'
+            }
+          >
+            <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-[var(--color-border-1)] bg-[var(--color-bg)] shadow-2xs">
+              {/* 调试面板 Header */}
+              <div className="flex h-11 shrink-0 items-center justify-between border-b border-[var(--color-border-1)] px-4 bg-[var(--color-fill-1)]/60">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-5 w-5 items-center justify-center rounded bg-[var(--color-primary)] text-white shadow-2xs">
+                    <SendOutlined className="text-[10px]" />
+                  </span>
+                  <span className="text-[13px] font-semibold text-[var(--color-text-1)]">{t('chat.test')}</span>
+                  {currentModelName && (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--color-bg)] px-2.5 py-0.5 text-xs text-[var(--color-text-2)] font-mono border border-[var(--color-border-1)] shadow-2xs">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      {currentModelName}
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="rounded bg-[var(--color-bg)] border border-[var(--color-border-1)] px-2 py-0.5 text-[11px] text-[var(--color-text-3)]">
+                    {t('skill.settings.testEnv')}
+                  </span>
+                  <Tooltip title={isTestChatFullscreen ? t('common.exitFullscreen') : t('common.fullscreen')}>
+                    <button
+                      type="button"
+                      className="flex h-7 w-7 items-center justify-center rounded text-[var(--color-text-3)] transition-colors hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)]"
+                      onClick={() => setIsTestChatFullscreen((prev) => !prev)}
+                      aria-label={isTestChatFullscreen ? t('common.exitFullscreen') : t('common.fullscreen')}
+                    >
+                      {isTestChatFullscreen ? <FullscreenExitOutlined /> : <FullscreenOutlined />}
+                    </button>
+                  </Tooltip>
+                </div>
+              </div>
+
+              {/* 调试面板 Chat 内容区 */}
+              <div className="flex-1 min-h-0 overflow-hidden bg-[var(--color-bg)]">
+                <CustomChatSSE
+                  showHeader={false}
+                  handleSendMessage={handleSendMessage}
+                  guide={guideValue}
+                  useAGUIProtocol={true}
+                  initialMessages={initialMessages}
+                  removePendingBotMessageOnCancel={true}
+                  conversationHistoryEnabled={chatHistoryEnabled}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default SkillSettingsPage;

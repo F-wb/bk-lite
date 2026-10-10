@@ -1,0 +1,764 @@
+"""MLflow 工具类 - 异常检测."""
+
+from typing import Any, Dict, List, Optional, Union, cast
+
+import mlflow
+import mlflow.pyfunc
+from loguru import logger
+import math
+import pandas as pd
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from numpy.typing import NDArray
+
+from .plotting import pelt as _pelt_plotting
+from .plotting import ecod as _ecod_plotting
+from .plotting.common import save_and_log_figure
+
+# 跨平台中文字体配置
+matplotlib.rc("font", family=["WenQuanYi Zen Hei", "sans-serif"])
+plt.rcParams["axes.unicode_minus"] = False
+
+
+class MLFlowUtils:
+    """MLflow 工具类 - 异常检测专用."""
+
+    @staticmethod
+    def setup_experiment(tracking_uri: Optional[str], experiment_name: str):
+        """
+        设置 MLflow 实验.
+
+        Args:
+            tracking_uri: MLflow tracking 服务地址，如果为 None 则使用本地文件系统
+            experiment_name: 实验名称
+        """
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+            logger.info(f"MLflow 跟踪地址: {tracking_uri}")
+        else:
+            mlflow.set_tracking_uri("file:./mlruns")
+            logger.info("MLflow 跟踪地址: file:./mlruns")
+
+        mlflow.set_experiment(experiment_name)
+        logger.info(f"MLflow 实验: {experiment_name}")
+
+    @staticmethod
+    def load_model(model_name: str, model_version: str = "latest"):
+        """
+        从 MLflow 加载模型.
+
+        Args:
+            model_name: 模型名称
+            model_version: 模型版本，默认为 "latest"
+
+        Returns:
+            加载的模型对象
+        """
+        model_uri = f"models:/{model_name}/{model_version}"
+        logger.info(f"从以下位置加载模型: {model_uri}")
+        return mlflow.pyfunc.load_model(model_uri)
+
+    @staticmethod
+    def flatten_dict(
+        d: Dict[str, Any], parent_key: str = "", sep: str = "."
+    ) -> Dict[str, Any]:
+        """
+        递归展平嵌套字典.
+
+        用于将多层嵌套的配置字典展平为单层字典，以便记录到 MLflow。
+
+        Args:
+            d: 待展平的字典
+            parent_key: 父级键名（递归时使用）
+            sep: 键名分隔符（默认为 "."）
+
+        Returns:
+            展平后的字典
+
+        Examples:
+            >>> config = {
+            ...     "hyperparams": {
+            ...         "search_space": {
+            ...             "contamination": [0.35, 0.37, 0.39]
+            ...         },
+            ...         "max_evals": 50
+            ...     }
+            ... }
+            >>> MLFlowUtils.flatten_dict(config)
+            {
+                "hyperparams.search_space.contamination": [0.35, 0.37, 0.39],
+                "hyperparams.max_evals": 50
+            }
+        """
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+
+            if isinstance(v, dict):
+                # 递归展平嵌套字典
+                items.extend(MLFlowUtils.flatten_dict(v, new_key, sep=sep).items())
+            else:
+                # 叶子节点（保留原始类型：int, float, bool, str, list, tuple）
+                items.append((new_key, v))
+
+        return dict(items)
+
+    @staticmethod
+    def log_params_batch(params: Dict[str, Any]):
+        """
+        批量记录参数到 MLflow.
+
+        Args:
+            params: 参数字典（可包含嵌套结构，建议先用 flatten_dict 展平）
+        """
+        if params:
+            # 过滤掉不支持的参数类型
+            valid_params = {}
+            for k, v in params.items():
+                if isinstance(v, (str, int, float, bool)):
+                    valid_params[k] = v
+                elif isinstance(v, (list, tuple)):
+                    str_v = str(v)
+                    if len(str_v) <= 500:  # MLflow 参数值长度限制
+                        valid_params[k] = str_v
+                    else:
+                        logger.warning(
+                            f"参数 {k} 过长 ({len(str_v)} 字符)，已截断前500字符"
+                        )
+                        valid_params[k] = str_v[:497] + "..."
+                else:
+                    logger.warning(f"跳过不支持类型 {type(v)} 的参数 {k}")
+
+            mlflow.log_params(valid_params)
+            logger.debug(f"已记录 {len(valid_params)} 个参数")
+
+    @staticmethod
+    def filter_numeric_metrics(
+        metrics: Dict[str, Any], keys: Optional[List[str]] = None
+    ) -> Dict[str, float]:
+        """筛选有限数值指标。"""
+        filtered_metrics: Dict[str, float] = {}
+        items = (
+            ((key, metrics.get(key)) for key in keys)
+            if keys is not None
+            else metrics.items()
+        )
+
+        for key, value in items:
+            if key is None or str(key).startswith("_"):
+                continue
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                filtered_metrics[str(key)] = float(value)
+
+        return filtered_metrics
+
+    @staticmethod
+    def format_metrics_for_log(
+        metrics: Dict[str, Any], keys: Optional[List[str]] = None
+    ) -> str:
+        """将指标字典格式化为便于日志打印的字符串。"""
+        filtered_metrics = MLFlowUtils.filter_numeric_metrics(metrics, keys)
+        return ", ".join(
+            f"{key}={value:.4f}" for key, value in filtered_metrics.items()
+        )
+
+    @staticmethod
+    def log_metrics_batch(
+        metrics: Dict[str, float], prefix: str = "", step: Optional[int] = None
+    ):
+        """
+        批量记录指标到 MLflow.
+
+        Args:
+            metrics: 指标字典
+            prefix: 指标名称前缀，如 "train_", "val_", "test_"
+            step: 记录步骤（用于时间序列指标）
+        """
+        if metrics:
+            filtered_metrics = MLFlowUtils.filter_numeric_metrics(metrics)
+            prefixed_metrics = {
+                f"{prefix}{key}": value for key, value in filtered_metrics.items()
+            }
+
+            if step is not None:
+                for key, value in prefixed_metrics.items():
+                    mlflow.log_metric(key, value, step=step)
+            else:
+                mlflow.log_metrics(prefixed_metrics)
+
+            logger.debug(f"已记录 {len(prefixed_metrics)} 个指标 (前缀={prefix})")
+
+    @staticmethod
+    def log_artifact(local_path: str, artifact_path: Optional[str] = None):
+        """
+        记录文件到 MLflow.
+
+        Args:
+            local_path: 本地文件路径
+            artifact_path: MLflow 中的artifact路径
+        """
+        mlflow.log_artifact(local_path, artifact_path)
+        logger.debug(f"已记录 artifact: {local_path}")
+
+    # ------------------------------------------------------------------
+    # 通用绘图方法（尚未拆出，保留在此）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def plot_anomaly_detection_results(
+        timestamps: Union[pd.DatetimeIndex, NDArray[Any]],
+        values: NDArray[Any],
+        predictions: NDArray[Any],
+        scores: NDArray[Any],
+        true_labels: Optional[NDArray[Any]] = None,
+        threshold: Optional[float] = None,
+        title: str = "异常检测结果",
+        artifact_name: str = "anomaly_detection_plot",
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> str:
+        """
+        绘制异常检测结果图并上传到 MLflow
+
+        Args:
+            timestamps: 时间戳索引
+            values: 原始数值
+            predictions: 预测标签 (0=正常, 1=异常)
+            scores: 异常分数
+            true_labels: 真实标签（可选）
+            threshold: 异常阈值
+            title: 图表标题
+            artifact_name: 保存的文件名
+            metrics: 评估指标字典（可选）
+
+        Returns:
+            保存的图片路径
+        """
+        fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+        # 准备索引
+        if isinstance(timestamps, pd.DatetimeIndex):
+            index = timestamps
+        else:
+            index = range(len(values))
+
+        # 上图: 原始数据 + 异常标记
+        ax1 = axes[0]
+
+        # 绘制原始数据
+        ax1.plot(
+            index, values, color="#2E86AB", linewidth=1.5, alpha=0.8, label="原始数据"
+        )
+
+        # 标记预测的异常点
+        anomaly_mask = predictions == 1
+        if anomaly_mask.any():
+            ax1.scatter(
+                index[anomaly_mask],
+                values[anomaly_mask],
+                color="#F24236",
+                s=80,
+                marker="o",
+                label="检测到的异常",
+                zorder=5,
+                alpha=0.8,
+            )
+
+        # 如果有真实标签，标记真实异常点
+        if true_labels is not None:
+            true_anomaly_mask = true_labels == 1
+            if true_anomaly_mask.any():
+                ax1.scatter(
+                    index[true_anomaly_mask],
+                    values[true_anomaly_mask],
+                    color="#06A77D",
+                    s=50,
+                    marker="x",
+                    label="真实异常",
+                    zorder=4,
+                    alpha=0.8,
+                    linewidths=2,
+                )
+
+        ax1.set_title(f"{title} - 数据视图", fontsize=12, fontweight="bold")
+        ax1.set_xlabel("时间", fontsize=10)
+        ax1.set_ylabel("数值", fontsize=10)
+        ax1.legend(loc="best", framealpha=0.9, fontsize=9)
+        ax1.grid(True, alpha=0.3, linestyle="--")
+
+        # 下图: 异常分数
+        ax2 = axes[1]
+
+        # 绘制异常分数
+        ax2.plot(
+            index, scores, color="#9D4EDD", linewidth=1.5, alpha=0.8, label="异常分数"
+        )
+
+        # 绘制阈值线
+        if threshold is not None:
+            ax2.axhline(
+                y=threshold,
+                color="#F24236",
+                linestyle="--",
+                linewidth=2,
+                label=f"阈值={threshold:.3f}",
+                alpha=0.8,
+            )
+
+        # 填充异常区域
+        if anomaly_mask.any():
+            # 创建异常区域的mask
+            ax2.fill_between(
+                index,
+                0,
+                scores.max(),
+                where=anomaly_mask,
+                color="#F24236",
+                alpha=0.2,
+                label="异常区域",
+            )
+
+        ax2.set_title("异常分数时间序列", fontsize=12, fontweight="bold")
+        ax2.set_xlabel("时间", fontsize=10)
+        ax2.set_ylabel("异常分数", fontsize=10)
+        ax2.legend(loc="best", framealpha=0.9, fontsize=9)
+        ax2.grid(True, alpha=0.3, linestyle="--")
+
+        # 如果有评估指标，添加文本框
+        if metrics:
+            # 过滤掉内部数据
+            display_metrics = {
+                k: v
+                for k, v in metrics.items()
+                if not k.startswith("_") and isinstance(v, (int, float))
+            }
+            metrics_text = "\n".join(
+                [f"{k}: {v:.4f}" for k, v in display_metrics.items()]
+            )
+            ax1.text(
+                0.02,
+                0.98,
+                metrics_text,
+                transform=ax1.transAxes,
+                fontsize=9,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+            )
+
+        plt.tight_layout()
+        return save_and_log_figure(artifact_name, "异常检测结果图已上传到 MLflow")
+
+    @staticmethod
+    def plot_confusion_matrix(
+        confusion_matrix: NDArray[Any],
+        title: str = "混淆矩阵",
+        artifact_name: str = "confusion_matrix",
+    ) -> str:
+        """
+        绘制混淆矩阵热力图
+
+        Args:
+            confusion_matrix: 混淆矩阵 [[TN, FP], [FN, TP]]
+            title: 图表标题
+            artifact_name: 保存的文件名
+
+        Returns:
+            保存的图片路径
+        """
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # 绘制热力图
+        im = ax.imshow(confusion_matrix, interpolation="nearest", cmap="Blues")
+        ax.figure.colorbar(im, ax=ax)
+
+        # 设置标签
+        classes = ["正常", "异常"]
+        ax.set(
+            xticks=np.arange(confusion_matrix.shape[1]),
+            yticks=np.arange(confusion_matrix.shape[0]),
+            xticklabels=classes,
+            yticklabels=classes,
+            title=title,
+            ylabel="真实标签",
+            xlabel="预测标签",
+        )
+
+        # 旋转标签
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+        # 在每个单元格中显示数值
+        fmt = "d"
+        thresh = confusion_matrix.max() / 2.0
+        for i in range(confusion_matrix.shape[0]):
+            for j in range(confusion_matrix.shape[1]):
+                ax.text(
+                    j,
+                    i,
+                    format(confusion_matrix[i, j], fmt),
+                    ha="center",
+                    va="center",
+                    color="white" if confusion_matrix[i, j] > thresh else "black",
+                    fontsize=14,
+                    fontweight="bold",
+                )
+
+        plt.tight_layout()
+        return save_and_log_figure(artifact_name, "混淆矩阵已上传到 MLflow")
+
+    @staticmethod
+    def plot_score_distribution(
+        normal_scores: NDArray[Any],
+        anomaly_scores: NDArray[Any],
+        threshold: float,
+        title: str = "异常分数分布",
+        artifact_name: str = "score_distribution",
+    ) -> str:
+        """
+        绘制正常样本和异常样本的分数分布对比
+
+        Args:
+            normal_scores: 正常样本的异常分数
+            anomaly_scores: 异常样本的异常分数
+            threshold: 异常阈值
+            title: 图表标题
+            artifact_name: 保存的文件名
+
+        Returns:
+            保存的图片路径
+        """
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # 绘制直方图
+        ax.hist(
+            normal_scores,
+            bins=50,
+            alpha=0.6,
+            color="#2E86AB",
+            label=f"正常样本 (n={len(normal_scores)})",
+            edgecolor="black",
+        )
+        ax.hist(
+            anomaly_scores,
+            bins=50,
+            alpha=0.6,
+            color="#F24236",
+            label=f"异常样本 (n={len(anomaly_scores)})",
+            edgecolor="black",
+        )
+
+        # 绘制阈值线
+        ax.axvline(
+            x=threshold,
+            color="green",
+            linestyle="--",
+            linewidth=2,
+            label=f"阈值={threshold:.3f}",
+        )
+
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.set_xlabel("异常分数", fontsize=10)
+        ax.set_ylabel("频数", fontsize=10)
+        ax.legend(loc="best", framealpha=0.9)
+        ax.grid(True, alpha=0.3, axis="y")
+
+        plt.tight_layout()
+        return save_and_log_figure(artifact_name, "分数分布图已上传到 MLflow")
+
+    @staticmethod
+    def plot_roc_curve(
+        y_true: NDArray[Any],
+        y_scores: NDArray[Any],
+        title: str = "ROC 曲线",
+        artifact_name: str = "roc_curve",
+    ) -> str:
+        """
+        绘制 ROC 曲线（Receiver Operating Characteristic）
+
+        ROC 曲线展示了不同阈值下，模型的真正例率（TPR）vs 假正例率（FPR）的关系。
+        适合用于整体性能评估和类别相对平衡的场景。
+
+        Args:
+            y_true: 真实标签 (0=正常, 1=异常)
+            y_scores: 异常分数（模型输出的概率或分数）
+            title: 图表标题
+            artifact_name: 保存的文件名（不含扩展名）
+
+        Returns:
+            保存的图片路径
+
+        注意:
+            - AUC = 1.0: 完美模型
+            - AUC = 0.5: 随机猜测（无区分能力）
+            - AUC > 0.9: 优秀
+            - AUC > 0.8: 良好
+            - AUC > 0.7: 可接受
+        """
+        from sklearn.metrics import roc_curve, auc
+
+        # 计算 ROC 曲线
+        fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+        roc_auc = auc(fpr, tpr)
+
+        # 绘图
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # ROC 曲线
+        ax.plot(
+            fpr,
+            tpr,
+            color="#F24236",
+            linewidth=2.5,
+            label=f"ROC 曲线 (AUC = {roc_auc:.3f})",
+        )
+
+        # 随机猜测基准线（对角线）
+        ax.plot(
+            [0, 1],
+            [0, 1],
+            color="gray",
+            linestyle="--",
+            linewidth=1.5,
+            label="随机猜测 (AUC = 0.5)",
+        )
+
+        # 样式设置
+        ax.set_xlim((0.0, 1.0))
+        ax.set_ylim((0.0, 1.05))
+        ax.set_xlabel("假正例率 (FPR)", fontsize=11)
+        ax.set_ylabel("真正例率 (TPR / Recall)", fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.legend(loc="lower right", framealpha=0.9, fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # ROC 方法需要额外记录 AUC 指标，不能直接用 save_and_log_figure
+        img_path = f"{artifact_name}.png"
+        plt.savefig(img_path, dpi=150, bbox_inches="tight")
+
+        if mlflow.active_run():
+            mlflow.log_artifact(img_path)
+            mlflow.log_metric(f"{artifact_name}_auc", float(roc_auc))
+            logger.info(f"ROC 曲线已上传到 MLflow: {img_path}, AUC={roc_auc:.3f}")
+
+            try:
+                import os
+
+                os.remove(img_path)
+            except Exception as e:
+                logger.warning(f"删除临时文件失败: {img_path}, 错误: {e}")
+
+        plt.close()
+
+        return img_path
+
+    @staticmethod
+    def plot_precision_recall_curve(
+        y_true: NDArray[Any],
+        y_scores: NDArray[Any],
+        title: str = "Precision-Recall 曲线",
+        artifact_name: str = "pr_curve",
+    ) -> str:
+        """
+        绘制 Precision-Recall 曲线（推荐用于异常检测）
+
+        PR 曲线展示了不同阈值下，模型的精确率（Precision）vs 召回率（Recall）的关系。
+        特别适合类别不平衡的场景（如异常检测中异常样本很少），更能反映少数类的性能。
+
+        Args:
+            y_true: 真实标签 (0=正常, 1=异常)
+            y_scores: 异常分数（模型输出的概率或分数）
+            title: 图表标题
+            artifact_name: 保存的文件名（不含扩展名）
+
+        Returns:
+            保存的图片路径
+
+        注意:
+            - AP (Average Precision): PR 曲线下的面积，越高越好
+            - 比 ROC 更适合不平衡数据（异常检测的常态）
+            - 基准线 = 数据集中的异常率（而非 0.5）
+
+        权衡关系:
+            - 高 Precision, 低 Recall: 保守策略（少误报，多漏报）
+            - 低 Precision, 高 Recall: 激进策略（少漏报，多误报）
+        """
+        from sklearn.metrics import precision_recall_curve, average_precision_score
+
+        # 计算 PR 曲线
+        precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+        ap = average_precision_score(y_true, y_scores)
+
+        # 计算基准线（随机猜测 = 数据集中的异常率）
+        baseline = float(y_true.sum() / len(y_true))
+
+        # 绘图
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # PR 曲线
+        ax.plot(
+            recall,
+            precision,
+            color="#06A77D",
+            linewidth=2.5,
+            label=f"PR 曲线 (AP = {ap:.3f})",
+        )
+
+        # 随机猜测基准线（水平线，值为异常率）
+        ax.axhline(
+            y=baseline,
+            color="gray",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"随机猜测 (异常率 = {baseline:.2%})",
+        )
+
+        # 样式设置
+        ax.set_xlim((0.0, 1.0))
+        ax.set_ylim((0.0, 1.05))
+        ax.set_xlabel("召回率 (Recall)", fontsize=11)
+        ax.set_ylabel("精确率 (Precision)", fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.legend(loc="best", framealpha=0.9, fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # PR 方法需要额外记录 AP/baseline 指标，不能直接用 save_and_log_figure
+        img_path = f"{artifact_name}.png"
+        plt.savefig(img_path, dpi=150, bbox_inches="tight")
+
+        if mlflow.active_run():
+            mlflow.log_artifact(img_path)
+            mlflow.log_metric(f"{artifact_name}_ap", float(ap))
+            mlflow.log_metric(f"{artifact_name}_baseline", baseline)
+            logger.info(f"PR 曲线已上传到 MLflow: {img_path}, AP={ap:.3f}")
+
+            try:
+                import os
+
+                os.remove(img_path)
+            except Exception as e:
+                logger.warning(f"删除临时文件失败: {img_path}, 错误: {e}")
+
+        plt.close()
+
+        return img_path
+
+    # ------------------------------------------------------------------
+    # PELT 专属绘图门面（实现已迁移到 plotting.pelt）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def plot_pelt_changepoint_results(
+        timestamps: Union[pd.DatetimeIndex, NDArray[Any]],
+        values: NDArray[Any],
+        changepoints: NDArray[Any],
+        predictions: NDArray[Any],
+        true_labels: Optional[NDArray[Any]] = None,
+        event_window: int = 1,
+        title: str = "PELT 变点检测结果",
+        artifact_name: str = "pelt_changepoint_plot",
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> str:
+        """绘制 PELT 专属变点/事件窗口图并上传到 MLflow."""
+        return _pelt_plotting.plot_pelt_changepoint_results(
+            timestamps=timestamps,
+            values=values,
+            changepoints=changepoints,
+            predictions=predictions,
+            true_labels=true_labels,
+            event_window=event_window,
+            title=title,
+            artifact_name=artifact_name,
+            metrics=metrics,
+        )
+
+    @staticmethod
+    def plot_pelt_changepoint_alignment(
+        timestamps: Union[pd.DatetimeIndex, NDArray[Any]],
+        values: NDArray[Any],
+        changepoints: NDArray[Any],
+        true_labels: NDArray[Any],
+        tolerance: int,
+        title: str = "PELT 变点对齐分析",
+        artifact_name: str = "pelt_changepoint_alignment",
+    ) -> str:
+        """绘制 PELT 预测变点与真实变点窗口的对齐图."""
+        return _pelt_plotting.plot_pelt_changepoint_alignment(
+            timestamps=timestamps,
+            values=values,
+            changepoints=changepoints,
+            true_labels=true_labels,
+            tolerance=tolerance,
+            title=title,
+            artifact_name=artifact_name,
+        )
+
+    @staticmethod
+    def plot_pelt_hyperopt_trajectory(
+        trial_history: List[Dict[str, Any]],
+        title: str = "PELT 超参数搜索轨迹",
+        artifact_name: str = "pelt_hyperopt_trajectory",
+    ) -> str:
+        """绘制 PELT 超参数搜索得分轨迹图."""
+        return _pelt_plotting.plot_pelt_hyperopt_trajectory(
+            trial_history=trial_history,
+            title=title,
+            artifact_name=artifact_name,
+        )
+
+    @staticmethod
+    def plot_pelt_pen_score_changepoints(
+        trial_history: List[Dict[str, Any]],
+        title: str = "PELT pen-score-num_changepoints 关系图",
+        artifact_name: str = "pelt_pen_score_num_changepoints",
+    ) -> str:
+        """绘制 pen、score 与变点数量之间的关系图."""
+        return _pelt_plotting.plot_pelt_pen_score_changepoints(
+            trial_history=trial_history,
+            title=title,
+            artifact_name=artifact_name,
+        )
+
+    # ------------------------------------------------------------------
+    # ECOD 专属绘图门面（实现已迁移到 plotting.ecod）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def plot_ecod_decomposition(
+        model,
+        X: pd.DataFrame,
+        feature_names: List[str],
+        sample_indices: Optional[List[int]] = None,
+        top_n: int = 10,
+        title: str = "ECOD 异常分数分解",
+        artifact_name: str = "ecod_decomposition",
+    ) -> str:
+        """
+        绘制 ECOD 异常分数分解图
+
+        展示左尾（值过小）和右尾（值过大）的异常贡献，
+        以及每个特征对异常分数的贡献度。
+
+        Args:
+            model: 训练好的 PyOD ECOD 模型实例 (需要已调用fit)
+            X: 特征数据 DataFrame
+            feature_names: 特征名称列表
+            sample_indices: 要展示的样本索引列表，默认展示异常分数最高的top_n个
+            top_n: 当sample_indices为None时，展示异常分数最高的N个样本
+            title: 图表标题
+            artifact_name: 保存的文件名
+
+        Returns:
+            保存的图片路径
+        """
+        return _ecod_plotting.plot_ecod_decomposition(
+            model=model,
+            X=X,
+            feature_names=feature_names,
+            sample_indices=sample_indices,
+            top_n=top_n,
+            title=title,
+            artifact_name=artifact_name,
+        )

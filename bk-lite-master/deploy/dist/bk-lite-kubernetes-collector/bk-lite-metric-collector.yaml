@@ -1,0 +1,774 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bk-lite-collector
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cadvisor
+  namespace: bk-lite-collector
+  annotations:
+    seccomp.security.alpha.kubernetes.io/pod: 'docker/default'
+spec:
+  selector:
+    matchLabels:
+      name: cadvisor
+  template:
+    metadata:
+      labels:
+        name: cadvisor
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '8080'
+        prometheus.io/path: '/metrics'
+    spec:
+      serviceAccountName: cadvisor
+      # 默认容忍 control-plane/master 污点：控制平面节点也需要节点级采集；
+      # 如需覆盖其他带自定义污点的节点，请在此追加精确容忍项（禁止无 key 的通配容忍）
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+      - name: cadvisor
+        image: bk-lite.tencentcloudcr.com/bklite/cadvisor:0.56.2
+        resources:
+          requests:
+            memory: 400Mi
+            cpu: 400m
+          limits:
+            memory: 2000Mi
+            cpu: 800m
+        args:
+          - --housekeeping_interval=10s
+          - --docker_only
+          - --store_container_labels=false
+          - --whitelisted_container_labels=io.kubernetes.container.name,io.kubernetes.pod.name,io.kubernetes.pod.namespace
+          # 监控链路只消费 cpu/内存/磁盘IO/网络四类指标，关闭其余采集组
+          # （尤其 disk 用量统计开销大），降低 cadvisor 自身资源占用
+          - --enable_metrics=cpu,diskIO,memory,network
+        volumeMounts:
+          - name: rootfs
+            mountPath: /rootfs
+            readOnly: true
+          - name: var-run
+            mountPath: /var/run
+            readOnly: true
+          - name: sys
+            mountPath: /sys
+            readOnly: true
+          - name: docker
+            mountPath: /var/lib/docker
+            readOnly: true
+          - name: disk
+            mountPath: /dev/disk
+            readOnly: true
+        ports:
+          - name: http
+            containerPort: 8080
+            protocol: TCP
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: rootfs
+        hostPath:
+          path: /
+      - name: var-run
+        hostPath:
+          path: /var/run
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: docker
+        hostPath:
+          path: /var/lib/docker
+      - name: disk
+        hostPath:
+          path: /dev/disk
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: telegraf-daemonset
+  namespace: bk-lite-collector
+spec:
+  selector:
+    matchLabels:
+      app: telegraf-daemonset
+  template:
+    metadata:
+      labels:
+        app: telegraf-daemonset
+    spec:
+      # 默认容忍 control-plane/master 污点：控制平面节点也需要节点级采集；
+      # 如需覆盖其他带自定义污点的节点，请在此追加精确容忍项（禁止无 key 的通配容忍）
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: telegraf
+          image: bk-lite.tencentcloudcr.com/bklite/telegraf:1.29.5
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+          envFrom:
+            - secretRef:
+                name: bk-lite-monitor-config-secret
+          env:
+            - name: HOST_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: telegraf-config-volume
+              mountPath: /etc/telegraf/telegraf.conf
+              subPath: telegraf.conf
+            - name: nats-ca-cert
+              mountPath: /etc/nats_ca.crt
+              subPath: ca.crt
+      volumes:
+        - name: telegraf-config-volume
+          configMap:
+            name: telegraf-daemonset-config
+        - name: nats-ca-cert
+          secret:
+            secretName: bk-lite-monitor-config-secret
+            items:
+              - key: ca.crt
+                path: ca.crt
+              
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: bk-lite-collector
+  labels:
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/name: kube-state-metrics
+    app.kubernetes.io/version: 2.13.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: exporter
+        app.kubernetes.io/name: kube-state-metrics
+        app.kubernetes.io/version: 2.13.0
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '8080'
+        prometheus.io/path: '/metrics'        
+    spec:
+      automountServiceAccountToken: true
+      containers:
+      - name: kube-state-metrics
+        image: bk-lite.tencentcloudcr.com/bklite/kube-state-metrics:2.13.0
+        resources:
+          requests:
+            memory: 64Mi
+            cpu: 50m
+          limits:
+            memory: 256Mi
+            cpu: 200m
+        args:
+          # 注意：本 KSM 与 agents/webhookd/bk-lite-resource-collector.yaml、
+          # agents/webhookd/bk-lite-metric-collector.yaml 的 KSM 是同名共享实例
+          # （bk-lite-collector/kube-state-metrics），同集群任意组合共装时后 apply 者覆盖
+          # 先 apply 者，因此三份文件的 args 必须逐字一致——取两条链路消费指标的并集
+          # （监控 metrics.json/web dashboard 17 个 + CMDB collection/constants.py 23 个，
+          # 重叠 6 个）；各链路的精确过滤在采集侧（vmagent keep / telegraf fieldpass）
+          - '--resources=cronjobs,daemonsets,deployments,jobs,namespaces,nodes,pods,replicasets,statefulsets'
+          - '--metric-allowlist=kube_cronjob_annotations,kube_cronjob_info,kube_daemonset_annotations,kube_daemonset_created,kube_daemonset_status_desired_number_scheduled,kube_daemonset_status_number_available,kube_daemonset_status_number_unavailable,kube_deployment_annotations,kube_deployment_created,kube_deployment_spec_replicas,kube_deployment_status_replicas_available,kube_deployment_status_replicas_unavailable,kube_job_annotations,kube_job_info,kube_namespace_labels,kube_node_info,kube_node_role,kube_node_status_allocatable,kube_node_status_capacity,kube_node_status_condition,kube_pod_container_resource_limits,kube_pod_container_resource_requests,kube_pod_container_status_restarts_total,kube_pod_container_status_waiting_reason,kube_pod_info,kube_pod_status_phase,kube_replicaset_annotations,kube_replicaset_created,kube_replicaset_owner,kube_replicaset_spec_replicas,kube_statefulset_annotations,kube_statefulset_created,kube_statefulset_replicas,kube_statefulset_status_replicas_ready'
+          # annotations 仅 CMDB 解析 last-applied-configuration 一个 key
+          - '--metric-annotations-allowlist=cronjobs=[kubectl.kubernetes.io/last-applied-configuration],daemonsets=[kubectl.kubernetes.io/last-applied-configuration],deployments=[kubectl.kubernetes.io/last-applied-configuration],jobs=[kubectl.kubernetes.io/last-applied-configuration],replicasets=[kubectl.kubernetes.io/last-applied-configuration],statefulsets=[kubectl.kubernetes.io/last-applied-configuration]'
+          # KSM 2.13 在 labels allowlist 为空时 kube_namespace_labels 整族不输出任何样本
+          # （internal/store/namespace.go），而 CMDB namespace 发现依赖该指标，必须保留
+          - '--metric-labels-allowlist=namespaces=[*]'
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: http-metrics
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        ports:
+        - containerPort: 8080
+          name: http-metrics
+        - containerPort: 8081
+          name: telemetry
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: telemetry
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          seccompProfile:
+            type: RuntimeDefault
+      nodeSelector:
+        kubernetes.io/os: linux
+      serviceAccountName: kube-state-metrics
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegraf-deployment
+  namespace: bk-lite-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telegraf
+  template:
+    metadata:
+      labels:
+        app: telegraf
+    spec:    
+      containers:
+        - name: telegraf
+          image: bk-lite.tencentcloudcr.com/bklite/telegraf:1.29.5
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+          envFrom:
+            - secretRef:
+                name: bk-lite-monitor-config-secret
+          env: 
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName      
+          ports:
+            - containerPort: 9090                      
+          volumeMounts:
+            - name: telegraf-config-volume
+              mountPath: /etc/telegraf/telegraf.conf
+              subPath: telegraf.conf
+            - name: nats-ca-cert
+              mountPath: /etc/nats_ca.crt
+              subPath: ca.crt
+      volumes:
+        - name: telegraf-config-volume
+          configMap:
+            name: telegraf-config
+        - name: nats-ca-cert
+          secret:
+            secretName: bk-lite-monitor-config-secret
+            items:
+              - key: ca.crt
+                path: ca.crt
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmagent
+  namespace: bk-lite-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vmagent
+  template:
+    metadata:
+      labels:
+        app: vmagent
+    spec:
+      serviceAccountName: vmagent    
+      containers:
+        - name: vmagent
+          image: bk-lite.tencentcloudcr.com/bklite/vmagent
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+          args:
+            - "--promscrape.config=/etc/prometheus/prometheus.yml"
+            - "--remoteWrite.url=http://telegraf:9090/receive"
+          envFrom:
+            - secretRef:
+                name: bk-lite-monitor-config-secret
+          volumeMounts:
+            - name: vmagent-config-volume
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml        
+      volumes:
+        - name: vmagent-config-volume
+          configMap:
+            name: vmagent-config
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bk-lite-kube-state-metrics
+  labels:
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/name: kube-state-metrics
+    app.kubernetes.io/version: 2.13.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bk-lite-kube-state-metrics
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: bk-lite-collector
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bk-lite-kube-state-metrics
+  labels:
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/name: kube-state-metrics
+    app.kubernetes.io/version: 2.13.0
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  - nodes
+  - pods
+  - services
+  - serviceaccounts
+  - resourcequotas
+  - replicationcontrollers
+  - limitranges
+  - persistentvolumeclaims
+  - persistentvolumes
+  - namespaces
+  - endpoints
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  - daemonsets
+  - deployments
+  - replicasets
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - certificatesigningrequests
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  - volumeattachments
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - mutatingwebhookconfigurations
+  - validatingwebhookconfigurations
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  - ingressclasses
+  - ingresses
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterrolebindings
+  - clusterroles
+  - rolebindings
+  - roles
+  verbs:
+  - list
+  - watch
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: bk-lite-collector
+  labels:
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/name: kube-state-metrics
+    app.kubernetes.io/version: 2.13.0
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vmagent
+  namespace: bk-lite-collector
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bk-lite-vmagent
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+  - namespaces
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bk-lite-vmagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bk-lite-vmagent
+subjects:
+- kind: ServiceAccount
+  name: vmagent
+  namespace: bk-lite-collector
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cadvisor
+  namespace: bk-lite-collector
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: bk-lite-collector
+  labels:
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/name: kube-state-metrics
+    app.kubernetes.io/version: 2.13.0
+spec:
+  clusterIP: None
+  ports:
+  - name: http-metrics
+    port: 8080
+    targetPort: http-metrics
+  - name: telemetry
+    port: 8081
+    targetPort: telemetry
+  selector:
+    app.kubernetes.io/name: kube-state-metrics
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telegraf
+  namespace: bk-lite-collector
+spec:
+  selector:
+    app: telegraf
+  ports:
+    - protocol: TCP
+      port: 9090
+      targetPort: 9090
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cadvisor
+  namespace: bk-lite-collector
+spec:
+  selector:
+    name: cadvisor
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: telegraf-config
+  namespace: bk-lite-collector
+data:
+  telegraf.conf: |
+    [global_tags]
+
+    [agent]
+      interval = "60s"
+      round_interval = true
+      metric_buffer_limit = 100000
+      flush_buffer_when_full = true
+      collection_jitter = "0s"
+      flush_interval = "5s"
+      flush_jitter = "0s"
+      debug = false
+      quiet = false
+      hostname = "${CLUSTER_NAME:-k8s-bklite-cluster}"
+
+    [[inputs.http_listener_v2]]
+      service_address = ":9090"
+      paths = ["/receive"]
+      data_format = "prometheusremotewrite"
+      
+    [[outputs.nats]]
+      servers = ["${NATS_URL:-nats://nats:4222}"]
+      username = "${NATS_USERNAME:-username}"
+      password = "${NATS_PASSWORD:-password}"
+      subject = "metrics.cloud"
+      data_format = "influx"
+      secure = true
+      insecure_skip_verify = false
+      tls_ca = "/etc/nats_ca.crt"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vmagent-config
+  namespace: bk-lite-collector
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 60s
+    scrape_configs:
+      - job_name: 'kubernetes-cadvisor'
+        kubernetes_sd_configs:
+        - role: pod
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_name]
+          action: keep
+          regex: cadvisor
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          target_label: __address__
+          regex: ([^:]+)(?::\d+)?;(\\d+)
+          replacement: $1:$2
+        - source_labels: [__meta_kubernetes_pod_node_name]
+          action: replace
+          target_label: node
+        - target_label: instance_id
+          replacement: "%{CLUSTER_NAME}"
+        - target_label: instance_type
+          replacement: k8s
+        - target_label: instance_name
+          replacement: "%{CLUSTER_NAME}"
+        metric_relabel_configs:
+        # 监控链路（metrics.json 与 web k8s dashboard）只消费以下 6 个指标族，
+        # 其余全部丢弃；新增图表指标时需同步扩充此清单
+        - source_labels: [__name__]
+          action: keep
+          regex: container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_fs_reads_total|container_fs_writes_total|container_network_receive_bytes_total|container_network_transmit_bytes_total
+        - source_labels: [container_label_io_kubernetes_pod_name]
+          target_label: pod
+          regex: (.+)
+          action: replace
+        - source_labels: [container_label_io_kubernetes_pod_namespace]
+          target_label: namespace
+          regex: (.+)
+          action: replace
+        # id(cgroup 路径)/name/image 超长且无查询消费；docker label 已复制为 pod/namespace
+        - regex: id|name|image|container_label_io_kubernetes_pod_name|container_label_io_kubernetes_pod_namespace
+          action: labeldrop
+      - job_name: 'kubernetes-kube-state-metrics'
+        kubernetes_sd_configs:
+        - role: pod
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          action: keep
+          regex: kube-state-metrics
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          target_label: __address__
+          regex: ([^:]+)(?::\d+)?;(\\d+)
+          replacement: $1:$2
+        - target_label: instance_id
+          replacement: "%{CLUSTER_NAME}"
+        - target_label: instance_type
+          replacement: k8s
+        - target_label: instance_name
+          replacement: "%{CLUSTER_NAME}"
+        metric_relabel_configs:
+        # KSM 实例暴露的是两条链路的并集，监控链路只消费以下 17 个指标
+        # （metrics.json 与 web k8s dashboard），其余（CMDB 专属的 annotations/
+        # created/owner 等）丢弃；新增图表指标时需同步扩充此清单
+        - source_labels: [__name__]
+          action: keep
+          regex: kube_daemonset_status_desired_number_scheduled|kube_daemonset_status_number_available|kube_daemonset_status_number_unavailable|kube_deployment_spec_replicas|kube_deployment_status_replicas_available|kube_deployment_status_replicas_unavailable|kube_node_info|kube_node_status_allocatable|kube_node_status_condition|kube_pod_container_resource_limits|kube_pod_container_resource_requests|kube_pod_container_status_restarts_total|kube_pod_container_status_waiting_reason|kube_pod_info|kube_pod_status_phase|kube_statefulset_replicas|kube_statefulset_status_replicas_ready
+        # 监控链路只按 instance_id/node/pod/namespace/container/phase/reason/
+        # condition/status/resource 及工作负载名聚合，其余维度未被任何查询消费，
+        # 抓取时丢弃以削减传输与存储
+        # pod_ip/internal_ip 保留供 Pod/Node 列表 IP 展示列读取；host_ip 为 Pod 宿主机 IP，仍丢弃
+        - regex: uid|unit|created_by_kind|created_by_name|host_ip|host_network|priority_class|os_image|kernel_version|kubelet_version|container_runtime_version|kubeproxy_version|pod_cidr|system_uuid|provider_id
+          action: labeldrop
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: telegraf-daemonset-config
+  namespace: bk-lite-collector
+data:
+  telegraf.conf: |
+    [global_tags]
+      agent_id="$HOST_NODE_NAME"
+      instance_id="$HOST_NODE_NAME"
+  
+    [agent]
+      interval = "60s"
+      round_interval = true
+      metric_batch_size = 1000
+      metric_buffer_limit = 10000
+      collection_jitter = "0s"
+      flush_interval = "30s"
+      flush_jitter = "0s"
+      precision = "0s"
+      hostname = "$HOST_NODE_NAME"
+      omit_hostname = false
+      
+
+    [[outputs.http]]
+    url = "http://telegraf:9090/receive"
+    method = "POST"
+    data_format = "prometheusremotewrite"
+    [outputs.http.headers]
+      Content-Type  = "application/x-protobuf"
+      Content-Encoding = "snappy"
+      X-Prometheus-Remote-Write-Version = "0.1.0"
+
+    [[inputs.cpu]]
+      percpu = true
+      totalcpu = true
+      collect_cpu_time = false
+      report_active = false
+      core_tags = false
+      tags = { "instance_name"="$HOST_NODE_NAME","node"="$HOST_NODE_NAME","instance_type"="k8s","instance_id"="${CLUSTER_NAME:-k8s-lite-cluster}"  }
+
+    [[inputs.disk]]
+      ignore_fs = ["tmpfs", "devtmpfs", "devfs", "iso9660", "overlay", "aufs", "squashfs"]
+      tags = { "instance_name"="$HOST_NODE_NAME","node"="$HOST_NODE_NAME","instance_type"="k8s","instance_id"="${CLUSTER_NAME:-k8s-lite-cluster}"  }
+
+    [[inputs.diskio]]
+      tags = { "instance_name"="$HOST_NODE_NAME","node"="$HOST_NODE_NAME","instance_type"="k8s","instance_id"="${CLUSTER_NAME:-k8s-lite-cluster}"  }
+
+    [[inputs.mem]]
+      tags = { "instance_name"="$HOST_NODE_NAME","node"="$HOST_NODE_NAME","instance_type"="k8s","instance_id"="${CLUSTER_NAME:-k8s-lite-cluster}"  }
+
+    [[inputs.net]]
+      tags = { "instance_name"="$HOST_NODE_NAME","node"="$HOST_NODE_NAME","instance_type"="k8s","instance_id"="${CLUSTER_NAME:-k8s-lite-cluster}"  }
+
+    [[inputs.processes]]
+      tags = { "instance_name"="$HOST_NODE_NAME","node"="$HOST_NODE_NAME","instance_type"="k8s","instance_id"="${CLUSTER_NAME:-k8s-lite-cluster}"  }
+
+    [[inputs.system]]
+      tags = { "instance_name"="$HOST_NODE_NAME","node"="$HOST_NODE_NAME","instance_type"="k8s","instance_id"="${CLUSTER_NAME:-k8s-lite-cluster}"  }  

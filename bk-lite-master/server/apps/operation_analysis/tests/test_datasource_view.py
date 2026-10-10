@@ -1,0 +1,1313 @@
+import json
+import logging
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+from django.http import Http404
+from rest_framework import status
+from rest_framework.test import APIRequestFactory, force_authenticate
+
+from apps.operation_analysis.common.datasource_security import LEGACY_RAW_MONITOR_QUERY_ERROR
+from apps.operation_analysis.services.datasource_preview.base import PreviewResult
+from apps.operation_analysis.views import datasource_view
+from apps.operation_analysis.views.datasource_view import _resolve_request_params
+
+
+def _build_request(user, data=None):
+    factory = APIRequestFactory()
+    request = factory.post(
+        "/operation_analysis/api/data_source/get_source_data/1/",
+        data=data or {},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    request.COOKIES["include_children"] = "0"
+    force_authenticate(request, user=user)
+    return request
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_datasource_create_rejects_raw_monitor_query_route(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    factory = APIRequestFactory()
+    request = factory.post(
+        "/operation_analysis/api/data_source/",
+        data={
+            "name": "未授权监控裸查询",
+            "rest_api": "monitor/mm_query",
+            "source_type": "nats",
+            "connection_config": {},
+            "query_config": {},
+            "params": [],
+            "chart_type": ["line"],
+            "field_schema": [],
+            "groups": [1],
+            "namespaces": [],
+            "tag": [],
+        },
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "create"})(request)
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.data["rest_api"] == [LEGACY_RAW_MONITOR_QUERY_ERROR]
+    assert not DataSourceAPIModel.objects.filter(rest_api="monitor/mm_query").exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_existing_raw_monitor_query_datasource_is_not_executable(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"query": "up"})
+
+    response, _payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": [{"name": "up", "value": 1}], "message": ""},
+        rest_api="monitor/mm_query",
+        params=[{"name": "query", "type": "string", "value": "", "filterType": "params"}],
+    )
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.data["detail"] == LEGACY_RAW_MONITOR_QUERY_ERROR
+    assert captured == {}
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("method", "action"),
+    [("put", "update"), ("patch", "partial_update"), ("delete", "destroy")],
+)
+def test_builtin_datasource_rejects_regular_mutations(authenticated_user, method, action):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    datasource = DataSourceAPIModel.objects.create(
+        name="builtin",
+        rest_api="builtin/query",
+        groups=[1],
+        is_build_in=True,
+        build_in_key="builtin::builtin/query",
+    )
+    factory = APIRequestFactory()
+    request = getattr(factory, method)(
+        f"/operation_analysis/api/data_source/{datasource.pk}/",
+        data={"name": "changed"} if method != "delete" else None,
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({method: action})(request, pk=str(datasource.pk))
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert "内置数据源" in response.data["detail"]
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_builtin_datasource_partial_update_allows_visibility_only(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    datasource = DataSourceAPIModel.objects.create(
+        name="builtin-visibility",
+        rest_api="builtin/visibility",
+        groups=[1],
+        is_build_in=True,
+        build_in_key="builtin::visibility",
+    )
+    factory = APIRequestFactory()
+    request = factory.patch(
+        f"/operation_analysis/api/data_source/{datasource.pk}/",
+        data={"groups": [1, 2]},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"patch": "partial_update"})(request, pk=str(datasource.pk))
+
+    datasource.refresh_from_db()
+    assert response.status_code == status.HTTP_200_OK
+    assert datasource.name == "builtin-visibility"
+    assert datasource.groups == [1, 2]
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_builtin_datasource_visibility_update_requires_edit_permission(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    datasource = DataSourceAPIModel.objects.create(
+        name="builtin-visibility-permission",
+        rest_api="builtin/visibility-permission",
+        groups=[1],
+        is_build_in=True,
+        build_in_key="builtin::visibility-permission",
+    )
+    factory = APIRequestFactory()
+    request = factory.patch(
+        f"/operation_analysis/api/data_source/{datasource.pk}/",
+        data={"groups": [1, 2]},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"patch": "partial_update"})(request, pk=str(datasource.pk))
+
+    datasource.refresh_from_db()
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert datasource.groups == [1]
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_builtin_visibility_update_rejects_nonsuperuser_with_edit_permission(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = False
+    authenticated_user.permission = {"ops-analysis": {"data_source-Edit"}}
+    datasource = DataSourceAPIModel.objects.create(
+        name="builtin-edit-not-super",
+        rest_api="builtin/edit-not-super",
+        groups=[1],
+        is_build_in=True,
+        build_in_key="builtin::edit-not-super",
+    )
+    factory = APIRequestFactory()
+    request = factory.patch(
+        f"/operation_analysis/api/data_source/{datasource.pk}/",
+        data={"groups": [1, 2]},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"patch": "partial_update"})(request, pk=str(datasource.pk))
+    datasource.refresh_from_db()
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert datasource.groups == [1]
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_superuser_can_clear_builtin_groups(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    datasource = DataSourceAPIModel.objects.create(
+        name="builtin-clear",
+        rest_api="builtin/clear",
+        groups=[1],
+        is_build_in=True,
+        build_in_key="builtin::clear",
+    )
+    factory = APIRequestFactory()
+    request = factory.patch(
+        f"/operation_analysis/api/data_source/{datasource.pk}/",
+        data={"groups": []},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"patch": "partial_update"})(request, pk=str(datasource.pk))
+    datasource.refresh_from_db()
+    assert response.status_code == status.HTTP_200_OK
+    assert datasource.groups == []
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_custom_datasource_rejects_empty_groups(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    factory = APIRequestFactory()
+    request = factory.post(
+        "/operation_analysis/api/data_source/",
+        data={
+            "name": "custom-empty-groups",
+            "rest_api": "custom/empty",
+            "source_type": "nats",
+            "connection_config": {},
+            "query_config": {},
+            "params": [],
+            "chart_type": ["table"],
+            "field_schema": [],
+            "groups": [],
+            "namespaces": [],
+            "tag": [],
+        },
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "create"})(request)
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "groups" in response.data
+    assert not DataSourceAPIModel.objects.filter(name="custom-empty-groups").exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_custom_datasource_rejects_create_that_omits_groups(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    factory = APIRequestFactory()
+    request = factory.post(
+        "/operation_analysis/api/data_source/",
+        data={
+            "name": "custom-omits-groups",
+            "rest_api": "custom/omits",
+            "source_type": "nats",
+            "connection_config": {},
+            "query_config": {},
+            "params": [],
+            "chart_type": ["table"],
+            "field_schema": [],
+            "namespaces": [],
+            "tag": [],
+        },
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "create"})(request)
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "groups" in response.data
+    assert not DataSourceAPIModel.objects.filter(name="custom-omits-groups").exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_custom_datasource_rejects_empty_groups_on_patch(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    datasource = DataSourceAPIModel.objects.create(
+        name="custom-keep-groups",
+        rest_api="custom/keep",
+        source_type="nats",
+        groups=[1],
+        created_by="s",
+        updated_by="s",
+    )
+    factory = APIRequestFactory()
+    request = factory.patch(
+        f"/operation_analysis/api/data_source/{datasource.pk}/",
+        data={"groups": []},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"patch": "partial_update"})(request, pk=str(datasource.pk))
+
+    datasource.refresh_from_db()
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "groups" in response.data
+    assert datasource.groups == [1]
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_builtin_datasource_rejects_visibility_mixed_with_content(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    datasource = DataSourceAPIModel.objects.create(
+        name="builtin-visibility-mixed-fields",
+        rest_api="builtin/visibility-mixed-fields",
+        groups=[1],
+        is_build_in=True,
+        build_in_key="builtin::visibility-mixed-fields",
+    )
+    factory = APIRequestFactory()
+    request = factory.patch(
+        f"/operation_analysis/api/data_source/{datasource.pk}/",
+        data={"groups": [1, 2], "name": "changed"},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"patch": "partial_update"})(request, pk=str(datasource.pk))
+
+    datasource.refresh_from_db()
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert datasource.name == "builtin-visibility-mixed-fields"
+    assert datasource.groups == [1]
+
+
+def _grant_view(user):
+    user.permission = {"ops-analysis": {"data_source-View", "data_source-Edit"}}
+    return user
+
+
+def _list_ids(payload):
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    items = data["items"] if isinstance(data, dict) and isinstance(data.get("items"), list) else data
+    return {item["id"] for item in items}
+
+
+def _build_instance(groups=(1,), rest_api="monitor/query_latest_active_alerts", params=None):
+    return SimpleNamespace(
+        id=1,
+        name="test-datasource",
+        groups=list(groups),
+        is_build_in=False,
+        rest_api=rest_api,
+        source_type=datasource_view.DataSourceAPIModel.SOURCE_TYPE_NATS,
+        connection_config={},
+        query_config={},
+        params=params
+        if params is not None
+        else [
+            {"name": "limit", "type": "number", "value": 10, "filterType": "params"},
+            {"name": "time_range", "type": "timeRange", "value": 10080, "filterType": "params"},
+            {"name": "group_by", "type": "string", "value": "day", "filterType": "fixed"},
+        ],
+        namespaces=SimpleNamespace(all=lambda: []),
+    )
+
+
+def _build_namespace(namespace_id):
+    return SimpleNamespace(
+        id=namespace_id,
+        name=f"ns-{namespace_id}",
+        enable_tls=False,
+        account="account",
+        decrypt_password="password",
+        domain="127.0.0.1:4222",
+        namespace="bk_lite",
+    )
+
+
+def _build_view_response(request, monkeypatch, downstream_result, *, rest_api=None, params=None):
+    captured = {}
+
+    class FakeGetNatsData:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            captured["kwargs"] = kwargs
+
+        def get_data(self):
+            return downstream_result
+
+    instance_kwargs = {}
+    if rest_api is not None:
+        instance_kwargs["rest_api"] = rest_api
+    if params is not None:
+        instance_kwargs["params"] = params
+
+    monkeypatch.setattr(
+        datasource_view.DataSourceAPIModelViewSet,
+        "get_object",
+        lambda self: _build_instance(**instance_kwargs),
+    )
+    monkeypatch.setattr(datasource_view, "GetNatsData", FakeGetNatsData)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk="1")
+    response.render()
+    return response, json.loads(response.rendered_content), captured
+
+
+@pytest.mark.django_db
+def test_get_source_data_returns_success_data(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"limit": "12", "group_by": "hour"})
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["result"] is True
+    assert payload["message"] == "success"
+    assert payload["data"] == {
+        "data": {"count": 0, "items": []},
+        "warnings": [],
+    }
+    assert captured["kwargs"]["params"]["limit"] == 12
+    assert captured["kwargs"]["params"]["group_by"] == "day"
+    assert isinstance(captured["kwargs"]["params"]["time_range"], list)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "business_payload",
+    [
+        [{"id": 1}],
+        {"items": [{"id": 1}]},
+        {"foo": "bar"},
+        {},
+        {"data": {"foo": "business-data"}},
+        {"warnings": ["business-warning"]},
+        {
+            "data": {"foo": "business-data"},
+            "warnings": ["business-warning"],
+        },
+    ],
+)
+def test_get_source_data_preserves_nats_business_payload_inside_transport_envelope(
+    authenticated_user,
+    monkeypatch,
+    business_payload,
+):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user)
+
+    response, payload, _ = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": business_payload, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["data"] == {
+        "data": business_payload,
+        "warnings": [],
+    }
+
+
+def _is_get_source_data_success_envelope(payload):
+    if not isinstance(payload, dict):
+        return False
+    inner = payload.get("data")
+    return payload.get("result") is True and payload.get("message") == "success" and isinstance(inner, dict) and "warnings" in inner
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "downstream_result",
+    [None, [], "timeout", {}, {"data": []}],
+)
+def test_get_source_data_rejects_nonstandard_downstream_result(
+    authenticated_user,
+    monkeypatch,
+    downstream_result,
+):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user)
+
+    response, payload, _ = _build_view_response(request, monkeypatch, downstream_result)
+
+    assert response.status_code >= 400
+    assert payload.get("result") is False
+    assert payload.get("message") == "下游返回非标准结果"
+    assert not _is_get_source_data_success_envelope(payload)
+
+
+@pytest.mark.django_db
+def test_get_source_data_nonstandard_downstream_logs_payload_type_only(authenticated_user, monkeypatch, caplog):
+    secret = "super-secret-token-do-not-log"
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user)
+
+    with caplog.at_level(logging.WARNING, logger="operation_analysis"):
+        response, payload, _ = _build_view_response(
+            request,
+            monkeypatch,
+            {"password": secret, "data": ["x" * 200]},
+        )
+
+    assert response.status_code >= 400
+    assert payload.get("result") is False
+    warning_text = "\n".join(record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING)
+    assert "payload_type=dict" in warning_text
+    assert "下游返回非标准结果" in warning_text
+    assert secret not in warning_text
+    assert "x" * 200 not in warning_text
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "source_type",
+    [
+        datasource_view.DataSourceAPIModel.SOURCE_TYPE_MYSQL,
+        datasource_view.DataSourceAPIModel.SOURCE_TYPE_POSTGRESQL,
+        datasource_view.DataSourceAPIModel.SOURCE_TYPE_REST_API,
+        datasource_view.DataSourceAPIModel.SOURCE_TYPE_EXCEL,
+    ],
+)
+def test_get_source_data_wraps_inline_datasources_in_transport_envelope(
+    authenticated_user,
+    monkeypatch,
+    source_type,
+):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user)
+    business_rows = [{"id": 1, "name": source_type}]
+
+    instance = SimpleNamespace(
+        id=1,
+        name=f"{source_type}-datasource",
+        groups=[1],
+        rest_api="",
+        source_type=source_type,
+        connection_config={},
+        query_config={},
+        transform_config={},
+        params=[],
+    )
+
+    class FakeExecutor:
+        def preview(self, connection_config, query_config, limit=100, **_kwargs):
+            return PreviewResult(
+                items=business_rows,
+                count=len(business_rows),
+                fields=[],
+            )
+
+    monkeypatch.setattr(
+        datasource_view.DataSourceAPIModelViewSet,
+        "get_object",
+        lambda self: instance,
+    )
+    monkeypatch.setattr(
+        datasource_view,
+        "get_preview_executor",
+        lambda current_source_type: FakeExecutor(),
+    )
+    monkeypatch.setattr(
+        "apps.operation_analysis.services.excel_materialize.load_excel_runtime",
+        lambda _instance, limit=100: {"items": business_rows, "warnings": []},
+    )
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk="1")
+    response.render()
+    payload = json.loads(response.rendered_content)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["data"] == {
+        "data": business_rows,
+        "warnings": [],
+    }
+
+
+@pytest.mark.django_db
+def test_get_source_data_accepts_decimal_number_param(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"limit": "12.5"})
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["result"] is True
+    assert captured["kwargs"]["params"]["limit"] == 12.5
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("message_text", "expected_status"),
+    [
+        ("没有权限访问指定的实例", status.HTTP_403_FORBIDDEN),
+        ("监控对象不存在", status.HTTP_404_NOT_FOUND),
+        ("limit 不能大于 100", status.HTTP_400_BAD_REQUEST),
+        ("下游服务执行失败", status.HTTP_502_BAD_GATEWAY),
+    ],
+)
+def test_get_source_data_exposes_downstream_business_failures(
+    authenticated_user,
+    monkeypatch,
+    message_text,
+    expected_status,
+):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"limit": 10})
+
+    response, payload, _ = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": False, "data": [], "message": message_text},
+    )
+
+    assert response.status_code == expected_status
+    assert payload["result"] is False
+    assert payload["message"] == message_text
+    assert payload["data"] == []
+
+
+@pytest.mark.django_db
+def test_get_source_data_returns_500_on_client_exception(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"limit": 10})
+
+    class FakeGetNatsData:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def get_data(self):
+            raise RuntimeError("nats unavailable")
+
+    monkeypatch.setattr(
+        datasource_view.DataSourceAPIModelViewSet,
+        "get_object",
+        lambda self: _build_instance(),
+    )
+    monkeypatch.setattr(datasource_view, "GetNatsData", FakeGetNatsData)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk="1")
+    response.render()
+    payload = json.loads(response.rendered_content)
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert payload["result"] is False
+    assert payload["message"] == "数据查询失败"
+
+
+@pytest.mark.django_db
+def test_get_source_data_returns_typed_not_found_for_deleted_datasource(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"limit": 10})
+
+    monkeypatch.setattr(
+        datasource_view.DataSourceAPIModelViewSet,
+        "get_object",
+        lambda self: (_ for _ in ()).throw(Http404()),
+    )
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk="1")
+    response.render()
+    payload = json.loads(response.rendered_content)
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert payload["result"] is False
+    assert payload["message"] == "数据源不存在或已删除"
+
+
+@pytest.mark.django_db
+def test_get_source_data_rejects_unknown_params(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"unknown_field": "x"})
+
+    response, payload, _ = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert payload["result"] is False
+    assert "存在未声明参数" in payload["message"]
+
+
+def test_resolve_request_params_allows_organization_param_runtime_marker():
+    instance = SimpleNamespace(
+        rest_api="monitor/query_latest_active_alerts",
+        params=[
+            {"name": "org_id", "type": "string", "value": "", "filterType": "filter"},
+        ],
+    )
+    resolved = _resolve_request_params(
+        instance,
+        {"org_id": "12", "organization_param": "org_id"},
+    )
+    assert resolved["org_id"] == "12"
+    assert resolved["organization_param"] == "org_id"
+
+
+@pytest.mark.django_db
+def test_get_source_data_applies_default_values_when_request_missing(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={})
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["result"] is True
+    assert captured["kwargs"]["params"]["limit"] == 10
+    assert captured["kwargs"]["params"]["group_by"] == "day"
+
+
+@pytest.mark.django_db
+def test_get_source_data_strips_residual_group_by_for_trend_apis(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(
+        authenticated_user,
+        data={"time": ["2026-08-11T00:00:00Z", "2026-08-11T01:00:00Z"], "group_by": "day"},
+    )
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"告警数": []}, "message": ""},
+        rest_api="alert/get_alert_trend_data",
+        params=[
+            {"name": "time", "type": "timeRange", "value": 10080, "filterType": "filter"},
+            {"name": "group_by", "type": "string", "value": "day", "filterType": "fixed"},
+        ],
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["result"] is True
+    assert "group_by" not in captured["kwargs"]["params"]
+    assert "time" in captured["kwargs"]["params"]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("time_range", "expected"),
+    [
+        (
+            ["2026-04-19T09:34:13.712Z", "2026-04-20T09:34:13.712Z"],
+            ["2026-04-19T09:34:13.712Z", "2026-04-20T09:34:13.712Z"],
+        ),
+        (
+            ["2026-04-19T17:34:13.712+08:00", "2026-04-20T17:34:13.712+08:00"],
+            ["2026-04-19T09:34:13.712Z", "2026-04-20T09:34:13.712Z"],
+        ),
+    ],
+)
+def test_get_source_data_accepts_iso8601_time_range(authenticated_user, monkeypatch, time_range, expected):
+    authenticated_user.is_superuser = True
+    request = _build_request(
+        authenticated_user,
+        data={"time_range": time_range},
+    )
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["result"] is True
+    assert captured["kwargs"]["params"]["time_range"] == expected
+
+
+def _freeze_gateway_now(monkeypatch, instant):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            aware = instant if instant.tzinfo is not None else instant.replace(tzinfo=timezone.utc)
+            return aware if tz is None else aware.astimezone(tz)
+
+    monkeypatch.setattr(datasource_view, "datetime", FrozenDateTime)
+
+
+@pytest.mark.django_db
+def test_get_source_data_rolls_unified_select_value_to_rfc3339_range(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    _freeze_gateway_now(monkeypatch, datetime(2026, 8, 20, 10, 0, 0, tzinfo=timezone.utc))
+    request = _build_request(
+        authenticated_user,
+        data={"time_range": {"selectValue": 15, "rangePickerVaule": None}},
+    )
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["result"] is True
+    assert captured["kwargs"]["params"]["time_range"] == [
+        "2026-08-20T09:45:00.000Z",
+        "2026-08-20T10:00:00.000Z",
+    ]
+
+
+@pytest.mark.django_db
+def test_get_source_data_prefers_select_value_over_stale_absolute_bounds(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    _freeze_gateway_now(monkeypatch, datetime(2026, 8, 20, 10, 0, 0, tzinfo=timezone.utc))
+    request = _build_request(
+        authenticated_user,
+        data={
+            "time_range": {
+                "selectValue": 15,
+                "start": "2026-08-20T04:00:00.000Z",
+                "end": "2026-08-20T10:00:00.000Z",
+            }
+        },
+    )
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert captured["kwargs"]["params"]["time_range"] == [
+        "2026-08-20T09:45:00.000Z",
+        "2026-08-20T10:00:00.000Z",
+    ]
+
+
+@pytest.mark.django_db
+def test_get_source_data_uses_absolute_bounds_when_select_value_is_custom(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    _freeze_gateway_now(monkeypatch, datetime(2026, 8, 20, 10, 0, 0, tzinfo=timezone.utc))
+    request = _build_request(
+        authenticated_user,
+        data={
+            "time_range": {
+                "selectValue": 0,
+                "start": "2026-08-19T00:00:00.000Z",
+                "end": "2026-08-20T00:00:00.000Z",
+            }
+        },
+    )
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert captured["kwargs"]["params"]["time_range"] == [
+        "2026-08-19T00:00:00.000Z",
+        "2026-08-20T00:00:00.000Z",
+    ]
+
+
+@pytest.mark.django_db
+def test_get_source_data_rejects_numeric_time_range_boundaries(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(
+        authenticated_user,
+        data={"time_range": [1776572053712, 1776658453712]},
+    )
+
+    response, payload, _ = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": [], "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert payload["result"] is False
+    assert "RFC3339" in payload["message"]
+
+
+@pytest.mark.django_db
+def test_get_source_data_allows_runtime_query_fields(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(
+        authenticated_user,
+        data={
+            "page": 2,
+            "page_size": 50,
+            "query_list": [{"field": "name", "type": "str*", "value": "bk"}],
+            "namespace_id": 3,
+        },
+    )
+
+    response, payload, captured = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["result"] is True
+    assert captured["kwargs"]["params"]["page"] == 2
+    assert captured["kwargs"]["params"]["page_size"] == 50
+    assert isinstance(captured["kwargs"]["params"]["query_list"], list)
+    assert captured["kwargs"]["params"]["namespace_id"] == 3
+
+
+@pytest.mark.django_db
+def test_get_source_data_applies_query_list_to_nats_table_payload(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(
+        authenticated_user,
+        data={"query_list": [{"field": "name", "type": "str*", "value": "bk"}]},
+    )
+
+    response, payload, _ = _build_view_response(
+        request,
+        monkeypatch,
+        {
+            "result": True,
+            "data": [
+                {"name": "bk-web"},
+                {"name": "ops-db"},
+                {"name": "bk-lite"},
+            ],
+            "message": "",
+        },
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert payload["data"]["data"] == [{"name": "bk-web"}, {"name": "bk-lite"}]
+
+
+@pytest.mark.django_db
+def test_get_source_data_rejects_invalid_runtime_query_fields(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(
+        authenticated_user,
+        data={"page": 0, "page_size": "oops", "query_list": "bad"},
+    )
+
+    response, payload, _ = _build_view_response(
+        request,
+        monkeypatch,
+        {"result": True, "data": {"count": 0, "items": []}, "message": ""},
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert payload["result"] is False
+    assert "page 必须大于 0" in payload["message"]
+
+
+@pytest.mark.django_db
+def test_get_source_data_rejects_namespace_when_datasource_has_no_namespaces(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"namespace_id": 3})
+
+    monkeypatch.setattr(
+        datasource_view.DataSourceAPIModelViewSet,
+        "get_object",
+        lambda self: _build_instance(),
+    )
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk="1")
+    response.render()
+    payload = json.loads(response.rendered_content)
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert payload["result"] is False
+    assert payload["message"] == "数据源未关联命名空间"
+
+
+@pytest.mark.django_db
+def test_get_source_data_rejects_unassociated_namespace(authenticated_user, monkeypatch):
+    authenticated_user.is_superuser = True
+    request = _build_request(authenticated_user, data={"namespace_id": 3})
+
+    monkeypatch.setattr(
+        datasource_view.DataSourceAPIModelViewSet,
+        "get_object",
+        lambda self: SimpleNamespace(
+            id=1,
+            name="test-datasource",
+            groups=[1],
+            rest_api="monitor/query_latest_active_alerts",
+            source_type=datasource_view.DataSourceAPIModel.SOURCE_TYPE_NATS,
+            connection_config={},
+            query_config={},
+            params=[
+                {"name": "limit", "type": "number", "value": 10, "filterType": "params"},
+                {"name": "time_range", "type": "timeRange", "value": 10080, "filterType": "params"},
+                {"name": "group_by", "type": "string", "value": "day", "filterType": "fixed"},
+            ],
+            namespaces=SimpleNamespace(all=lambda: [_build_namespace(9)]),
+        ),
+    )
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk="1")
+    response.render()
+    payload = json.loads(response.rendered_content)
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert payload["result"] is False
+    assert payload["message"] == "数据源未关联所选命名空间"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_status", "zh_message"),
+    [
+        ("invalid_namespace_param", status.HTTP_400_BAD_REQUEST, "命名空间参数无效"),
+        ("datasource_namespace_unlinked", status.HTTP_400_BAD_REQUEST, "数据源未关联命名空间"),
+        ("datasource_namespace_not_selected", status.HTTP_400_BAD_REQUEST, "数据源未关联所选命名空间"),
+        ("namespace_unavailable", status.HTTP_500_INTERNAL_SERVER_ERROR, "未找到可用命名空间"),
+        ("namespace_server_missing", status.HTTP_500_INTERNAL_SERVER_ERROR, "命名空间未配置连接信息"),
+        ("module_not_found", status.HTTP_500_INTERNAL_SERVER_ERROR, "数据源配置异常"),
+    ],
+)
+def test_classify_runtime_exception_uses_code_not_message_text(code, expected_status, zh_message):
+    from django.utils import translation
+
+    from apps.operation_analysis.common.get_nats_source_data import NatsSourceError
+
+    error = NatsSourceError(code, namespace_name="命名空间参数无效")
+    with translation.override("zh-Hans"):
+        http_status, message = datasource_view._classify_runtime_exception(error)
+    assert http_status == expected_status
+    assert message == zh_message
+
+    with translation.override("en"):
+        en_status, en_message = datasource_view._classify_runtime_exception(error)
+    assert en_status == expected_status
+    assert en_message != zh_message
+    assert code not in en_message
+
+
+def test_classify_runtime_exception_ignores_legacy_chinese_runtime_text():
+    http_status, message = datasource_view._classify_runtime_exception(RuntimeError("未找到可用的命名空间"))
+    assert http_status == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert message == "数据查询失败"
+
+    http_status, message = datasource_view._classify_runtime_exception(RuntimeError("命名空间 demo 未配置服务器连接"))
+    assert http_status == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert message == "数据查询失败"
+
+
+def test_classify_runtime_exception_keeps_password_decryption_message():
+    from apps.operation_analysis.models.datasource_models import NamespacePasswordDecryptionError
+
+    error = NamespacePasswordDecryptionError("命名空间密码解密失败，请重新录入密码")
+    http_status, message = datasource_view._classify_runtime_exception(error)
+    assert http_status == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert message == "命名空间密码解密失败，请重新录入密码"
+
+
+# --- Tests for issue #3394: NameSpaceModelViewSet.partial_update permission enforcement ---
+
+
+def _build_patch_request(user, data=None):
+    factory = APIRequestFactory()
+    request = factory.patch(
+        "/operation_analysis/api/namespace/1/",
+        data=data or {},
+        format="json",
+    )
+    force_authenticate(request, user=user)
+    return request
+
+
+def test_namespace_partial_update_blocked_without_permission(authenticated_user):
+    """PATCH /namespace/{id}/ must return 403 when user lacks namespace-Edit permission.
+
+    Regression test for issue #3394: before the fix, partial_update had no @HasPermission
+    decorator and any authenticated user could PATCH a namespace.
+    If this fix is reverted, the HasPermission wrapper disappears and the method goes
+    straight to the DRF default, which does NOT return 403 — so this test would fail.
+    """
+    authenticated_user.is_superuser = False
+    # User has no namespace-Edit permission
+    authenticated_user.permission = {"ops-analysis": set()}
+
+    request = _build_patch_request(authenticated_user, data={"domain": "attacker.example.com:4222"})
+
+    view = datasource_view.NameSpaceModelViewSet.as_view({"patch": "partial_update"})
+    response = view(request, pk="1")
+
+    assert response.status_code == 403, "PATCH /namespace/{id}/ must be blocked for users without namespace-Edit permission"
+
+
+def test_namespace_partial_update_allowed_with_permission(authenticated_user, monkeypatch):
+    """PATCH /namespace/{id}/ must proceed past permission check when user has namespace-Edit."""
+    authenticated_user.is_superuser = False
+    authenticated_user.permission = {"ops-analysis": {"namespace-Edit"}}
+
+    # Monkeypatch update to avoid hitting DB so we can verify the permission gate passes
+    update_called = []
+
+    def fake_update(self, request, *args, **kwargs):
+        update_called.append(True)
+        from rest_framework.response import Response
+
+        return Response({"id": 1, "name": "test"})
+
+    monkeypatch.setattr(datasource_view.NameSpaceModelViewSet, "update", fake_update)
+
+    request = _build_patch_request(authenticated_user, data={"domain": "new.example.com:4222"})
+    view = datasource_view.NameSpaceModelViewSet.as_view({"patch": "partial_update"})
+    response = view(request, pk="1")
+
+    assert update_called, "update() must be called when user has namespace-Edit permission"
+    assert response.status_code != 403, "User with namespace-Edit permission must not be blocked"
+
+
+# --- Tests for issue #3393: DataSourceTagModelViewSet read permission enforcement ---
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("action", ["list", "retrieve"])
+def test_datasource_tag_read_blocked_without_permission(authenticated_user, action):
+    """标签列表和详情必须拒绝缺少 data_source-View 权限的用户。"""
+    tag = datasource_view.DataSourceTag.objects.create(
+        tag_id="security",
+        name="Security",
+        created_by="system",
+        updated_by="system",
+    )
+    authenticated_user.is_superuser = False
+    authenticated_user.permission = {"ops-analysis": set()}
+
+    factory = APIRequestFactory()
+    request = factory.get("/operation_analysis/api/tag/")
+    force_authenticate(request, user=authenticated_user)
+    view = datasource_view.DataSourceTagModelViewSet.as_view({"get": action})
+
+    kwargs = {"pk": str(tag.pk)} if action == "retrieve" else {}
+    response = view(request, **kwargs)
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("action", ["list", "retrieve"])
+def test_datasource_tag_read_allowed_with_permission(authenticated_user, action):
+    """拥有 data_source-View 权限的用户仍可读取标签列表和详情。"""
+    tag = datasource_view.DataSourceTag.objects.create(
+        tag_id="cmdb",
+        name="CMDB",
+        created_by="system",
+        updated_by="system",
+    )
+    authenticated_user.is_superuser = False
+    authenticated_user.permission = {"ops-analysis": {"data_source-View"}}
+
+    factory = APIRequestFactory()
+    request = factory.get("/operation_analysis/api/tag/")
+    force_authenticate(request, user=authenticated_user)
+    view = datasource_view.DataSourceTagModelViewSet.as_view({"get": action})
+
+    kwargs = {"pk": str(tag.pk)} if action == "retrieve" else {}
+    response = view(request, **kwargs)
+
+    assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_list_includes_empty_groups_builtin_for_any_org(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    _grant_view(authenticated_user)
+    global_ds = DataSourceAPIModel.objects.create(
+        name="global-builtin",
+        rest_api="builtin/global",
+        groups=[],
+        is_build_in=True,
+        build_in_key="builtin::global",
+    )
+    hidden = DataSourceAPIModel.objects.create(
+        name="restricted-builtin",
+        rest_api="builtin/restricted",
+        groups=[2],
+        is_build_in=True,
+        build_in_key="builtin::restricted",
+    )
+    factory = APIRequestFactory()
+    request = factory.get("/operation_analysis/api/data_source/", {"page_size": -1})
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"get": "list"})(request)
+    response.render()
+    payload = json.loads(response.rendered_content)
+    ids = _list_ids(payload)
+    assert global_ds.id in ids
+    assert hidden.id not in ids
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_superuser_list_includes_restricted_builtin_from_other_org(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    hidden = DataSourceAPIModel.objects.create(
+        name="restricted-builtin-super",
+        rest_api="builtin/restricted-super",
+        groups=[2],
+        is_build_in=True,
+        build_in_key="builtin::restricted-super",
+    )
+    factory = APIRequestFactory()
+    request = factory.get("/operation_analysis/api/data_source/", {"page_size": -1})
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"get": "list"})(request)
+    response.render()
+    payload = json.loads(response.rendered_content)
+    assert hidden.id in _list_ids(payload)
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_get_source_data_allows_empty_groups_builtin(authenticated_user, monkeypatch):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    datasource = DataSourceAPIModel.objects.create(
+        name="global-query",
+        rest_api="monitor/query_latest_active_alerts",
+        groups=[],
+        is_build_in=True,
+        build_in_key="builtin::global-query",
+        params=[{"name": "limit", "type": "number", "value": 10, "filterType": "params"}],
+    )
+    captured = {}
+
+    class FakeGetNatsData:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def get_data(self):
+            return {"result": True, "data": [], "message": ""}
+
+    monkeypatch.setattr(datasource_view, "GetNatsData", FakeGetNatsData)
+    factory = APIRequestFactory()
+    request = factory.post(
+        f"/operation_analysis/api/data_source/get_source_data/{datasource.pk}/",
+        data={},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "99"
+    force_authenticate(request, user=authenticated_user)
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk=str(datasource.pk))
+    assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_get_source_data_rejects_restricted_builtin_outside_allowlist(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+
+    authenticated_user.is_superuser = True
+    datasource = DataSourceAPIModel.objects.create(
+        name="restricted-query",
+        rest_api="builtin/restricted-query",
+        groups=[2],
+        is_build_in=True,
+        build_in_key="builtin::restricted-query",
+    )
+    factory = APIRequestFactory()
+    request = factory.post(
+        f"/operation_analysis/api/data_source/get_source_data/{datasource.pk}/",
+        data={},
+        format="json",
+    )
+    request.COOKIES["current_team"] = "1"
+    force_authenticate(request, user=authenticated_user)
+    response = datasource_view.DataSourceAPIModelViewSet.as_view({"post": "get_source_data"})(request, pk=str(datasource.pk))
+    response.render()
+    payload = json.loads(response.rendered_content)
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert payload["message"] == "无权访问当前数据源"

@@ -1,0 +1,151 @@
+from apps.node_mgmt.constants.node import NodeConstants
+
+
+class ControllerConstants:
+    """控制器相关常量"""
+
+    LINUX_INSTALL_DIR = "/opt/fusion-collectors"
+    WINDOWS_INSTALL_DIR = "C:\\fusion-collectors"
+    SIDECAR_CONFIG_FILENAME = "sidecar.yml"
+
+    CONTROLLER = [
+        {
+            "os": "linux",
+            "cpu_architecture": NodeConstants.X86_64_ARCH,
+            "name": "Controller",
+            "description": "The Controller is primarily used to manage various types of collectors, composed of Sidecarand NAS Executor, enabling automated deployment, resource coordination, and task execution on servers.",
+            "version_command": "cat /opt/fusion-collectors/VERSION",
+        },
+        {
+            "os": "linux",
+            "cpu_architecture": NodeConstants.ARM64_ARCH,
+            "name": "Controller",
+            "description": "The Controller is primarily used to manage various types of collectors, composed of Sidecarand NAS Executor, enabling automated deployment, resource coordination, and task execution on servers.",
+            "version_command": "cat /opt/fusion-collectors/VERSION",
+        },
+        {
+            "os": "windows",
+            "cpu_architecture": NodeConstants.X86_64_ARCH,
+            "name": "Controller",
+            "description": "The Controller is primarily used to manage various types of collectors, composed of Sidecarand NAS Executor, enabling automated deployment, resource coordination, and task execution on servers.",
+            "version_command": (
+                f'powershell -NoProfile -Command "'
+                f"if (Test-Path '{WINDOWS_INSTALL_DIR}\\VERSION') "
+                f"{{ (Get-Content '{WINDOWS_INSTALL_DIR}\\VERSION' -Raw).Trim() }} "
+                f"else {{ Write-Output '' }}\""
+            ),
+        },
+    ]
+
+    # 控制器状态
+    NORMAL = "normal"
+    ABNORMAL = "abnormal"
+    NOT_INSTALLED = "not_installed"
+
+    SIDECAR_STATUS_ENUM = {
+        NORMAL: "正常",
+        ABNORMAL: "异常",
+        NOT_INSTALLED: "未安装",
+    }
+
+    # 控制器默认更新时间（秒）
+    DEFAULT_UPDATE_INTERVAL = 30
+
+    # Etag缓存时间（秒）
+    E_CACHE_TIMEOUT = 60 * 5  # 5分钟
+
+    # 控制器下发目录
+    CONTROLLER_INSTALL_DIR = {
+        NodeConstants.LINUX_OS: {"storage_dir": "/tmp", "install_dir": "/tmp"},
+        NodeConstants.WINDOWS_OS: {"storage_dir": "/tmp", "install_dir": "C:\\gse"},
+    }
+
+    # 设置权限并运行命令
+    RUN_COMMAND = {
+        NodeConstants.LINUX_OS: (
+            'if [ "$(id -u)" -eq 0 ]; then SUDO=""; '
+            'elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"; '
+            "else echo 'Error: root or sudo is required to install controller to /opt/fusion-collectors'; exit 1; fi && "
+            "$SUDO rm -rf /opt/fusion-collectors && "
+            "$SUDO mv /tmp/fusion-collectors /opt/fusion-collectors && "
+            "$SUDO chmod -R +x /opt/fusion-collectors/* && "
+            "cd /opt/fusion-collectors && "
+            "$SUDO bash ./install.sh {server_url}/api/v1/node_mgmt/open_api/node "
+            "{server_token} {cloud} {group} {node_name} {node_id}"
+        ),
+        NodeConstants.WINDOWS_OS: (
+            "powershell -command "
+            '"Set-ExecutionPolicy Unrestricted -Force; & '
+            "'{}\\install.ps1' -ServerUrl {} -ServerToken {} -Cloud {} -Group {} -NodeName {} -NodeId {}\""
+        ),
+    }
+
+    # 卸载命令
+    UNINSTALL_COMMAND = {
+        NodeConstants.LINUX_OS: (
+            'if [ "$(id -u)" -eq 0 ]; then SUDO=""; '
+            'elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"; '
+            "else echo 'Error: root or sudo is required to uninstall controller from /opt/fusion-collectors'; exit 1; fi && "
+            "cd /opt/fusion-collectors && $SUDO chmod +x uninstall.sh && $SUDO ./uninstall.sh"
+        ),
+        NodeConstants.WINDOWS_OS: 'powershell -command "Remove-Item -Path {} -Recurse"',
+    }
+
+    # 控制器目录删除命令
+    CONTROLLER_DIR_DELETE_COMMAND = {
+        NodeConstants.LINUX_OS: (
+            'if [ "$(id -u)" -eq 0 ]; then SUDO=""; '
+            'elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"; '
+            "else echo 'Error: root or sudo is required to remove /opt/fusion-collectors'; exit 1; fi && "
+            "$SUDO rm -rf /opt/fusion-collectors"
+        ),
+        NodeConstants.WINDOWS_OS: 'powershell -command "Remove-Item -Path {} -Recurse"',
+    }
+
+    # 标签字段
+    GROUP_TAG = "group"
+    CLOUD_TAG = "zone"
+    INSTALL_METHOD_TAG = "install_method"
+    NODE_TYPE_TAG = "node_type"  # 节点类型标签（用于标识容器节点、K8s节点等）
+
+    # 安装方式
+    MANUAL = "manual"
+    AUTO = "auto"
+
+    INSTALL_METHOD_ENUM = {
+        MANUAL: "手动安装",
+        AUTO: "自动安装",
+    }
+
+    # 节点类型
+    NODE_TYPE_CONTAINER = "container"  # 容器节点
+    NODE_TYPE_HOST = "host"  # 主机节点
+
+    NODE_TYPE_ENUM = {
+        NODE_TYPE_CONTAINER: "容器节点",
+        NODE_TYPE_HOST: "主机节点",
+    }
+
+    WAITING = "waiting"
+    INSTALLED = "installed"
+    # 手动安装控制器状态
+    MANUAL_INSTALL_STATUS_ENUM = {
+        WAITING: "等待安装",
+        INSTALLED: "安装成功",
+    }
+
+    SIDECAR_CONFIG_PATH = {
+        NodeConstants.LINUX_OS: f"{LINUX_INSTALL_DIR}/{SIDECAR_CONFIG_FILENAME}",
+        NodeConstants.WINDOWS_OS: rf"{WINDOWS_INSTALL_DIR}\{SIDECAR_CONFIG_FILENAME}",
+    }
+
+    # Sidecar 服务重启命令
+    SIDECAR_RESTART_CMD = {
+        NodeConstants.LINUX_OS: (
+            "if systemctl list-unit-files bk-sidecar.service >/dev/null 2>&1; "
+            "then systemctl restart bk-sidecar.service; "
+            "else systemctl restart sidecar.service; fi",
+            None,
+        ),
+        NodeConstants.WINDOWS_OS: ("Restart-Service sidecar", "powershell"),
+    }

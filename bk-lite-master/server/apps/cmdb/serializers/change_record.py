@@ -1,0 +1,25 @@
+from rest_framework import serializers
+
+from apps.cmdb.models.change_record import ChangeRecord
+
+
+class ChangeRecordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChangeRecord
+        fields = (
+            "id",
+            "inst_id",
+            "inst_uuid",
+            "model_id",
+            "label",
+            "type",
+            "before_data",
+            "after_data",
+            "attribute_snapshot",
+            "operator",
+            "created_at",
+            "model_object",
+            "message",
+            "scenario",
+        )
+        read_only_fields = ("id", "created_at")

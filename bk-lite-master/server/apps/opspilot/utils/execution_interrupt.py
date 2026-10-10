@@ -1,0 +1,232 @@
+"""
+执行中断控制模块
+
+提供基于 django cache 的轻量级中断信号存储，用于 workflow / AGUI / tools 协作式中断。
+缓存过期后自动回退到数据库查询 WorkFlowTaskResult.status == INTERRUPTED。
+
+配置项：
+    WORKFLOW_INTERRUPT_CACHE_TTL (环境变量):
+        中断信号缓存过期时间（秒），默认 3600（1 小时）。
+        对于长时间运行的工作流，可适当增大此值。
+        缓存过期后会自动回退到数据库查询，确保中断信号不丢失。
+
+        示例：
+            export WORKFLOW_INTERRUPT_CACHE_TTL=7200  # 2 小时
+"""
+
+import asyncio
+import os
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any, Dict, Optional
+
+from asgiref.sync import sync_to_async
+from django.core.cache import cache
+
+from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.utils.db_cleanup import run_with_db_cleanup
+
+INTERRUPT_CACHE_TTL = int(os.getenv("WORKFLOW_INTERRUPT_CACHE_TTL", "3600"))
+INTERRUPT_CACHE_PREFIX = "workflow_interrupt"
+# SSE 主循环读标志，后台按该间隔轮询；避免每帧 await 查库拖垮事件吞吐。
+INTERRUPT_WATCH_INTERVAL_SECONDS = float(os.getenv("INTERRUPT_WATCH_INTERVAL_SECONDS", "1.0"))
+
+InterruptChecker = Callable[[str], Awaitable[bool]]
+
+
+def _check_interrupt_in_database(execution_id: str) -> bool:
+    """
+    数据库兜底查询：检查 WorkFlowTaskResult.status == INTERRUPTED。
+
+    仅在缓存未命中时调用，避免频繁数据库访问。
+    使用 exists() 优化查询性能。
+
+    本函数可能经 ``sync_to_async(thread_sensitive=False)`` 跑在 asyncio 默认
+    executor 线程上，必须在本线程清理连接，外层 SensitiveThread 的
+    ``close_old_connections`` 清不到这里。
+    """
+
+    def _query() -> bool:
+        # 延迟导入避免循环依赖
+        from apps.opspilot.enum import WorkFlowTaskStatus
+        from apps.opspilot.models import WorkFlowTaskResult
+
+        try:
+            return WorkFlowTaskResult.objects.filter(
+                execution_id=execution_id,
+                status=WorkFlowTaskStatus.INTERRUPTED,
+            ).exists()
+        except Exception as e:
+            logger.warning(
+                "Failed to check interrupt status in database: execution_id=%s, error=%s",
+                execution_id,
+                str(e),
+            )
+            return False
+
+    return run_with_db_cleanup(_query)
+
+
+async def _check_interrupt_in_database_async(execution_id: str) -> bool:
+    """
+    异步版本的数据库兜底查询。
+
+    使用 sync_to_async 包装同步 ORM 调用，安全地在异步上下文中执行。
+    注意：使用 thread_sensitive=False 避免在 LangGraph 异步节点中触发
+    "You cannot submit onto CurrentThreadExecutor from its own thread" 错误。
+    ORM 清理由 ``_check_interrupt_in_database`` 内部的 ``run_with_db_cleanup`` 负责。
+    """
+    return await sync_to_async(_check_interrupt_in_database, thread_sensitive=False)(execution_id)
+
+
+def _get_interrupt_cache_key(execution_id: str) -> str:
+    return f"{INTERRUPT_CACHE_PREFIX}:{execution_id}"
+
+
+def request_interrupt(execution_id: str, reason: str = "user_manual", meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """记录中断请求。"""
+    payload = {
+        "execution_id": execution_id,
+        "reason": reason,
+        "requested_at": int(time.time() * 1000),
+        "meta": meta or {},
+    }
+    cache.set(_get_interrupt_cache_key(execution_id), payload, INTERRUPT_CACHE_TTL)
+    logger.info("Execution interrupt requested: execution_id=%s, reason=%s", execution_id, reason)
+    return payload
+
+
+def get_interrupt_request(execution_id: str) -> Optional[Dict[str, Any]]:
+    """获取中断请求信息。"""
+    if not execution_id:
+        return None
+    return cache.get(_get_interrupt_cache_key(execution_id))
+
+
+def is_interrupt_requested(execution_id: str) -> bool:
+    """
+    检查是否已请求中断。
+
+    双重检查机制：
+    1. 优先查询缓存（快速路径）
+    2. 缓存未命中时回退到数据库查询 WorkFlowTaskResult.status == INTERRUPTED
+
+    这确保即使缓存过期（默认 1 小时），长时间运行的任务仍能检测到中断请求。
+    """
+    if not execution_id:
+        return False
+
+    # 快速路径：缓存命中
+    cache_result = get_interrupt_request(execution_id)
+    if cache_result is not None:
+        logger.debug("Interrupt check hit cache: execution_id=%s", execution_id)
+        return True
+
+    # 慢速路径：数据库兜底
+    db_result = _check_interrupt_in_database(execution_id)
+    if db_result:
+        logger.info(
+            "Interrupt check hit database (cache expired): execution_id=%s",
+            execution_id,
+        )
+    return db_result
+
+
+async def is_interrupt_requested_async(execution_id: str) -> bool:
+    """
+    异步版本的中断检查。
+
+    在异步上下文中使用此函数，避免 "You cannot call this from an async context" 错误。
+
+    双重检查机制：
+    1. 优先查询缓存（快速路径）
+    2. 缓存未命中时回退到数据库查询 WorkFlowTaskResult.status == INTERRUPTED
+    """
+    if not execution_id:
+        return False
+
+    # 快速路径：缓存命中
+    cache_result = get_interrupt_request(execution_id)
+    if cache_result is not None:
+        logger.debug("Interrupt check hit cache (async): execution_id=%s", execution_id)
+        return True
+
+    # 慢速路径：数据库兜底（使用异步版本）
+    db_result = await _check_interrupt_in_database_async(execution_id)
+    if db_result:
+        logger.info(
+            "Interrupt check hit database (cache expired, async): execution_id=%s",
+            execution_id,
+        )
+    return db_result
+
+
+def clear_interrupt_request(execution_id: str) -> None:
+    """清理中断请求。"""
+    if not execution_id:
+        return
+    cache.delete(_get_interrupt_cache_key(execution_id))
+    logger.info("Execution interrupt request cleared: execution_id=%s", execution_id)
+
+
+class InterruptWatch:
+    """按时间轮询中断标志，供 SSE 主循环非阻塞读取。
+
+    启动时立即查一次；之后按 ``interval_seconds`` 后台轮询。
+    ``is_interrupted()`` 只读内存 Event，不触发缓存/数据库访问。
+    """
+
+    def __init__(
+        self,
+        execution_id: str | None,
+        *,
+        interval_seconds: float = INTERRUPT_WATCH_INTERVAL_SECONDS,
+        checker: InterruptChecker | None = None,
+    ) -> None:
+        self._execution_id = str(execution_id or "").strip()
+        self._interval = max(float(interval_seconds), 0.05)
+        self._checker: InterruptChecker = checker or is_interrupt_requested_async
+        self._flag = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self.check_count = 0
+
+    def is_interrupted(self) -> bool:
+        return self._flag.is_set()
+
+    async def start(self) -> None:
+        if not self._execution_id or self._task is not None:
+            return
+        if await self._poll_once():
+            return
+        self._task = asyncio.create_task(self._loop(), name=f"interrupt-watch:{self._execution_id}")
+
+    async def aclose(self) -> None:
+        task = self._task
+        self._task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _poll_once(self) -> bool:
+        self.check_count += 1
+        try:
+            if await self._checker(self._execution_id):
+                self._flag.set()
+                return True
+        except Exception:
+            logger.warning(
+                "InterruptWatch poll failed: execution_id=%s",
+                self._execution_id,
+                exc_info=True,
+            )
+        return False
+
+    async def _loop(self) -> None:
+        while not self._flag.is_set():
+            await asyncio.sleep(self._interval)
+            if await self._poll_once():
+                return

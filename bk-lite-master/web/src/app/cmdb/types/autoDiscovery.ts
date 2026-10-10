@@ -1,0 +1,371 @@
+export type TopologyProtocol = 'lldp' | 'huawei_ndp' | 'cdp' | 'fdb' | 'arp';
+
+export type TopologyFallbackStrategy =
+  | 'prefer_neighbors_then_fdb_then_arp'
+  | 'strict_neighbors_only';
+
+export type TopologyIntervalMode = 'recommended' | 'custom';
+
+export interface TopologyTaskParams {
+  has_network_topo?: boolean;
+  topology_interval_minutes?: number;
+  topology_interval_mode?: TopologyIntervalMode;
+  topology_timeout?: number;
+  topology_protocols?: TopologyProtocol[];
+  topology_fallback_strategy?: TopologyFallbackStrategy;
+  min_confidence?: number;
+  [key: string]: any;
+}
+
+export interface SnmpTopologyFormValues {
+  hasNetworkTopo?: boolean;
+  topologyIntervalMinutes?: number;
+  topologyIntervalMode?: TopologyIntervalMode;
+  topologyTimeout?: number;
+  topologyProtocols?: TopologyProtocol[];
+  topologyFallbackStrategy?: TopologyFallbackStrategy;
+  minConfidence?: number;
+}
+
+export interface CollectTaskMessage {
+  all: number;
+  add: number;
+  update: number;
+  delete: number;
+  association: number;
+  add_error: number;
+  add_success: number;
+  delete_error: number;
+  delete_success: number;
+  update_error: number;
+  update_success: number;
+  association_error: number;
+  association_success: number;
+  message?: string;
+  last_time?: string;
+  raw_total?: number;
+  raw_host?: number;
+  raw_process?: number;
+  raw_dropped?: number;
+  raw_retained?: number;
+  raw_truncated?: boolean;
+}
+
+export interface CredentialPoolItem {
+  credential_id?: string;
+  credential_source?: 'inline' | 'vault';
+  vault_credential_id?: string;
+  vault_type_key?: string;
+  _client_id?: string;
+  username?: string;
+  user?: string;
+  password?: string;
+  enable_password?: string;
+  transport_protocol?: 'ssh' | 'telnet' | string;
+  port?: number | string;
+  database?: string;
+  version?: string;
+  level?: string;
+  integrity?: string;
+  privacy?: string;
+  community?: string;
+  authkey?: string;
+  privkey?: string;
+  snmp_port?: number | string;
+  https_port?: number | string;
+  [key: string]: any;
+}
+
+export interface CredentialFieldSchema {
+  key: string;
+  type: 'string' | 'password' | 'integer' | 'boolean';
+  required: boolean;
+  default?: string | number | boolean;
+  min?: number;
+  max?: number;
+  label: string;
+  label_key?: string;
+  help?: string;
+  help_key?: string;
+}
+
+export interface CredentialSchema {
+  schema_version: number;
+  allow_multiple: boolean;
+  allow_unknown_fields: boolean;
+  encrypted_fields: string[];
+  fields: CredentialFieldSchema[];
+}
+
+export interface CollectTask {
+  id: number;
+  name: string;
+  task_type: string;
+  driver_type: string;
+  model_id: string;
+  exec_status: number;
+  data_cleanup_strategy?: string;
+  expire_days?: number;
+  updated_at: string;
+  message: CollectTaskMessage;
+  exec_time: string | null;
+  input_method: number;
+  examine: boolean,
+  credential?: CredentialPoolItem | CredentialPoolItem[];
+  params?: TopologyTaskParams;
+  [permission: string]: any;
+}
+
+export interface TreeNode {
+  id: string;
+  model_id?: string;
+  target_model_id?: string;
+  supports_host_discovery?: boolean;
+  classification_id?: string;
+  default_timeout?: number;
+  key: string;
+  name: string;
+  type?: string;
+  task_type?: string;
+  credential_protocol?: string;
+  credential_kind?: string;
+  credential_default_port?: number;
+  credential_tip_key?: string;
+  encrypted_fields?: string[];
+  credential_schema?: CredentialSchema;
+  credential_category?: string | null;
+  credential_binding?: string | null;
+  credential_type_keys?: string[];
+  tag?: string[];
+  desc?: string;
+  children?: TreeNode[];
+  tabItems?: TreeNode[];
+}
+
+export interface ModelItem {
+  id: string;
+  model_id: string;
+  target_model_id?: string;
+  supports_host_discovery?: boolean;
+  classification_id?: string;
+  default_timeout?: number;
+  key: string;
+  name: string;
+  type?: string;
+  task_type?: string;
+  credential_protocol?: string;
+  credential_kind?: string;
+  credential_default_port?: number;
+  credential_tip_key?: string;
+  encrypted_fields?: string[];
+  credential_schema?: CredentialSchema;
+  credential_category?: string | null;
+  credential_binding?: string | null;
+  credential_type_keys?: string[];
+  tag?: string[];
+  desc?: string;
+  tabItems?: TreeNode[];
+};
+
+export interface TaskStatusStats {
+  success: number;
+  failed: number;
+  running: number;
+}
+
+export type TaskStatusMap = Record<string, TaskStatusStats>;
+
+export interface TaskStats {
+  running: number;
+  success: number;
+  failed: number;
+}
+
+export interface BaseTaskFormProps {
+  children?: React.ReactNode;
+  showAdvanced?: boolean;
+  timeoutProps?: {
+    min?: number;
+    addonAfter?: string;
+  };
+  modelId: string;
+  submitLoading?: boolean;
+  onClose: () => void;
+  onTest?: () => void;
+}
+
+export interface TaskData {
+  data: any[];
+  count: number;
+  total_count?: number;
+  retained_count?: number;
+  truncated?: boolean;
+}
+
+export interface TopologyLinkRow {
+  relationship_id?: string;
+  relationship_type?: string;
+  evidence_source?: string;
+  confidence?: number | string;
+  source_device?: string;
+  source_port_id?: string;
+  source_inst_name?: string;
+  target_device?: string;
+  target_port_id?: string;
+  target_inst_name?: string;
+  remote_device_name?: string;
+  remote_port_name?: string;
+  vlan?: string | null;
+  status?: string;
+  [key: string]: any;
+}
+
+export interface TopologySummaryData {
+  summary?: Record<string, number>;
+  links?: TopologyLinkRow[];
+  stale_links?: TopologyLinkRow[];
+  unresolved_neighbors?: Array<Record<string, any>>;
+  dropped?: TopologyLinkRow[];
+}
+
+export interface TaskDetailData {
+  add: TaskData;
+  update: TaskData;
+  delete: TaskData;
+  relation: TaskData;
+  raw_data?: TaskData;
+  topology?: TopologySummaryData;
+}
+
+export interface TaskTableProps {
+  type: string;
+  taskId: number;
+  columns: any[];
+  data: any[];
+}
+
+export interface StatisticCardConfig {
+  title: string;
+  value: number;
+  bgColor: string;
+  borderColor: string;
+  valueColor: string;
+  failedCount?: number;
+  showFailed?: boolean;
+}
+
+export type NodeMgmtSyncStatus =
+  | 'unexecuted'
+  | 'waiting_sync'
+  | 'running'
+  | 'submitted'
+  | 'success'
+  | 'partial_success'
+  | 'blocked'
+  | 'failed'
+  | 'timeout';
+
+export interface NodeMgmtSyncHealth {
+  schedule_status: 'healthy' | 'reconciling' | 'degraded';
+  node_config_status: 'healthy' | 'waiting_sync' | 'reconciling' | 'degraded' | 'disabled' | 'unknown';
+  last_reconciled_at: string | null;
+  reason_code: string;
+  message: string;
+}
+
+export interface NodeMgmtSyncTask {
+  id: number;
+  name: string;
+  is_builtin: boolean;
+  auto_sync_enabled: boolean;
+  auto_collect_enabled: boolean;
+  sync_interval_minutes: number;
+  collect_interval_minutes: number;
+  version: number;
+  schedule_status: NodeMgmtSyncHealth['schedule_status'];
+  node_config_status: NodeMgmtSyncHealth['node_config_status'];
+  last_reconciled_at: string | null;
+  reconcile_error_code: string;
+  reconcile_error_message: string;
+  health: NodeMgmtSyncHealth;
+  last_sync_at: string | null;
+  last_collect_at: string | null;
+}
+
+export type NodeMgmtSyncConfig = NodeMgmtSyncTask;
+
+export type NodeMgmtSyncSummary = CollectTaskMessage;
+
+export interface NodeMgmtSyncItem {
+  id?: string | number;
+  _row_key?: string;
+  model_id?: string;
+  inst_name?: string;
+  name?: string;
+  pid?: string | number;
+  ip?: string;
+  ip_addr?: string;
+  cloud_name?: string;
+  organization?: Array<number | string>;
+  _status?: string;
+  _error?: string;
+  [key: string]: any;
+}
+
+export interface NodeMgmtSyncDetailData {
+  add?: TaskData;
+  update?: TaskData;
+  delete?: TaskData;
+  relation?: TaskData;
+  raw_data?: TaskData;
+  todo?: Array<Record<string, any>>;
+  executed?: Array<Record<string, any>>;
+  collect_diagnoses?: Array<{
+    cloud_region_id?: number;
+    task_id?: number;
+    decision?: string;
+    child_status?: string;
+    reason_code?: string;
+    raw_host?: number;
+    raw_process?: number;
+    collect_success?: number;
+    collect_failed?: number;
+  }>;
+}
+
+export interface NodeMgmtSyncRun {
+  id: number | null;
+  task_id?: number | null;
+  run_type: string | null;
+  status: string | null;
+  reason_code?: string;
+  started_at: string | null;
+  submitted_at?: string | null;
+  finished_at: string | null;
+  deadline_at?: string | null;
+  message: CollectTaskMessage;
+  summary: NodeMgmtSyncSummary;
+  detail: NodeMgmtSyncDetailData;
+  error_message: string;
+}
+
+export interface NodeMgmtSyncDisplayPayload {
+  task: NodeMgmtSyncTask;
+  display_source: string;
+  display_schema: string;
+  can_view_raw_detail?: boolean;
+  message: CollectTaskMessage;
+  summary: NodeMgmtSyncSummary;
+  detail: NodeMgmtSyncDetailData;
+  run: NodeMgmtSyncRun;
+}
+
+export interface NodeMgmtSyncRowsPage {
+  total_count: number;
+  retained_count: number;
+  matched_retained_count: number;
+  truncated: boolean;
+  page: number;
+  page_size: number;
+  data: NodeMgmtSyncItem[];
+}

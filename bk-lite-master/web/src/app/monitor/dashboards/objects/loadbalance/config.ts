@@ -1,0 +1,235 @@
+import type { SimpleDashboardConfig } from '../common/simple-dashboard-core';
+import {
+  DEVICE_TEMPERATURE_CHART_GUIDE,
+  DEVICE_TEMPERATURE_KPI_GUIDE
+} from '../common/device-temperature-guide';
+
+// 共享负载均衡仪表盘：覆盖 bk-lite Loadbalance 对象下所有品牌 SNMP 插件（首品牌 F5 BIG-IP）。
+// 品牌间连接/内存指标名可能不同，用 PromQL `or` 回退链做品牌自适应；取不到的实例对应卡片/趋势显示「--」/空，不伪造。
+export const LOADBALANCE_DASHBOARD_CONFIG: SimpleDashboardConfig = {
+  routeKey: 'loadbalance',
+  pageTitle: '负载均衡监控仪表盘',
+  objectFallbackName: 'Loadbalance',
+  instanceType: 'loadbalance',
+  collectionStatusQuery:
+    "count({instance_type='loadbalance', __$labels__}) by (instance_id)",
+  metaItems: ['Telegraf', 'snmp'],
+  metrics: [
+    {
+      name: 'snmp_uptime',
+      display_name: '运行时长',
+      description: '设备自上次重启以来的持续运行时间，反映设备稳定性。',
+      unit: 's',
+      query: 'sum(snmp_uptime{__$labels__} / 100) by (instance_id)',
+      color: '#597ef7'
+    },
+    {
+      name: 'device_cpu_usage',
+      display_name: 'CPU 使用率',
+      description:
+        '负载均衡主机 CPU 使用率。品牌自适应：直报利用率（F5 sysGlobalHostCpuUsageRatio5s）或各核负载均值。持续偏高说明流量处理负载吃紧。',
+      unit: 'percent',
+      query:
+        'avg(device_cpu_usage{__$labels__}) by (instance_id) or avg(snmp_device_cpu_usage{__$labels__}) by (instance_id)',
+      color: '#2f6bff'
+    },
+    {
+      name: 'device_memory_usage',
+      display_name: '内存使用率',
+      description:
+        '负载均衡主机内存使用率（百分比）。品牌自适应：①设备直报利用率；②已用/总量（F5）。',
+      unit: 'percent',
+      query:
+        'avg(device_memory_usage{__$labels__}) by (instance_id) or (sum(device_memory_used{__$labels__}) by (instance_id) / sum(device_memory_total{__$labels__}) by (instance_id) * 100) or (sum(snmp_device_memory_used{__$labels__}) by (instance_id) / sum(snmp_device_memory_total{__$labels__}) by (instance_id) * 100) or ((sum(device_memory_total{__$labels__}) by (instance_id) - sum(device_memory_free{__$labels__}) by (instance_id)) / sum(device_memory_total{__$labels__}) by (instance_id) * 100)',
+      color: '#ff8a1f'
+    },
+    {
+      name: 'device_memory_used',
+      display_name: '内存已用',
+      description: '负载均衡设备各内存池当前已使用的字节数之和（F5 走 sysStatMemoryUsed）。物理/虚拟版均有值。',
+      unit: 'bytes',
+      query:
+        'sum(device_memory_used{__$labels__}) by (instance_id) or sum(snmp_device_memory_used{__$labels__}) by (instance_id)',
+      color: '#ff8a1f'
+    },
+    {
+      name: 'lb_connections',
+      display_name: '当前连接',
+      description:
+        '负载均衡当前客户端连接数。品牌自适应回退：当前客户端连接（F5 sysStatClientCurConns）。反映负载与连接表压力。',
+      unit: 'counts',
+      query:
+        'lb_current_connections{__$labels__} or snmp_lb_current_connections{__$labels__}',
+      color: '#13c2c2'
+    },
+    {
+      name: 'device_temperature_celsius',
+      display_name: '最高温度',
+      description:
+        '负载均衡机箱最高温度（摄氏度）。品牌自适应：物理设备有值（F5 走 F5-BIGIP-SYSTEM sysChassisTempTemperature 专用温度表）；哨兵语义由 collect_type 契约注入；虚拟版（F5 VE，无物理机箱）显示「--」。异常升高多为风扇故障或散热不良。',
+      unit: 'celsius',
+      query: 'max(device_temperature_celsius{__$labels__}) by (instance_id)',
+      color: '#f5222d'
+    },
+    {
+      name: 'device_fan_state',
+      display_name: '风扇状态',
+      description:
+        '负载均衡风扇状态（1=正常 / 2=异常）。品牌自适应：物理设备有值（F5 sysChassisFanStatus；good→1，其余→2）。折线偏离 1 即散热异常。虚拟版显示「--」。',
+      unit: 'none',
+      query: 'max(device_fan_state{__$labels__}) by (instance_id)',
+      color: '#13c2c2'
+    },
+    {
+      name: 'device_psu_state',
+      display_name: '电源状态',
+      description:
+        '负载均衡电源模块状态（1=正常 / 2=异常）。品牌自适应：物理设备有值（F5 sysChassisPowerSupplyStatus）。折线偏离 1 即电源冗余缺失或硬件故障。虚拟版显示「--」。',
+      unit: 'none',
+      query: 'max(device_psu_state{__$labels__}) by (instance_id)',
+      color: '#722ed1'
+    },
+    {
+      name: 'device_total_incoming_traffic',
+      display_name: '入向总流量',
+      description: '设备所有接口入向流量速率之和（字节/秒）。',
+      unit: 'byteps',
+      query:
+        '(sum(rate(interface_ifHCInOctets{__$labels__}[__$window__])) by (instance_id)) or (sum(rate(interface_ifInOctets{__$labels__}[__$window__])) by (instance_id))',
+      color: '#27c274'
+    },
+    {
+      name: 'device_total_outgoing_traffic',
+      display_name: '出向总流量',
+      description: '设备所有接口出向流量速率之和（字节/秒）。',
+      unit: 'byteps',
+      query:
+        '(sum(rate(interface_ifHCOutOctets{__$labels__}[__$window__])) by (instance_id)) or (sum(rate(interface_ifOutOctets{__$labels__}[__$window__])) by (instance_id))',
+      color: '#2f6bff'
+    }
+  ],
+  summaryCards: [
+    {
+      title: '运行时长',
+      metric: 'snmp_uptime',
+      unit: 's',
+      formatter: 'duration',
+      isUptimeCard: true,
+      icon: 'clock',
+      color: '#597ef7',
+      guide: [{ label: '运行时长', detail: '设备自上次重启后的持续运行时间；期间发生重启会重新计时。' }],
+      footer: [{ label: '启动', metric: 'snmp_uptime', formatter: 'startedAt' }]
+    },
+    {
+      title: 'CPU 使用率',
+      metric: 'device_cpu_usage',
+      unit: 'percent',
+      color: '#2f6bff',
+      icon: 'thunder',
+      compare: true,
+      compareFavorableDirection: 'down',
+      guide: [{ label: 'CPU 使用率', detail: '主机 CPU 使用率，逼近 100% 说明处理能力将耗尽。' }]
+    },
+    {
+      title: '内存使用率',
+      metric: 'device_memory_usage',
+      unit: 'percent',
+      color: '#ff8a1f',
+      icon: 'memory',
+      compare: true,
+      compareFavorableDirection: 'down',
+      guide: [{ label: '内存使用率', detail: '主机内存使用率，持续偏高可能影响连接处理性能。' }],
+      footer: [{ label: '已用', metric: 'device_memory_used', unit: 'bytes' }]
+    },
+    {
+      title: '当前连接',
+      metric: 'lb_connections',
+      unit: 'counts',
+      color: '#13c2c2',
+      icon: 'api',
+      compare: true,
+      compareFavorableDirection: 'down',
+      guide: [{ label: '当前连接', detail: '当前客户端连接数，快速攀升可能是连接突增或容量逼近上限。' }]
+    },
+    {
+      title: '最高温度',
+      metric: 'device_temperature_celsius',
+      unit: 'celsius',
+      color: '#f5222d',
+      icon: 'health',
+      compare: true,
+      compareFavorableDirection: 'down',
+      guide: DEVICE_TEMPERATURE_KPI_GUIDE
+    },
+    {
+      title: '入向总流量',
+      metric: 'device_total_incoming_traffic',
+      unit: 'byteps',
+      color: '#27c274',
+      icon: 'api',
+      guide: [{ label: '入向总流量', detail: '全部接口入向字节速率；突增优先查广播风暴、异常主机与上联拥塞。' }],
+      footer: [{ label: '出向', metric: 'device_total_outgoing_traffic', unit: 'byteps' }]
+    }
+  ],
+  charts: [
+    {
+      title: 'CPU 与内存使用率趋势',
+      subtitle: 'CPU、内存',
+      metric: 'device_cpu_usage',
+      guide: [{ label: '资源使用率', detail: '对比 CPU 与内存使用率，两者持续高位说明负载均衡负载吃紧。' }],
+      series: [
+        { metric: 'device_cpu_usage', label: 'CPU 使用率', color: '#2f6bff', unit: 'percent' },
+        { metric: 'device_memory_usage', label: '内存使用率', color: '#ff8a1f', unit: 'percent' }
+      ]
+    },
+    {
+      title: '设备收发流量趋势',
+      subtitle: '入向、出向',
+      metric: 'device_total_incoming_traffic',
+      guide: [{ label: '收发流量', detail: '对比入/出向总流量；突增查风暴与上联，持续高水位结合接口错误计数排查。' }],
+      series: [
+        { metric: 'device_total_incoming_traffic', label: '入向', color: '#27c274', unit: 'byteps' },
+        { metric: 'device_total_outgoing_traffic', label: '出向', color: '#2f6bff', unit: 'byteps' }
+      ]
+    },
+    {
+      title: '当前连接趋势',
+      subtitle: '客户端连接数',
+      metric: 'lb_connections',
+      guide: [{ label: '当前连接', detail: '当前客户端连接数随时间变化，突增提示连接洪泛或异常流量。' }],
+      series: [
+        { metric: 'lb_connections', label: '当前连接', color: '#13c2c2', unit: 'counts' }
+      ]
+    },
+    {
+      title: '机箱温度趋势',
+      subtitle: '最高温度（℃）',
+      metric: 'device_temperature_celsius',
+      guide: DEVICE_TEMPERATURE_CHART_GUIDE,
+      series: [
+        { metric: 'device_temperature_celsius', label: '最高温度', color: '#f5222d', unit: 'celsius' }
+      ]
+    },
+    {
+      title: '风扇状态',
+      subtitle: '状态值随时间（1=正常）',
+      metric: 'device_fan_state',
+      guide: [{ label: '风扇状态', detail: '风扇状态值随时间变化，1 为正常；折线偏离 1（2 异常）即散热异常。虚拟版/无风扇 OID 显示空。' }],
+      series: [
+        { metric: 'device_fan_state', label: '风扇状态', color: '#13c2c2', unit: 'none' }
+      ]
+    },
+    {
+      title: '电源状态',
+      subtitle: '状态值随时间（1=正常）',
+      metric: 'device_psu_state',
+      guide: [{ label: '电源状态', detail: '电源模块状态值随时间变化，1 为正常；折线偏离 1 即电源冗余缺失或硬件故障。虚拟版显示空。' }],
+      series: [
+        { metric: 'device_psu_state', label: '电源状态', color: '#722ed1', unit: 'none' }
+      ]
+    }
+  ],
+  ringPanels: [],
+  statusPanels: [],
+  details: []
+};

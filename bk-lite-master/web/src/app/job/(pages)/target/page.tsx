@@ -1,0 +1,837 @@
+'use client';
+
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import {
+  Button,
+  Input,
+  Select,
+  Tag,
+  Popconfirm,
+  message,
+  Form,
+  Radio,
+  Alert,
+  Upload,
+  InputNumber,
+} from 'antd';
+import { PlusOutlined, InboxOutlined, CloseOutlined } from '@ant-design/icons';
+import CustomTable from '@/components/custom-table';
+import OperateModal from '@/components/operate-modal';
+import { useTranslation } from '@/utils/i18n';
+import useApiClient from '@/utils/request';
+import useJobApi from '@/app/job/api';
+import useCloudRegionApi from '@/app/node-manager/api/useCloudRegionApi';
+import { Target, WinRMScheme } from '@/app/job/types';
+import { ColumnItem } from '@/types';
+import GroupTreeSelect from '@/components/group-tree-select';
+import SearchCombination from '@/components/search-combination';
+import Password from '@/components/password';
+import { SearchFilters, FieldConfig } from '@/components/search-combination/types';
+import OrganizationTags, { getOrganizationColumnWidth } from '@/app/job/components/organization-tags';
+
+const { Dragger } = Upload;
+const TARGET_DATA_COLUMN_COUNT = 7;
+const MIN_TARGET_DATA_COLUMN_WIDTH = 120;
+const TARGET_ACTION_COLUMN_WIDTH = 120;
+const SAVED_SECRET = '********';
+
+const TargetPage = () => {
+  const { t } = useTranslation();
+  const { isLoading: isApiReady } = useApiClient();
+  const {
+    getTargetList,
+    createTarget,
+    updateTarget,
+    deleteTarget,
+    testTargetConnection,
+    testSavedTargetConnection,
+  } = useJobApi();
+  const { getCloudList } = useCloudRegionApi();
+
+  const [form] = Form.useForm();
+  const [data, setData] = useState<Target[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [searchFilters, setSearchFilters] = useState<SearchFilters>({});
+  const [pagination, setPagination] = useState({
+    current: 1,
+    total: 0,
+    pageSize: 20,
+  });
+
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalType, setModalType] = useState<'add' | 'edit'>('add');
+  const [editingTarget, setEditingTarget] = useState<Target | null>(null);
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const [testLoading, setTestLoading] = useState(false);
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+  const [targetDataColumnWidth, setTargetDataColumnWidth] = useState(MIN_TARGET_DATA_COLUMN_WIDTH);
+
+  const [cloudRegions, setCloudRegions] = useState<{ id: number; name: string }[]>([]);
+
+  // Form field watchers
+  const [sshCredentialType, setSshCredentialType] = useState<'key' | 'password'>('password');
+  const [keepExistingKey, setKeepExistingKey] = useState(false);
+  const [sshPasswordVersion, setSshPasswordVersion] = useState(0);
+  const [winrmPasswordVersion, setWinrmPasswordVersion] = useState(0);
+  const osType = Form.useWatch('os_type', form) || 'linux';
+  const editingCredential = editingTarget?.ssh_credential_type;
+
+  const winrmSchemeOptions = useMemo(
+    () => ([
+      { label: 'HTTP', value: 'http' as WinRMScheme },
+      { label: 'HTTPS', value: 'https' as WinRMScheme },
+    ]),
+    []
+  );
+
+  useEffect(() => {
+    if (!modalOpen) {
+      return;
+    }
+
+    if (osType === 'windows') {
+      const nextValues: Record<string, unknown> = {};
+
+      if (form.getFieldValue('winrm_port') === undefined) {
+        nextValues.winrm_port = 5985;
+      }
+      if (!form.getFieldValue('winrm_scheme')) {
+        nextValues.winrm_scheme = 'http';
+      }
+
+      if (Object.keys(nextValues).length > 0) {
+        form.setFieldsValue(nextValues);
+      }
+      return;
+    }
+
+    const nextValues: Record<string, unknown> = {};
+
+    if (form.getFieldValue('ssh_port') === undefined) {
+      nextValues.ssh_port = 22;
+    }
+    if (!form.getFieldValue('ssh_user')) {
+      nextValues.ssh_user = 'root';
+    }
+    if (!form.getFieldValue('ssh_credential_type')) {
+      nextValues.ssh_credential_type = 'password';
+      setSshCredentialType('password');
+    }
+
+    if (Object.keys(nextValues).length > 0) {
+      form.setFieldsValue(nextValues);
+    }
+  }, [form, modalOpen, osType]);
+
+  const fetchCloudRegions = useCallback(async () => {
+    try {
+      const res = await getCloudList();
+      setCloudRegions(Array.isArray(res) ? res : []);
+    } catch {
+      // error handled by interceptor
+    }
+  }, []);
+
+  const fetchData = useCallback(
+    async (params: { filters?: SearchFilters; current?: number; pageSize?: number } = {}) => {
+      setLoading(true);
+      try {
+        const filters = params.filters ?? searchFilters;
+        const queryParams: Record<string, unknown> = {
+          page: params.current ?? pagination.current,
+          page_size: params.pageSize ?? pagination.pageSize,
+        };
+        if (filters && Object.keys(filters).length > 0) {
+          Object.entries(filters).forEach(([field, conditions]) => {
+            conditions.forEach((condition) => {
+              if (condition.lookup_expr === 'in' && Array.isArray(condition.value)) {
+                queryParams[field] = (condition.value as string[]).join(',');
+              } else {
+                queryParams[field] = condition.value;
+              }
+            });
+          });
+        }
+        const res = await getTargetList(queryParams as any);
+        setData(res.items || []);
+        setPagination((prev) => ({
+          ...prev,
+          total: res.count || 0,
+        }));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [searchFilters, pagination.current, pagination.pageSize]
+  );
+
+  useEffect(() => {
+    if (!isApiReady) {
+      fetchData();
+      fetchCloudRegions();
+    }
+  }, [isApiReady]);
+
+  useEffect(() => {
+    if (!isApiReady) {
+      fetchData();
+    }
+  }, [pagination.current, pagination.pageSize]);
+
+  useEffect(() => {
+    const container = tableContainerRef.current;
+    if (!container) return;
+
+    const updateTargetColumnWidth = () => {
+      const tableBody = container.querySelector<HTMLElement>('.ant-table-body');
+      const scrollbarWidth = tableBody ? tableBody.offsetWidth - tableBody.clientWidth : 0;
+      const availableWidth = container.clientWidth - TARGET_ACTION_COLUMN_WIDTH - scrollbarWidth;
+      const averageWidth = Math.floor(availableWidth / TARGET_DATA_COLUMN_COUNT);
+      setTargetDataColumnWidth(Math.max(MIN_TARGET_DATA_COLUMN_WIDTH, averageWidth));
+    };
+
+    const frameId = window.requestAnimationFrame(updateTargetColumnWidth);
+    const resizeObserver = new ResizeObserver(updateTargetColumnWidth);
+    resizeObserver.observe(container);
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      resizeObserver.disconnect();
+    };
+  }, [data.length, loading]);
+
+  const handleSearchChange = useCallback((filters: SearchFilters) => {
+    setSearchFilters(filters);
+    setPagination((prev) => ({ ...prev, current: 1 }));
+    fetchData({ filters, current: 1 });
+  }, [fetchData]);
+
+  const fieldConfigs: FieldConfig[] = useMemo(() => [
+    {
+      name: 'name',
+      label: t('job.targetName'),
+      lookup_expr: 'icontains',
+    },
+    {
+      name: 'ip',
+      label: t('job.ipAddress'),
+      lookup_expr: 'icontains',
+    },
+    {
+      name: 'cloud_region',
+      label: t('job.cloudRegion'),
+      lookup_expr: 'icontains',
+    },
+    {
+      name: 'driver',
+      label: t('job.executionDriver'),
+      lookup_expr: 'in',
+      options: [
+        { id: 'ansible', name: t('job.driverAnsible') },
+        { id: 'ssh', name: t('job.driverSSH') },
+        { id: 'sidecar', name: 'Sidecar' },
+      ],
+    },
+    {
+      name: 'team',
+      label: t('job.organization'),
+      lookup_expr: 'icontains',
+    },
+  ], [t]);
+
+  const handleTableChange = (pag: any) => {
+    setPagination(pag);
+  };
+
+  const getDriverSelectOptions = () => {
+    return [{ label: t('job.driverAnsible'), value: 'ansible' }];
+  };
+
+  const handleDelete = async (record: Target) => {
+    await deleteTarget(record.id);
+    message.success(t('job.deleteTarget'));
+    fetchData();
+  };
+
+  const openAddModal = () => {
+    setModalType('add');
+    setEditingTarget(null);
+    form.resetFields();
+    form.setFieldsValue({
+      os_type: 'linux',
+      driver: 'ansible',
+      ssh_port: 22,
+      ssh_user: 'root',
+      ssh_credential_type: 'password',
+      winrm_port: 5985,
+      winrm_scheme: 'http',
+      winrm_user: '',
+      winrm_cert_validation: true,
+    });
+    setSshCredentialType('password');
+    setKeepExistingKey(false);
+    setSshPasswordVersion((version) => version + 1);
+    setWinrmPasswordVersion((version) => version + 1);
+    setModalOpen(true);
+  };
+
+  const openEditModal = (record: Target) => {
+    setModalType('edit');
+    setEditingTarget(record);
+    form.resetFields();
+    form.setFieldsValue({
+      name: record.name,
+      os_type: record.os_type,
+      cloud_region_id: record.cloud_region_id,
+      ip: record.ip,
+      team: record.team || [],
+      driver: record.driver,
+      ssh_port: record.ssh_port || 22,
+      ssh_user: record.ssh_user || 'root',
+      ssh_credential_type: record.ssh_credential_type || 'password',
+      ssh_password: record.has_ssh_password ? SAVED_SECRET : undefined,
+      winrm_port: record.winrm_port || 5985,
+      winrm_scheme: (record.winrm_scheme as WinRMScheme) || 'http',
+      winrm_user: record.winrm_user || '',
+      winrm_password: record.has_winrm_password ? SAVED_SECRET : undefined,
+      winrm_cert_validation: record.winrm_cert_validation ?? true,
+    });
+    const credentialType = (record.ssh_credential_type || 'password') as 'key' | 'password';
+    setSshCredentialType(credentialType);
+    setKeepExistingKey(credentialType === 'key' && record.has_ssh_key);
+    setSshPasswordVersion((version) => version + 1);
+    setWinrmPasswordVersion((version) => version + 1);
+    setModalOpen(true);
+  };
+
+  const selectedKeyFile = (values: Record<string, any>): File | undefined => {
+    const upload = values.ssh_key_file;
+    return upload?.fileList?.[0]?.originFileObj
+      || upload?.file?.originFileObj
+      || upload?.file;
+  };
+
+  const resolveWinrmCertValidation = (values: Record<string, any>): boolean => (
+    values.winrm_cert_validation
+    ?? editingTarget?.winrm_cert_validation
+    ?? true
+  );
+
+  const handleSubmit = async () => {
+    try {
+      const values = await form.validateFields();
+      setConfirmLoading(true);
+      const formData = new FormData();
+      formData.append('name', values.name);
+      formData.append('ip', values.ip);
+      formData.append('os_type', values.os_type);
+      if (values.cloud_region_id !== undefined && values.cloud_region_id !== null) {
+        formData.append('cloud_region_id', String(values.cloud_region_id));
+      }
+      formData.append('driver', values.driver);
+      formData.append('credential_source', 'manual');
+      formData.append('credential_id', '');
+      if (values.os_type === 'windows') {
+        formData.append('winrm_port', String(values.winrm_port));
+        formData.append('winrm_scheme', values.winrm_scheme || 'http');
+        formData.append('winrm_user', values.winrm_user || '');
+        if (values.winrm_password && values.winrm_password !== SAVED_SECRET) {
+          formData.append('winrm_password', values.winrm_password);
+        }
+        formData.append('winrm_cert_validation', String(resolveWinrmCertValidation(values)));
+      } else {
+        formData.append('ssh_port', String(values.ssh_port));
+        formData.append('ssh_user', values.ssh_user || '');
+        formData.append('ssh_credential_type', values.ssh_credential_type || 'password');
+        if (values.ssh_credential_type === 'password' && values.ssh_password && values.ssh_password !== SAVED_SECRET) {
+          formData.append('ssh_password', values.ssh_password);
+        } else if (values.ssh_credential_type === 'key') {
+          const keyFile = selectedKeyFile(values);
+          if (keyFile) formData.append('ssh_key_file', keyFile);
+        }
+      }
+      if (Array.isArray(values.team) && values.team.length > 0) {
+        formData.append('team', JSON.stringify(values.team));
+      }
+
+      if (modalType === 'add') {
+        await createTarget(formData);
+        message.success(t('job.addTarget'));
+      } else if (editingTarget) {
+        await updateTarget(editingTarget.id, formData);
+        message.success(t('job.editTarget'));
+      }
+      setModalOpen(false);
+      fetchData();
+    } catch {
+      // validation or API error
+    } finally {
+      setConfirmLoading(false);
+    }
+  };
+
+  const handleTestConnection = async () => {
+    try {
+      const values = await form.validateFields();
+      setTestLoading(true);
+      const keyFile = selectedKeyFile(values);
+      const formData = new FormData();
+      formData.append('ip', values.ip);
+      formData.append('driver', values.driver);
+      formData.append('cloud_region_id', String(values.cloud_region_id));
+      formData.append('os_type', values.os_type);
+      formData.append('credential_source', 'manual');
+      if (values.os_type === 'windows') {
+        formData.append('winrm_port', String(values.winrm_port));
+        formData.append('winrm_scheme', values.winrm_scheme);
+        formData.append('winrm_user', values.winrm_user);
+        if (values.winrm_password !== SAVED_SECRET) {
+          formData.append('winrm_password', values.winrm_password);
+        }
+        formData.append('winrm_cert_validation', String(resolveWinrmCertValidation(values)));
+      } else {
+        formData.append('ssh_port', String(values.ssh_port));
+        formData.append('ssh_user', values.ssh_user);
+        formData.append('ssh_credential_type', values.ssh_credential_type);
+        if (values.ssh_credential_type === 'password') {
+          if (values.ssh_password !== SAVED_SECRET) {
+            formData.append('ssh_password', values.ssh_password);
+          }
+        } else if (keyFile) {
+          formData.append('ssh_key_file', keyFile);
+        }
+      }
+      const res = editingTarget
+        ? await testSavedTargetConnection(editingTarget.id, formData)
+        : await testTargetConnection(formData);
+      if (res.success) {
+        message.success(res.message || t('job.testConnectionSuccess'));
+      } else {
+        message.error(res.message || t('job.testConnectionFailed'));
+      }
+    } catch {
+      // error handled by interceptor
+    } finally {
+      setTestLoading(false);
+    }
+  };
+
+  const handleWinrmSchemeChange = (value: WinRMScheme) => {
+    const nextPort = value === 'https' ? 5986 : 5985;
+    form.setFieldsValue({
+      winrm_scheme: value,
+      winrm_port: nextPort,
+    });
+  };
+
+  const getDriverColor = (driver: string) => {
+    switch (driver) {
+      case 'sidecar':
+        return '#1890ff';
+      case 'ssh':
+      case 'ansible':
+        return '#fa8c16';
+      default:
+        return undefined;
+    }
+  };
+
+  const organizationColumnWidth = getOrganizationColumnWidth(data, targetDataColumnWidth);
+
+  const columns: ColumnItem[] = [
+    {
+      title: t('job.targetName'),
+      dataIndex: 'name',
+      key: 'name',
+      width: targetDataColumnWidth,
+    },
+    {
+      title: t('job.ipAddress'),
+      dataIndex: 'ip',
+      key: 'ip',
+      width: targetDataColumnWidth,
+    },
+    {
+      title: t('job.cloudRegion'),
+      dataIndex: 'cloud_region_name',
+      key: 'cloud_region_name',
+      width: targetDataColumnWidth,
+    },
+    {
+      title: t('job.osType'),
+      dataIndex: 'os_type_display',
+      key: 'os_type_display',
+      width: targetDataColumnWidth,
+    },
+    {
+      title: t('job.currentDriver'),
+      dataIndex: 'driver',
+      key: 'driver',
+      width: targetDataColumnWidth,
+      render: (_: unknown, record: Target) => (
+        <span style={{ color: getDriverColor(record.driver) }}>
+          {record.driver_display || record.driver}
+        </span>
+      ),
+    },
+    {
+      title: t('job.credential'),
+      dataIndex: 'credential',
+      key: 'credential',
+      width: targetDataColumnWidth,
+      render: (_: unknown, record: Target) => {
+        const hasCredential = record.ssh_user || record.ssh_port;
+        return (
+          <Tag
+            color={hasCredential ? 'success' : 'error'}
+            className="!m-0"
+          >
+            {hasCredential ? t('job.credentialConfigured') : t('job.credentialNotConfigured')}
+          </Tag>
+        );
+      },
+    },
+    {
+      title: t('job.organization'),
+      dataIndex: 'team_name',
+      key: 'team_name',
+      width: organizationColumnWidth,
+      render: (_: unknown, record: Target) => <OrganizationTags names={record.team_name} />,
+    },
+    {
+      title: t('job.operation'),
+      dataIndex: 'action',
+      key: 'action',
+      width: TARGET_ACTION_COLUMN_WIDTH,
+      fixed: 'right',
+      render: (_: unknown, record: Target) => (
+        <div className="flex items-center gap-3">
+          <a
+            className="text-(--color-primary) cursor-pointer"
+            onClick={() => openEditModal(record)}
+          >
+            {t('job.editRule')}
+          </a>
+          <Popconfirm
+            title={t('job.deleteTarget')}
+            description={t('job.deleteTargetConfirm')}
+            okText={t('job.confirm')}
+            cancelText={t('job.cancel')}
+            okButtonProps={{ danger: true }}
+            onConfirm={() => handleDelete(record)}
+          >
+            <a className="text-(--color-primary) cursor-pointer">
+              {t('job.deleteTarget')}
+            </a>
+          </Popconfirm>
+        </div>
+      ),
+    },
+  ];
+
+  return (
+    <div className="w-full h-full flex flex-col">
+      {/* Header */}
+      <div className="mb-4 shrink-0 rounded-lg border border-[var(--color-border-1)] bg-[var(--color-bg-1)] px-6 py-4">
+        <h2 className="m-0 mb-1 text-base font-medium text-[var(--color-text-1)]">
+          {t('job.targetManagement')}
+        </h2>
+        <p className="m-0 text-sm text-[var(--color-text-3)]">
+          {t('job.targetManagementDesc')}
+        </p>
+      </div>
+
+      {/* Table Section */}
+      <div className="flex min-h-0 flex-1 flex-col rounded-lg border border-[var(--color-border-1)] bg-[var(--color-bg-1)] px-6 py-6">
+        {/* Toolbar */}
+        <div className="mb-4 flex items-center justify-between shrink-0">
+          <SearchCombination
+            fieldConfigs={fieldConfigs}
+            onChange={handleSearchChange}
+            fieldWidth={120}
+            selectWidth={300}
+          />
+          <div className="flex gap-2">
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={openAddModal}
+            >
+              {t('job.addTarget')}
+            </Button>
+          </div>
+        </div>
+
+        {/* Table */}
+        <div ref={tableContainerRef} className="flex-1 min-h-0">
+          <CustomTable
+            columns={columns}
+            dataSource={data}
+            loading={loading}
+            rowKey="id"
+            pagination={pagination}
+            onChange={handleTableChange}
+          />
+        </div>
+      </div>
+
+      {/* Add/Edit Modal */}
+      <OperateModal
+        title={modalType === 'add' ? t('job.addTarget') : t('job.editTarget')}
+        open={modalOpen}
+        confirmLoading={confirmLoading}
+        onCancel={() => setModalOpen(false)}
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button onClick={() => setModalOpen(false)}>{t('job.cancel')}</Button>
+            <Button type="primary" loading={confirmLoading} onClick={handleSubmit}>
+              {t('job.save')}
+            </Button>
+          </div>
+        }
+        width={680}
+      >
+        <Form form={form} layout="vertical" colon={false}>
+          {/* Section: Basic Info */}
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-base">📋</span>
+            <span className="text-sm font-medium text-[var(--color-text-1)]">
+              {t('job.basicInfo')}
+            </span>
+          </div>
+
+          <Form.Item
+            name="name"
+            label={t('job.targetName')}
+            rules={[{ required: true, message: t('job.targetNamePlaceholder') }]}
+          >
+            <Input placeholder={t('job.targetNamePlaceholder')} />
+          </Form.Item>
+
+          <Form.Item
+            name="os_type"
+            label={t('job.operatingSystem')}
+            rules={[{ required: true }]}
+          >
+            <Radio.Group>
+              <Radio value="linux">{t('job.linux')}</Radio>
+              <Radio value="windows">{t('job.windows')}</Radio>
+            </Radio.Group>
+          </Form.Item>
+
+          <Form.Item
+            name="cloud_region_id"
+            label={t('job.cloudRegion')}
+            rules={[{ required: true, message: t('job.selectCloudRegion') }]}
+          >
+            <Select
+              placeholder={t('job.selectCloudRegion')}
+              options={cloudRegions.map((r) => ({
+                label: r.name,
+                value: r.id,
+              }))}
+            />
+          </Form.Item>
+
+          <Form.Item
+            name="ip"
+            label={t('job.ipAddress')}
+            rules={[{ required: true, message: t('job.ipPlaceholder') }]}
+          >
+            <Input placeholder={t('job.ipPlaceholder')} />
+          </Form.Item>
+
+          <Form.Item
+            name="team"
+            label={t('job.organization')}
+            rules={[{ required: true, message: t('job.organizationPlaceholder') }]}
+          >
+            <GroupTreeSelect multiple placeholder={t('job.organizationPlaceholder')} />
+          </Form.Item>
+
+          {/* Section: Driver Config */}
+          <div className="flex items-center gap-2 mb-4 mt-6">
+            <span className="text-base">⚙️</span>
+            <span className="text-sm font-medium text-[var(--color-text-1)]">
+              {t('job.driverConfig')}
+            </span>
+          </div>
+
+          <Form.Item
+            name="driver"
+            label={t('job.executionDriver')}
+            rules={[{ required: true }]}
+          >
+            <Select
+              placeholder={t('job.selectDriver')}
+              options={getDriverSelectOptions()}
+            />
+          </Form.Item>
+          <div className="-mt-4 mb-4 text-xs text-[var(--color-text-3)]">
+            {t('job.driverHelp')}
+          </div>
+
+          {osType === 'windows' ? (
+            <>
+              <Form.Item
+                name="winrm_scheme"
+                label={t('job.protocol')}
+                rules={[{ required: true }]}
+              >
+                <Select options={winrmSchemeOptions} onChange={handleWinrmSchemeChange} />
+              </Form.Item>
+
+              <Form.Item
+                name="winrm_port"
+                label={t('job.port')}
+                rules={[{ required: true }]}
+              >
+                <InputNumber min={1} max={65535} className="w-full" />
+              </Form.Item>
+
+              <Form.Item
+                name="winrm_user"
+                label={t('job.username')}
+                rules={[{ required: true }]}
+              >
+                <Input />
+              </Form.Item>
+
+              <Form.Item
+                name="winrm_password"
+                label={t('job.password')}
+                rules={[{ required: true, message: t('job.passwordPlaceholder') }]}
+              >
+                <Password
+                  key={`winrm-password-${winrmPasswordVersion}`}
+                  placeholder={t('job.passwordPlaceholder')}
+                  clickToEdit={Boolean(editingTarget?.has_winrm_password && editingTarget.os_type === 'windows')}
+                />
+              </Form.Item>
+
+              <Alert
+                type="warning"
+                showIcon
+                message={t('job.windowsTestConnectionNote')}
+                className="mb-4"
+              />
+
+              <Button
+                block
+                type="dashed"
+                loading={testLoading}
+                onClick={handleTestConnection}
+              >
+                {t('job.testConnection')}
+              </Button>
+            </>
+          ) : (
+            <>
+              <Form.Item
+                name="ssh_port"
+                label={t('job.sshPort')}
+              >
+                <InputNumber min={1} max={65535} className="w-full" />
+              </Form.Item>
+
+              <Form.Item
+                name="ssh_user"
+                label={t('job.sshUser')}
+                rules={[{ required: true }]}
+              >
+                <Input placeholder="root" />
+              </Form.Item>
+
+              <Form.Item
+                name="ssh_credential_type"
+                label={t('job.sshCredential')}
+                required
+              >
+                <Radio.Group
+                  onChange={(e) => {
+                    const nextType = e.target.value as 'key' | 'password';
+                    setSshCredentialType(nextType);
+                    setKeepExistingKey(nextType === 'key' && Boolean(editingTarget?.has_ssh_key));
+                  }}
+                >
+                  <Radio value="key">{t('job.sshKey')}</Radio>
+                  <Radio value="password">{t('job.sshPassword')}</Radio>
+                </Radio.Group>
+              </Form.Item>
+
+              {sshCredentialType === 'password' ? (
+                <Form.Item
+                  name="ssh_password"
+                  rules={[{ required: true, message: t('job.sshPasswordPlaceholder') }]}
+                >
+                  <Password
+                    key={`ssh-password-${sshPasswordVersion}`}
+                    placeholder={t('job.sshPasswordPlaceholder')}
+                    clickToEdit={Boolean(
+                      editingTarget?.has_ssh_password
+                      && editingTarget.os_type === 'linux'
+                      && editingCredential === 'password'
+                    )}
+                  />
+                </Form.Item>
+              ) : (
+                keepExistingKey ? (
+                  <div className="mb-4 flex items-center justify-between rounded-md border border-[var(--color-border-1)] px-3 py-2">
+                    <span>{t('job.uploadedKey', undefined, { name: editingTarget?.ssh_key_file_name || t('job.privateKeyFile') })}</span>
+                    <Button
+                      type="text"
+                      size="small"
+                      aria-label={t('job.replaceKey')}
+                      icon={<CloseOutlined />}
+                      onClick={() => {
+                        setKeepExistingKey(false);
+                        form.setFieldValue('ssh_key_file', undefined);
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <Form.Item
+                    name="ssh_key_file"
+                    label={t('job.privateKeyFile')}
+                    rules={[{ required: true, message: t('job.selectKeyFile') }]}
+                  >
+                    <Dragger
+                      maxCount={1}
+                      beforeUpload={() => false}
+                      accept=".pem,.key,.pub"
+                    >
+                      <p className="ant-upload-drag-icon">
+                        <InboxOutlined />
+                      </p>
+                      <p className="ant-upload-text text-sm">
+                        {t('job.selectKeyFile')}
+                      </p>
+                    </Dragger>
+                  </Form.Item>
+                )
+              )}
+
+              <Alert
+                type="warning"
+                showIcon
+                message={t('job.testConnectionNote')}
+                className="mb-4"
+              />
+
+              <Button
+                block
+                type="dashed"
+                loading={testLoading}
+                onClick={handleTestConnection}
+              >
+                {t('job.testConnection')}
+              </Button>
+            </>
+          )}
+        </Form>
+      </OperateModal>
+    </div>
+  );
+};
+
+export default TargetPage;
