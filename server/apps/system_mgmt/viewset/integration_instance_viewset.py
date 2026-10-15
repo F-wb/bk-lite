@@ -272,6 +272,59 @@ class IntegrationInstanceViewSet(MaintainerViewSet):
             )
         return build_test_connection_response(result)
 
+    @action(methods=["POST"], detail=False, url_path="execute_capability")
+    @HasPermission("asset_info-View", app_name="cmdb")
+    def execute_capability(self, request, *args, **kwargs):
+        """通用能力执行入口。供 CMDB SSH 终端等场景调用第三方 Provider 能力。"""
+        provider_key = (request.data.get("provider_key") or "").strip()
+        capability_key = (request.data.get("capability_key") or "").strip()
+        operation = (request.data.get("operation") or "").strip()
+        params = request.data.get("params") or {}
+
+        if not provider_key or not capability_key or not operation:
+            return Response(
+                {"success": False, "summary": "provider_key, capability_key, operation are required"},
+                status=400,
+            )
+
+        instance = (
+            IntegrationInstance.objects.filter(
+                provider_key=provider_key,
+                enabled=True,
+                status=IntegrationInstanceStatusChoices.READY,
+            )
+            .order_by("id")
+            .first()
+        )
+        if instance is None:
+            return Response(
+                {"success": False, "summary": f"No ready integration instance for provider '{provider_key}'"},
+                status=404,
+            )
+
+        logger.info(
+            f"IntegrationInstanceViewSet.execute_capability: invoked, "
+            f"provider_key={provider_key}, capability_key={capability_key}, "
+            f"operation={operation}, instance_id={instance.id}, "
+            f"invoked_by={getattr(request.user, 'username', 'anonymous')}"
+        )
+
+        runtime_service = RuntimeApplicationService()
+        try:
+            result = runtime_service.execute(
+                provider_key=provider_key,
+                capability_key=capability_key,
+                operation=operation,
+                config=instance.get_runtime_config(),
+                **(params or {}),
+            )
+        except TypeError as error:
+            return Response(
+                {"success": False, "summary": f"Invalid capability operation: {error}"},
+                status=400,
+            )
+        return Response(result.to_dict())
+
     @action(methods=["GET"], detail=False)
     @HasPermission("integration_center-View")
     def available_instances(self, request, *args, **kwargs):

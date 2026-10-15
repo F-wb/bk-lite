@@ -197,7 +197,7 @@ const TopMenu: React.FC<TopMenuProps> = ({ hideMainMenu, hideBrand }) => {
         }`}
         style={
           appTopBrandGrid
-            ? { gridTemplateColumns: `${APP_TOP_SIDE_RAIL_WIDTH_PX}px minmax(0,1fr) auto` }
+            ? { gridTemplateColumns: `auto minmax(0,1fr) auto` }
             : undefined
         }
       >
@@ -209,10 +209,10 @@ const TopMenu: React.FC<TopMenuProps> = ({ hideMainMenu, hideBrand }) => {
               ? 'z-10 flex h-full items-center space-x-2 px-4'
               : 'z-10 flex items-center justify-self-start space-x-2'
           }
-          style={showAppTopNav ? { width: APP_TOP_SIDE_RAIL_WIDTH_PX } : undefined}
+          style={showAppTopNav ? { maxWidth: APP_TOP_SIDE_RAIL_WIDTH_PX } : undefined}
         >
-          <img src={logoUrl} className="block h-10 w-auto object-contain" alt="logo" />
-          <div className="font-medium">{portalName}</div>
+          <img src={logoUrl} className="block h-10 w-auto max-w-[64px] object-contain" alt="logo" />
+          <div className="font-medium whitespace-nowrap overflow-hidden text-ellipsis">{portalName}</div>
           {showAppSwitcher && (
             <Popover content={renderContent} title={t('common.appList')} trigger="hover">
               <div className={`flex cursor-pointer items-center justify-center rounded-[10px] px-3 py-2 ${styles.nav}`}>

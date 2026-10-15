@@ -44,6 +44,7 @@ import {
   resolveMonitorLinkMessage,
 } from '@/app/cmdb/utils/systemLinkage';
 import MonitorBindModal from './MonitorBindModal';
+import SshTerminalButton from '@/app/cmdb/components/SshTerminalButton';
 import { HandledRequestError } from '@/utils/request';
 
 const InfoList: React.FC<AssetDataFieldProps> = ({
@@ -673,6 +674,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
               >
                 {t('subscription.subscribe')}
               </Button>
+              <SshTerminalButton instDetail={instDetail} modelId={modelId} />
               <PermissionWrapper
                 requiredPermissions={['Edit']}
                 instPermissions={instDetail.permission}

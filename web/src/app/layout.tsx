@@ -75,7 +75,7 @@ const PortalBrandingHead = () => {
       head.appendChild(faviconLink);
     }
 
-    faviconLink.type = 'image/png';
+    faviconLink.type = faviconUrl?.endsWith('.svg') ? 'image/svg+xml' : 'image/png';
     faviconLink.href = faviconUrl || portalBrandingDefaults.faviconUrl;
   }, [faviconUrl]);
 
@@ -458,7 +458,7 @@ export default function RootLayout({
         <ConsoleLayoutBootstrap />
         {/* Tab title is owned by bootstrap script + PortalTabTitle (avoid a second React <title> overwrite). */}
         <script dangerouslySetInnerHTML={{ __html: PORTAL_TAB_TITLE_BOOTSTRAP_SCRIPT }} />
-        <link rel="icon" href="/logo-site.png" type="image/png" data-portal-favicon="true" />
+        <link rel="icon" href="/logo-site.svg" type="image/svg+xml" data-portal-favicon="true" />
         <Script src="/iconfont.js" strategy="afterInteractive"/>
         {/* 企业品牌映射必须在 hydration 前加载；src 保持稳定，避免 SSR/客户端生成不同地址。 */}
         <Script src="/__enterprise-brands.js" strategy="beforeInteractive" />

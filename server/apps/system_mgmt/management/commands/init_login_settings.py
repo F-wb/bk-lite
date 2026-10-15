@@ -94,9 +94,9 @@ class Command(BaseCommand):
             key="otp_whitelist",
             defaults={"value": default_otp_whitelist_value()},
         )
-        SystemSettings.objects.get_or_create(key="portal_name", defaults={"value": "BlueKing Lite"})
+        SystemSettings.objects.get_or_create(key="portal_name", defaults={"value": "盛大运维系统"})
         SystemSettings.objects.get_or_create(key="portal_logo_url", defaults={"value": ""})
         SystemSettings.objects.get_or_create(key="portal_favicon_url", defaults={"value": ""})
         SystemSettings.objects.get_or_create(key="watermark_enabled", defaults={"value": "0"})
-        SystemSettings.objects.get_or_create(key="watermark_text", defaults={"value": "BlueKing Lite · ${username} · ${date}"})
+        SystemSettings.objects.get_or_create(key="watermark_text", defaults={"value": "盛大运维系统 · ${username} · ${date}"})
         init_builtin_platform_login_auth()

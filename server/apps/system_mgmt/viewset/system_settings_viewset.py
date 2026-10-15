@@ -27,11 +27,11 @@ class SystemSettingsViewSet(viewsets.ModelViewSet):
 
     PORTAL_BRANDING_KEYS = ("portal_name", "portal_logo_url", "portal_favicon_url")
     PORTAL_SETTING_DEFAULTS = {
-        "portal_name": "BlueKing Lite",
+        "portal_name": "盛大运维系统",
         "portal_logo_url": "",
         "portal_favicon_url": "",
         "watermark_enabled": "0",
-        "watermark_text": "BlueKing Lite · ${username} · ${date}",
+        "watermark_text": "盛大运维系统 · ${username} · ${date}",
     }
     SENSITIVE_INFO_SETTING_DEFAULTS = {
         "sensitive_info_protection_enabled": "0",

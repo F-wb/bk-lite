@@ -1,0 +1,31 @@
+name: JumpServer
+description: JumpServer 堡垒机 SSH 终端集成
+
+capabilities:
+  ssh_terminal:
+    name: SSH 终端
+    description: 通过 JumpServer Luna 提供 Web SSH 终端连接能力
+  asset_query:
+    name: 资产查询
+    description: 按 IP 查询 JumpServer 资产信息
+
+fields:
+  base_url:
+    label: JumpServer 地址
+    placeholder: https://jumpserver.example.com
+    help_text: JumpServer 服务地址，不含尾部斜杠
+  api_key:
+    label: API Key
+    help_text: JumpServer Admin API Key（Access Key）
+  api_secret:
+    label: API Secret
+    help_text: JumpServer Admin API Secret
+  default_system_user:
+    label: 默认系统账号
+    help_text: SSH 登录默认使用的系统账号
+  token_expire_seconds:
+    label: Token 过期时间（秒）
+    help_text: 连接 Token 过期时间，默认 3600 秒
+  auto_create_user:
+    label: 自动创建用户
+    help_text: 用户首次连接时自动在 JumpServer 创建账号

@@ -1,0 +1,31 @@
+name: JumpServer
+description: JumpServer bastion host SSH terminal integration
+
+capabilities:
+  ssh_terminal:
+    name: SSH Terminal
+    description: Web SSH terminal via JumpServer Luna
+  asset_query:
+    name: Asset Query
+    description: Query JumpServer assets by IP
+
+fields:
+  base_url:
+    label: JumpServer URL
+    placeholder: https://jumpserver.example.com
+    help_text: JumpServer service URL without trailing slash
+  api_key:
+    label: API Key
+    help_text: JumpServer Admin API Key (Access Key)
+  api_secret:
+    label: API Secret
+    help_text: JumpServer Admin API Secret
+  default_system_user:
+    label: Default System User
+    help_text: Default system account for SSH login
+  token_expire_seconds:
+    label: Token Expire Seconds
+    help_text: Connection token expiration time in seconds
+  auto_create_user:
+    label: Auto Create User
+    help_text: Automatically create user in JumpServer on first connect
