@@ -17,7 +17,7 @@
 | 最后更新时间 | 2026-10-17 11:10 |
 | 上一任作业 Agent | TRAE Agent（Trae 团队模型） |
 | 文档仓库 `d:\Code` | 分支 `main`，**无 remote（仅本地）**，最新提交 `6a215c2`（共 20 个提交） |
-| 交接/汇聚仓 `d:\Code\bk-lite` | 分支 `main`，remote：内网 `gitlab`（gitlab.ext.sdprint.tech）+ GitHub `origin`；本文件提交 `a8a9dc15`（未推送） |
+| 交接/汇聚仓 `d:\Code\bk-lite` | 分支 `main`，remote：内网 `gitlab`（gitlab.ext.sdprint.tech）+ GitHub `origin`；本文件本地提交 `a8a9dc15`/`150f4933`；GitHub 脱敏分支 `docs/ai-handover`@`171ede2e` 已推；GitLab 待网络通后推 main |
 | 源码仓库 `d:\Code\bk-lite\bk-lite-master` | 当前分支 `shengda/v1.0-custom` @ `6e0be26b9e`（= 上游 master `371c89c9` + 二开）；`main` 为上游镜像分支 |
 | 服务器源码副本 | `/opt/bk-lite-src`，分支同上，工作区干净 |
 | 运行环境 | 192.168.1.11（测试机，无生产数据），`/opt/bk-lite`，compose 项目名 `compose` |
@@ -52,7 +52,8 @@
 | **交接/汇聚仓** | `d:\Code\bk-lite` | `main`；remote：`gitlab`=内网 `git@gitlab.ext.sdprint.tech:fanwenbin/bk-lite.git`、`origin`=GitHub fork | 2026-10-17 建（initial `251a48e4`），把源码留档与本交接文档汇聚到公司 GitLab；**本交接文档在此仓提交**（`a8a9dc15`） |
 | 源码 fork | `d:\Code\bk-lite\bk-lite-master` | `main`（上游镜像，**禁止提交二开**）、`shengda/v1.0-custom`（二开唯一落点）；remote：`origin`=个人 fork、`upstream`=上游官方仓 | server/web 源码与构建 |
 
-> ⚠️ 嵌套结构：交接仓把 `bk-lite-master/` 作为普通目录纳入（内层仍保留自己的 `.git`）；当前 `git status` 有上万条 CRLF/文件模式噪音，**在交接仓提交一律用 pathspec 只提自己的文件，禁止 `git add -A`**。是否向 `gitlab`/`origin` 推送由用户决定（含内网地址，推送前确认可见范围）。
+> ⚠️ 嵌套结构：交接仓把 `bk-lite-master/` 作为普通目录纳入（内层仍保留自己的 `.git`）；当前 `git status` 有上万条 CRLF/文件模式噪音，**在交接仓提交一律用 pathspec 只提自己的文件，禁止 `git add -A`**。
+> 推送策略（2026-10-17 定）：**完整版只推内网 GitLab 的 main**（含内网地址，当前网络不通待 VPN 下 `git push gitlab main`）；GitHub 只放**脱敏版**孤立分支 `docs/ai-handover`（与源码 main/shengda 分支无共同历史，互不影响），脱敏替换：内网 IP→`<内网测试机IP>`、ACR→`<内部镜像仓库地址>`、GitLab 主机/私钥位置占位。
 
 - 服务器构建用源码副本：`/opt/bk-lite-src`（仅 `git pull --ff-only`，**不在服务器 merge/解决冲突**）。
 - `d:\Code\bk-lite\` 下还有 `install.run`、`bootstrap.sh`（安装器留档）、`bk-lite-master.zip`（最初浅克隆包）。
@@ -235,4 +236,4 @@
 
 | 日期 | Agent | 变更摘要 |
 |---|---|---|
-| 2026-10-17 | TRAE Agent | 首版创建：整合 10-10 至 10-17 全部上下文（一期二开、fork 重建、镜像流水线、备份体系、AI 评估、10-17 事故与 apply-state 加固）；快照源码分支 `shengda/v1.0-custom@6e0be26b9e`，18 容器运行中。文件实际名 `AI_HANDOVER.md`（IDE 标签显示为 `.md.md`），提交于交接仓 `a8a9dc15`；同日补充第三个仓库边界（交接仓 + 内网 GitLab remote） |
+| 2026-10-17 | TRAE Agent | 首版创建：整合 10-10 至 10-17 全部上下文（一期二开、fork 重建、镜像流水线、备份体系、AI 评估、10-17 事故与 apply-state 加固）；快照源码分支 `shengda/v1.0-custom@6e0be26b9e`，18 容器运行中。文件实际名 `AI_HANDOVER.md`（IDE 标签显示为 `.md.md`），提交于交接仓 `a8a9dc15`；同日补充第三个仓库边界（交接仓 + 内网 GitLab remote，`150f4933`）。**分发**：GitHub 已推**脱敏版**孤立分支 `docs/ai-handover`（`171ede2e`，仅含本文档；main/shengda 源码分支未动）；内网 GitLab 完整版 main 待网络（VPN/公司网）通后 `git push gitlab main` |
