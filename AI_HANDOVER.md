@@ -29,7 +29,7 @@
 | 仓库 | 路径 | 说明 |
 |---|---|---|
 | 源码 fork | `d:\Code\bk-lite\bk-lite-master` | `main`=上游镜像（**禁二开**）；`shengda/v1.0-custom`=二开唯一分支；remote `origin`(GitHub 个人 fork) + `upstream` |
-| **交接仓（本文件所在）** | `d:\Code\bk-lite` | 全部专题手册与 `ops/` 脚本已归集于此；remote `gitlab`(内网，完整版只推它) + `origin`(GitHub，仅推脱敏分支 `docs/ai-handover`) |
+| **交接仓（本文件所在）** | `d:\Code\bk-lite` | 全部专题手册与 `ops/` 脚本已归集于此；remote `gitlab`(内网 HTTP，SSH 22 被代理拦) + `origin`(GitHub)。**推送策略**：GitLab 仓 main/shengda 是源码镜像（他人维护，**不动**），本仓完整版推为独立分支 `docs/ai-handover`；GitHub 同分支名放脱敏版 |
 | 文档旧仓 | `d:\Code` | 无 remote；手册与 ops 已迁出，仅留他用目录 |
 
 - 运行态：基线目录 `/opt/bk-lite`；自研脚本线上副本在 `deploy/`（镜像收敛）与 `scripts/`（备份还原）。
@@ -68,7 +68,6 @@
 - [ ] 【用户侧】一期排除模块的前端菜单手动隐藏（应用管理 UI）
 - [ ] 【待决策】异地备份（现备份与生产同机同盘）；测试机 crontab 当前为空
 - [ ] 【待决策】SSH 保活（`~/.ssh/config` 加 ServerAliveInterval）
-- [ ] 【待网络】交接仓完整版推内网 GitLab：`git -C d:\Code\bk-lite push gitlab main`（VPN 下执行；GitHub 脱敏分支 `docs/ai-handover` 已推）
 - [ ] 每月第一周跟进上游（运维手册 §6.4）；启用 AI 时按部署手册场景 E
 
 ## 8. 接手第一步
@@ -93,3 +92,4 @@
 | 日期 | 摘要 |
 |---|---|
 | 2026-10-17 | 初版；同日按"精炼聚焦"原则重写：去时间线流水账与大表（细节归手册），新增 Agent 协作三规则；手册与 ops 脚本归集到交接仓，GitHub 脱敏分支已推 |
+| 2026-10-17 | 内网 GitLab 已推：发现远端 main/shengda 为源码镜像（与本仓历史无关），经用户确认**推为独立分支 `docs/ai-handover`**（HTTP 传输，SSH 22 被代理 reset），不触碰源码镜像分支 |
