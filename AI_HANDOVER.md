@@ -5,7 +5,7 @@
 > 2. 完成重大架构设计、复杂故障处理、阶段任务收尾或额度耗尽前，**必须更新本文档**（更新第十三节"交接更新日志"并刷新第一节快照），交接给下一任 Agent。
 > 3. 本文档含真实内网地址、仓库地址、镜像地址等字面量，**仅限内部使用**；如需对外分发，必须先替换/删除内网 IP、ACR 地址、个人 GitHub fork 地址等信息（对外交付的正式文档一律使用"盛大运维系统"命名，不得出现上游开源项目名称）。
 >
-> **文档位置**：`d:\Code\bk-lite\AI_HANDOVER.md.md`（同时提交在 d:\Code 文档仓库）
+> **文档位置**：`d:\Code\bk-lite\AI_HANDOVER.md`（在 bk-lite 交接仓内；IDE 标签可能显示为 `AI_HANDOVER.md.md`）
 > **创建/本次更新**：2026-10-17
 
 ---
@@ -17,6 +17,7 @@
 | 最后更新时间 | 2026-10-17 11:10 |
 | 上一任作业 Agent | TRAE Agent（Trae 团队模型） |
 | 文档仓库 `d:\Code` | 分支 `main`，**无 remote（仅本地）**，最新提交 `6a215c2`（共 20 个提交） |
+| 交接/汇聚仓 `d:\Code\bk-lite` | 分支 `main`，remote：内网 `gitlab`（gitlab.ext.sdprint.tech）+ GitHub `origin`；本文件提交 `a8a9dc15`（未推送） |
 | 源码仓库 `d:\Code\bk-lite\bk-lite-master` | 当前分支 `shengda/v1.0-custom` @ `6e0be26b9e`（= 上游 master `371c89c9` + 二开）；`main` 为上游镜像分支 |
 | 服务器源码副本 | `/opt/bk-lite-src`，分支同上，工作区干净 |
 | 运行环境 | 192.168.1.11（测试机，无生产数据），`/opt/bk-lite`，compose 项目名 `compose` |
@@ -43,12 +44,15 @@
 
 ## 3. 仓库与目录布局
 
-### 3.1 两个 Git 仓库（边界务必分清）
+### 3.1 Git 仓库边界（三个，务必分清）
 
 | 仓库 | 路径 | 分支/远端 | 用途 |
 |---|---|---|---|
 | 文档与运维资产仓 | `d:\Code` | `main`，**无 remote** | 8 份盛大系列文档 + `ops/` 4 个脚本；只本地提交 |
-| 源码 fork | `d:\Code\bk-lite\bk-lite-master` | `main`（上游镜像，**禁止提交二开**）、`shengda/v1.0-custom`（二开唯一落点）；remote：`origin`=个人 fork `https://github.com/F-wb/bk-lite`，`upstream`=上游官方仓 | server/web 源码与构建 |
+| **交接/汇聚仓** | `d:\Code\bk-lite` | `main`；remote：`gitlab`=内网 `git@gitlab.ext.sdprint.tech:fanwenbin/bk-lite.git`、`origin`=GitHub fork | 2026-10-17 建（initial `251a48e4`），把源码留档与本交接文档汇聚到公司 GitLab；**本交接文档在此仓提交**（`a8a9dc15`） |
+| 源码 fork | `d:\Code\bk-lite\bk-lite-master` | `main`（上游镜像，**禁止提交二开**）、`shengda/v1.0-custom`（二开唯一落点）；remote：`origin`=个人 fork、`upstream`=上游官方仓 | server/web 源码与构建 |
+
+> ⚠️ 嵌套结构：交接仓把 `bk-lite-master/` 作为普通目录纳入（内层仍保留自己的 `.git`）；当前 `git status` 有上万条 CRLF/文件模式噪音，**在交接仓提交一律用 pathspec 只提自己的文件，禁止 `git add -A`**。是否向 `gitlab`/`origin` 推送由用户决定（含内网地址，推送前确认可见范围）。
 
 - 服务器构建用源码副本：`/opt/bk-lite-src`（仅 `git pull --ff-only`，**不在服务器 merge/解决冲突**）。
 - `d:\Code\bk-lite\` 下还有 `install.run`、`bootstrap.sh`（安装器留档）、`bk-lite-master.zip`（最初浅克隆包）。
@@ -231,4 +235,4 @@
 
 | 日期 | Agent | 变更摘要 |
 |---|---|---|
-| 2026-10-17 | TRAE Agent | 首版创建：整合 10-10 至 10-17 全部上下文（一期二开、fork 重建、镜像流水线、备份体系、AI 评估、10-17 事故与 apply-state 加固）；快照提交 `6a215c2`，源码分支 `shengda/v1.0-custom@6e0be26b9e`，18 容器运行中 |
+| 2026-10-17 | TRAE Agent | 首版创建：整合 10-10 至 10-17 全部上下文（一期二开、fork 重建、镜像流水线、备份体系、AI 评估、10-17 事故与 apply-state 加固）；快照源码分支 `shengda/v1.0-custom@6e0be26b9e`，18 容器运行中。文件实际名 `AI_HANDOVER.md`（IDE 标签显示为 `.md.md`），提交于交接仓 `a8a9dc15`；同日补充第三个仓库边界（交接仓 + 内网 GitLab remote） |
