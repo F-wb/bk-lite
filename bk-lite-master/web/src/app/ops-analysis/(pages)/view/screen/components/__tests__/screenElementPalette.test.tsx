@@ -36,16 +36,22 @@ describe('screen element palette', () => {
     );
 
     expect(screen.getByRole('button', { name: '说明' })).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'opsAnalysis.screen.collapseDisplayElements' }),
+    ).toBeTruthy();
     expect(screen.queryByText('opsAnalysis.screen.elementCorner')).toBeNull();
     expect(screen.queryByText('opsAnalysis.screen.titleFrame.hero-6')).toBeNull();
     expect(screen.queryByText('opsAnalysis.screen.panelFrame.border-22')).toBeNull();
 
     await user.click(screen.getByRole('button', { name: '说明' }));
     expect(onSelectItem).toHaveBeenCalledWith('text-1');
+    expect(screen.getByRole('button', { name: '说明' }).className).toContain('cursor-pointer');
 
-    await user.click(
-      screen.getByRole('button', { name: 'opsAnalysis.screen.elementPanelFrame' }),
-    );
+    const frameGroup = screen.getByRole('button', {
+      name: 'opsAnalysis.screen.elementPanelFrame',
+    });
+    expect(frameGroup.className).toContain('cursor-pointer');
+    await user.click(frameGroup);
     expect(screen.getByText('opsAnalysis.screen.panelFrame.border-24')).toBeTruthy();
     expect(screen.queryByText('opsAnalysis.screen.titleFrame.hero-6')).toBeNull();
 
@@ -147,9 +153,11 @@ describe('screen element palette', () => {
       />,
     );
 
-    await user.click(
-      screen.getByRole('button', { name: 'opsAnalysis.screen.elementChart' }),
-    );
+    const chartButton = screen.getByRole('button', {
+      name: 'opsAnalysis.screen.elementChart',
+    });
+    expect(chartButton.className).toContain('cursor-pointer');
+    await user.click(chartButton);
     expect(onOpenChartSelector).toHaveBeenCalledTimes(1);
     expect(document.querySelector('[data-screen-catalog-flyout]')).toBeNull();
   });
@@ -186,5 +194,55 @@ describe('screen element palette', () => {
     expect(target?.className).not.toContain('shadow-[');
     expect(line?.className).toContain('h-0.5');
     expect(line?.className).not.toContain('rounded');
+  });
+
+  it('scrolls the element list until the selected row is visible', () => {
+    const items = [0, 1, 2].map((index) =>
+      createScreenTextItem([], {
+        id: `text-${index}`,
+        content: `项${index}`,
+        zIndex: 3 - index,
+      }),
+    );
+    const props = {
+      items,
+      onSelectItem: () => undefined,
+      onAddText: () => undefined,
+      onAddClock: () => undefined,
+      onAddTitleFrame: () => undefined,
+      onAddDecoration: () => undefined,
+      onAddShape: () => undefined,
+      onOpenChartSelector: () => undefined,
+      onOpenItemMenu: () => undefined,
+      onReorderItem: () => undefined,
+    };
+    const box = (top: number, bottom: number) =>
+      ({
+        x: 0,
+        y: top,
+        width: 160,
+        height: bottom - top,
+        left: 0,
+        right: 160,
+        top,
+        bottom,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    const view = render(<ScreenElementPalette {...props} selectedItemId={null} />);
+    const list = document.querySelector('[data-screen-element-list]') as HTMLElement;
+    const row = document.querySelector('[data-screen-list-item="text-2"]') as HTMLElement;
+    const listRect = vi.spyOn(list, 'getBoundingClientRect').mockReturnValue(box(0, 100));
+    const rowRect = vi.spyOn(row, 'getBoundingClientRect').mockReturnValue(box(240, 270));
+
+    view.rerender(<ScreenElementPalette {...props} selectedItemId="text-2" />);
+    expect(list.scrollTop).toBe(170);
+
+    rowRect.mockReturnValue(box(20, 50));
+    view.rerender(<ScreenElementPalette {...props} selectedItemId={null} />);
+    view.rerender(<ScreenElementPalette {...props} selectedItemId="text-2" />);
+    expect(list.scrollTop).toBe(170);
+
+    listRect.mockRestore();
+    rowRect.mockRestore();
   });
 });

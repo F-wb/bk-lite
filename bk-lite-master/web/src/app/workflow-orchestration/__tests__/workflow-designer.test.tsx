@@ -107,7 +107,7 @@ const atoms = [
     input_schema: {
       type: 'object',
       properties: {
-        targets: { type: 'array', title: '目标主机', description: '可从左侧拖入兼容字段或手动填写，也可从作业平台选择主机', items: { type: 'string' }, maxItems: 100 },
+        targets: { type: 'array', title: '目标主机', description: '可从左侧拖入兼容字段或手动填写，也可从节点管理或作业平台选择主机；两个来源不能混选', items: { type: 'string' }, maxItems: 100 },
         linux_script_type: { type: 'string', title: 'Linux 脚本类型', enum: ['shell'], default: 'shell' },
         linux_script_content: { type: 'string', title: 'Linux 脚本' },
       },
@@ -330,8 +330,8 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
     expect(within(nodeTestDialog!).getByText('目标主机')).not.toBeNull();
     expect(within(nodeTestDialog!).getByText('报告模板')).not.toBeNull();
     expect(within(nodeTestDialog!).getByRole('button', { name: /选择 Word \/ Excel 模板/ })).not.toBeNull();
-    expect(within(nodeTestDialog!).getByRole('link', { name: 'Word' }).getAttribute('href')).toBe('/workflow-orchestration/templates/health-inspection-example.docx');
-    expect(within(nodeTestDialog!).getByRole('link', { name: 'Excel' }).getAttribute('href')).toBe('/workflow-orchestration/templates/health-inspection-example.xlsx');
+    expect(within(nodeTestDialog!).getByRole('button', { name: 'Word' })).not.toBeNull();
+    expect(within(nodeTestDialog!).getByRole('button', { name: 'Excel' })).not.toBeNull();
     fireEvent.click(within(nodeTestDialog!).getByRole('button', { name: /Cancel|取\s*消/ }));
 
     const inspector = screen.getByDisplayValue('健康巡检表单').closest<HTMLElement>('.ant-modal-content');
@@ -345,8 +345,8 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
     expect(within(debugDialog!).getByText('目标主机')).not.toBeNull();
     expect(within(debugDialog!).getByText('报告模板')).not.toBeNull();
     expect(within(debugDialog!).queryByText('调试入口')).toBeNull();
-    expect(within(debugDialog!).getByRole('link', { name: 'Word' }).getAttribute('href')).toBe('/workflow-orchestration/templates/health-inspection-example.docx');
-    expect(within(debugDialog!).getByRole('link', { name: 'Excel' }).getAttribute('href')).toBe('/workflow-orchestration/templates/health-inspection-example.xlsx');
+    expect(within(debugDialog!).getByRole('button', { name: 'Word' })).not.toBeNull();
+    expect(within(debugDialog!).getByRole('button', { name: 'Excel' })).not.toBeNull();
   });
 
   it('多触发器流程调试时选择一个入口并生成单条调试执行', async () => {
@@ -447,9 +447,12 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
     fireEvent.click(screen.getByRole('button', { name: '添加节点' }));
     fireEvent.click(await screen.findByRole('button', { name: /作业执行/ }));
 
+    const nodeName = screen.getByDisplayValue('作业执行');
+    expect(nodeName.closest('.ant-form-item')?.querySelector('.ant-form-item-required')).not.toBeNull();
     expect(screen.getAllByTestId('workflow-reference-dropzone').length).toBeGreaterThan(0);
-    fireEvent.click(await screen.findByRole('button', { name: /选择作业平台主机/ }));
-    expect(screen.queryByRole('tab', { name: /节点管理/ })).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: /选择主机/ }));
+    expect(screen.getByRole('tab', { name: /节点管理/ })).not.toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: '作业平台' }));
     const row = (await screen.findByText('job-linux-01')).closest('tr');
     expect(row).not.toBeNull();
     fireEvent.click(within(row!).getByRole('checkbox'));
@@ -469,6 +472,8 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
     fireEvent.click(await screen.findByRole('button', { name: /Webhook 触发器/ }));
 
     expect(await screen.findByText('Webhook 接口')).not.toBeNull();
+    const triggerName = screen.getByDisplayValue('Webhook 触发器');
+    expect(triggerName.closest('.ant-form-item')?.querySelector('.ant-form-item-required')).not.toBeNull();
     expect(screen.queryByRole('button', { name: /添加请求输入字段/ })).toBeNull();
     expect(screen.getByText('立即响应（返回 execution_id）')).not.toBeNull();
 
@@ -787,8 +792,8 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
     const testDialogTitle = await screen.findByText('测试当前节点');
     const testDialog = testDialogTitle.closest<HTMLElement>('.ant-modal-content');
     expect(testDialog).not.toBeNull();
-    expect(within(testDialog!).getByRole('link', { name: 'Word' })).not.toBeNull();
-    expect(within(testDialog!).getByRole('link', { name: 'Excel' })).not.toBeNull();
+    expect(within(testDialog!).getByRole('button', { name: 'Word' })).not.toBeNull();
+    expect(within(testDialog!).getByRole('button', { name: 'Excel' })).not.toBeNull();
     expect(within(testDialog!).getByRole('button', { name: /上传测试模板/ })).not.toBeNull();
     fireEvent.click(within(testDialog!).getByRole('button', { name: /执行节点/ }));
     expect(await screen.findByText('请先上传 Word 或 Excel 测试模板')).not.toBeNull();
@@ -953,7 +958,7 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
 
     fireEvent.click(within(testDialog!).getByRole('button', { name: /已选择 1 台主机/ }));
     expect(await screen.findByText(/已选 1 台/)).not.toBeNull();
-    expect(screen.queryByRole('tab', { name: /节点管理/ })).toBeNull();
+    expect(screen.getByRole('tab', { name: /节点管理/ })).not.toBeNull();
 
     const otherRow = (await screen.findByText(otherTarget.name)).closest('tr');
     expect(otherRow).not.toBeNull();
@@ -1105,6 +1110,7 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
         recipients: ['ops'],
         title: '模板标题',
         body: '模板内容',
+        __node_title: '模板节点名称',
       },
       organization_id: 1,
       created_by: 'admin',
@@ -1139,7 +1145,11 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
       expect.objectContaining({
         name: '常用邮件通知',
         atom_key: 'bklite_notification',
-        parameters: expect.objectContaining({ title: '巡检完成', body: '完成' }),
+        parameters: expect.objectContaining({
+          title: '巡检完成',
+          body: '完成',
+          __node_title: '发送巡检结果',
+        }),
       }),
     ));
 
@@ -1159,6 +1169,7 @@ describe('编排中心正式设计器', { timeout: 30000 }, () => {
 
     expect(await screen.findByDisplayValue('模板标题')).not.toBeNull();
     expect(screen.getByDisplayValue('模板内容')).not.toBeNull();
+    expect(screen.getByDisplayValue('模板节点名称')).not.toBeNull();
     expect(mocks.patch).not.toHaveBeenCalled();
   });
 

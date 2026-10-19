@@ -1,5 +1,5 @@
 export type WorkflowStatus = 'DRAFT' | 'PUBLISHED';
-export type ExecutionStatus = 'QUEUED' | 'RUNNING' | 'WAITING_APPROVAL' | 'TERMINATING' | 'SUCCEEDED' | 'FAILED' | 'TIMED_OUT' | 'TERMINATED';
+export type ExecutionStatus = 'QUEUED' | 'RUNNING' | 'WAITING_APPROVAL' | 'TERMINATING' | 'UNKNOWN' | 'SUCCEEDED' | 'FAILED' | 'TIMED_OUT' | 'TERMINATED';
 export type WorkflowTriggerType = 'FORM' | 'SCHEDULE' | 'WEBHOOK' | 'NATS';
 
 export interface PaginatedResponse<T> {
@@ -270,6 +270,7 @@ export interface JsonSchema {
   'x-target-binding'?: TargetFieldBinding;
   'x-file-options'?: FileFieldOptions;
   'x-enum-labels'?: Record<string, string>;
+  'x-enum-channel-types'?: Record<string, string>;
   'x-enum-usernames'?: Record<string, string>;
   'x-enum-metadata'?: Record<string, { scope?: 'personal' | 'team'; default_model?: string }>;
   'x-binding'?: 'literal-only';
@@ -307,6 +308,14 @@ export interface AtomExecutionRecord {
   job_task_id: number | null;
   error_type: string;
   error_message: string;
+}
+
+export interface DownloadableArtifact {
+  id: string;
+  format: 'docx' | 'xlsx';
+  filename: string;
+  size: number;
+  download_url: string;
 }
 
 export interface ExecutionArtifactRecord {
@@ -408,6 +417,7 @@ export interface ExecutionRecord {
   atom_executions: AtomExecutionRecord[];
   artifacts: ExecutionArtifactRecord[];
   artifact_count?: number;
+  downloadable_artifacts?: DownloadableArtifact[];
   pending_approval_count?: number;
   actionable_approval_ids?: string[];
   waiting_node_summary?: string;

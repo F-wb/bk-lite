@@ -3,6 +3,7 @@
 对照 specs/capabilities/legacy-prd-运营分析-运营分析.md：内置画布从 YAML 导入并标记为内置只读对象。
 """
 
+import copy
 import json
 from pathlib import Path
 
@@ -44,16 +45,91 @@ def _count_nested_key(value, target_key):
 def test_builtin_yaml_contains_alert_room3d_and_application3d_screens():
     payload = yaml.safe_load(BUILTIN_CANVASES_PATH.read_text(encoding="utf-8"))
 
-    assert payload["meta"]["object_counts"]["screens"] == 3
+    assert payload["meta"]["object_counts"]["screens"] == 4
     assert payload["meta"]["object_counts"]["topologies"] == 0
     assert [screen["key"] for screen in payload["screens"]] == [
         "screen::告警运营大屏_内置",
         "screen::3D机房大屏_内置",
         "screen::3D应用大屏_内置",
+        "screen::应用拓扑大屏_内置",
     ]
-    assert [screen["name"] for screen in payload["screens"]] == ["告警运营大屏", "3D机房大屏", "3D应用大屏"]
+    assert [screen["name"] for screen in payload["screens"]] == [
+        "告警运营大屏",
+        "3D机房大屏",
+        "3D应用大屏",
+        "应用拓扑大屏",
+    ]
     assert "基础资源态势大屏_内置" not in BUILTIN_CANVASES_PATH.read_text(encoding="utf-8")
     assert "运营健康拓扑_内置" not in BUILTIN_CANVASES_PATH.read_text(encoding="utf-8")
+
+
+def test_builtin_application_topology_screen_filter_uses_canvas_contract():
+    payload = yaml.safe_load(BUILTIN_CANVASES_PATH.read_text(encoding="utf-8"))
+    screen = next(screen for screen in payload["screens"] if screen["key"] == "screen::应用拓扑大屏_内置")
+    widget = next(item for item in screen["view_sets"]["items"] if item["id"] == "builtin-application-topology-main")
+
+    clock = next(item for item in screen["view_sets"]["items"] if item["id"] == "legacy-clock")
+    assert clock == {
+        "h": 56,
+        "w": 360,
+        "x": 1528,
+        "y": 20,
+        "id": "legacy-clock",
+        "kind": "clock",
+        "format": "YYYY-MM-DD HH:mm:ss",
+        "zIndex": 3,
+        "textStyle": {"color": "canvas", "fontSize": 25, "fontWeight": 600},
+    }
+    assert widget["valueConfig"]["applicationTopology"] == {"depth": 3}
+    assert widget["valueConfig"]["filterBindings"] == {
+        "application_system_id__string": True,
+        "application_topology_depth__string": True,
+    }
+    assert screen["view_sets"]["filters"] == [
+        {
+            "id": "application_system_id__string",
+            "key": "application_system_id",
+            "name": "应用系统",
+            "type": "string",
+            "order": 0,
+            "enabled": True,
+            "defaultValue": None,
+            "inputConfig": {
+                "control": "select",
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "cmdb/list_application_systems"},
+                    "valueField": "inst_uuid",
+                    "labelField": "inst_name",
+                },
+            },
+            "inputMode": "select",
+        },
+        {
+            "id": "application_topology_depth__string",
+            "key": "application_topology_depth",
+            "name": "展开层级",
+            "type": "string",
+            "order": 1,
+            "enabled": True,
+            "defaultValue": "3",
+            "inputConfig": {
+                "control": "select",
+                "optionsSource": {
+                    "type": "static",
+                    "staticItems": [
+                        {"label": "1", "value": "1"},
+                        {"label": "2", "value": "2"},
+                        {"label": "3", "value": "3"},
+                        {"label": "4", "value": "4"},
+                        {"label": "5", "value": "5"},
+                    ],
+                },
+            },
+            "inputMode": "select",
+        },
+    ]
+    assert "应用系统::cmdb/list_application_systems" in screen["refs"]["datasource_keys"]
 
 
 def test_builtin_application3d_screen_yaml_contains_only_the_self_fetch_scene_widget():
@@ -116,51 +192,118 @@ def test_builtin_application3d_screen_yaml_contains_only_the_self_fetch_scene_wi
 def test_builtin_room3d_screen_yaml_is_self_fetch_scene():
     payload = yaml.safe_load(BUILTIN_CANVASES_PATH.read_text(encoding="utf-8"))
     screen = _load_builtin_room3d_screen()
-    assert screen["view_sets"]["viewport"] == {
-        "theme": "screen-dark",
-        "width": 1920,
-        "height": 1080,
-        "background": {"key": "tech-grid", "type": "builtIn"},
+    viewport = screen["view_sets"]["viewport"]
+    assert viewport["theme"] == "screen-dark"
+    assert viewport["width"] == 1920
+    assert viewport["height"] == 1080
+    assert viewport["adapter"] == "fill"
+    assert viewport["background"] == {"type": "color", "color": "#071829"}
+    assert screen["view_sets"]["decorations"] == {"title": "机房运行总览", "showClock": False, "showTitle": False}
+    assert screen["refs"]["namespace_keys"] == []
+    assert set(screen["refs"]["datasource_keys"]) == {
+        "机房机柜容量::cmdb/get_room_rack_capacity",
+        "机房设备类型分布::cmdb/get_room_device_type_distribution",
+        "机房活跃告警::cmdb/get_room_active_alarms",
     }
-    assert screen["view_sets"]["decorations"] == {"title": "机柜全景", "showClock": False, "showTitle": False}
-    assert screen["refs"] == {"datasource_keys": [], "namespace_keys": []}
-    assert len(screen["view_sets"]["items"]) == 3
-    title = screen["view_sets"]["items"][0]
-    clock = screen["view_sets"]["items"][1]
-    widget = screen["view_sets"]["items"][2]
+    items = screen["view_sets"]["items"]
+    assert screen["view_sets"]["filters"] == [
+        {
+            "id": "server_room_id__string",
+            "key": "server_room_id",
+            "name": "Room",
+            "type": "string",
+            "order": 0,
+            "enabled": True,
+            "defaultValue": None,
+            "inputConfig": {
+                "control": "select",
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "cmdb/get_room_list"},
+                    "valueField": "inst_uuid",
+                    "labelField": "inst_name",
+                },
+            },
+            "inputMode": "select",
+        }
+    ]
+    title = next(item for item in items if item["id"] == "legacy-title-frame")
+    clock = next(item for item in items if item["id"] == "legacy-clock")
+    widget = next(item for item in items if item["id"] == "builtin-room3d-main")
+    widgets = [item for item in items if item.get("type") == "widget"]
+    chart_widgets = [item for item in widgets if item["id"] != "builtin-room3d-main"]
+    # 机房概况 3 张单值，U 位已用/总计 2 张单值，其余 7 个图表。
+    assert len(chart_widgets) == 12
+    assert {item["chartType"] for item in chart_widgets} == {"single", "gauge", "pie", "topN", "table"}
+    assert all(item["valueConfig"]["filterBindings"] == {"server_room_id__string": True} for item in widgets)
+    assert all(item["valueConfig"]["appearance"]["frame"] == "bare" for item in widgets)
+    assert all(item.get("chartType") != "multiValue" for item in widgets)
+    singles = [item for item in chart_widgets if item["chartType"] == "single"]
+    assert [item["valueConfig"]["selectedFields"] for item in singles] == [
+        ["rack_count"],
+        ["device_count"],
+        ["unracked_device_count"],
+        ["used_u"],
+        ["total_u"],
+    ]
+    assert widget["x"] > singles[0]["x"]
+    assert widget["x"] + widget["w"] < next(item["x"] for item in chart_widgets if item["id"] == "room-coverage")
     assert title == {
-        "h": 94,
-        "w": 1911,
-        "x": 2,
+        "h": 87,
+        "w": 1479,
+        "x": 231,
         "y": 1,
         "id": "legacy-title-frame",
         "kind": "titleFrame",
-        "preset": "hero-6",
-        "zIndex": 2,
-        "content": "机柜全景",
-        "textStyle": {"fontSize": 40},
+        "preset": "hero-3",
+        "zIndex": 37,
+        "content": "机房运行总览",
+        "textStyle": {"color": "#E6F3FF", "fontSize": 28, "fontWeight": 700},
     }
     assert clock == {
-        "h": 56,
-        "w": 360,
-        "x": 1544,
-        "y": 19,
+        "h": 50,
+        "w": 295,
+        "x": 1620,
+        "y": 4,
         "id": "legacy-clock",
         "kind": "clock",
         "format": "YYYY-MM-DD HH:mm:ss",
-        "zIndex": 3,
-        "textStyle": {"color": "canvas", "fontSize": 25, "fontWeight": 600},
+        "zIndex": 38,
+        "textStyle": {"color": "#91AFC6", "fontSize": 23, "fontWeight": 600},
     }
-    assert widget["x"] == 0
-    assert widget["y"] == 80
-    assert widget["w"] == 1920
-    assert widget["h"] == 1000
+    section_titles = [item for item in items if item.get("kind") == "titleFrame" and item["id"] != "legacy-title-frame"]
+    assert {item["preset"] for item in section_titles} == {"section-3"}
+    assert [item["content"] for item in section_titles] == [
+        "机房规模",
+        "U 使用率",
+        "机柜 U 占用 TOP5",
+        "设备类型",
+        "监控状态",
+        "告警等级",
+        "机柜告警 TOP5",
+        "告警设备",
+    ]
+    assert [item["content"] for item in items if item.get("kind") == "text"] == [
+        "机柜总数",
+        "设备总数",
+        "未落位",
+        "已用 U",
+        "总 U",
+    ]
+    scale_singles = [item for item in singles if item["id"].startswith("room-kpi-")]
+    assert len({item["w"] for item in scale_singles}) == 1
+    assert [item["x"] for item in scale_singles] == [39, 148, 257]
+    scale_captions = [
+        item
+        for item in items
+        if item.get("id", "").startswith("caption-room-") and item["id"] in {"caption-room-racks", "caption-room-devices", "caption-room-unracked"}
+    ]
+    assert [(item["x"], item["w"]) for item in scale_captions] == [(item["x"], item["w"]) for item in scale_singles]
     assert widget["chartType"] == "room3D"
-    assert widget["valueConfig"] == {
-        "chartType": "room3D",
-        "sceneWidgetType": "room3D",
-        "appearance": {"frame": "bare"},
-    }
+    assert widget["w"] < 1920
+    assert widget["valueConfig"]["chartType"] == "room3D"
+    assert widget["valueConfig"]["sceneWidgetType"] == "room3D"
+    assert widget["valueConfig"]["appearance"] == {"frame": "bare"}
     assert "dataSource" not in widget["valueConfig"]
     assert all(item["key"] != "CMDB 3D机房布局::cmdb/get_room3d_layout" for item in payload["datasources"])
     assert all(item.get("rest_api") != "cmdb/get_room_list" for item in payload["datasources"])
@@ -269,12 +412,16 @@ def test_builtin_alert_cmdb_datasource_contracts_are_complete():
         "get_instance_group_by": "主机操作系统分布",
         "cmdb/get_model_classification_options": "CMDB 模型分类列表（选项）",
         "cmdb/get_region_options": "CMDB 地区列表（选项）",
+        "cmdb/get_room_list": "CMDB 机房列表（选项）",
         "cmdb/get_change_trend": "CMDB 变更趋势",
     }
     for rest_api, expected_name in expected_names.items():
         assert by_api[rest_api]["name"] == expected_name
     assert "cmdb/get_room3d_layout" not in by_api
-    assert "cmdb/get_room_list" not in by_api
+    room_list = by_api["cmdb/get_room_list"]
+    assert room_list["key"] == "CMDB 机房列表::cmdb/get_room_list"
+    assert room_list["chart_type"] == []
+    assert {field["key"] for field in room_list["field_schema"]} == {"inst_uuid", "inst_name"}
     source_api_by_rest = {item["rest_api"]: item for item in source_api}
     assert source_api_by_rest["alert/get_alert_trend_data"]["key"] == "告警趋势::alert/get_alert_trend_data"
     assert source_api_by_rest["alert/get_alert_source_distribution"]["key"] == "告警来源分布::alert/get_alert_source_distribution"
@@ -328,17 +475,14 @@ def test_builtin_alert_screen_yaml_uses_page_configurable_nodes_only():
         "theme": "screen-dark",
         "width": 3840,
         "height": 2160,
-        "background": {"key": "tech-grid", "type": "builtIn"},
+        "adapter": "fill",
+        "background": {"type": "color", "color": "#03192D"},
     }
     assert screen["view_sets"]["decorations"] == {"title": "告警运营大屏", "showClock": False, "showTitle": False}
     assert "edges" not in screen["view_sets"]
-    assert len(nodes) == 17
+    assert len(nodes) == 49
     assert len(widgets) == 15
-    assert nodes[0]["kind"] == "titleFrame"
-    assert nodes[0]["preset"] == "hero-5"
-    assert nodes[0]["textStyle"] == {"fontSize": 72}
-    assert nodes[1]["kind"] == "clock"
-    assert nodes[1]["textStyle"] == {"color": "canvas", "fontSize": 60, "fontWeight": 600}
+    assert all(node["valueConfig"]["appearance"]["frame"] == "bare" for node in widgets)
     assert all(node["type"] == "widget" for node in widgets)
     assert all("valueConfig" in node for node in widgets)
     assert _count_nested_key(widgets, "config") == 0
@@ -353,6 +497,16 @@ def test_builtin_alert_screen_yaml_uses_page_configurable_nodes_only():
     assert "按渠道通知成功率::alert/get_notification_channel_stats" in datasource_refs
 
     node_by_id = {node["id"]: node for node in nodes}
+    assert node_by_id["legacy-title-frame"]["kind"] == "titleFrame"
+    assert node_by_id["legacy-title-frame"]["preset"] == "hero-5"
+    assert node_by_id["legacy-title-frame"]["textStyle"] == {
+        "align": "right",
+        "color": "#EAF3FF",
+        "fontSize": 56,
+        "fontWeight": 700,
+    }
+    assert node_by_id["legacy-clock"]["kind"] == "clock"
+    assert node_by_id["legacy-clock"]["textStyle"] == {"color": "#EAF3FF", "fontSize": 34, "fontWeight": 600}
     kpi_ids = [
         "alert-kpi-created",
         "alert-kpi-closed",
@@ -1051,7 +1205,9 @@ def test_init_builtin_canvases_creates_builtin_alert_screen():
     assert screen.view_sets["viewport"]["theme"] == "screen-dark"
     assert screen.view_sets["decorations"] == {"title": "告警运营大屏", "showClock": False, "showTitle": False}
     assert "edges" not in screen.view_sets
-    assert len(nodes) == 17
+    assert len(nodes) == 49
+    assert screen.view_sets["viewport"]["adapter"] == "fill"
+    assert screen.view_sets["viewport"]["background"] == {"type": "color", "color": "#03192D"}
     widgets = [node for node in nodes if node.get("type") == "widget"]
     assert len(widgets) == 15
     assert all(node.get("type") == "widget" for node in widgets)
@@ -1063,11 +1219,16 @@ def test_init_builtin_canvases_creates_builtin_alert_screen():
     node_by_id = {node["id"]: node for node in nodes}
     assert node_by_id["legacy-title-frame"]["kind"] == "titleFrame"
     assert node_by_id["legacy-title-frame"]["preset"] == "hero-5"
-    assert node_by_id["legacy-title-frame"]["textStyle"] == {"fontSize": 72}
+    assert node_by_id["legacy-title-frame"]["textStyle"] == {
+        "align": "right",
+        "color": "#EAF3FF",
+        "fontSize": 56,
+        "fontWeight": 700,
+    }
     assert node_by_id["legacy-clock"]["kind"] == "clock"
     assert node_by_id["legacy-clock"]["textStyle"] == {
-        "color": "canvas",
-        "fontSize": 60,
+        "color": "#EAF3FF",
+        "fontSize": 34,
         "fontWeight": 600,
     }
     assert screen.view_sets["filters"] == [
@@ -1083,7 +1244,16 @@ def test_init_builtin_canvases_creates_builtin_alert_screen():
                 "end": "2026-08-04T00:00:00.000Z",
                 "selectValue": 10080,
             },
-        }
+        },
+        {
+            "id": "organization__string",
+            "key": "organization",
+            "name": "组织",
+            "type": "string",
+            "order": 1,
+            "enabled": True,
+            "defaultValue": "",
+        },
     ]
     period_node_ids = {
         "alert-level-trend",
@@ -1114,50 +1284,22 @@ def test_init_builtin_canvases_creates_builtin_alert_screen():
     room3d_screen = Screen.objects.get(name="3D机房大屏", is_build_in=True)
     assert room3d_screen.build_in_key == "screen::3D机房大屏_内置"
     assert room3d_screen.directory.build_in_key == "__builtin__"
-    assert room3d_screen.view_sets["decorations"] == {"title": "机柜全景", "showClock": False, "showTitle": False}
-    assert room3d_screen.view_sets["items"] == [
-        {
-            "h": 94,
-            "w": 1911,
-            "x": 2,
-            "y": 1,
-            "id": "legacy-title-frame",
-            "kind": "titleFrame",
-            "preset": "hero-6",
-            "zIndex": 2,
-            "content": "机柜全景",
-            "textStyle": {"fontSize": 40},
-        },
-        {
-            "h": 56,
-            "w": 360,
-            "x": 1544,
-            "y": 19,
-            "id": "legacy-clock",
-            "kind": "clock",
-            "format": "YYYY-MM-DD HH:mm:ss",
-            "zIndex": 3,
-            "textStyle": {"color": "canvas", "fontSize": 25, "fontWeight": 600},
-        },
-        {
-            "h": 1000,
-            "w": 1920,
-            "x": 0,
-            "y": 80,
-            "id": "builtin-room3d-main",
-            "type": "widget",
-            "title": "3D机房",
-            "zIndex": 1,
-            "chartType": "room3D",
-            "valueConfig": {
-                "chartType": "room3D",
-                "sceneWidgetType": "room3D",
-                "appearance": {"frame": "bare"},
-            },
-        },
-    ]
+    assert room3d_screen.view_sets["decorations"] == {"title": "机房运行总览", "showClock": False, "showTitle": False}
+    room3d_yaml = _load_builtin_room3d_screen()
+    imported_items = copy.deepcopy(room3d_screen.view_sets["items"])
+    for item in imported_items:
+        value_config = item.get("valueConfig") or {}
+        data_source = value_config.get("dataSource")
+        if isinstance(data_source, int):
+            value_config["dataSource"] = DataSourceAPIModel.objects.get(id=data_source).build_in_key
+    assert imported_items == room3d_yaml["view_sets"]["items"]
+    assert room3d_screen.view_sets["filters"] == room3d_yaml["view_sets"]["filters"]
     assert not DataSourceAPIModel.objects.filter(rest_api="cmdb/get_room3d_layout").exists()
-    assert not DataSourceAPIModel.objects.filter(rest_api="cmdb/get_room_list").exists()
+    room_list = DataSourceAPIModel.objects.get(rest_api="cmdb/get_room_list", is_build_in=True)
+    assert room_list.is_active is True
+    assert room_list.name == "CMDB 机房列表（选项）"
+    assert room_list.build_in_key == "CMDB 机房列表::cmdb/get_room_list"
+    assert room_list.chart_type == []
 
     application3d_screen = Screen.objects.get(name="3D应用大屏", is_build_in=True)
     assert application3d_screen.build_in_key == "screen::3D应用大屏_内置"

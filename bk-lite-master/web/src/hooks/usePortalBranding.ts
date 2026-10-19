@@ -7,10 +7,10 @@ import {
   writeJsonCache,
 } from '@/utils/portalTabTitle';
 
-const DEFAULT_PORTAL_NAME = 'BlueKing Lite';
-const DEFAULT_PORTAL_LOGO_URL = '/logo-site.png';
-const DEFAULT_PORTAL_FAVICON_URL = '/logo-site.png';
-const DEFAULT_WATERMARK_TEXT = 'BlueKing Lite · ${username} · ${date}';
+const DEFAULT_PORTAL_NAME = '盛大运维系统';
+const DEFAULT_PORTAL_LOGO_URL = '/logo-site.svg';
+const DEFAULT_PORTAL_FAVICON_URL = '/logo-site.svg';
+const DEFAULT_WATERMARK_TEXT = '盛大运维系统 · ${username} · ${date}';
 const PORTAL_BRANDING_EVENT = 'portal-branding-updated';
 
 export interface PortalBrandingState {

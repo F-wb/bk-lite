@@ -23,6 +23,7 @@ import { getScreenRndNodeClassName } from "../utils/classNames";
 import { calculateScreenVisualMetrics } from "../utils/metrics";
 import { resolveScreenCanvasBackgroundStyle } from "../utils/screenBackground";
 import {
+  isScreenDecorationItem,
   isScreenWidgetItem,
   readScreenChromeDrag,
   SCREEN_CHROME_DRAG_MIME,
@@ -37,6 +38,10 @@ import ScreenWidgetRenderer from "./screenWidgetRenderer";
 const RndComponent = Rnd as unknown as React.ComponentType<any>;
 
 const unresolvedDataSource = () => undefined as DatasourceItem | undefined;
+const OUTSIDE_CANVAS_CLICK_TOLERANCE_PX = 4;
+
+const isCanvasFrameTarget = (target: EventTarget | null) =>
+  target instanceof Element && Boolean(target.closest(".screen-canvas-stage"));
 
 interface ScreenCanvasProps {
   viewSets: ScreenViewSets;
@@ -72,6 +77,7 @@ interface ScreenCanvasProps {
       NonNullable<ScreenWidgetItem['valueConfig']>['networkStatusTopology']
     >,
   ) => void;
+  onDismissInspector?: () => void;
 }
 
 interface CanvasSize {
@@ -115,6 +121,7 @@ interface ScreenRndItemProps {
   onResizeItem?: (itemId: string, size: { w: number; h: number }) => void;
   onEditItem?: (itemId: string) => void;
   onOpenItemMenu?: (itemId: string, point: { x: number; y: number }) => void;
+  passThroughPointerEvents?: boolean;
 }
 
 const getWidgetGeometry = (item: ScreenItemGeometry): WidgetGeometry => ({
@@ -161,6 +168,7 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
     onResizeItem,
     onEditItem,
     onOpenItemMenu,
+    passThroughPointerEvents = false,
   }) => {
     const rndRef = useRef<any>(null);
     const interactingRef = useRef(false);
@@ -358,7 +366,10 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
         }}
         className={getScreenRndNodeClassName(editable && selected)}
         data-screen-item-id={item.id}
-        style={{ zIndex: item.zIndex }}
+        style={{
+          zIndex: item.zIndex,
+          pointerEvents: passThroughPointerEvents ? "none" : undefined,
+        }}
         onClick={
           editable
             ? (event: React.MouseEvent) => {
@@ -372,12 +383,12 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
             : undefined
         }
         onContextMenu={
-          editable
+          editable && onOpenItemMenu
             ? (event: React.MouseEvent) => {
               event.preventDefault();
               event.stopPropagation();
               onSelectItem?.(item.id);
-              onOpenItemMenu?.(item.id, { x: event.clientX, y: event.clientY });
+              onOpenItemMenu(item.id, { x: event.clientX, y: event.clientY });
             }
             : undefined
         }
@@ -449,6 +460,7 @@ interface ScreenCanvasNodeProps {
   editable: boolean;
   selected: boolean;
   scale: number;
+  scaleY: number;
   fitScale: number;
   screenDensity: number;
   screenUiScale: number;
@@ -479,6 +491,7 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
   editable,
   selected,
   scale,
+  scaleY,
   fitScale,
   screenDensity,
   screenUiScale,
@@ -511,6 +524,8 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
       refreshCause={refreshCause}
       screenId={screenId}
       fitScale={fitScale}
+      scaleX={scale}
+      scaleY={scaleY}
       screenDensity={screenDensity}
       screenUiScale={screenUiScale}
       dataSourceResolver={dataSourceResolver}
@@ -540,13 +555,18 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
       editable={editable}
       selected={editable && selected}
       scale={scale}
-      minWidth={isWidget ? 160 : 24}
-      minHeight={isWidget ? 110 : 16}
+      minWidth={
+        isScreenWidgetItem(item) ? (item.chartType === 'single' ? 72 : 160) : 24
+      }
+      minHeight={
+        isScreenWidgetItem(item) ? (item.chartType === 'single' ? 40 : 110) : 16
+      }
       onSelectItem={onSelectItem}
       onMoveItem={onMoveItem}
       onResizeItem={onResizeItem}
       onEditItem={isWidget ? onEditItem : undefined}
       onOpenItemMenu={onOpenItemMenu}
+      passThroughPointerEvents={!editable && isScreenDecorationItem(item)}
     >
       {content}
     </ScreenRndItem>
@@ -576,10 +596,12 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
   onOpenItemMenu,
   onDropChrome,
   onTopologyLayoutChange,
+  onDismissInspector,
   forceContain = false,
 }) => {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
+  const outsidePointerRef = useRef<{ x: number; y: number } | null>(null);
   const [containerSize, setContainerSize] = useState<CanvasSize>({
     width: 0,
     height: 0,
@@ -627,10 +649,12 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
 
   const presentation = Boolean(fullscreen || shareMode);
   const screenMetrics = useMemo(() => {
-    const padding = presentation ? 0 : 32;
+    // 上下收紧，左右保留。高度是等比适配的短边，少留的垂直间距会直接变成画布高度。
+    const paddingX = presentation ? 0 : 32;
+    const paddingY = presentation ? 0 : 12;
     return calculateScreenVisualMetrics({
-      contentWidth: Math.max(containerSize.width - padding, 0),
-      contentHeight: Math.max(containerSize.height - padding, 0),
+      contentWidth: Math.max(containerSize.width - paddingX, 0),
+      contentHeight: Math.max(containerSize.height - paddingY, 0),
       designWidth: width,
       designHeight: height,
       adapter: displayAdapter,
@@ -658,9 +682,31 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
     <div
       ref={containerRef}
       className={`screen-canvas-workbench flex h-full min-h-0 w-full ${workbenchAlign} ${
-        presentation ? "screen-canvas-workbench--preview p-0" : "p-4"
+        presentation ? "screen-canvas-workbench--preview p-0" : "px-4 py-1.5"
       }`}
       style={screenTheme.variables as React.CSSProperties}
+      onPointerDown={(event) => {
+        if (event.button !== 0) {
+          outsidePointerRef.current = null;
+          return;
+        }
+        outsidePointerRef.current = { x: event.clientX, y: event.clientY };
+      }}
+      onClick={(event) => {
+        const start = outsidePointerRef.current;
+        outsidePointerRef.current = null;
+        if (!editable || !onDismissInspector || isCanvasFrameTarget(event.target)) {
+          return;
+        }
+        if (
+          start &&
+          Math.hypot(event.clientX - start.x, event.clientY - start.y) >
+            OUTSIDE_CANVAS_CLICK_TOLERANCE_PX
+        ) {
+          return;
+        }
+        onDismissInspector();
+      }}
     >
       <div
         className="screen-canvas-stage shrink-0"
@@ -728,6 +774,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
                 editable={editable}
                 selected={selectedItemId === item.id}
                 scale={scale}
+                scaleY={screenMetrics.scaleY}
                 fitScale={screenMetrics.fitScale}
                 screenDensity={screenMetrics.screenDensity}
                 screenUiScale={screenMetrics.screenUiScale}

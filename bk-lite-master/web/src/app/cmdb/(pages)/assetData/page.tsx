@@ -11,7 +11,6 @@ import {
   Space,
   Modal,
   message,
-  Spin,
   Dropdown,
   TablePaginationConfig,
   Tree,
@@ -36,6 +35,7 @@ import GroupTreeSelector from '@/components/group-tree-select';
 import PermissionWrapper from '@/components/permission';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
 import RefreshIconButton from '@/components/refresh-icon-button';
+import ToolbarSplitShell from '@/components/toolbar-split-shell';
 import { useTranslation } from '@/utils/i18n';
 import { useUserInfoContext } from '@/context/userInfo';
 import { useClientData } from '@/context/client';
@@ -57,6 +57,7 @@ import {
 import { useCommon, useCmdbUserList } from '@/app/cmdb/context/common';
 import { resolveCmdbInstUuid } from '@/app/cmdb/utils/instUuid';
 import { useAssetDataStore, type FilterItem } from '@/app/cmdb/store';
+import { isMultiIpSearchAttr } from './list/multiIpSearch';
 import { useModelApi, useClassificationApi, useInstanceApi, useCollectApi } from '@/app/cmdb/api';
 import {
   GroupItem,
@@ -305,8 +306,10 @@ const AssetDataContent = () => {
   const [modelInstCount, setModelInstCount] = useState<Record<string, number>>(
     {}
   );
-  // 是否折叠操作栏
-  const [isActionsCollapsed, setIsActionsCollapsed] = useState(false);
+  // 窄屏时把「数据订阅」收进更多。导入导出记录始终在更多里，新建和导出保持可见。
+  const [secondaryActionsCollapsed, setSecondaryActionsCollapsed] = useState(false);
+  const [quickCreateToken, setQuickCreateToken] = useState(0);
+  const searchAttr = useAssetDataStore((state) => state.searchAttr);
   const urlQueryInitialized = useRef(false);
   const initialDataLoaded = useRef(false);
   const treeWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -332,12 +335,15 @@ const AssetDataContent = () => {
     let frameId: number | null = null;
     const updateCollapseState = () => {
       if (!rowEl || !leftEl || !sizerEl) return;
-      const rowWidth = rowEl.getBoundingClientRect().width;
-      const leftContentWidth = leftEl.scrollWidth;
-      const sizerWidth = sizerEl.getBoundingClientRect().width;
+      const shell = rowEl.firstElementChild as HTMLElement | null;
+      const rowWidth = (shell ?? rowEl).clientWidth;
+      const inputWidth = isMultiIpSearchAttr(searchAttr) ? 360 : 200;
+      // 组织选择 200、属性下拉 120、搜索按钮 32、精确匹配约 108、刷新 32，间距 8。
+      const preferredFilterWidth = 200 + 120 + inputWidth + 32 + 108 + 32 + 8 * 4;
+      const fullActionsWidth = sizerEl.getBoundingClientRect().width;
       const recoveryBuffer = 30;
-      const shouldCollapse = leftContentWidth + sizerWidth > rowWidth + recoveryBuffer;
-      setIsActionsCollapsed((prev) => (prev === shouldCollapse ? prev : shouldCollapse));
+      const shouldCollapse = preferredFilterWidth + fullActionsWidth > rowWidth + recoveryBuffer;
+      setSecondaryActionsCollapsed((prev) => (prev === shouldCollapse ? prev : shouldCollapse));
     };
 
     // 创建一个观察器，当窗口大小变化时，更新折叠状态
@@ -357,7 +363,7 @@ const AssetDataContent = () => {
       if (frameId) cancelAnimationFrame(frameId);
       observer.disconnect();
     };
-  }, []);
+  }, [searchAttr]);
 
   useEffect(() => {
     // 主页中当模型为host时，获取云区域选项test8.7
@@ -945,7 +951,7 @@ const AssetDataContent = () => {
     (modelName: string, modelId: string) => (
       <div className="flex items-center" data-asset-model-id={modelId}>
         <EllipsisWithTooltip text={modelName} className={assetDataStyle.treeLabel} />
-        <span className="ml-1 text-gray-400">({modelInstCount[modelId] || 0})</span>
+        <span className="ml-1 text-[var(--color-text-4)]">({modelInstCount[modelId] || 0})</span>
       </div>
     ),
     [modelInstCount]
@@ -1187,31 +1193,31 @@ const AssetDataContent = () => {
       width: 280,
       fixed: 'right',
       render: (_: unknown, record: any) => (
-        <>
-          <Button type="link" className="mr-[10px]" onClick={() => checkDetail(record)}>
+        <div className="flex items-center gap-2">
+          <Button type="link" size="small" onClick={() => checkDetail(record)}>
             {t('common.detail')}
           </Button>
           <PermissionWrapper requiredPermissions={['Add Associate']} instPermissions={record.permission}>
-            <Button type="link" className="mr-[10px]" onClick={() => showInstanceModal(record)}>
+            <Button type="link" size="small" onClick={() => showInstanceModal(record)}>
               {t('Model.association')}
             </Button>
           </PermissionWrapper>
           <PermissionWrapper requiredPermissions={['Add']}>
-            <Button type="link" className="mr-[10px]" disabled={!propertyListGroups.length} onClick={() => showCopyModal(record)}>
+            <Button type="link" size="small" disabled={!propertyListGroups.length} onClick={() => showCopyModal(record)}>
               {t('common.copy')}
             </Button>
           </PermissionWrapper>
           <PermissionWrapper requiredPermissions={['Edit']} instPermissions={record.permission}>
-            <Button type="link" className="mr-[10px]" disabled={!propertyListGroups.length} onClick={() => showAttrModal('edit', record)}>
+            <Button type="link" size="small" disabled={!propertyListGroups.length} onClick={() => showAttrModal('edit', record)}>
               {t('common.edit')}
             </Button>
           </PermissionWrapper>
           <PermissionWrapper requiredPermissions={['Delete']} instPermissions={record.permission}>
-            <Button type="link" danger onClick={() => showDeleteConfirm(record)}>
+            <Button type="link" size="small" danger onClick={() => showDeleteConfirm(record)}>
               {t('common.delete')}
             </Button>
           </PermissionWrapper>
-        </>
+        </div>
       ),
     };
     const tableColumns = [...columnsWithFollow, ...(externalIdColumn ? [externalIdColumn] : []), actionColumn];
@@ -1223,7 +1229,6 @@ const AssetDataContent = () => {
     setCurrentColumns([...orderedColumns, actionColumn]);
   }, [propertyList, displayFieldKeys, propertyListGroups, modelId, followPendingKey, handleFollowToggle, isFollowed, t, userList]);
 
-  const showSubscribeAction = selectedRowKeys.length > 0 || storeQueryList.length > 0;
   const showBatchSyncMonitor = canSyncMonitor(modelId) && isMonitorSold(clientData);
   const batchSyncMonitorItem: NonNullable<MenuProps['items']>[number] = {
     key: 'batchSyncMonitor',
@@ -1236,15 +1241,6 @@ const AssetDataContent = () => {
   };
 
   const batchOperateItems: MenuProps['items'] = [
-    {
-      key: 'subscribe',
-      label: (
-        <a onClick={() => openSubscription(selectedRowKeys.length > 0 ? 'list_selection' : 'list_filter')}>
-          {t('subscription.subscribe')}
-        </a>
-      ),
-      disabled: !showSubscribeAction,
-    },
     {
       key: 'batchEdit',
       label: (
@@ -1260,7 +1256,6 @@ const AssetDataContent = () => {
       ),
       disabled: !selectedRowKeys.length || !propertyListGroups.length,
     },
-    ...(showBatchSyncMonitor ? [batchSyncMonitorItem] : []),
     {
       key: 'batchDelete',
       label: (
@@ -1270,24 +1265,10 @@ const AssetDataContent = () => {
       ),
       disabled: !selectedRowKeys.length,
     },
+    ...(showBatchSyncMonitor
+      ? [{ type: 'divider' as const, key: 'divider-monitor' }, batchSyncMonitorItem]
+      : []),
   ];
-
-  // 添加实例菜单项，添加权限检查
-  const addInstItemsWithPermission: MenuProps['items'] = addInstItems.map(
-    (item) => {
-      if (!item || ('type' in item && item.type === 'divider') || !('label' in item)) {
-        return item;
-      }
-      return {
-        ...item,
-        label: (
-          <PermissionWrapper requiredPermissions={['Add']} fallback={item.label}>
-            {item.label}
-          </PermissionWrapper>
-        ),
-      };
-    }
-  );
 
   const transfers = useTransferTasks(transferOpen, (task) => {
     if (task.model_id === modelId) void updateFieldList();
@@ -1298,26 +1279,43 @@ const AssetDataContent = () => {
     setTransferOpen(true);
   };
 
-  const buildPrefixedItems = (items: MenuProps['items'], prefix: string) =>
-    items.map((item, index) => {
-      if (!item) return item;
-      const baseKey = 'key' in item && item.key ? String(item.key) : `${prefix}-${index}`;
-      return {
-        ...item,
-        key: `${prefix}-${baseKey}`,
-      };
-    });
+  const transferMoreItem: NonNullable<MenuProps['items']>[number] = {
+    key: 'transfers',
+    label: (
+      <a onClick={() => setTransferOpen(true)}>
+        {t('Transfer.title')}
+        {pendingTransfers ? ` (${pendingTransfers})` : ''}
+      </a>
+    ),
+  };
 
-  const collapsedMoreItems: MenuProps['items'] = [
-    ...buildPrefixedItems(addInstItemsWithPermission, 'add'),
-    { type: 'divider', key: 'divider-add-export' },
-    ...buildPrefixedItems(exportItems, 'export'),
-    { type: 'divider', key: 'divider-export-batch' },
-    ...buildPrefixedItems(batchOperateItems, 'batch'),
+  const subscriptionMoreItem: NonNullable<MenuProps['items']>[number] = {
+    key: 'subscription',
+    label: (
+      <a onClick={() => openSubscription('drawer')}>{t('subscription.dataSubscription')}</a>
+    ),
+  };
+
+  const moreItems: MenuProps['items'] = [
+    transferMoreItem,
+    ...(secondaryActionsCollapsed ? [subscriptionMoreItem] : []),
+    { type: 'divider', key: 'divider-secondary-batch' },
+    ...batchOperateItems,
   ];
 
+  const openQuickCreate = (source: 'list_selection' | 'list_filter') => {
+    setSubscriptionSource(source);
+    if (source === 'list_selection') {
+      setQuickContext({ selectedInstanceUuids: selectedRowKeys.map((key) => String(key)) });
+    } else {
+      setQuickContext({ queryList: storeQueryList });
+    }
+    setQuickCreateToken((token) => token + 1);
+    setSubscriptionDrawerOpen(true);
+  };
+
   return (
-    <Spin spinning={loading} wrapperClassName={assetDataStyle.assetLoading}>
+    <div className={assetDataStyle.assetLoading}>
       <div className={assetDataStyle.assetData}>
         {/* 左侧树形选择器 */}
         <div className={`${assetDataStyle.groupSelector}`}>
@@ -1373,102 +1371,106 @@ const AssetDataContent = () => {
         </div>
         {/* 右侧资产列表 */}
         <div className={assetDataStyle.assetList}>
-          <div
-            ref={topRowRef}
-            className={`flex justify-between ${storeQueryList.length === 0 ? 'mb-4' : ''}`}
-          >
-            {/* 左侧组织搜索框 */}
-            <div ref={leftActionsRef}>
-              <Space>
-                <GroupTreeSelector
-                  style={{
-                    width: '200px',
-                  }}
-                  placeholder={t('common.selectTip')}
-                  value={organization}
-                  onChange={selectOrganization}
-                  filterByRootId={
-                    selectedGroup?.id ? Number(selectedGroup.id) : undefined
-                  }
-                />
-                {/* 中间部分 */}
-                <SearchFilter
-                  key={modelId}
-                  proxyOptions={proxyOptions}
-                  userList={userList}
-                  modelId={modelId}
-                  displayFieldKeys={displayFieldKeys}
-                  attrList={propertyList.filter(
-                    (item) => item.attr_type !== 'organization'
-                  )}
-                  onSearch={handleSearch}
-                  onChange={handleFilterBarChange}
-                  onFilterChange={handleFilterBarChange}
-                />
-                {modelId === 'ip' && (
-                  <Tag
-                    color={isConflictFilterActive ? 'error' : 'default'}
-                    style={{ cursor: 'pointer', userSelect: 'none' }}
-                    onClick={handleConflictFilterToggle}
+          <div ref={topRowRef}>
+            <ToolbarSplitShell
+              className={`!flex-nowrap${storeQueryList.length === 0 ? '' : ' !mb-0'}`}
+              trailingClassName="!w-full min-w-0 !flex-nowrap"
+              trailing={(
+                <>
+                  <div ref={leftActionsRef} className="flex min-w-0 shrink items-center gap-2">
+                    <GroupTreeSelector
+                      style={{
+                        width: '200px',
+                        flexShrink: 0,
+                      }}
+                      placeholder={t('common.selectTip')}
+                      value={organization}
+                      onChange={selectOrganization}
+                      filterByRootId={
+                        selectedGroup?.id ? Number(selectedGroup.id) : undefined
+                      }
+                    />
+                    <SearchFilter
+                      key={modelId}
+                      allowShrink
+                      proxyOptions={proxyOptions}
+                      userList={userList}
+                      modelId={modelId}
+                      displayFieldKeys={displayFieldKeys}
+                      attrList={propertyList.filter(
+                        (item) => item.attr_type !== 'organization'
+                      )}
+                      onSearch={handleSearch}
+                      onChange={handleFilterBarChange}
+                      onFilterChange={handleFilterBarChange}
+                    />
+                    {modelId === 'ip' && (
+                      <Tag
+                        color={isConflictFilterActive ? 'error' : 'default'}
+                        style={{ cursor: 'pointer', userSelect: 'none' }}
+                        onClick={handleConflictFilterToggle}
+                      >
+                        {t('IPAM.conflictFilter')}
+                      </Tag>
+                    )}
+                    <span className="shrink-0">
+                      <RefreshIconButton
+                        loading={loading}
+                        onClick={() => fetchData()}
+                      />
+                    </span>
+                  </div>
+                  <div className="shrink-0">
+                    <Dropdown menu={{ items: exportItems }} placement="bottom">
+                      <Button>
+                        <Space>
+                          {t('export')}
+                          <DownOutlined />
+                        </Space>
+                      </Button>
+                    </Dropdown>
+                  </div>
+                  <Dropdown
+                    menu={{ items: moreItems }}
+                    placement="bottom"
                   >
-                    {t('IPAM.conflictFilter')}
-                  </Tag>
-                )}
-                <RefreshIconButton
-                  loading={loading}
-                  onClick={() => fetchData()}
-                />
-              </Space>
-            </div>
-            {/* 右侧操作按钮 */}
-            <Space>
-              <div
-                className={`${assetDataStyle.actionGroup} ${isActionsCollapsed ? assetDataStyle.actionGroupCollapsed : ''}`}
-                aria-hidden={isActionsCollapsed}
-              >
-                <PermissionWrapper requiredPermissions={['Add']}>
-                  <Dropdown menu={{ items: addInstItems }} placement="bottom">
-                    <Button type="primary">
+                    <Button className="shrink-0">
                       <Space>
-                        {t('common.addNew')}
+                        {t('more')}
                         <DownOutlined />
                       </Space>
                     </Button>
                   </Dropdown>
-                </PermissionWrapper>
-                <Dropdown menu={{ items: exportItems }} placement="bottom">
-                  <Button>
-                    <Space>
-                      {t('export')}
-                      <DownOutlined />
-                    </Space>
-                  </Button>
-                </Dropdown>
-              </div>
-              <Dropdown
-                menu={{ items: isActionsCollapsed ? collapsedMoreItems : batchOperateItems }}
-                placement="bottom"
-              >
-                <Button>
-                  <Space>
-                    {t('more')}
-                    <DownOutlined />
-                  </Space>
-                </Button>
-              </Dropdown>
-              <Button onClick={() => setTransferOpen(true)}>{t('Transfer.title')}
-                {pendingTransfers ? ` (${pendingTransfers})` : ''}
-              </Button>
-              <Button icon={<UnorderedListOutlined aria-hidden="true" />} onClick={() => openSubscription('drawer')}>
-                {t('subscription.dataSubscription')}
-              </Button>
-            </Space>
+                  {secondaryActionsCollapsed ? null : (
+                    <Button
+                      className="shrink-0"
+                      icon={<UnorderedListOutlined aria-hidden="true" />}
+                      onClick={() => openSubscription('drawer')}
+                    >
+                      {t('subscription.dataSubscription')}
+                    </Button>
+                  )}
+                  <div className="shrink-0">
+                    <PermissionWrapper requiredPermissions={['Add']}>
+                      <Dropdown menu={{ items: addInstItems }} placement="bottom">
+                        <Button type="primary">
+                          <Space>
+                            {t('common.new')}
+                            <DownOutlined />
+                          </Space>
+                        </Button>
+                      </Dropdown>
+                    </PermissionWrapper>
+                  </div>
+                </>
+              )}
+            />
           </div>
           <div ref={actionSizerRef} className={assetDataStyle.actionSizer}>
             <Space>
               <Button type="primary">
                 <Space>
-                  {t('common.addNew')}
+                  {t('common.new')}
                   <DownOutlined aria-hidden="true" />
                 </Space>
               </Button>
@@ -1483,9 +1485,6 @@ const AssetDataContent = () => {
                   {t('more')}
                   <DownOutlined aria-hidden="true" />
                 </Space>
-              </Button>
-              <Button>{t('Transfer.title')}
-                {pendingTransfers ? ` (${pendingTransfers})` : ''}
               </Button>
               <Button icon={<UnorderedListOutlined aria-hidden="true" />}>
                 {t('subscription.dataSubscription')}
@@ -1511,7 +1510,7 @@ const AssetDataContent = () => {
             dataSource={tableData}
             columns={currentColumns}
             pagination={pagination}
-            loading={tableLoading}
+            loading={loading || tableLoading}
             scroll={{
               x: 'max-content',
               y: storeQueryList.length > 0
@@ -1557,6 +1556,15 @@ const AssetDataContent = () => {
             modelId={modelId}
             modelName={currentModelName}
             quickDefaults={quickDefaults}
+            quickCreateToken={quickCreateToken}
+            canCreateFromSelection={selectedRowKeys.length > 0}
+            canCreateFromFilter={storeQueryList.length > 0}
+            onCreateFromSelection={() => openQuickCreate('list_selection')}
+            onCreateFromFilter={() => openQuickCreate('list_filter')}
+            onCreateBlank={() => {
+              setSubscriptionSource('drawer');
+              setQuickContext({});
+            }}
           />
           <Modal
             open={quickSubscribeModalOpen}
@@ -1565,7 +1573,7 @@ const AssetDataContent = () => {
             centered
             onCancel={() => setQuickSubscribeModalOpen(false)}
             footer={(
-              <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+              <div className="flex justify-end gap-2">
                 <Button
                   type="primary"
                   loading={quickSubscribeSubmitting}
@@ -1582,7 +1590,7 @@ const AssetDataContent = () => {
                 <Button onClick={() => setQuickSubscribeModalOpen(false)}>
                   {t('subscription.cancel')}
                 </Button>
-              </Space>
+              </div>
             )}
             destroyOnHidden
             styles={{
@@ -1606,7 +1614,7 @@ const AssetDataContent = () => {
           </Modal>
         </div>
       </div>
-    </Spin>
+    </div>
   );
 };
 

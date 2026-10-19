@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
   Button,
   Tag,
@@ -32,9 +32,11 @@ import useJobApi from '@/app/job/api';
 import { Script, ScriptFormData, ScriptParam, ScriptParamType, ScriptType } from '@/app/job/types';
 import { ColumnItem } from '@/types';
 import GroupTreeSelect from '@/components/group-tree-select';
-import SearchCombination from '@/components/search-combination';
-import { SearchFilters, FieldConfig } from '@/components/search-combination/types';
+import SearchActionBar from '@/components/search-action-bar';
+import TopSection from '@/components/top-section';
 import ScriptEditor from '@/app/job/components/script-editor';
+import TemplateVersionDrawer from '@/app/job/components/template-version-drawer';
+import VersionBadge from '@/components/version-badge';
 import OrganizationTags, { getOrganizationColumnWidth } from '@/app/job/components/organization-tags';
 import { useRouter } from 'next/navigation';
 import styles from './page.module.scss';
@@ -124,7 +126,7 @@ const ScriptLibraryPage = () => {
   const [data, setData] = useState<Script[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
-  const [searchFilters, setSearchFilters] = useState<SearchFilters>({});
+  const [searchKey, setSearchKey] = useState('');
   const [pagination, setPagination] = useState({
     current: 1,
     total: 0,
@@ -137,6 +139,7 @@ const ScriptLibraryPage = () => {
   const [confirmLoading, setConfirmLoading] = useState(false);
 
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [versionScriptId, setVersionScriptId] = useState<number | null>(null);
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importConfirmLoading, setImportConfirmLoading] = useState(false);
 
@@ -159,24 +162,16 @@ const ScriptLibraryPage = () => {
   const enumOptions = enumOptionsWatch && enumOptionsWatch.length > 0 ? enumOptionsWatch : [''];
 
   const fetchData = useCallback(
-    async (fetchParams: { filters?: SearchFilters; current?: number; pageSize?: number } = {}) => {
+    async (fetchParams: { keyword?: string; current?: number; pageSize?: number } = {}) => {
       setLoading(true);
       try {
-        const filters = fetchParams.filters ?? searchFilters;
+        const keyword = (fetchParams.keyword ?? searchKey).trim();
         const queryParams: Record<string, unknown> = {
           page: fetchParams.current ?? pagination.current,
           page_size: fetchParams.pageSize ?? pagination.pageSize,
         };
-        if (filters && Object.keys(filters).length > 0) {
-          Object.entries(filters).forEach(([field, conditions]) => {
-            conditions.forEach((condition) => {
-              if (condition.lookup_expr === 'in' && Array.isArray(condition.value)) {
-                queryParams[field] = (condition.value as string[]).join(',');
-              } else {
-                queryParams[field] = condition.value;
-              }
-            });
-          });
+        if (keyword) {
+          queryParams.name = keyword;
         }
         const res = await getScriptList(queryParams as any);
         setData(res.items || []);
@@ -188,7 +183,7 @@ const ScriptLibraryPage = () => {
         setLoading(false);
       }
     },
-    [searchFilters, pagination.current, pagination.pageSize]
+    [searchKey, pagination.current, pagination.pageSize]
   );
 
   useEffect(() => {
@@ -203,40 +198,11 @@ const ScriptLibraryPage = () => {
     }
   }, [pagination.current, pagination.pageSize]);
 
-  const handleSearchChange = useCallback((filters: SearchFilters) => {
-    setSearchFilters(filters);
+  const handleSearch = useCallback((value: string) => {
+    setSearchKey(value);
     setPagination((prev) => ({ ...prev, current: 1 }));
-    fetchData({ filters, current: 1 });
+    fetchData({ keyword: value, current: 1 });
   }, [fetchData]);
-
-  const fieldConfigs: FieldConfig[] = useMemo(() => [
-    {
-      name: 'name',
-      label: t('job.scriptName'),
-      lookup_expr: 'icontains',
-    },
-    {
-      name: 'script_type',
-      label: t('job.scriptType'),
-      lookup_expr: 'in',
-      options: SCRIPT_TYPE_OPTIONS.map((o) => ({ id: o.value, name: o.label })),
-    },
-    {
-      name: 'team',
-      label: t('job.organization'),
-      lookup_expr: 'icontains',
-    },
-    {
-      name: 'created_by',
-      label: t('job.creator'),
-      lookup_expr: 'icontains',
-    },
-    {
-      name: 'description',
-      label: t('job.scriptDescription'),
-      lookup_expr: 'icontains',
-    },
-  ], [t]);
 
   const handleTableChange = (pag: any) => {
     setPagination(pag);
@@ -626,6 +592,13 @@ const ScriptLibraryPage = () => {
       width: 120,
     },
     {
+      title: t('job.version'),
+      dataIndex: 'current_revision_label',
+      key: 'current_revision_label',
+      width: 160,
+      render: (value: string) => <VersionBadge value={value} fallback="--" />,
+    },
+    {
       title: t('job.updateTime'),
       dataIndex: 'updated_at',
       key: 'updated_at',
@@ -643,7 +616,7 @@ const ScriptLibraryPage = () => {
       title: t('job.operation'),
       dataIndex: 'action',
       key: 'action',
-      width: 220,
+      width: 260,
       fixed: 'right',
       render: (_: unknown, record: Script) => (
         <div className="flex items-center gap-3">
@@ -664,6 +637,12 @@ const ScriptLibraryPage = () => {
             onClick={() => router.push(`/job/execution/quick-exec?script_id=${record.id}`)}
           >
             {t('job.executeScript')}
+          </a>
+          <a
+            className="text-[var(--color-primary)] cursor-pointer"
+            onClick={() => setVersionScriptId(record.id)}
+          >
+            {t('job.version')}
           </a>
           <Popconfirm
             title={t('job.deleteScript')}
@@ -686,48 +665,42 @@ const ScriptLibraryPage = () => {
 
   return (
     <div className="w-full h-full flex flex-col overflow-hidden">
-      {/* Header */}
-      <div
-        className="rounded-lg px-6 py-4 mb-4 flex-shrink-0 bg-[var(--color-bg-1)] border border-[var(--color-border-1)]"
-      >
-        <h2
-          className="text-base font-medium m-0 mb-1 text-[var(--color-text-1)]"
-        >
-          {t('job.scriptLibraryTitle')}
-        </h2>
-        <p className="text-sm m-0 text-[var(--color-text-3)]">
-          {t('job.scriptLibraryDesc')}
-        </p>
-      </div>
+      <TopSection
+        title={t('job.scriptLibraryTitle')}
+        content={t('job.scriptLibraryDesc')}
+        className="mb-4 shrink-0"
+      />
 
       {/* Table Section */}
       <div
         className="rounded-lg px-6 py-6 flex-1 min-h-0 flex flex-col bg-[var(--color-bg-1)] border border-[var(--color-border-1)]"
       >
-        {/* Toolbar */}
-        <div className="flex justify-between mb-4 flex-shrink-0">
-          <SearchCombination
-            fieldConfigs={fieldConfigs}
-            onChange={handleSearchChange}
-            fieldWidth={120}
-            selectWidth={300}
-          />
-          <div className="flex gap-2">
-            <Button icon={<ExportOutlined />} onClick={handleExportScripts}>
-              {t('job.batchExportScripts')}
-            </Button>
-            <Button icon={<ImportOutlined />} onClick={openImportModal}>
-              {t('job.batchImportScripts')}
-            </Button>
-            <Button
-              type="primary"
-              icon={<PlusOutlined />}
-              onClick={openAddModal}
-            >
-              {t('job.addScript')}
-            </Button>
-          </div>
-        </div>
+        <SearchActionBar
+          searchProps={{
+            placeholder: t('common.search'),
+            allowClear: true,
+            value: searchKey,
+            onChange: (event) => setSearchKey(event.target.value),
+            onSearch: handleSearch,
+          }}
+          actions={(
+            <>
+              <Button icon={<ExportOutlined />} onClick={handleExportScripts}>
+                {t('job.batchExportScripts')}
+              </Button>
+              <Button icon={<ImportOutlined />} onClick={openImportModal}>
+                {t('job.batchImportScripts')}
+              </Button>
+              <Button
+                type="primary"
+                icon={<PlusOutlined />}
+                onClick={openAddModal}
+              >
+                {t('common.new')}
+              </Button>
+            </>
+          )}
+        />
 
         {/* Table */}
         <div className="flex-1 min-h-0">
@@ -1016,6 +989,13 @@ const ScriptLibraryPage = () => {
             </Form.Item>
           </Form>
         }
+      />
+      <TemplateVersionDrawer
+        open={versionScriptId !== null}
+        kind="script"
+        targetId={versionScriptId}
+        onClose={() => setVersionScriptId(null)}
+        onRestored={() => fetchData()}
       />
     </div>
   );

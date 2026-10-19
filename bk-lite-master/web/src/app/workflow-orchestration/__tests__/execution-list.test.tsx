@@ -201,6 +201,38 @@ describe('执行记录统一详情入口', () => {
     ));
   });
 
+  it('已终止的审批在全部执行里是查看，抽屉只保留审批内容', async () => {
+    const terminated = { ...execution, status: 'TERMINATED', actionable_approval_ids: [], pending_approval_count: 0 };
+    const skippedNode = { ...approvalNode, state: 'SKIPPED', state_counts: { SKIPPED: 1 }, actionable_interaction_ids: [] };
+    mocks.get.mockImplementation((url: string) => {
+      if (url.endsWith('/executions/execution-1/')) return Promise.resolve(terminated);
+      if (url.endsWith('/executions/execution-1/nodes/')) return Promise.resolve({ nodes: [skippedNode], default_node_reference: 'approve_release' });
+      if (url.includes('/nodes/approve_release/')) return Promise.resolve({
+        node: skippedNode,
+        instances: [{ id: 'approval-1', label: '第 1 次', state: 'SKIPPED' }],
+        selected_instance_id: 'approval-1',
+        execution_info: { status: 'SKIPPED', started_at: execution.created_at },
+        inputs: {}, outputs: {}, system_context: {}, error: null, audit_events: [], artifacts: [], control: {}, technical: {},
+        interaction: {
+          id: 'approval-1', type: 'APPROVAL', status: 'PENDING', title: '确认生产目标范围', description: '请在页面确认或拒绝',
+          public_context: { change_title: '本地闭环审批验收' }, candidate_users: ['alice'], can_act: false,
+          operator: '', decision: '', comment: '', created_at: execution.created_at, due_at: null, handled_at: null,
+        },
+      });
+      return Promise.resolve({ count: 1, items: [terminated] });
+    });
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: '查看' }));
+
+    expect(await screen.findByText('请在页面确认或拒绝')).not.toBeNull();
+    expect(screen.getByText('审批上下文')).not.toBeNull();
+    expect(screen.getAllByText('alice').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: '通过审批' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '驳回审批' })).toBeNull();
+    expect(screen.queryByPlaceholderText('通过时选填；驳回时必填原因')).toBeNull();
+  });
+
   it('待我审批页签内点击审批打开详情抽屉', async () => {
     mocks.searchParams = 'scope=mine';
     const { container } = renderPage();
@@ -355,7 +387,9 @@ describe('执行记录统一详情入口', () => {
     expect(screen.queryByRole('button', { name: '查看节点 审批结果' })).toBeNull();
     expect(screen.getByText('2 / 2')).not.toBeNull();
     expect(screen.getByRole('button', { name: '查看节点 文档生成' }).getAttribute('aria-current')).toBe('step');
-    expect(await screen.findByText('inspection.xlsx')).not.toBeNull();
+    const filename = await screen.findByText('inspection.xlsx');
+    const inputToggle = screen.getByRole('button', { name: '折叠输入' });
+    expect(filename.compareDocumentPosition(inputToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.queryByRole('button', { name: '预览' })).toBeNull();
     expect(screen.getByRole('button', { name: /下载/ })).not.toBeNull();
     expect(mocks.get).not.toHaveBeenCalledWith(expect.stringContaining('/nodes/__end__/'), expect.anything());
@@ -517,6 +551,91 @@ describe('执行记录统一详情入口', () => {
       expect.stringContaining('query=%E5%81%A5%E5%BA%B7%E5%B7%A1%E6%A3%80'),
       expect.anything(),
     ));
+  });
+
+  it('表头筛选后翻页仍请求下一页并保留筛选', async () => {
+    mocks.get.mockImplementation((url: string) => {
+      if (String(url).includes('/executions/?')) return Promise.resolve({ count: 40, items: [execution] });
+      return Promise.resolve({ count: 0, items: [] });
+    });
+    renderPage();
+    await screen.findByText(execution.workflow_name);
+    mocks.get.mockClear();
+
+    const filterTrigger = screen.getByRole('columnheader', { name: /^状态/ }).querySelector<HTMLElement>('.ant-table-filter-trigger');
+    expect(filterTrigger).not.toBeNull();
+    fireEvent.click(filterTrigger!);
+    const dropdown = await waitFor(() => {
+      const element = document.querySelector<HTMLElement>('.ant-table-filter-dropdown');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    fireEvent.click(within(dropdown).getByText('已终止'));
+    fireEvent.click(within(dropdown).getByRole('button', { name: /OK|确定/ }));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledWith(
+      expect.stringContaining('status=TERMINATED'),
+      expect.anything(),
+    ));
+    mocks.get.mockClear();
+
+    const pageTwo = document.querySelector<HTMLElement>('.ant-pagination-item-2');
+    expect(pageTwo).not.toBeNull();
+    fireEvent.click(pageTwo!);
+
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledWith(
+      expect.stringMatching(/page=2.*status=TERMINATED|status=TERMINATED.*page=2/),
+      expect.anything(),
+    ));
+  });
+
+  it('执行列表仅对仍可下载的文件显示下载，单个文件直接下载，多个文件按文件名选择', async () => {
+    const file = (id: string, filename: string) => ({
+      id, format: filename.endsWith('.xlsx') ? 'xlsx' : 'docx', filename, size: 1024,
+      download_url: `/workflow_orchestration/api/artifacts/${id}/download/`,
+    });
+    const withOne = {
+      ...execution, id: 'execution-one', status: 'SUCCEEDED', actionable_approval_ids: [],
+      downloadable_artifacts: [file('artifact-1', 'health.xlsx')],
+    };
+    const withMany = {
+      ...execution, id: 'execution-many', workflow_name: '多报告巡检', status: 'SUCCEEDED', actionable_approval_ids: [],
+      downloadable_artifacts: [file('artifact-a', 'health-a.xlsx'), file('artifact-b', 'health-b.docx')],
+    };
+    const withoutFile = {
+      ...execution, id: 'execution-none', workflow_name: '无报告流程', status: 'FAILED', actionable_approval_ids: [],
+      downloadable_artifacts: [],
+    };
+    mocks.get.mockImplementation((url: string) => {
+      if (String(url).includes('/artifacts/')) return Promise.resolve(new Blob(['report']));
+      return Promise.resolve({ count: 3, items: [withOne, withMany, withoutFile] });
+    });
+    const previousCreate = URL.createObjectURL;
+    const previousRevoke = URL.revokeObjectURL;
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, writable: true, value: vi.fn(() => 'blob:report') });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, writable: true, value: vi.fn() });
+    try {
+      renderPage();
+      expect(await screen.findAllByRole('button', { name: '下载' })).toHaveLength(2);
+      const row = screen.getByText('无报告流程').closest('tr');
+      expect(row).not.toBeNull();
+      expect(within(row as HTMLElement).queryByRole('button', { name: '下载' })).toBeNull();
+
+      fireEvent.click(within(screen.getByText('生产变更前置检查').closest('tr') as HTMLElement).getByRole('button', { name: '下载' }));
+      await waitFor(() => expect(mocks.get).toHaveBeenCalledWith(
+        '/workflow_orchestration/api/artifacts/artifact-1/download/',
+        { responseType: 'blob' },
+      ));
+
+      fireEvent.click(within(screen.getByText('多报告巡检').closest('tr') as HTMLElement).getByRole('button', { name: '下载' }));
+      fireEvent.click(await screen.findByRole('menuitem', { name: 'health-b.docx' }));
+      await waitFor(() => expect(mocks.get).toHaveBeenCalledWith(
+        '/workflow_orchestration/api/artifacts/artifact-b/download/',
+        { responseType: 'blob' },
+      ));
+    } finally {
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, writable: true, value: previousCreate });
+      Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, writable: true, value: previousRevoke });
+    }
   });
 
   it('严格模式初始化时列表和详情接口均只请求一次', async () => {

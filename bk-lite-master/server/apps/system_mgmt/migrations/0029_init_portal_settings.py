@@ -5,11 +5,11 @@ def create_portal_settings(apps, schema_editor):
     SystemSettings = apps.get_model("system_mgmt", "SystemSettings")
 
     portal_settings = [
-        {"key": "portal_name", "value": "BlueKing Lite"},
+        {"key": "portal_name", "value": "盛大运维系统"},
         {"key": "portal_logo_url", "value": ""},
         {"key": "portal_favicon_url", "value": ""},
         {"key": "watermark_enabled", "value": "0"},
-        {"key": "watermark_text", "value": "BlueKing Lite · ${username} · ${date}"},
+        {"key": "watermark_text", "value": "盛大运维系统 · ${username} · ${date}"},
     ]
 
     for setting in portal_settings:

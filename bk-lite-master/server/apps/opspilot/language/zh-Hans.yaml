@@ -133,6 +133,7 @@ error:
   training_document_no_retrain: 训练文档不可重新训练
   qa_pair_update_failed: 更新 QA 对失败。
   skill_quota_exceeded: 技能数量超过配额限制。
+  run_model_call_limit_range: 每步调用次数须在 1 到 100 之间
   pilot_start_failed: Pilot 启动失败。
   no_delete_permission: 你没有权限删除此实例
   generate_question_failed: 生成问题失败
@@ -203,6 +204,12 @@ error:
   skill_package_missing_file: 技能包缺少 {filename}
   no_embedding_model: 知识库未配置向量模型,无法重建索引
   material_build_in_progress: 资料正在构建中，请勿重复提交
+  knowledge_base_required: knowledge_base 必填
+  material_ids_required: material_ids 必填
+  material_ids_invalid: material_ids 必须为整数列表
+  material_ids_too_many: 单次最多删除 200 条资料
+  material_not_in_knowledge_base: 资料不存在或不属于当前知识库
+  material_delete_in_progress: 资料正在构建中，请等待完成后再删除
   material_build_dispatch_failed: 知识构建任务投递失败，请稍后重试
   material_no_source_file: 该资料没有可下载的原始文件
   material_source_file_missing: 原始文件不存在
@@ -250,6 +257,8 @@ tools:
         description: 列出某实例已采集的指标。
       monitor_query_metric_data:
         description: 查询指定指标的时序数据。
+      monitor_summarize_metric_trend:
+        description: 用完整历史汇总指标趋势，只返回会在预测跨度内到达阈值的序列。
       monitor_list_active_alerts:
         description: 查询监控策略产生的实例活跃告警（监控详情页告警列表，非告警中心工单）。
       monitor_query_alert_segments:
@@ -311,7 +320,7 @@ tools:
       用当前用户身份查询统一告警中心的告警列表、详情与关联事件。只读，不支持认领或关闭。
     tools:
       alerts_list_alerts:
-        description: 查询告警中心工单列表，可按状态、级别和关键词筛选。
+        description: 查询告警中心工单列表。status=active 表示未关闭的活动告警；「当前」「有哪些」不会当关键字。可按状态、级别筛选。
       alerts_get_alert_detail:
         description: 按告警 ID 查询告警详情。
       alerts_list_alert_events:
@@ -327,13 +336,22 @@ tools:
         description: 按关键词和时间范围查询日志。
       log_search_raw:
         description: 使用原生 LogsQL 查询日志。
+  ops_analysis_dashboard:
+    name: 运营分析仪表盘
+    description: |
+      用当前用户身份检索运营分析数据源，并把校验通过的方案应用到当前仪表盘。
+    tools:
+      search_data_sources:
+        description: 检索当前组织可用于搭建运营分析仪表盘的数据源。返回的 candidates[].id 是唯一合法的 dataSource，fields[].name 是唯一合法字段名，禁止编造。组件标题用 fields[].title，说明用 fields[].description。chart_type 是该数据源允许的图表。一张盘要混用目录里实际支持的类型，不要全部做成 single。概览源最多两个 single 或 gauge，其余改用 pie、topN、line、table 的其他数据源。检索后的下一步只能调用 prepare_dashboard_proposal，不要只回复文字，也不要让用户手工添加。
+      prepare_dashboard_proposal:
+        description: 校验并应用运营分析仪表盘方案。通过后页面直接写入当前画布，不要再次调用。proposal.schemaVersion 固定为 "1.0"。layout 是扁平组件数组，禁止 row、children。dataSource 只能填 search_data_sources 返回的数字 id，字段只能填该数据源 fields 里的 name。chartType 必须属于该数据源的 chart_type。single 和 gauge 的 selectedFields 必须有一个字段。pie 填写 dimensionField 与 valueField。画布 12 列，同一行宽度之和不得超过 12。dashboard_id 用 current。用户要求搭建时必须调用本工具，不能只输出文字方案。
   attachment_file:
     name: 工作流附件文件
     description: |
-      为工作流执行生成 Markdown、PDF 或 Word 附件文件，并返回可下载链接。
+      生成 TXT、Markdown、PDF、Word、PowerPoint、Excel 或 CSV 附件。仅当用户明确要求生成、导出或写入新文件时使用；询问已有文件内容时不要使用。
     tools:
       generate_attachment_file:
-        description: 生成工作流附件文件，保存到 MinIO 后端存储，并返回下载链接。
+        description: 生成 txt、md、pdf、docx、pptx、xlsx 或 csv 附件并返回下载链接。txt 和 md 用纯文本；pptx 按标题分页；xlsx 和 csv 需要带表头的逗号分隔数据。用户要 PPT 时必须用 pptx，禁止降级成 docx。用户要 txt 时不要改成 md。
   kubernetes:
     name: Kubernetes工具
     description: |

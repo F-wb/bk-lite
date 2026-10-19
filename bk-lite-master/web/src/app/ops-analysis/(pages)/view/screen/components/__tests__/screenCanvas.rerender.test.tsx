@@ -1,9 +1,10 @@
 import React from 'react';
 import '@ant-design/v5-patch-for-react-19';
-import { cleanup, render } from '@testing-library/react';
+import { cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import ScreenCanvas from '../screenCanvas';
 import { createScreenWidgetItem } from '../../utils/layoutUtils';
+import { createScreenDecorationItem, createScreenShapeItem } from '../../utils/screenItems';
 import { buildDefaultScreenViewSets } from '../../utils/viewport';
 import * as metrics from '../../utils/metrics';
 
@@ -16,7 +17,19 @@ vi.mock('@/utils/i18n', () => ({
 }));
 
 vi.mock('react-rnd', () => ({
-  Rnd: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  Rnd: ({
+    children,
+    style,
+    ...rest
+  }: {
+    children: React.ReactNode;
+    style?: React.CSSProperties;
+    'data-screen-item-id'?: string;
+  }) => (
+    <div data-screen-item-id={rest['data-screen-item-id']} style={style}>
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock('../screenWidgetRenderer', () => ({
@@ -134,5 +147,78 @@ describe('ScreenCanvas item updates', () => {
 
     expect(view.getByTestId(`widget-${first.id}`).getAttribute('data-fit-scale')).toBe('0.5');
     spy.mockRestore();
+  });
+
+  it('lets decoration borders pass pointer events outside edit mode', () => {
+    const base = buildDefaultScreenViewSets();
+    const border = createScreenDecorationItem([], 'panelFrame', 'border-22');
+    const shape = createScreenShapeItem([], 'rect');
+    const viewSets = { ...base, items: [border, shape] };
+    const view = render(<ScreenCanvas viewSets={viewSets} />);
+    const borderSelector = `[data-screen-item-id="${border.id}"]`;
+    const pointerEvents = (selector: string) =>
+      (view.container.querySelector(selector) as HTMLElement | null)?.style.pointerEvents;
+
+    expect(pointerEvents(borderSelector)).toBe('none');
+    expect(pointerEvents(`[data-screen-item-id="${shape.id}"]`)).toBe('');
+
+    view.rerender(<ScreenCanvas viewSets={viewSets} editMode />);
+    expect(pointerEvents(borderSelector)).toBe('');
+
+    view.rerender(<ScreenCanvas viewSets={viewSets} editMode fullscreen />);
+    expect(pointerEvents(borderSelector)).toBe('none');
+  });
+});
+
+describe('ScreenCanvas outside click', () => {
+  const renderCanvas = (props: Partial<React.ComponentProps<typeof ScreenCanvas>> = {}) => {
+    const onSelectItem = vi.fn();
+    const onDismissInspector = vi.fn();
+    const view = render(
+      <ScreenCanvas
+        viewSets={buildDefaultScreenViewSets()}
+        editMode
+        onSelectItem={onSelectItem}
+        onDismissInspector={onDismissInspector}
+        {...props}
+      />,
+    );
+    const workbench = view.container.querySelector('.screen-canvas-workbench');
+    const canvas = view.container.querySelector('.screen-tech-canvas');
+    if (!workbench || !canvas) {
+      throw new Error('canvas workbench was not rendered');
+    }
+    return { onSelectItem, onDismissInspector, workbench, canvas };
+  };
+
+  it('collapses the inspector from the margin and keeps a canvas click on canvas settings', () => {
+    const { onSelectItem, onDismissInspector, workbench, canvas } = renderCanvas();
+
+    fireEvent.click(workbench);
+    expect(onDismissInspector).toHaveBeenCalledTimes(1);
+    expect(onSelectItem).not.toHaveBeenCalled();
+
+    fireEvent.click(canvas);
+    expect(onSelectItem).toHaveBeenCalledWith(null);
+    expect(onDismissInspector).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a drag that ends on the workbench margin', () => {
+    const { onDismissInspector, workbench } = renderCanvas();
+
+    fireEvent.pointerDown(workbench, { button: 0, clientX: 10, clientY: 10 });
+    fireEvent.click(workbench, { clientX: 40, clientY: 10 });
+
+    expect(onDismissInspector).not.toHaveBeenCalled();
+  });
+
+  it('does not dismiss outside edit mode or while presenting fullscreen', () => {
+    const preview = renderCanvas({ editMode: false });
+    fireEvent.click(preview.workbench);
+    expect(preview.onDismissInspector).not.toHaveBeenCalled();
+
+    const fullscreen = renderCanvas({ fullscreen: true });
+    fireEvent.click(fullscreen.workbench);
+    expect(fullscreen.onDismissInspector).not.toHaveBeenCalled();
   });
 });

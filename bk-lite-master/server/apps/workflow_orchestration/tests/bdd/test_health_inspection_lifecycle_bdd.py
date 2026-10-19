@@ -11,10 +11,11 @@ from openpyxl import load_workbook
 from pytest_bdd import given, scenarios, then, when
 
 from apps.workflow_orchestration.models import Workflow, WorkflowExecution, WorkflowInteraction
+from apps.workflow_orchestration.services.demo_templates import BUILTIN_TEMPLATE_DIR
 from apps.workflow_orchestration.services.reports import parse_report_template, render_report
 
 FEATURE = str(Path(__file__).parent / "health_inspection_lifecycle.feature")
-TEMPLATE_DIR = Path(__file__).resolve().parents[5] / "web/public/workflow-orchestration/templates"
+TEMPLATE_DIR = BUILTIN_TEMPLATE_DIR
 scenarios(FEATURE)
 
 pytestmark = [pytest.mark.bdd, pytest.mark.django_db]
@@ -140,11 +141,12 @@ def builtin_templates_render(ctx):
         rendered = render_report(content, fmt, ctx["health_data"])
         text = _rendered_text(fmt, rendered)
         assert "results" in parsed.loops
-        assert any("host.hostname" in item for item in parsed.placeholders)
+        assert "metric_summary" in parsed.loops
         assert "10.10.90.120" in text
         assert "CPU Total" in text
         assert "Ethernet0" in text
-        assert "win-demo-01" in text
+        assert "CPU 使用率" in text
+        assert "Windows 巡检主机" in text
         assert "{{" not in text
 
 

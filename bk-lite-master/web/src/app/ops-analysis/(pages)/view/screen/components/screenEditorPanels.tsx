@@ -414,6 +414,7 @@ export const ScreenElementPalette: React.FC<ScreenElementPaletteProps> = ({
 }) => {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const draggingIdRef = useRef<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
@@ -622,7 +623,29 @@ export const ScreenElementPalette: React.FC<ScreenElementPaletteProps> = ({
     return null;
   })();
 
+  useEffect(() => {
+    if (!selectedItemId || collapsed) return;
+    const list = listRef.current;
+    if (!list) return;
+    const row = list.querySelector(
+      `[data-screen-list-item="${CSS.escape(selectedItemId)}"]`,
+    );
+    if (!(row instanceof HTMLElement)) return;
+    const listRect = list.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const delta =
+      rowRect.top < listRect.top
+        ? rowRect.top - listRect.top
+        : rowRect.bottom > listRect.bottom
+          ? rowRect.bottom - listRect.bottom
+          : 0;
+    if (delta !== 0) list.scrollTop += delta;
+  }, [collapsed, listed, selectedItemId]);
+
   const activeGroup = paletteGroups.find((group) => group.id === paletteGroup);
+  const paletteToggleLabel = collapsed
+    ? t('opsAnalysis.screen.expandDisplayElements')
+    : t('opsAnalysis.screen.collapseDisplayElements');
 
   return (
     <aside
@@ -633,21 +656,23 @@ export const ScreenElementPalette: React.FC<ScreenElementPaletteProps> = ({
           : 'w-[192px] border-r border-(--color-border-1) bg-(--color-bg-1)'
       }`}
     >
-      <button
-        type="button"
-        aria-label={collapsed ? t('common.expand') : t('common.collapse')}
-        className="absolute top-5 z-30 flex h-6 w-6 items-center justify-center border border-(--color-border-1) bg-(--color-bg-1) text-(--color-text-2) shadow-sm hover:bg-(--color-fill-2)"
-        style={{
-          right: collapsed ? -24 : -12,
-          borderRadius: collapsed ? '0 50% 50% 0' : '50%',
-        }}
-        onClick={() => {
-          setCollapsed((current) => !current);
-          setPaletteGroup(null);
-        }}
-      >
-        {collapsed ? <RightOutlined aria-hidden /> : <LeftOutlined aria-hidden />}
-      </button>
+      <Tooltip title={paletteToggleLabel} placement="right">
+        <button
+          type="button"
+          aria-label={paletteToggleLabel}
+          className="absolute top-5 z-30 flex h-6 w-6 cursor-pointer items-center justify-center border border-(--color-border-1) bg-(--color-bg-1) text-(--color-text-2) shadow-sm hover:bg-(--color-fill-2)"
+          style={{
+            right: collapsed ? -24 : -12,
+            borderRadius: collapsed ? '0 50% 50% 0' : '50%',
+          }}
+          onClick={() => {
+            setCollapsed((current) => !current);
+            setPaletteGroup(null);
+          }}
+        >
+          {collapsed ? <RightOutlined aria-hidden /> : <LeftOutlined aria-hidden />}
+        </button>
+      </Tooltip>
       <div
         className={`flex h-full min-h-0 flex-col bg-(--color-bg-1) ${
           collapsed ? 'pointer-events-none opacity-0' : ''
@@ -660,7 +685,7 @@ export const ScreenElementPalette: React.FC<ScreenElementPaletteProps> = ({
           </div>
           <button
             type="button"
-            className="mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-(--color-text-2) hover:bg-(--color-fill-1)"
+            className="mb-0.5 flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-(--color-text-2) hover:bg-(--color-fill-1)"
             onClick={() => {
               setPaletteGroup(null);
               onOpenChartSelector();
@@ -680,7 +705,7 @@ export const ScreenElementPalette: React.FC<ScreenElementPaletteProps> = ({
                 key={group.id}
                 type="button"
                 aria-expanded={active}
-                className={`mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs ${
+                className={`mb-0.5 flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-xs ${
                   active
                     ? 'bg-(--color-fill-2) font-medium text-(--color-primary)'
                     : 'text-(--color-text-2) hover:bg-(--color-fill-1)'
@@ -708,7 +733,11 @@ export const ScreenElementPalette: React.FC<ScreenElementPaletteProps> = ({
             );
           })}
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
+        <div
+          ref={listRef}
+          data-screen-element-list=""
+          className="min-h-0 flex-1 overflow-y-auto px-2 py-2"
+        >
           <div className="mb-1 px-1 text-xs font-semibold text-(--color-text-1)">
             {t('opsAnalysis.screen.elementList')}
           </div>
@@ -773,7 +802,7 @@ export const ScreenElementPalette: React.FC<ScreenElementPaletteProps> = ({
                   >
                     <button
                       type="button"
-                      className={`flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs ${
+                      className={`flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs ${
                         selected
                           ? 'font-medium text-(--color-text-1)'
                           : 'text-(--color-text-2)'
@@ -1161,7 +1190,7 @@ export const ScreenCanvasSettings: React.FC<ScreenCanvasSettingsProps> = ({
                     height: preset.height,
                   })
                 }
-                className={`flex items-center justify-center rounded-md border px-1 py-1.5 text-xs transition-colors ${
+                className={`flex cursor-pointer items-center justify-center rounded-md border px-1 py-1.5 text-xs transition-colors ${
                   isActive
                     ? 'border-(--color-primary) bg-(--color-primary)/10 font-semibold text-(--color-primary)'
                     : 'border-(--color-border-1) bg-(--color-bg-1) text-(--color-text-2) hover:border-(--color-border-2) hover:text-(--color-text-1)'
@@ -1317,7 +1346,7 @@ export const ScreenCanvasSettings: React.FC<ScreenCanvasSettingsProps> = ({
                       background: { type: 'preset', key: item.key },
                     })
                   }
-                  className={`group relative flex flex-col overflow-hidden rounded-md border text-left transition-all ${
+                  className={`group relative flex cursor-pointer flex-col overflow-hidden rounded-md border text-left transition-all ${
                     isSelected
                       ? 'border-(--color-primary) shadow-sm ring-2 ring-(--color-primary)/30'
                       : 'border-(--color-border-1) hover:border-(--color-border-2)'
@@ -1611,7 +1640,7 @@ export const ScreenStyleInspector: React.FC<ScreenStyleInspectorProps> = ({
             <button
               type="button"
               onClick={() => patchAppearance({ ...appearance, frame: 'panel' })}
-              className={`flex flex-col items-center justify-center gap-1.5 rounded-lg border p-2.5 text-xs transition-all ${
+              className={`flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border p-2.5 text-xs transition-all ${
                 appearance.frame !== 'bare'
                   ? 'border-(--color-primary) bg-(--color-primary)/10 font-semibold text-(--color-primary)'
                   : 'border-(--color-border-1) bg-(--color-bg-1) text-(--color-text-2) hover:border-(--color-border-2)'
@@ -1623,7 +1652,7 @@ export const ScreenStyleInspector: React.FC<ScreenStyleInspectorProps> = ({
             <button
               type="button"
               onClick={() => patchAppearance({ ...appearance, frame: 'bare' })}
-              className={`flex flex-col items-center justify-center gap-1.5 rounded-lg border p-2.5 text-xs transition-all ${
+              className={`flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border p-2.5 text-xs transition-all ${
                 appearance.frame === 'bare'
                   ? 'border-(--color-primary) bg-(--color-primary)/10 font-semibold text-(--color-primary)'
                   : 'border-(--color-border-1) bg-(--color-bg-1) text-(--color-text-2) hover:border-(--color-border-2)'
@@ -1712,7 +1741,7 @@ export const ScreenStyleInspector: React.FC<ScreenStyleInspectorProps> = ({
                       key={preset}
                       type="button"
                       onClick={() => onChange({ ...item, preset })}
-                      className={`flex flex-col overflow-hidden rounded border text-left transition-all ${
+                      className={`flex cursor-pointer flex-col overflow-hidden rounded border text-left transition-all ${
                         isCur
                           ? 'border-(--color-primary) ring-2 ring-(--color-primary)/30'
                           : 'border-(--color-border-1) hover:border-(--color-border-2)'
@@ -1869,7 +1898,7 @@ export const ScreenStyleInspector: React.FC<ScreenStyleInspectorProps> = ({
                       key={preset}
                       type="button"
                       onClick={() => onChange({ ...item, preset })}
-                      className={`flex flex-col items-center overflow-hidden rounded border p-1 text-center transition-all ${
+                      className={`flex cursor-pointer flex-col items-center overflow-hidden rounded border p-1 text-center transition-all ${
                         isCur
                           ? 'border-(--color-primary) bg-(--color-primary)/10 ring-1 ring-(--color-primary)'
                           : 'border-(--color-border-1) bg-(--color-bg-1) hover:border-(--color-border-2)'
@@ -1900,7 +1929,7 @@ export const ScreenStyleInspector: React.FC<ScreenStyleInspectorProps> = ({
                       key={preset}
                       type="button"
                       onClick={() => onChange({ ...item, preset })}
-                      className={`flex flex-col items-center overflow-hidden rounded border p-1 text-center transition-all ${
+                      className={`flex cursor-pointer flex-col items-center overflow-hidden rounded border p-1 text-center transition-all ${
                         isCur
                           ? 'border-(--color-primary) bg-(--color-primary)/10 ring-1 ring-(--color-primary)'
                           : 'border-(--color-border-1) bg-(--color-bg-1) hover:border-(--color-border-2)'

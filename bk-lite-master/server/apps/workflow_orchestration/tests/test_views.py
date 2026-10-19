@@ -388,6 +388,22 @@ def test_workflow_list_is_server_paginated_and_filtered(superuser):
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("fmt", ["docx", "xlsx"])
+def test_sample_templates_download_from_backend_assets(superuser, fmt):
+    from apps.workflow_orchestration.services.demo_templates import builtin_health_template_path
+
+    view = WorkflowViewSet.as_view({"get": "sample_templates"})
+    response = view(
+        _request(APIRequestFactory(), "get", f"/workflows/sample-templates/{fmt}/", superuser),
+        fmt=fmt,
+    )
+
+    assert response.status_code == 200
+    assert response["Content-Disposition"].endswith(f'filename="health-inspection-example.{fmt}"')
+    assert b"".join(response.streaming_content) == builtin_health_template_path(fmt).read_bytes()
+
+
+@pytest.mark.django_db
 def test_dashboard_returns_only_current_team_actionable_mvp_summary(superuser):
     workflow = Workflow.objects.create(
         name="生产流程",
@@ -1131,6 +1147,7 @@ def test_soft_delete_preserves_terminal_history_and_disables_triggers(superuser)
         WorkflowExecution.Status.RUNNING,
         WorkflowExecution.Status.WAITING_APPROVAL,
         WorkflowExecution.Status.TERMINATING,
+        WorkflowExecution.Status.UNKNOWN,
     ],
 )
 def test_soft_delete_rejects_every_non_terminal_execution(superuser, execution_status):
@@ -1214,6 +1231,41 @@ def test_publish_records_atom_keys(superuser, mocker):
     assert "node_test_data" not in version.canvas_metadata
     workflow.refresh_from_db()
     assert "node_test_data" not in workflow.canvas_metadata
+
+
+@pytest.mark.django_db
+def test_publish_enables_workflow(superuser, mocker):
+    from apps.system_mgmt.models import Channel, ChannelChoices
+
+    channel = Channel.objects.create(
+        name="发布启用测试邮箱",
+        channel_type=ChannelChoices.EMAIL,
+        config={"smtp_server": "127.0.0.1", "port": 1025},
+        description="",
+        team=[7],
+    )
+    _enable_notification()
+    task = _notification_task("notify")
+    task["inputParameters"]["channel_id"] = channel.id
+    workflow = Workflow.objects.create(
+        name="发布即启用",
+        team=[7],
+        definition={"tasks": [task]},
+        canvas_metadata={},
+        created_by=superuser.username,
+    )
+    mocker.patch("apps.workflow_orchestration.views.ConductorClient")
+    publish = WorkflowViewSet.as_view({"post": "publish"})
+
+    response = publish(
+        _request(APIRequestFactory(), "post", f"/workflows/{workflow.id}/publish/", superuser),
+        pk=workflow.id,
+    )
+
+    assert response.status_code == 200, response.data
+    workflow.refresh_from_db()
+    assert workflow.enabled is True
+    assert workflow.status == Workflow.Status.PUBLISHED
 
 
 @pytest.mark.django_db
@@ -1343,6 +1395,56 @@ def test_execution_list_mine_filter_returns_only_current_users_pending_approvals
 
 
 @pytest.mark.django_db
+def test_terminated_execution_is_not_an_actionable_approval(superuser):
+    workflow = Workflow.objects.create(name="已终止审批", team=[7], definition={})
+    waiting = WorkflowExecution.objects.create(
+        workflow=workflow,
+        workflow_version=1,
+        team=[7],
+        status=WorkflowExecution.Status.WAITING_APPROVAL,
+    )
+    terminated = WorkflowExecution.objects.create(
+        workflow=workflow,
+        workflow_version=1,
+        team=[7],
+        status=WorkflowExecution.Status.TERMINATED,
+    )
+    waiting_interaction = WorkflowInteraction.objects.create(
+        execution=waiting,
+        interaction_type=WorkflowInteraction.Type.APPROVAL,
+        task_reference="waiting-approval",
+        conductor_task_id="task-waiting",
+        title="仍可审批",
+        candidate_users=[superuser.username],
+        team=[7],
+    )
+    WorkflowInteraction.objects.create(
+        execution=terminated,
+        interaction_type=WorkflowInteraction.Type.APPROVAL,
+        task_reference="terminated-approval",
+        conductor_task_id="task-terminated",
+        title="已终止的审批",
+        candidate_users=[superuser.username],
+        team=[7],
+    )
+    view = WorkflowExecutionViewSet.as_view({"get": "list"})
+
+    mine = view(_request(APIRequestFactory(), "get", "/executions/?mine=1", superuser))
+    all_rows = view(_request(APIRequestFactory(), "get", "/executions/", superuser))
+
+    assert mine.status_code == 200
+    assert [item["id"] for item in mine.data["items"]] == [str(waiting.id)]
+    terminated_row = next(item for item in all_rows.data["items"] if item["id"] == str(terminated.id))
+    assert terminated_row["actionable_approval_ids"] == []
+    waiting_row = next(item for item in all_rows.data["items"] if item["id"] == str(waiting.id))
+    assert waiting_row["actionable_approval_ids"] == [str(waiting_interaction.id)]
+
+    count_view = WorkflowInteractionViewSet.as_view({"get": "pending_count"})
+    count_response = count_view(_request(APIRequestFactory(), "get", "/interactions/pending-count/", superuser))
+    assert count_response.data == {"count": 1}
+
+
+@pytest.mark.django_db
 def test_execution_list_enforces_bounded_server_pagination(superuser):
     workflow = Workflow.objects.create(name="分页流程", team=[7], definition={})
     for execution_status in (
@@ -1391,6 +1493,55 @@ def test_execution_list_filters_by_workflow_name_on_server(superuser):
 
     assert response.data["count"] == 1
     assert response.data["items"][0]["id"] == str(matched.id)
+
+
+@pytest.mark.django_db
+def test_execution_list_returns_only_live_artifacts_for_download(superuser):
+    workflow = Workflow.objects.create(name="巡检下载", team=[7], definition={})
+    ready = WorkflowExecution.objects.create(workflow=workflow, workflow_version=1, team=[7], status=WorkflowExecution.Status.SUCCEEDED)
+    expired_execution = WorkflowExecution.objects.create(workflow=workflow, workflow_version=1, team=[7], status=WorkflowExecution.Status.SUCCEEDED)
+    removed_execution = WorkflowExecution.objects.create(workflow=workflow, workflow_version=1, team=[7], status=WorkflowExecution.Status.FAILED)
+    empty = WorkflowExecution.objects.create(workflow=workflow, workflow_version=1, team=[7], status=WorkflowExecution.Status.SUCCEEDED)
+    now = timezone.now()
+
+    def artifact(execution, filename, *, expires_at, deleted_at=None, object_key):
+        return ExecutionArtifact.objects.create(
+            execution=execution,
+            team=[7],
+            format="xlsx" if filename.endswith(".xlsx") else "docx",
+            object_key=object_key,
+            filename=filename,
+            content_type="application/octet-stream",
+            sha256="d" * 64,
+            size=128,
+            expires_at=expires_at,
+            deleted_at=deleted_at,
+        )
+
+    first = artifact(ready, "health-a.xlsx", expires_at=now + timedelta(days=1), object_key="workflow-orchestration/executions/health-a.xlsx")
+    second = artifact(ready, "health-b.docx", expires_at=now + timedelta(days=1), object_key="workflow-orchestration/executions/health-b.docx")
+    ExecutionArtifact.objects.filter(pk=first.pk).update(created_at=now - timedelta(minutes=2))
+    ExecutionArtifact.objects.filter(pk=second.pk).update(created_at=now - timedelta(minutes=1))
+    artifact(expired_execution, "expired.xlsx", expires_at=now - timedelta(minutes=1), object_key="workflow-orchestration/executions/expired.xlsx")
+    artifact(
+        removed_execution,
+        "removed.xlsx",
+        expires_at=now + timedelta(days=1),
+        deleted_at=now,
+        object_key="workflow-orchestration/executions/removed.xlsx",
+    )
+
+    response = WorkflowExecutionViewSet.as_view({"get": "list"})(_request(APIRequestFactory(), "get", "/executions/?query=巡检下载", superuser))
+
+    assert response.status_code == 200
+    rows = {item["id"]: item for item in response.data["items"]}
+    ready_files = rows[str(ready.id)]["downloadable_artifacts"]
+    assert [item["filename"] for item in ready_files] == ["health-a.xlsx", "health-b.docx"]
+    assert ready_files[0]["download_url"] == f"/workflow_orchestration/api/artifacts/{first.id}/download/"
+    assert set(ready_files[0]) == {"id", "format", "filename", "size", "download_url"}
+    assert rows[str(expired_execution.id)]["downloadable_artifacts"] == []
+    assert rows[str(removed_execution.id)]["downloadable_artifacts"] == []
+    assert rows[str(empty.id)]["downloadable_artifacts"] == []
 
 
 @pytest.mark.django_db

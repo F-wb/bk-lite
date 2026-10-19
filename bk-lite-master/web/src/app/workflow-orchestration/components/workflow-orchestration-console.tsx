@@ -1,7 +1,7 @@
 'use client';
 
 import { ArrowLeftOutlined, CloseOutlined, CopyOutlined, HistoryOutlined, PlayCircleOutlined, PlusOutlined, SaveOutlined, SendOutlined, UploadOutlined } from '@ant-design/icons';
-import { Background, BackgroundVariant, ReactFlow, type Connection, type Edge, type Node, useEdgesState, useNodesState } from '@xyflow/react';
+import { applyEdgeChanges, Background, BackgroundVariant, ReactFlow, type Connection, type Edge, type EdgeChange, type Node, useEdgesState, useNodesState } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { Alert, App, Button, Descriptions, Drawer, Empty, Form, Input, InputNumber, Popconfirm, Select, Space, Spin, Tag, Timeline, Typography, Upload } from 'antd';
 import { useRouter } from 'next/navigation';
@@ -29,10 +29,11 @@ import { defaultTriggerRuntimeInputs, WorkflowTriggerRuntimeForm } from './workf
 import { OPSPILOT_ATOM_KEYS, OpsPilotAtomForm } from './opspilot-atom-form';
 import { approvalDecisionReference, configureApprovalTask } from '../lib/approval-dsl';
 import { localizeAtom } from '../lib/atom-localization';
+import { BUILTIN_SAMPLE_TEMPLATE_URLS } from '../lib/sample-templates';
 import { buildWorkflowFlow, commonTriggerInputSchema, expandApprovalCanvasEdges, flattenTasks, projectApprovalCanvasEdges, workflowTriggerNodes, type WorkflowCanvasMetadata, type WorkflowReturnNode, type WorkflowTriggerNode } from '../lib/canvas-dsl';
 import { configureConditionTask, type ConditionConfiguration, type ConditionOperator } from '../lib/condition-dsl';
 import { layoutWorkflowCanvas } from '../lib/canvas-layout';
-import { buildDataReferenceOptions, buildWorkflowOutputReferenceOptions, dataReferencePreview, resolveNodeTestInputs, type DataReferenceOption } from '../lib/data-references';
+import { buildDataReferenceOptions, buildWorkflowOutputReferenceOptions, dataReferencePreview, resolveNodeTestInputs, resolveTriggerGroupLabel, type DataReferenceOption } from '../lib/data-references';
 import { buildNodeTestInputContract, materializeNodeTestInputs } from '../lib/node-test-input-contract';
 import type { AtomCatalogItem, ConductorDefinition, ConductorTask, ExecutionRecord, JsonSchema, PaginatedResponse, WorkflowRecord, WorkflowTriggerType, WorkflowVersionRecord } from '../lib/types';
 import { useAutoRequest, useRequestCoordinator } from '../lib/use-request-coordinator';
@@ -391,10 +392,28 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
   const isOpsPilotStyleAtom = Boolean(selectedTask?.type === 'SIMPLE' && OPSPILOT_ATOM_KEYS.has(selectedTask.name));
   const referenceLabels = useMemo(() => ({
     triggerInput: t('workflowOrchestration.editor.triggerInput', '触发输入'),
-    systemContext: t('workflowOrchestration.editor.systemContext', '系统上下文'),
+    systemContext: t('workflowOrchestration.editor.systemContext', '运行信息'),
     allOutputs: t('workflowOrchestration.editor.allOutputs', '全部输出'),
+    systemFields: {
+      execution_id: t('workflowOrchestration.editor.systemField.execution_id', '执行号'),
+      workflow_id: t('workflowOrchestration.editor.systemField.workflow_id', '流程'),
+      workflow_version: t('workflowOrchestration.editor.systemField.workflow_version', '流程版本'),
+      organization_id: t('workflowOrchestration.editor.systemField.organization_id', '组织'),
+      trigger_id: t('workflowOrchestration.editor.systemField.trigger_id', '触发器'),
+      trigger_type: t('workflowOrchestration.editor.systemField.trigger_type', '触发类型'),
+      actor_id: t('workflowOrchestration.editor.systemField.actor_id', '发起人标识'),
+      actor_name: t('workflowOrchestration.editor.systemField.actor_name', '发起人'),
+      started_at: t('workflowOrchestration.editor.systemField.started_at', '开始时间'),
+      trace_id: t('workflowOrchestration.editor.systemField.trace_id', '追踪号'),
+    },
   }), [t]);
-  const references = useMemo(() => selectedTask && definition ? buildDataReferenceOptions(definition, selectedTask.taskReferenceName, localizedAtoms, commonTriggerInputSchema(metadata), referenceLabels, metadata.edges) : [], [definition, localizedAtoms, metadata, referenceLabels, selectedTask]);
+  const triggerGroupLabel = useMemo(() => resolveTriggerGroupLabel(
+    selectedTask?.taskReferenceName || '',
+    workflowTriggerNodes(metadata).map((item) => ({ id: item.id, name: item.name })),
+    metadata.edges,
+    referenceLabels.triggerInput,
+  ), [metadata, referenceLabels.triggerInput, selectedTask?.taskReferenceName]);
+  const references = useMemo(() => selectedTask && definition ? buildDataReferenceOptions(definition, selectedTask.taskReferenceName, localizedAtoms, commonTriggerInputSchema(metadata), referenceLabels, metadata.edges, metadata.node_titles, triggerGroupLabel) : [], [definition, localizedAtoms, metadata, referenceLabels, selectedTask, triggerGroupLabel]);
   const inspectorTriggers = useMemo(() => workflowTriggerNodes(metadata), [metadata]);
   const inspectorTestTrigger = inspectorTriggers.find((item) => item.id === nodeTestTriggerId) || inspectorTriggers.find((item) => item.trigger_type === 'FORM') || inspectorTriggers[0];
   const nodeTestInputContract = useMemo(() => buildNodeTestInputContract(selectedTask, selectedAtom?.input_schema, inspectorTestTrigger?.input_schema), [inspectorTestTrigger, selectedAtom?.input_schema, selectedTask]);
@@ -407,15 +426,18 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
     label: item.label,
     value: item.value,
     type: item.type,
-    source: item.source,
+    source: item.sourceLabel || item.source,
+    sourceKey: item.sourceReference || item.source,
+    displayName: item.displayName || item.path || item.label,
+    jsonPath: item.jsonPath || item.path,
     path: item.path,
     preview: dataReferencePreview(item, inspectorTestInputs, inspectorTestData),
   })), [inspectorTestData, inspectorTestInputs, references]);
-  const returnReferences = useMemo(() => definition ? buildWorkflowOutputReferenceOptions(definition, localizedAtoms) : [], [definition, localizedAtoms]);
+  const returnReferences = useMemo(() => definition ? buildWorkflowOutputReferenceOptions(definition, localizedAtoms, { allOutputs: referenceLabels.allOutputs }, metadata.node_titles) : [], [definition, localizedAtoms, metadata.node_titles, referenceLabels.allOutputs]);
   const selectedCondition = selectedTask?.type === 'SWITCH' && selectedTask.name === 'condition'
     ? metadata.condition_nodes?.[selectedTask.taskReferenceName] || { logic: 'ALL' as const, rules: [{ left: '${system.execution_id}', operator: 'EQ' as const, rightKind: 'literal' as const, right: '' }] }
     : undefined;
-  const visibleAtoms = localizedAtoms.filter((item) => !query.trim() || `${item.name} ${item.key} ${item.category}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const visibleAtoms = localizedAtoms.filter((item) => !query.trim() || `${item.name} ${item.description || ''} ${item.key} ${item.category}`.toLowerCase().includes(query.trim().toLowerCase()));
   const selectedScheduleConfigKey = selectedTrigger?.trigger_type === 'SCHEDULE'
     ? JSON.stringify(normalizeScheduleConfig(selectedTrigger.config))
     : '';
@@ -503,7 +525,11 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
     if (!definition) return;
     const reference = uniqueId(atom.key.replace(/^bklite_/, '').replace(/[^a-z0-9_]/gi, '_'), new Set(tasks.map((item) => item.taskReferenceName)));
     const next = { ...definition, tasks: [...definition.tasks, { name: atom.key, taskReferenceName: reference, type: 'SIMPLE' as const, inputParameters: defaultNodeInputValues(atom.input_schema, atom.ui_schema) }] };
-    addNodeToCanvas(reference, next, snapshotMetadata());
+    const current = snapshotMetadata();
+    addNodeToCanvas(reference, next, {
+      ...current,
+      node_titles: { ...(current.node_titles || {}), [reference]: atom.name },
+    });
   };
 
   const addControl = (type: 'SWITCH' | 'HUMAN') => {
@@ -612,9 +638,17 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
   const changeTaskTitle = (value: string) => {
     if (!selectedTask) return;
     const nodeTitles = { ...(metadata.node_titles || {}) };
-    if (value) nodeTitles[selectedTask.taskReferenceName] = value;
-    else delete nodeTitles[selectedTask.taskReferenceName];
+    nodeTitles[selectedTask.taskReferenceName] = value;
     changeMetadata({ ...snapshotMetadata(), node_titles: nodeTitles });
+  };
+
+  const resolveEditableNodeTitle = (fallback: string) => {
+    if (!selectedTask) return fallback;
+    const titles = metadata.node_titles || {};
+    if (Object.prototype.hasOwnProperty.call(titles, selectedTask.taskReferenceName)) {
+      return titles[selectedTask.taskReferenceName] ?? '';
+    }
+    return fallback;
   };
 
   const cacheInspectorTestData = (key: string, value: unknown) => {
@@ -1004,14 +1038,20 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
     } catch (error) { setIssues([error instanceof Error ? error.message : t('workflowOrchestration.editor.validationFailed', '流程校验未通过')]); }
   };
 
-  const persistDraft = async (): Promise<WorkflowRecord | undefined> => {
+  const persistDraft = async ({ syncUrl = true }: { syncUrl?: boolean } = {}): Promise<WorkflowRecord | undefined> => {
     if (!workflow || !definition) return;
     const payload = { name: workflow.name.trim(), description: workflow.description, definition, canvas_metadata: snapshotMetadata() };
+    const wasNew = !workflow.id;
     const saved = workflow.id
       ? await patch<WorkflowRecord>(`${API}/workflows/${workflow.id}/`, { ...payload, draft_revision: workflow.draft_revision })
       : await post<WorkflowRecord>(`${API}/workflows/`, { ...payload, starter: 'blank' });
     setWorkflow(saved); setDefinition(saved.definition); setMetadata(saved.canvas_metadata as WorkflowCanvasMetadata); setDirty(false);
-    if (!workflow.id) router.replace(`/workflow-orchestration/workflows/${saved.id}?mode=edit`);
+    if (wasNew) {
+      const nextUrl = `/workflow-orchestration/workflows/${saved.id}?mode=edit`;
+      // 测试前首次保存时避免 router.replace remount，以免冲掉已打开的原子配置抽屉。
+      if (syncUrl) router.replace(nextUrl);
+      else window.history.replaceState(window.history.state, '', nextUrl);
+    }
     return saved;
   };
 
@@ -1037,7 +1077,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
       onOk: async () => {
         setBusy(true);
         try {
-          const saved = await persistDraft();
+          const saved = await persistDraft({ syncUrl: false });
           if (!saved) return;
           message.success(t('workflowOrchestration.editor.draftSavedForTest', '草稿已保存，请继续测试'));
           continueAction(saved.id);
@@ -1059,7 +1099,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
       const published = await post<WorkflowRecord>(`${API}/workflows/${persisted.id}/publish/`, { name: persisted.name, description: persisted.description, definition, canvas_metadata: canvasMetadata, draft_revision: persisted.draft_revision });
       setWorkflow(published); setDefinition(published.definition); setMetadata(published.canvas_metadata as WorkflowCanvasMetadata); setDirty(false);
       if (!workflow.id) router.replace(`/workflow-orchestration/workflows/${published.id}?mode=edit`);
-      message.success(t('workflowOrchestration.editor.publishedSuccess', 'v{version} 已发布，流程{status}', { version: published.current_version, status: published.enabled ? t('workflowOrchestration.editor.remainsEnabled', '保持启用') : t('workflowOrchestration.editor.remainsDisabled', '保持停用') }));
+      message.success(t('workflowOrchestration.editor.publishedAndEnabled', 'v{version} 已发布并启用', { version: published.current_version }));
     } finally { setBusy(false); }
   };
 
@@ -1169,8 +1209,8 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
       title: t('workflowOrchestration.atom.nodeType.trigger', '触发'),
       description: t('workflowOrchestration.editor.triggerGroupHint', '定义流程从何时、以什么输入开始。'),
       items: (pendingSource ? [] : ['FORM', 'SCHEDULE', 'WEBHOOK', 'NATS'] as const)
-        .filter((type) => matchesPickerQuery(`${triggerLabels[type]} ${type}`))
-        .map((type) => ({ key: type, title: triggerLabels[type], description: t('workflowOrchestration.editor.createEntry', '创建一个流程入口'), icon: <AtomIcon nodeType="TRIGGER" className="text-2xl" />, onClick: () => addTrigger(type) })),
+        .map((type) => ({ key: type, title: triggerLabels[type], description: t('workflowOrchestration.editor.createEntry', '创建一个流程入口'), icon: <AtomIcon nodeType="TRIGGER" className="text-2xl" />, onClick: () => addTrigger(type) }))
+        .filter((item) => matchesPickerQuery(`${item.title} ${item.key} ${item.description}`)),
     },
     {
       key: 'action',
@@ -1198,8 +1238,8 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
       title: t('workflowOrchestration.atom.nodeType.return', '响应'),
       description: t('workflowOrchestration.editor.responseGroupHint', '把流程结果返回给对应的触发入口。'),
       items: (waitingWebhookExists && !webhookResponseExists ? ['WEBHOOK'] as const : [])
-        .filter((type) => matchesPickerQuery(`${returnLabels[type]} ${type}`))
-        .map((type) => ({ key: type, title: returnLabels[type], description: t('workflowOrchestration.editor.returnHint', '结束当前路径并返回结果'), icon: <AtomIcon nodeType="RETURN" className="text-2xl" />, onClick: () => addReturn(type) })),
+        .map((type) => ({ key: type, title: returnLabels[type], description: t('workflowOrchestration.editor.returnHint', '结束当前路径并返回结果'), icon: <AtomIcon nodeType="RETURN" className="text-2xl" />, onClick: () => addReturn(type) }))
+        .filter((item) => matchesPickerQuery(`${item.title} ${item.key} ${item.description}`)),
     },
   ];
   const pickerGroups = allPickerGroups.filter((group) => group.items.length > 0 && (!firstNodeOnly || group.key === 'trigger'));
@@ -1227,7 +1267,18 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
         <WorkflowCanvasActionRail readOnly={readOnly} onOpenPicker={() => { setPendingSource(undefined); closeInspector(); setPickerOpen(true); }} />
         <ReactFlow className="h-[calc(100%-37px)]!" nodes={interactive} edges={interactiveEdges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} connectionLineStyle={connectionLineStyle} fitView fitViewOptions={{ maxZoom: 1 }} proOptions={{ hideAttribution: true }} deleteKeyCode={null} nodesDraggable={!readOnly} nodesConnectable={!readOnly}
           onNodesChange={(changes) => { if (changes.some((item) => item.type === 'position')) setDirty(true); onNodesChange(changes); }}
-          onEdgesChange={(changes) => { setDirty(true); onEdgesChange(changes); }}
+          onEdgesChange={(changes: EdgeChange<Edge>[]) => {
+            const nextEdges = applyEdgeChanges(changes, edges);
+            onEdgesChange(changes);
+            setDirty(true);
+            if (changes.some((item) => item.type === 'remove' || item.type === 'add') && definition) {
+              const visibleEdges = nextEdges.map(({ id, source, target, sourceHandle, targetHandle }) => ({ id, source, target, sourceHandle, targetHandle }));
+              setMetadata((current) => ({
+                ...current,
+                edges: expandApprovalCanvasEdges(definition, visibleEdges),
+              }));
+            }
+          }}
           onConnect={(connection: Connection) => {
             if (!connection.source || !connection.target || connection.source === connection.target) return;
             if (edges.some((edge) => edge.source === connection.source && edge.target === connection.target)) { message.warning(t('workflowOrchestration.editor.pathExists', '这条路径已经存在')); return; }
@@ -1238,10 +1289,18 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
               || (topLevel.has(connection.source) && topLevel.has(connection.target))
               || (topLevel.has(connection.source) && returnIds.has(connection.target));
             if (!supported) { message.warning(t('workflowOrchestration.editor.unsupportedConnection', 'MVP 仅支持连接触发器、顶层节点和响应节点；嵌套路径由控制节点配置')); return; }
-            setEdges((items) => [
-              ...items.filter((edge) => !(connection.sourceHandle && edge.source === connection.source && edge.sourceHandle === connection.sourceHandle)),
+            const nextVisibleEdges = [
+              ...edges.filter((edge) => !(connection.sourceHandle && edge.source === connection.source && edge.sourceHandle === connection.sourceHandle)),
               { id: `${connection.source}-${connection.target}-${Date.now()}`, source: connection.source!, target: connection.target!, sourceHandle: connection.sourceHandle, targetHandle: connection.targetHandle },
-            ]);
+            ];
+            setEdges(nextVisibleEdges);
+            setMetadata((current) => ({
+              ...current,
+              edges: expandApprovalCanvasEdges(
+                definition,
+                nextVisibleEdges.map(({ id, source, target, sourceHandle, targetHandle }) => ({ id, source, target, sourceHandle, targetHandle })),
+              ),
+            }));
             setDirty(true);
           }}
           onPaneClick={() => setSelectedId(undefined)}
@@ -1289,7 +1348,9 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
         parameterActions={!readOnly && selectedTask?.type === 'SIMPLE' && selectedAtom ? <AtomConfigTemplateActions
           atomKey={selectedAtom.key}
           parameters={selectedTask.inputParameters || {}}
+          nodeTitle={resolveEditableNodeTitle(selectedAtom.name || selectedTask.name)}
           onLoad={changeTaskInputs}
+          onLoadNodeTitle={changeTaskTitle}
         /> : undefined}
         outputSchema={selectedTrigger?.trigger_type === 'SCHEDULE' ? scheduleOutputSchema : selectedTrigger?.trigger_type === 'WEBHOOK' ? webhookInputSchema : selectedTrigger?.input_schema || selectedAtom?.output_schema}
         outputData={metadata.node_test_data?.[selectedNode.id]}
@@ -1301,7 +1362,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
         hideUpstreamInput={Boolean(selectedTrigger)}
       >
         <div className="flex flex-col gap-5">
-          {selectedTrigger && <Form className="flex flex-col gap-5" layout="vertical"><Form.Item className="mb-0" label={t('workflowOrchestration.editor.nodeName', '节点名称')}><Input disabled={readOnly} value={selectedTrigger.name} onChange={(event) => changeTrigger({ name: event.target.value })} /></Form.Item>
+          {selectedTrigger && <Form className="flex flex-col gap-5" layout="vertical"><Form.Item className="mb-0" label={t('workflowOrchestration.editor.nodeName', '节点名称')} required><Input disabled={readOnly} value={selectedTrigger.name} placeholder={t('workflowOrchestration.editor.enterNodeName', '请输入节点名称')} onChange={(event) => changeTrigger({ name: event.target.value })} /></Form.Item>
             {selectedTrigger.trigger_type === 'FORM' && <section className="flex flex-col gap-4"><Alert type="info" showIcon message={t('workflowOrchestration.editor.triggerInputHint', '{trigger} 定义本入口的运行输入', { trigger: triggerLabels[selectedTrigger.trigger_type] })} /><FormSchemaEditor context="form" readOnly={readOnly} value={selectedTrigger.input_schema} onChange={(inputSchema) => changeTrigger({ input_schema: inputSchema })} /></section>}
             {selectedTrigger.trigger_type === 'SCHEDULE' && <ScheduleTriggerEditor
               value={selectedTrigger.config}
@@ -1356,7 +1417,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
                 schema={selectedAtom?.input_schema}
                 value={selectedTask.inputParameters || {}}
                 references={references}
-                nodeTitle={selectedNode?.data.title || selectedAtom?.name || selectedTask.name}
+                nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
                 readOnly={readOnly}
                 workflowId={workflow.id || null}
                 onChange={changeTaskInputs}
@@ -1368,15 +1429,17 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
                   schema={selectedAtom?.input_schema}
                   value={selectedTask.inputParameters || {}}
                   references={references}
+                  nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
                   readOnly={readOnly}
                   targetRecords={jobTargetRecords}
                   fieldActions={readOnly ? {} : {
                     targets: <Button onClick={() => {
                       setJobTargetSelectorPurpose('params');
                       setJobTargetSelectorOpen(true);
-                    }}>{t('workflowOrchestration.editor.selectJobPlatformHosts', '选择作业平台主机')}</Button>,
+                    }}>{t('workflowOrchestration.launch.selectTarget', '选择主机')}</Button>,
                   }}
                   onChange={changeTaskInputs}
+                  onNodeTitleChange={changeTaskTitle}
                 />
                 : OPSPILOT_ATOM_KEYS.has(selectedTask.name)
                   ? <OpsPilotAtomForm
@@ -1385,7 +1448,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
                     value={selectedTask.inputParameters || {}}
                     references={references}
                     workflowId={workflow.id || null}
-                    nodeTitle={selectedNode?.data.title || selectedAtom?.name || selectedTask.name}
+                    nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
                     readOnly={readOnly}
                     onChange={changeTaskInputs}
                     onNodeTitleChange={changeTaskTitle}
@@ -1395,13 +1458,17 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
                     uiSchema={selectedAtom?.ui_schema}
                     value={selectedTask.inputParameters || {}}
                     references={references}
+                    atomKey={selectedTask.name}
+                    nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
+                    readOnly={readOnly}
                     onChange={changeTaskInputs}
+                    onNodeTitleChange={changeTaskTitle}
                   />)}
             {selectedCondition && <ConditionEditor
               value={selectedCondition}
               references={references}
               readOnly={readOnly}
-              nodeTitle={selectedNode?.data.title || t('workflowOrchestration.editor.conditionBranch', '条件分支')}
+              nodeTitle={resolveEditableNodeTitle(t('workflowOrchestration.editor.conditionBranch', '条件分支'))}
               onChange={changeCondition}
               onNodeTitleChange={changeTaskTitle}
             />}
@@ -1409,7 +1476,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
               <Form.Item className="mb-0" label={t('workflowOrchestration.editor.nodeName', '节点名称')} required>
                 <Input
                   disabled={readOnly}
-                  value={selectedNode?.data.title || t('workflowOrchestration.editor.humanApproval', '人工审批')}
+                  value={resolveEditableNodeTitle(t('workflowOrchestration.editor.humanApproval', '人工审批'))}
                   placeholder={t('workflowOrchestration.editor.enterNodeName', '请输入节点名称')}
                   onChange={(event) => changeTaskTitle(event.target.value)}
                 />
@@ -1422,7 +1489,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
               </Form.Item>
             </Form>}
           </section>}
-          {selectedReturn && <Form className="flex flex-col gap-5" layout="vertical"><Form.Item className="mb-0" label={t('workflowOrchestration.editor.nodeName', '节点名称')}><Input disabled={readOnly} value={selectedReturn.name} onChange={(event) => changeReturn({ name: event.target.value })} /></Form.Item><Form.Item className="mb-0" label={t('workflowOrchestration.editor.returnReference', '返回数据引用')} tooltip={t('workflowOrchestration.editor.returnReferenceHint', '从可用节点输出中选择，不支持自由表达式')}><Select showSearch optionFilterProp="label" disabled={readOnly} value={String(selectedReturn.config.body || '') || undefined} placeholder={t('workflowOrchestration.editor.selectNodeOutput', '选择节点输出')} options={returnReferences.map((item) => ({ value: item.value, label: item.label }))} onChange={(body) => changeReturn({ config: { ...selectedReturn.config, body } })} /></Form.Item></Form>}
+          {selectedReturn && <Form className="flex flex-col gap-5" layout="vertical"><Form.Item className="mb-0" label={t('workflowOrchestration.editor.nodeName', '节点名称')} required><Input disabled={readOnly} value={selectedReturn.name} placeholder={t('workflowOrchestration.editor.enterNodeName', '请输入节点名称')} onChange={(event) => changeReturn({ name: event.target.value })} /></Form.Item><Form.Item className="mb-0" label={t('workflowOrchestration.editor.returnReference', '返回数据引用')} tooltip={t('workflowOrchestration.editor.returnReferenceHint', '从可用节点输出中选择，不支持自由表达式')}><Select showSearch optionFilterProp="label" disabled={readOnly} value={String(selectedReturn.config.body || '') || undefined} placeholder={t('workflowOrchestration.editor.selectNodeOutput', '选择节点输出')} options={returnReferences.map((item) => ({ value: item.value, label: item.label }))} onChange={(body) => changeReturn({ config: { ...selectedReturn.config, body } })} /></Form.Item></Form>}
         </div>
       </WorkflowNodeInspector>}
     </div>
@@ -1490,8 +1557,8 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
                   maxCount: 1,
                   sourceModes: ['upload'],
                   sampleFiles: [
-                    { name: 'Word', url: '/workflow-orchestration/templates/health-inspection-example.docx' },
-                    { name: 'Excel', url: '/workflow-orchestration/templates/health-inspection-example.xlsx' },
+                    { name: 'Word', url: BUILTIN_SAMPLE_TEMPLATE_URLS.docx },
+                    { name: 'Excel', url: BUILTIN_SAMPLE_TEMPLATE_URLS.xlsx },
                   ],
                 },
               }} />
@@ -1566,7 +1633,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
                     </span>
                   </span>
                   <span className="shrink-0 text-sm text-[var(--color-primary)]">
-                    {t('workflowOrchestration.editor.selectJobPlatformHosts', '选择作业平台主机')}
+                    {t('workflowOrchestration.launch.selectTarget', '选择主机')}
                   </span>
                 </button>
               </Form.Item>

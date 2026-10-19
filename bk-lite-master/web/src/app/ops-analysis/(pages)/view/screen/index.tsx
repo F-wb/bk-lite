@@ -12,6 +12,7 @@ import {
   type SetStateAction,
 } from "react";
 import { message, Modal, Select, Tabs } from "antd";
+import { WidgetCsvExportRegistryProvider, notifyWidgetCsvExportNotStarted, useWidgetCsvExportRegistryState } from "@/app/ops-analysis/context/widgetCsvExportRegistry";
 import { useTranslation } from "@/utils/i18n";
 import { useScreenApi } from "@/app/ops-analysis/api/screen";
 import { useDirectoryApi } from "@/app/ops-analysis/api";
@@ -62,6 +63,7 @@ import {
   buildScreenItemMenu,
   type ScreenItemMenuKey,
 } from "./components/screenItemMenu";
+import { resolveScreenItemMenuMode } from "@/app/ops-analysis/utils/widgetCsvMenu";
 import ScreenToolbar from "./components/screenToolbar";
 import { ScreenInspectorPane } from "./components/screenInspectorPane";
 import {
@@ -97,6 +99,8 @@ import {
 } from "./utils/screenItems";
 import { copyScreenChromeItem } from "./utils/copyScreenItem";
 import { copyScreenWidget } from "@/app/ops-analysis/utils/widgetCopy";
+import { relabelBuiltinRoom3DFilter } from "@/app/ops-analysis/utils/room3DScreenFilter";
+import { relabelApplicationTopologyFilters } from "@/app/ops-analysis/utils/applicationTopologyCanvasFilter";
 import {
   closeScreenFieldEdit,
   commitScreenEdit,
@@ -199,8 +203,27 @@ const ScreenDataConfig = memo(
   areScreenDataConfigPropsEqual,
 );
 
-const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode = false }, ref) => {
+const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode = false, onEditingChange }, ref) => {
+  const onEditingChangeRef = useRef(onEditingChange);
+  onEditingChangeRef.current = onEditingChange;
+  useEffect(() => {
+    return () => {
+      onEditingChangeRef.current?.(false);
+    };
+  }, []);
   const { t } = useTranslation();
+  const labelSceneFilters = useCallback(
+    <T extends { filters?: UnifiedFilterDefinition[] }>(viewSets: T) =>
+      relabelApplicationTopologyFilters(
+        relabelBuiltinRoom3DFilter(viewSets, t("dashboard.room3DFilterName")),
+        {
+          system: t("dashboard.applicationTopologyFilterName"),
+          depth: t("dashboard.applicationTopologyDepth"),
+        },
+      ),
+    [t],
+  );
+  const csvExportRegistry = useWidgetCsvExportRegistryState();
   const { getScreenDetail, saveScreen } = useScreenApi();
   const { updateItem } = useDirectoryApi();
   const { hasPermission } = useBtnPermissions();
@@ -222,6 +245,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
   const [filterConfigOpen, setFilterConfigOpen] = useState(false);
   const [widgetSelectorOpen, setWidgetSelectorOpen] = useState(false);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [itemMenu, setItemMenu] = useState<{
     itemId: string;
     x: number;
@@ -407,7 +431,9 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
   const applyScreenDraftPayload = useCallback(
     (payload: CanvasDraftPayload) => {
       restoreDraftRefreshInterval(payload, setSavedRefreshInterval);
-      const normalized = normalizeScreenViewSets(payload.view_sets);
+      const normalized = labelSceneFilters(
+        normalizeScreenViewSets(payload.view_sets),
+      );
       const loadedDefinitions = normalized.filters ?? [];
       historyCommitRef.current({
         viewSets: { ...normalized, filters: loadedDefinitions },
@@ -422,7 +448,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
       setRefreshCause("manual");
       void syncScreenCanvasResources(normalized);
     },
-    [queryState, setSavedRefreshInterval, shareOrganizationSeed, syncScreenCanvasResources],
+    [labelSceneFilters, queryState, setSavedRefreshInterval, shareOrganizationSeed, syncScreenCanvasResources],
   );
   const screenDraft = useCanvasDraft({
     resourceType: "screen",
@@ -473,7 +499,9 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
         const data = await getScreenDetail(screenId);
         if (cancelled) return;
 
-        const normalized = normalizeScreenViewSets(data?.view_sets);
+        const normalized = labelSceneFilters(
+          normalizeScreenViewSets(data?.view_sets),
+        );
         await syncScreenCanvasResources(normalized);
         if (cancelled) return;
 
@@ -520,6 +548,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
     };
   }, [
     getScreenDetail,
+    labelSceneFilters,
     queryState.resetQueryState,
     selectedScreen?.data_id,
     shareOrganizationSeed,
@@ -561,16 +590,18 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
   ]);
 
   const projectDocument = useCallback((viewSets: ScreenViewSets): ScreenEditDocument => {
-    const filters = buildFiltersFromScreenItems({
-      viewSets,
-      previousDefinitions: filtersRef.current,
-      dataSources,
-    });
+    const filters = labelSceneFilters({
+      filters: buildFiltersFromScreenItems({
+        viewSets,
+        previousDefinitions: filtersRef.current,
+        dataSources,
+      }),
+    }).filters ?? [];
     return {
       filters,
       viewSets: syncScreenFilterBindings(viewSets, filters, dataSources),
     };
-  }, [dataSources]);
+  }, [dataSources, labelSceneFilters]);
 
   const rememberSession = useCallback((next: ScreenEditSession) => {
     sessionRef.current = next;
@@ -916,6 +947,8 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
     });
     setEditMode(true);
     setSelectedItemId(null);
+    setInspectorCollapsed(false);
+    onEditingChangeRef.current?.(true);
   }, [
     queryState.appliedFilterValues,
     queryState.appliedNamespaceId,
@@ -943,6 +976,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
     setSelectedItemId(null);
     setPendingConfigItem(null);
     setFilterConfigOpen(false);
+    onEditingChangeRef.current?.(false);
   }, [
     editQuerySnapshot,
     queryState.appliedFilterValues,
@@ -977,6 +1011,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
       setEditQuerySnapshot(null);
       setFilterConfigOpen(false);
       resetScreenHistory();
+      onEditingChangeRef.current?.(false);
       message.success(t("opsAnalysis.screen.saveSuccess"));
     } catch (error) {
       console.error("Failed to save screen:", error);
@@ -1003,6 +1038,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
   const handleSelectCanvasItem = useCallback(
     (itemId: string | null) => {
       runAfterDataGuard(() => {
+        setInspectorCollapsed(false);
         setSelectedItemId(itemId);
         setPendingConfigItem(null);
         setInspectorTab("style");
@@ -1016,6 +1052,20 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
     },
     [runAfterDataGuard],
   );
+
+  const handleDismissInspector = useCallback(() => {
+    runAfterDataGuard(() => {
+      setSelectedItemId(null);
+      setPendingConfigItem(null);
+      setInspectorCollapsed(true);
+    });
+  }, [runAfterDataGuard]);
+
+  useEffect(() => {
+    if (selectedItemId != null || pendingConfigItem != null) {
+      setInspectorCollapsed(false);
+    }
+  }, [pendingConfigItem, selectedItemId]);
 
   const openItemMenu = useCallback(
     (itemId: string, point: { x: number; y: number }) => {
@@ -1042,14 +1092,24 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
         handleDeleteItem(itemId);
         return;
       }
+      if (key === "exportCsv") {
+        const target = draftViewSetsRef.current.items.find((item) => item.id === itemId);
+        const title = target && isScreenWidgetItem(target) ? target.title || "" : "";
+        void csvExportRegistry.run(itemId, { title }).then((started) => {
+          notifyWidgetCsvExportNotStarted(started, t);
+        });
+        return;
+      }
       handleLayerAction(itemId, key);
     },
     [
+      csvExportRegistry,
       handleCopyItem,
       handleDeleteItem,
       handleLayerAction,
       handleOpenItemConfig,
       itemMenu?.itemId,
+      t,
     ],
   );
 
@@ -1060,9 +1120,18 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
     return buildScreenItemMenu(target, draftViewSets.items, {
       shareMode,
       isBuiltIn: Boolean(selectedScreen?.is_build_in),
+      mode: resolveScreenItemMenuMode({
+        editMode,
+        shareMode,
+        fullscreen: isFullscreen,
+      }),
+      rawData: isScreenWidgetItem(target) ? csvExportRegistry.readWidgetRawData(target.id) : undefined,
     });
   }, [
+    csvExportRegistry,
     draftViewSets.items,
+    editMode,
+    isFullscreen,
     itemMenu,
     selectedScreen?.is_build_in,
     shareMode,
@@ -1228,10 +1297,13 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
         onMoveItem={handleMoveItem}
         onResizeItem={handleResizeItem}
         onEditItem={handleOpenItemConfig}
-        onOpenItemMenu={editMode && !shareMode ? openItemMenu : undefined}
+        onOpenItemMenu={openItemMenu}
         onDropChrome={editMode && !shareMode ? handleDropChrome : undefined}
         onTopologyLayoutChange={
           editMode && !shareMode ? handleTopologyLayoutChange : undefined
+        }
+        onDismissInspector={
+          editMode && !shareMode ? handleDismissInspector : undefined
         }
       />
     ),
@@ -1245,6 +1317,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
       handleMoveItem,
       handleResizeItem,
       handleTopologyLayoutChange,
+      handleDismissInspector,
       queryState.appliedFilterValues,
       queryState.appliedNamespaceId,
       queryState.definitions,
@@ -1267,12 +1340,12 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
       definitions={queryState.definitions}
       values={queryState.filterValues}
       onChange={queryState.setFilterValues}
-      onSearch={(values) =>
-        queryState.applyQuery(values, queryState.namespaceDraftId)
-      }
-      onReset={(values) =>
-        queryState.applyQuery(values, queryState.namespaceDraftId)
-      }
+      onSearch={(values) => {
+        queryState.applyQuery(values, queryState.namespaceDraftId);
+      }}
+      onReset={(values) => {
+        queryState.applyQuery(values, queryState.namespaceDraftId);
+      }}
       prefixContent={namespaceSelectorElement}
     />
   ) : null;
@@ -1296,6 +1369,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
   ) : null;
 
   return (
+    <WidgetCsvExportRegistryProvider registry={csvExportRegistry}>
     <>
       <div
         className={
@@ -1311,8 +1385,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
           emptyDescription={t("opsAnalysis.screen.selectFirst")}
           headerVisible={!isFullscreen}
           filterBarVisible={!isFullscreen}
-          compactHeader
-          flushContent={isFullscreen}
+          flushContent
           contentClassName={isFullscreen ? "bg-slate-950" : undefined}
           toolbar={
             <ScreenToolbar
@@ -1405,6 +1478,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
               <div className="min-h-0 min-w-0 flex-1">{screenCanvas}</div>
               <ScreenInspectorPane
                 label={t("opsAnalysis.screen.inspectorResize")}
+                collapsed={inspectorCollapsed}
                 onBlur={(event) => {
                   const currentTarget = event.target instanceof Element ? event.target : null;
                   const field = currentTarget?.closest("input, textarea");
@@ -1533,6 +1607,7 @@ const Screen = forwardRef<ScreenRef, ScreenProps>(({ selectedScreen, shareMode =
         />
       )}
     </>
+    </WidgetCsvExportRegistryProvider>
   );
 });
 

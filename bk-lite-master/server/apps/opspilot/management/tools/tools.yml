@@ -1203,3 +1203,25 @@ toolkits:
         type: string
         description: 被执行的python代码
         required: true
+- id: ops_analysis_dashboard
+  name: 运营分析仪表盘
+  description: 用当前用户身份检索运营分析数据源，并把校验通过的方案应用到当前仪表盘。
+  tools:
+  - name: search_data_sources
+    description: 检索当前组织可用于搭建运营分析仪表盘的数据源。返回的 candidates[].id 是唯一合法的 dataSource，fields[].name 是唯一合法字段名，禁止编造。组件标题用 fields[].title，说明用 fields[].description。chart_type 是该数据源允许的图表。一张盘要混用目录里实际支持的类型，不要全部做成 single。概览源最多两个 single 或 gauge，其余改用 pie、topN、line、table 的其他数据源。检索后的下一步只能调用 prepare_dashboard_proposal，不要只回复文字，也不要让用户手工添加。
+    parameters:
+      requirements:
+        type: array
+        description: 结构化数据需求列表，每项至少包含 text，可包含 purpose、domain、metric、dimension、analysisType、chartType。
+        required: true
+  - name: prepare_dashboard_proposal
+    description: 校验并应用运营分析仪表盘方案。通过后页面直接写入当前画布，不要再次调用。proposal.schemaVersion 固定为 "1.0"。layout 是扁平组件数组，禁止 row、children。dataSource 只能填 search_data_sources 返回的数字 id，字段只能填该数据源 fields 里的 name。chartType 必须属于该数据源的 chart_type。single 和 gauge 的 selectedFields 必须有一个字段。pie 填写 dimensionField 与 valueField。画布 12 列，同一行宽度之和不得超过 12。dashboard_id 用 current。用户要求搭建时必须调用本工具，不能只输出文字方案。
+    parameters:
+      proposal:
+        type: object
+        description: schemaVersion 为字符串 "1.0" 的对象。layout 必须显式传入数组，只有要求清空时才为空。组件在 layout，每项用 valueConfig.chartType 与 valueConfig.dataSource（检索返回的数字 id）。single 和 gauge 的 valueConfig.selectedFields 填写一个 fields[].name，不能为空。pie 用 dimensionField 与 valueField。禁止 title、panels、chart_type、data_source_id。
+        required: true
+      dashboard_id:
+        type: string
+        description: 当前打开的仪表盘用 current。目录节点 id（如 dashboard_426）也表示这张盘。
+        required: false

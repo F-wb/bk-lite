@@ -33,7 +33,7 @@
 | 文档旧仓 | `d:\Code` | 无 remote；手册与 ops 已迁出，仅留他用目录 |
 
 - 运行态：基线目录 `/opt/bk-lite`；自研脚本线上副本在 `deploy/`（镜像收敛）与 `scripts/`（备份还原）。
-- 交接仓内 `bk-lite-master/` 是 vendored 目录（自带内层 .git），`git status` 上万条 CRLF 噪音——**提交必须 pathspec，严禁 add -A**。
+- 交接仓已解除对 `bk-lite-master/` 的跟踪（2026-10-19，`.gitignore` 排除；此前 vendored 跟踪产生 1.7 万条 CRLF/快照漂移噪音，已清除）。提交仍用 pathspec 只提自己的文件。
 
 ## 4. 铁律（不得违反）
 
