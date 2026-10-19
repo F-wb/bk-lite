@@ -1,2 +1,6 @@
 # bk-lite-master 是独立源码仓（自带内层 .git），不纳入交接仓跟踪
 /bk-lite-master/
+
+# 官方安装器工件（基线升级时本地取用，不入库）
+/bootstrap.sh
+/install.run
