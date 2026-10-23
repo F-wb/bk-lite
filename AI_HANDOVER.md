@@ -13,11 +13,12 @@
 
 「盛大运维系统」= 开源运维平台基线（官方安装器部署）+ 少量二开（品牌、钉钉登录、JumpServer SSH 终端），二开以自建前后端镜像经 ACR 覆盖交付。**一期已交付验收；AI 模块评估完成、暂缓实施。**
 
-## 2. 当前状态快照（2026-10-17）
+## 2. 当前状态快照（2026-10-23）
 
 | 项 | 值 |
 |---|---|
-| 源码 | `bk-lite-master` 仓分支 `shengda/v1.0-custom` @ `6e0be26b9e`（= 上游 master `371c89c9` + 30 个二开文件）；服务器构建副本 `/opt/bk-lite-src` 同点 |
+| 源码 | `bk-lite-master` 仓分支 `shengda/v1.0-custom` @ `6e0be26b9e`（= 二开基线 上游 `371c89c9` + 30 个二开文件）；服务器构建副本 `/opt/bk-lite-src` 同点 |
+| 上游镜像 | `main` 已 ff 到上游最新 `3bf6df19b4`（2026-10-23 同步，GitHub 与 GitLab 同 hash；上游已领先二开基线 441 提交，类型一升级时 shengda 再 merge） |
 | 运行环境 | 测试机 192.168.1.11 `/opt/bk-lite`（compose 项目名 `compose`），18 容器全 Up，`https://192.168.1.11/` = 200 |
 | 当前镜像 | ACR `:server-20261015d`（29 层）/ `:web-20261015c`（11 层）；回滚点 `:server-20261015c` / `:web-20261015b` |
 | 启用应用（9 个） | `system_mgmt,cmdb,monitor,node_mgmt,console_mgmt,alerts,log,job_mgmt,patch_mgmt` |
@@ -28,8 +29,8 @@
 
 | 仓库 | 路径 | 说明 |
 |---|---|---|
-| 源码 fork | `d:\Code\bk-lite\bk-lite-master` | `main`=上游镜像（**禁二开**）；`shengda/v1.0-custom`=二开唯一分支；remote `origin`(GitHub 个人 fork) + `upstream` |
-| **交接仓（本文件所在）** | `d:\Code\bk-lite` | 全部专题手册与 `ops/` 脚本已归集于此；remote `gitlab`(内网 HTTP，SSH 22 被代理拦) + `origin`(GitHub)。**推送策略**：GitLab 仓 main/shengda 是源码镜像（他人维护，**不动**），本仓完整版推为独立分支 `docs/ai-handover`；GitHub 同分支名放脱敏版 |
+| 源码 fork | `d:\Code\bk-lite\bk-lite-master` | `main`=上游镜像（**禁二开**，GitHub 与 GitLab 同 hash）；`shengda/v1.0-custom`=二开唯一分支；remote `origin`(GitHub 个人 fork) + `upstream`。**GitLab 推送**：`git push origin main` 后再 `git push http://gitlab.ext.sdprint.tech/fanwenbin/bk-lite.git main:main`（HTTP；SSH 22 被代理拦。GitLab main 曾是受保护分支，force push 需网页临时开开关） |
+| **交接仓（本文件所在）** | `d:\Code\bk-lite` | 全部专题手册与 `ops/` 脚本已归集于此；remote `gitlab`(内网 HTTP，SSH 22 被代理拦) + `origin`(GitHub)。**推送策略**：完整版推 GitLab 独立分支 `docs/ai-handover`；GitHub 同分支名放脱敏版；源码 main/shengda 归 `bk-lite-master` 仓管，本仓不碰 |
 | 文档旧仓 | `d:\Code` | 无 remote；手册与 ops 已迁出，仅留他用目录 |
 
 - 运行态：基线目录 `/opt/bk-lite`；自研脚本线上副本在 `deploy/`（镜像收敛）与 `scripts/`（备份还原）。
@@ -47,7 +48,7 @@
 
 ## 5. 升级速查（细则见部署手册第五章）
 
-- **类型一·跟进上游代码（月度，最常见）**：本机 merge → buildx 构建推 ACR → 服务器 `pull` + `up -d --force-recreate server web`。**不重跑安装器**。
+- **类型一·跟进上游代码（月度，最常见）**：本机 merge → buildx 构建推 ACR → 服务器 `pull` + `up -d --force-recreate server web`。**不重跑安装器**。镜像 main 同步：merge 后 push GitHub + GitLab（见第三节），两边同 hash。
 - **类型二·升级基线**：备份留证 → 预下载安装器比对变化 → 不带开关重跑（禁 `--clean`）→ `apply-state.sh --cleanup-beat` → `pull && up -d` → 七项校验 → 登记台账。**先在测试机演练**。
 - 构建要点：全停容器+prune；`docker buildx build --provenance=false --push`，先 pull `server-base:latest` 补 blob；推送校验只比层数（server 29 / web 11）。
 - 备份：`/opt/bk-lite/scripts/backup-all.sh`；还原 `restore-all.sh --from <时间戳>`。
@@ -93,3 +94,4 @@
 |---|---|
 | 2026-10-17 | 初版；同日按"精炼聚焦"原则重写：去时间线流水账与大表（细节归手册），新增 Agent 协作三规则；手册与 ops 脚本归集到交接仓，GitHub 脱敏分支已推 |
 | 2026-10-17 | 内网 GitLab 已推：发现远端 main/shengda 为源码镜像（与本仓历史无关），经用户确认**推为独立分支 `docs/ai-handover`**（HTTP 传输，SSH 22 被代理 reset），不触碰源码镜像分支 |
+| 2026-10-23 | 源码镜像治理：查明 GitLab main/shengda 原是 10-10 的 squash 快照（有打包失真、无法 ff），经用户确认 force 覆盖为真历史——main=上游最新 `3bf6df19b4`（GitHub 同步），shengda=`6e0be26b`；GitLab 受保护分支需网页临时开 force push；此后三端同 hash，月度同步=push GitHub+GitLab |
