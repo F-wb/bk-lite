@@ -73,6 +73,7 @@
 11. 官方 latest 镜像启全模块要额外 ~10 个容器（conductor JVM、victoria-traces、rum 独立的 redis/minio/victoria-logs/victoria-traces）；16G 机器上很紧张，且**降 `APP_WORKERS` 对 server 占用帮助有限**（大头在 celery/nats_listener/长连接进程）。
 12. **上游 URL 结构已重构**（2026-11-03 版本实测）：Django 动态挂载 `api/v1/<app>/`，旧全局 `/api/menu`、`/api/get_login_auth_bindings/` 等**在 Django 侧已不存在**；前端经 Next.js BFF `/api/proxy/<app>/...` 转发（且有 308 去尾斜杠重定向，curl 验证需 `-L`）。验证登录绑定用 `/api/v1/core/api/get_login_auth_bindings/`。traefik web 路由绑 `Host(<IP>)`——用 `curl https://localhost/` 测试会 404，属测试方法问题。
 13. 新版官方镜像 supervisor conf 增加 workflow_worker / opspilot 长连接等，但 9 应用模式下 `startup.sh` 只加载对应的子集，不会崩溃循环（实测 supervisor 全 RUNNING）。
+14. **全新 DB 的两处"假故障"（2026-11-03 95 实测）**：① `SIDECAR_INIT_TOKEN/SIDECAR_NODE_ID` 未定义警告——上游 compose 引用但安装器不写入 `.env`，空值即默认运行形态（11 同款已跑月余），95 的 `.env` 已补显式空定义消除噪音；② vector 反复 Restarting 报 `No sources defined`——全新库无日志采集源配置所致，**在日志模块创建采集规则后自愈**。另：traefik 基线只发布 443（80/tcp 不暴露宿主机），`http://IP:443` 明文打 TLS 端口会 404——**访问必须 `https://IP/` 并信任自签证书**。
 
 ## 7. 待办
 
