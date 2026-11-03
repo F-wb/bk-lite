@@ -21,7 +21,9 @@ import useJobApi from '@/app/job/api';
 import { Script, Playbook, ScriptParam } from '@/app/job/types';
 import HostSelectionModal, { HostItem, TargetSourceType } from '@/app/job/components/jobHostSelectionModalRuntime';
 import { AddTargetHostButton, TargetSourceSelector } from '@/app/job/components/target-selection-controls';
-import ScriptEditor from '@/app/job/components/script-editor';
+import ScriptEditor from '@/components/script-editor';
+import { buildJobBuiltinScriptVariables } from '@/app/job/constants/builtin-script-vars';
+import Permission from '@/components/permission';
 import { createDefaultExecutionName } from '@/app/job/utils/execution-name';
 import {
   parseCommandLineArgs,
@@ -693,6 +695,7 @@ const QuickExecPage = () => {
               <Form.Item
                 label={t('job.scriptContent')}
                 name="scriptContent"
+                tooltip={t('job.optionalVariablesHint')}
                 validateTrigger="onBlur"
                 rules={[{ validator: validateScriptContent }]}
               >
@@ -701,6 +704,12 @@ const QuickExecPage = () => {
                   onLangChange={setScriptLang}
                   onBlur={() => {
                     void form.validateFields(['scriptContent']);
+                  }}
+                  variablePanel={{
+                    visible: true,
+                    followFullscreen: false,
+                    defaultExpanded: false,
+                    variables: buildJobBuiltinScriptVariables(t),
                   }}
                 />
               </Form.Item>
@@ -724,9 +733,11 @@ const QuickExecPage = () => {
 
           <Divider />
 
-          <Button type="primary" loading={executeLoading} onClick={handleExecute}>
-            {t('job.executeNow')}
-          </Button>
+          <Permission requiredPermissions={['Add']}>
+            <Button type="primary" loading={executeLoading} onClick={handleExecute}>
+              {t('job.executeNow')}
+            </Button>
+          </Permission>
         </Form>
       </div>
 

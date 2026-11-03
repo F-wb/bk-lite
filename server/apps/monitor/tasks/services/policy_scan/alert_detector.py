@@ -9,6 +9,8 @@ from apps.monitor.models import MonitorAlert, MonitorEvent
 from apps.monitor.services.alert_lifecycle_events import record_lifecycle_events
 from apps.monitor.services.alert_lifecycle_notify import AlertLifecycleNotifier
 from apps.monitor.tasks.utils.policy_calculate import vm_to_dataframe, calculate_alerts
+from apps.monitor.tasks.utils.policy_calculate_multi import calculate_multi_alerts
+from apps.monitor.tasks.utils.policy_multi import is_multi_query
 from apps.monitor.utils.alert_name_variables import overlay_dimension_field_values
 from apps.monitor.utils.dimension import (
     build_dimensions,
@@ -51,6 +53,8 @@ class AlertDetector:
         )
 
     def detect_threshold_alerts(self, *, log_events=True, vm_data=None):
+        if self._is_multi_policy():
+            return self._detect_multi_threshold_alerts()
         trigger_count = getattr(self.policy, "trigger_count", 1) or 1
         if vm_data is None:
             vm_data = self.metric_query_service.query_comparison_metrics(
@@ -74,6 +78,7 @@ class AlertDetector:
             "display_unit": self.metric_query_service.get_display_unit(),
             "enum_value_map": self.metric_query_service.get_enum_value_map(),
             "resource_context_resolver": self._build_metric_resource_context,
+            **self._content_unit_context(),
         }
 
         thresholds = self.metric_query_service.convert_thresholds(
@@ -107,6 +112,85 @@ class AlertDetector:
 
         return alert_events, info_events, hold_events
 
+    def _is_multi_policy(self) -> bool:
+        return is_multi_query(getattr(self.policy, "query_condition", None) or {})
+
+    def _detect_multi_threshold_alerts(self):
+        """逐条件查询后做 join。不把 VM 响应正文打进日志。"""
+        trigger_count = getattr(self.policy, "trigger_count", 1) or 1
+        service = self.metric_query_service
+        payloads = service.query_multi_comparison_metrics(self.policy.period, trigger_count)
+        conditions = []
+        series_by_ref = {}
+        display_units = {}
+        metric_names = {}
+        enum_maps = {}
+        for condition in service.multi_conditions():
+            ref = condition.get("ref")
+            converted = service.convert_condition_values(payloads.get(ref) or {}, condition)
+            series_by_ref[ref] = (converted.get("data") or {}).get("result") or []
+            conditions.append(service.condition_with_converted_thresholds(condition))
+            display_units[ref] = service.condition_display_unit(condition)
+            metric_names[ref] = service.condition_metric_name(condition)
+            enum_maps[ref] = service.condition_enum_map(condition)
+
+        group_by_keys = self._get_group_by_keys()
+        template_context = {
+            "monitor_object": self.policy.monitor_object.name if self.policy.monitor_object else "",
+            "metric_name": self._get_metric_display_name(),
+            "instances_map": self.instances_map,
+            "instance_id_keys": group_by_keys,
+            "monitor_instance_id_key": self._get_monitor_instance_id_key(),
+            "dimension_name_map": self._build_dimension_name_map(),
+            "resource_context_resolver": self._build_metric_resource_context,
+            "condition_display_units": display_units,
+            "condition_metric_names": metric_names,
+            "condition_enum_maps": enum_maps,
+        }
+        alert_events, info_events, hold_events = calculate_multi_alerts(
+            self.policy.alert_name,
+            series_by_ref,
+            conditions,
+            template_context,
+            n=trigger_count,
+        )
+        if self.policy.source:
+            alert_events = self._filter_events_by_scope(alert_events)
+            info_events = self._filter_events_by_scope(info_events)
+            hold_events = self._filter_events_by_scope(hold_events)
+        return alert_events, info_events, hold_events
+
+    def _content_unit_context(self) -> dict:
+        """告警文案用的源单位：扫描已换算则 content 不再二次自适应。"""
+        get_calc = getattr(self.metric_query_service, "get_effective_calculation_unit", None)
+        if callable(get_calc):
+            source_unit = get_calc() or ""
+        else:
+            source_unit = (
+                getattr(self.policy, "calculation_unit", None)
+                or getattr(self.policy, "metric_unit", None)
+                or ""
+            )
+        overlay_source_unit = (
+            getattr(self.policy, "calculation_unit", None)
+            or getattr(self.policy, "metric_unit", None)
+            or ""
+        )
+        is_converted = getattr(self.metric_query_service, "is_metric_unit_converted", None)
+        if callable(is_converted):
+            scan_unit_converted = bool(is_converted())
+        else:
+            metric_unit = getattr(self.policy, "metric_unit", None) or ""
+            calculation_unit = getattr(self.policy, "calculation_unit", None) or ""
+            scan_unit_converted = bool(
+                metric_unit and calculation_unit and metric_unit != calculation_unit
+            )
+        return {
+            "source_unit": source_unit,
+            "overlay_source_unit": overlay_source_unit,
+            "scan_unit_converted": scan_unit_converted,
+        }
+
     def _converted_recovery_threshold(self):
         recovery = getattr(self.policy, "recovery_threshold", None) or {}
         if not recovery.get("method") or recovery.get("value") is None:
@@ -115,7 +199,8 @@ class AlertDetector:
         return converted[0] if converted else recovery
 
     def _get_metric_display_name(self):
-        if self.policy.query_condition.get("type") == "formula":
+        query_type = self.policy.query_condition.get("type")
+        if query_type in {"formula", "multi"}:
             return self.policy.query_condition.get("result_name", "")
 
         metric = self.metric_query_service.metric
@@ -534,4 +619,15 @@ class AlertDetector:
     def _get_baseline_keys(self) -> set:
         if self.baselines_map:
             return set(self.baselines_map)
+        if self._policy_belongs_to_group():
+            return set()
         return set(self.instances_map)
+
+    def _policy_belongs_to_group(self) -> bool:
+        cached = getattr(self, "_is_group_rule", None)
+        if cached is not None:
+            return cached
+        from apps.monitor.models import PolicyGroupRule
+
+        self._is_group_rule = PolicyGroupRule.objects.filter(policy_id=self.policy.id).exists()
+        return self._is_group_rule

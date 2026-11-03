@@ -8,6 +8,7 @@ from apps.alerts.constants.constants import AlertShieldMatchType, LogAction, Log
 from apps.alerts.filters.alert import AlertModelFilter
 from apps.alerts.models.alert_operator import AlertShield
 from apps.alerts.models.models import Alert, Event
+from apps.alerts.notification_templates.timefmt import resolve_display_timezone
 from apps.alerts.open_api.errors import AlertsOpenAPIError
 from apps.alerts.open_api.serializers import (
     parse_batch_payload,
@@ -35,6 +36,9 @@ class AlertsOpenAPIService:
 
     def __init__(self, context):
         self.context = context
+
+    def _display_timezone(self):
+        return resolve_display_timezone([self.context.username])
 
     def _base_alert_qs(self):
         queryset = Alert.objects.exclude(session_status__in=SessionStatus.NO_CONFIRMED)
@@ -271,11 +275,13 @@ class AlertsOpenAPIService:
         filterset = AlertModelFilter(data=query_params, queryset=queryset, request=request)
         queryset = filterset.qs.order_by(parse_ordering(query_params))
         count, page, page_size, page_items = self._paginate(queryset, query_params, max_page_size=max_page_size)
+        rows = list(page_items)
+        timezone_name = self._display_timezone() if rows else None
         return {
             "count": count,
             "page": page,
             "page_size": page_size,
-            "items": [serialize_alert(alert, detail=False) for alert in page_items],
+            "items": [serialize_alert(alert, detail=False, timezone_name=timezone_name) for alert in rows],
         }
 
     def get_alert(self, alert_id):
@@ -284,7 +290,7 @@ class AlertsOpenAPIService:
             alert = self._base_alert_qs().get(alert_id=alert_id)
         except Alert.DoesNotExist:
             self._not_found()
-        return serialize_alert(alert, detail=True)
+        return serialize_alert(alert, detail=True, timezone_name=self._display_timezone())
 
     def list_alert_events(self, alert_id, query_params, *, max_page_size=LEGACY_OPENAPI_MAX_PAGE_SIZE):
         self.context.require_feature("Alarms-View")
@@ -294,9 +300,11 @@ class AlertsOpenAPIService:
             self._not_found()
         events_qs = Event.objects.select_related("source").filter(alert=alert).order_by("-received_at")
         count, page, page_size, page_items = self._paginate(events_qs, query_params, max_page_size=max_page_size)
+        rows = list(page_items)
+        timezone_name = self._display_timezone() if rows else None
         return {
             "count": count,
             "page": page,
             "page_size": page_size,
-            "items": [serialize_event(event) for event in page_items],
+            "items": [serialize_event(event, timezone_name=timezone_name) for event in rows],
         }

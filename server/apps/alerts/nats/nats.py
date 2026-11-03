@@ -24,6 +24,7 @@ from apps.alerts.error import AuthenticationSourceError
 from apps.alerts.models.alert_operator import AlarmStrategy, NotifyResult
 from apps.alerts.models.alert_source import AlertSource
 from apps.alerts.models.models import Alert, Event, Incident, Level
+from apps.alerts.notification_templates.timefmt import DEFAULT_DISPLAY_TIMEZONE, format_template_datetime, resolve_display_timezone
 from apps.alerts.utils.permission_scope import apply_operator_scope, apply_team_scope_with_group_ids
 from apps.core.logger import alert_logger as logger
 from apps.core.utils.internal_event_auth import TRUSTED_INTERNAL_EVENT_CALLERS, legacy_internal_event_auth_allowed, verify_internal_event
@@ -205,7 +206,20 @@ def _resolve_target_timezone(timezone_name=None):
             return ZoneInfo(timezone_name)
         except Exception:
             logger.warning("Invalid timezone provided for alert trend: %s", timezone_name)
-    return timezone.get_current_timezone()
+    return ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
+
+
+def _caller_display_timezone(user_info):
+    info = user_info or {}
+    explicit = info.get("timezone")
+    if isinstance(explicit, str) and explicit.strip():
+        try:
+            ZoneInfo(explicit.strip())
+            return explicit.strip()
+        except Exception:
+            logger.warning("Invalid caller timezone %s", explicit)
+    username = info.get("username") or info.get("user")
+    return resolve_display_timezone([username] if username else [])
 
 
 def _parse_client_datetime(value, target_tz):
@@ -330,68 +344,122 @@ def _build_period_series(queryset, time_field, trunc_func, target_tz, aware_star
     return result
 
 
-@nats_client.register
-def get_alert_trend_data(*args, **kwargs) -> Dict[str, Any]:
-    """
-    获取告警趋势数据。
-
-    聚合粒度按时间窗自动推导：
-    ≤6h minute / ≤7d hour / ≤2y day / 更长 month。
-    """
-    logger.info("[AlertNatsRPC] === get_alert_trend_data ===, args=%s, kwargs=%s", args, kwargs)
-    user_info = kwargs.pop("user_info", {})
-    target_tz = _resolve_target_timezone((user_info or {}).get("timezone") or kwargs.pop("timezone", None))
+def _query_alert_trend_frame(handler_name, user_info, timezone_name, time_values, extra_filters):
+    """解析授权告警、时间窗和自动粒度，供告警趋势类接口复用。"""
+    target_tz = _resolve_target_timezone((user_info or {}).get("timezone") or timezone_name)
     queryset, error = _get_authorized_alert_queryset(user_info)
     if error:
-        return error
+        return None, error
 
-    time_values = kwargs.pop("time", [])
-    kwargs.pop("group_by", None)
-    aware_start, aware_end, group_by, validation_error = _resolve_alert_trend_group_by(time_values, target_tz, "get_alert_trend_data")
+    aware_start, aware_end, group_by, validation_error = _resolve_alert_trend_group_by(time_values, target_tz, handler_name)
     if validation_error:
-        return {
-            "result": False,
-            "data": [],
-            "message": validation_error,
-        }
+        return None, {"result": False, "data": [], "message": validation_error}
 
     start_dt = aware_start.astimezone(target_tz)
     end_dt = aware_end.astimezone(target_tz)
     trunc_func, _ = group_dy_date_format(group_by)
-
-    # 构建告警过滤条件
     alert_filter = Q()
     alert_model_fields = set(Alert.model_fields())
-    for key, value in kwargs.items():
+    for key, value in extra_filters.items():
         if key not in alert_model_fields:
             logger.warning("[AlertNatsRPC] 过滤条件包含非法字段 '%s'，已忽略", key)
             continue
         alert_filter &= Q(**{key: value})
 
-    # 生成时间序列
     all_periods = _generate_time_periods(group_by, start_dt, end_dt)
+    return {
+        "queryset": queryset,
+        "alert_qs": queryset.filter(alert_filter) if alert_filter else queryset,
+        "trunc_func": trunc_func,
+        "target_tz": target_tz,
+        "aware_start": aware_start,
+        "aware_end": aware_end,
+        "all_periods": all_periods,
+    }, None
 
-    # 固定返回三条系列：告警数、事件数、已恢复告警数
-    alert_qs = queryset.filter(alert_filter) if alert_filter else queryset
 
-    data = {
-        "告警数": _build_period_series(alert_qs, "created_at", trunc_func, target_tz, aware_start, aware_end, all_periods),
-        "告警关联事件数": _build_period_series(
-            Event.objects.filter(alert__in=queryset).distinct(), "received_at", trunc_func, target_tz, aware_start, aware_end, all_periods
-        ),
-        "已恢复告警数": _build_period_series(
-            alert_qs,
-            "updated_at",
-            trunc_func,
-            target_tz,
-            aware_start,
-            aware_end,
-            all_periods,
-            extra_filter=Q(status=AlertStatus.AUTO_RECOVERY),
-        ),
+def _trend_series(frame, queryset, time_field, extra_filter=None):
+    return _build_period_series(
+        queryset,
+        time_field,
+        frame["trunc_func"],
+        frame["target_tz"],
+        frame["aware_start"],
+        frame["aware_end"],
+        frame["all_periods"],
+        extra_filter=extra_filter,
+    )
+
+
+def _pop_alert_trend_controls(kwargs):
+    user_info = kwargs.pop("user_info", {})
+    timezone_name = kwargs.pop("timezone", None)
+    time_values = kwargs.pop("time", [])
+    kwargs.pop("group_by", None)
+    kwargs.pop("organization", None)
+    return user_info, timezone_name, time_values
+
+
+@nats_client.register
+def get_alert_trend_data(*args, **kwargs) -> Dict[str, Any]:
+    """获取告警、关联事件和已恢复告警的时间序列。
+
+    聚合粒度按时间窗自动推导：≤6h minute / ≤7d hour / ≤2y day / 更长 month。
+    """
+    del args
+    user_info, timezone_name, time_values = _pop_alert_trend_controls(kwargs)
+    logger.info("event=get_alert_trend_data")
+    frame, error = _query_alert_trend_frame("get_alert_trend_data", user_info, timezone_name, time_values, kwargs)
+    if error:
+        return error
+
+    return {
+        "result": True,
+        "data": {
+            "告警数": _trend_series(frame, frame["alert_qs"], "created_at"),
+            "告警关联事件数": _trend_series(
+                frame,
+                Event.objects.filter(alert__in=frame["queryset"]).distinct(),
+                "received_at",
+            ),
+            "已恢复告警数": _trend_series(
+                frame,
+                frame["alert_qs"],
+                "updated_at",
+                extra_filter=Q(status=AlertStatus.AUTO_RECOVERY),
+            ),
+        },
+        "message": "",
     }
 
-    return {"result": True, "data": data, "message": ""}
+
+@nats_client.register
+def get_alert_open_close_trend(*args, **kwargs) -> Dict[str, Any]:
+    """获取新增告警和关闭告警两条时间序列。
+
+    折线直接使用字典键作图例，与告警趋势一样用中文键：
+    告警数按 created_at，关闭告警数按 updated_at 且 status 属于全部 CLOSED_STATUS。
+    粒度按时间窗自动推导，不接受 bucket 或 series。
+    """
+    del args
+    user_info, timezone_name, time_values = _pop_alert_trend_controls(kwargs)
+    frame, error = _query_alert_trend_frame("get_alert_open_close_trend", user_info, timezone_name, time_values, kwargs)
+    if error:
+        return error
+
+    return {
+        "result": True,
+        "data": {
+            "告警数": _trend_series(frame, frame["alert_qs"], "created_at"),
+            "关闭告警数": _trend_series(
+                frame,
+                frame["alert_qs"],
+                "updated_at",
+                extra_filter=Q(status__in=AlertStatus.CLOSED_STATUS),
+            ),
+        },
+        "message": "",
+    }
 
 
 @nats_client.register
@@ -959,7 +1027,7 @@ def receive_alert_events(*args, **kwargs) -> Dict[str, Any]:
             "ingestion": ingestion,
             "source_id": source_id,
             "pusher": pusher,
-            "timestamp": timezone.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": format_template_datetime(timezone.now()),
         }
         if event_results is not None:
             data["event_results"] = event_results
@@ -1177,6 +1245,9 @@ def get_alert_snapshot_statistics(**kwargs):
         processing_count=Count("id", filter=Q(status=AlertStatus.PROCESSING)),
         auto_recovery_count=Count("id", filter=Q(status=AlertStatus.AUTO_RECOVERY)),
     )
+    critical_level_ids = Level.objects.filter(level_type=LevelType.ALERT, level_name__iexact="Critical").values_list("level_id", flat=True)
+    severe_level_keys = [str(level_id) for level_id in critical_level_ids]
+    severe_active_count = queryset.filter(status__in=AlertStatus.ACTIVATE_STATUS, level__in=severe_level_keys).count() if severe_level_keys else 0
     return {
         "result": True,
         "data": {
@@ -1188,6 +1259,7 @@ def get_alert_snapshot_statistics(**kwargs):
             "auto_recovery_rate": (
                 round(status_counts["auto_recovery_count"] / status_counts["total_count"] * 100, 1) if status_counts["total_count"] else 0
             ),
+            "severe_active_count": severe_active_count,
         },
         "message": "",
     }
@@ -1414,13 +1486,13 @@ def get_active_alert_top(limit=10, **kwargs):
     return {"result": True, "data": alerts_with_duration, "message": ""}
 
 
-def _format_alert_datetime(value):
+def _format_alert_datetime(value, timezone_name=None):
     if value is None:
         return None
-    return timezone.localtime(value).isoformat()
+    return format_template_datetime(value, timezone_name)
 
 
-def _serialize_alert_for_tool(alert, *, detail=False):
+def _serialize_alert_for_tool(alert, *, detail=False, timezone_name=None):
     data = {
         "alert_id": alert.alert_id,
         "title": alert.title,
@@ -1437,10 +1509,10 @@ def _serialize_alert_for_tool(alert, *, detail=False):
         "rule_id": alert.rule_id,
         "fingerprint": alert.fingerprint,
         "dimensions": alert.dimensions or {},
-        "first_event_time": _format_alert_datetime(alert.first_event_time),
-        "last_event_time": _format_alert_datetime(alert.last_event_time),
-        "created_at": _format_alert_datetime(alert.created_at),
-        "updated_at": _format_alert_datetime(alert.updated_at),
+        "first_event_time": _format_alert_datetime(alert.first_event_time, timezone_name),
+        "last_event_time": _format_alert_datetime(alert.last_event_time, timezone_name),
+        "created_at": _format_alert_datetime(alert.created_at, timezone_name),
+        "updated_at": _format_alert_datetime(alert.updated_at, timezone_name),
     }
     if detail:
         data["labels"] = alert.labels or {}
@@ -1448,7 +1520,7 @@ def _serialize_alert_for_tool(alert, *, detail=False):
     return data
 
 
-def _serialize_event_for_tool(event):
+def _serialize_event_for_tool(event, timezone_name=None):
     source = getattr(event, "source", None)
     return {
         "event_id": event.event_id,
@@ -1461,7 +1533,7 @@ def _serialize_event_for_tool(event):
         "resource_id": event.resource_id,
         "resource_type": event.resource_type,
         "resource_name": event.resource_name,
-        "received_at": _format_alert_datetime(event.received_at),
+        "received_at": _format_alert_datetime(event.received_at, timezone_name),
     }
 
 
@@ -1613,13 +1685,14 @@ def list_alerts(query_data=None, user_info=None, **kwargs):
 
     queryset = queryset.order_by("-created_at")
     count, items = _paginate_queryset(queryset, page, page_size)
+    timezone_name = _caller_display_timezone(user_info) if items else None
     return {
         "result": True,
         "data": {
             "count": count,
             "page": page,
             "page_size": page_size,
-            "items": [_serialize_alert_for_tool(alert) for alert in items],
+            "items": [_serialize_alert_for_tool(alert, timezone_name=timezone_name) for alert in items],
         },
         "message": "",
     }
@@ -1639,7 +1712,7 @@ def get_alert_detail(alert_id=None, user_info=None, **kwargs):
     alert = queryset.filter(alert_id=alert_id).first()
     if alert is None:
         return {"result": False, "data": {}, "message": "告警不存在"}
-    return {"result": True, "data": _serialize_alert_for_tool(alert, detail=True), "message": ""}
+    return {"result": True, "data": _serialize_alert_for_tool(alert, detail=True, timezone_name=_caller_display_timezone(user_info)), "message": ""}
 
 
 @nats_client.register
@@ -1664,13 +1737,14 @@ def list_alert_events(alert_id=None, query_data=None, user_info=None, **kwargs):
         return {"result": False, "data": {"count": 0, "page": 1, "page_size": 20, "items": []}, "message": "page/page_size 必须是正整数"}
     events_qs = Event.objects.select_related("source").filter(alert=alert).order_by("-received_at")
     count, items = _paginate_queryset(events_qs, page, page_size)
+    timezone_name = _caller_display_timezone(user_info) if items else None
     return {
         "result": True,
         "data": {
             "count": count,
             "page": page,
             "page_size": page_size,
-            "items": [_serialize_event_for_tool(event) for event in items],
+            "items": [_serialize_event_for_tool(event, timezone_name=timezone_name) for event in items],
         },
         "message": "",
     }

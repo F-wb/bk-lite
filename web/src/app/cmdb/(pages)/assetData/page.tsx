@@ -7,6 +7,7 @@ import type { TransferTask } from '@/app/cmdb/types/transfer';
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { KeepAlive, useActivate, useUnactivate } from 'react-activation';
 import {
+  Alert,
   Button,
   Space,
   Modal,
@@ -17,6 +18,7 @@ import {
   Input,
   Tag,
   Tooltip,
+  Skeleton,
 } from 'antd';
 import CompactEmptyState from '@/components/compact-empty-state';
 import type { MenuProps } from 'antd';
@@ -28,6 +30,7 @@ import {
   StarOutlined,
   UnorderedListOutlined,
 } from '@ant-design/icons';
+import InstUuidCopy from './instUuidCopy';
 import { useSearchParams, usePathname } from 'next/navigation';
 import { useScreenAwareRouter } from '@/console-layout';
 import CustomTable from '@/components/custom-table';
@@ -39,12 +42,11 @@ import ToolbarSplitShell from '@/components/toolbar-split-shell';
 import { useTranslation } from '@/utils/i18n';
 import { useUserInfoContext } from '@/context/userInfo';
 import { useClientData } from '@/context/client';
+import { useModuleLinkApi } from '@/app/module-link/api';
 import { deepClone, getAssetColumns } from '@/app/cmdb/utils/common';
 import {
+  canOpenMonitorLink,
   canSyncMonitor,
-  isMonitorSold,
-  pickBatchPushCounts,
-  resolveBatchPushSummaryLevel,
   isSystemLinkAttr,
   resolveListDisplayFieldKeys,
   buildExternalIdLines,
@@ -55,7 +57,8 @@ import {
   ensureCollectTaskMap,
 } from '@/app/cmdb/utils/collectTask';
 import { useCommon, useCmdbUserList } from '@/app/cmdb/context/common';
-import { resolveCmdbInstUuid } from '@/app/cmdb/utils/instUuid';
+import { INST_UUID_COLUMN_KEY, resolveCmdbInstUuid } from '@/app/cmdb/utils/instUuid';
+import { instanceUuidFilterAttr } from './searchFilterAttrs';
 import { useAssetDataStore, type FilterItem } from '@/app/cmdb/store';
 import { isMultiIpSearchAttr } from './list/multiIpSearch';
 import { useModelApi, useClassificationApi, useInstanceApi, useCollectApi } from '@/app/cmdb/api';
@@ -72,6 +75,7 @@ import {
 import { ExportModalRef } from '@/app/cmdb/types/assetData';
 import SearchFilter from './list/searchFilter';
 import FilterBar from './list/filterBar';
+import AdvancedFilterDrawer, { AdvancedFilterChips } from './list/advancedFilterDrawer';
 import ImportInst from './list/importInst';
 import FieldModal from './list/fieldModal';
 import SelectInstance from './detail/relationships/selectInstance';
@@ -104,6 +108,22 @@ import {
 } from './treeSelectedNodeScroll';
 
 const { confirm } = Modal;
+
+const AssetDataWorkspaceSkeleton = () => (
+  <div className="flex h-full min-h-0 gap-3 p-3" aria-busy="true" aria-label="loading">
+    <div className="w-60 shrink-0 rounded-lg bg-[var(--color-bg)] p-3">
+      <Skeleton.Input active className="!h-8 !w-full !min-w-0" />
+      <Skeleton active title={false} paragraph={{ rows: 8 }} className="mt-4" />
+    </div>
+    <div className="min-w-0 flex-1 rounded-lg bg-[var(--color-bg)] p-4">
+      <div className="mb-4 flex justify-end gap-2">
+        <Skeleton.Input active className="!h-8 !w-64 !min-w-0" />
+        <Skeleton.Button active className="!h-8 !w-20" />
+      </div>
+      <Skeleton active title={false} paragraph={{ rows: 9 }} />
+    </div>
+  </div>
+);
 
 const COPY_EXCLUDE_FIELDS = ['_id', 'inst_id', 'inst_uuid', 'id', 'created_at', 'updated_at', 'created_by', 'updated_by'];
 
@@ -223,7 +243,7 @@ interface ImportRef {
 const AssetDataContent = () => {
   const { t } = useTranslation();
   const { selectedGroup, userId } = useUserInfoContext();
-  const { clientData } = useClientData();
+  const { clientData, loading: clientLoading } = useClientData();
   const { getModelAssociationTypes, getModelAttrList, getModelAttrGroupsFullInfo } = useModelApi();
   const { getClassificationList } = useClassificationApi();
   const {
@@ -234,8 +254,8 @@ const AssetDataContent = () => {
     setInstanceShowFieldSettings,
     deleteInstance,
     batchDeleteInstances,
-    batchPushToMonitor,
   } = useInstanceApi();
+  const { createCmdbMonitorTask } = useModuleLinkApi();
   const { getCollectTaskNames } = useCollectApi();
   const router = useScreenAwareRouter();
   const pathname = usePathname();
@@ -259,6 +279,7 @@ const AssetDataContent = () => {
   const [selectedRowKeys, setSelectedRowKeys] = useState<Array<any>>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [tableLoading, setTableLoading] = useState<boolean>(false);
+  const [loadError, setLoadError] = useState(false);
   const [modelGroup, setModelGroup] = useState<GroupItem[]>([]);
   const [originModels, setOriginModels] = useState<ModelItem[]>([]);
   const [groupId, setGroupId] = useState<string>('');
@@ -308,8 +329,10 @@ const AssetDataContent = () => {
   );
   // 窄屏时把「数据订阅」收进更多。导入导出记录始终在更多里，新建和导出保持可见。
   const [secondaryActionsCollapsed, setSecondaryActionsCollapsed] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [quickCreateToken, setQuickCreateToken] = useState(0);
   const searchAttr = useAssetDataStore((state) => state.searchAttr);
+  const storeAdvancedFilter = useAssetDataStore((state) => state.advanced_filter);
   const urlQueryInitialized = useRef(false);
   const initialDataLoaded = useRef(false);
   const treeWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -338,8 +361,8 @@ const AssetDataContent = () => {
       const shell = rowEl.firstElementChild as HTMLElement | null;
       const rowWidth = (shell ?? rowEl).clientWidth;
       const inputWidth = isMultiIpSearchAttr(searchAttr) ? 360 : 200;
-      // 组织选择 200、属性下拉 120、搜索按钮 32、精确匹配约 108、刷新 32，间距 8。
-      const preferredFilterWidth = 200 + 120 + inputWidth + 32 + 108 + 32 + 8 * 4;
+      // 刷新 32、组织 200、高级筛选约 88、属性下拉 120、搜索按钮 32、精确匹配约 108，间距 8。
+      const preferredFilterWidth = 32 + 200 + 88 + 120 + inputWidth + 32 + 108 + 8 * 6;
       const fullActionsWidth = sizerEl.getBoundingClientRect().width;
       const recoveryBuffer = 30;
       const shouldCollapse = preferredFilterWidth + fullActionsWidth > rowWidth + recoveryBuffer;
@@ -415,11 +438,18 @@ const AssetDataContent = () => {
     exportRef.current?.showModal({
       title,
       modelId,
-      columns: columns.filter((col) => col.key !== EXTERNAL_ID_COLUMN_KEY),
-      displayFieldKeys: displayFieldKeys.filter((key) => key !== EXTERNAL_ID_COLUMN_KEY),
+      columns: columns.filter(
+        (col) => col.key !== EXTERNAL_ID_COLUMN_KEY && col.key !== INST_UUID_COLUMN_KEY,
+      ),
+      displayFieldKeys: displayFieldKeys.filter(
+        (key) => key !== EXTERNAL_ID_COLUMN_KEY && key !== INST_UUID_COLUMN_KEY,
+      ),
       selectedKeys,
       exportType,
+      total: exportType === 'all' && typeof pagination.total === 'number' ? pagination.total : undefined,
       tableData,
+      queryList: exportType === 'all' ? useAssetDataStore.getState().query_list : undefined,
+      advancedFilter: exportType === 'all' ? useAssetDataStore.getState().advanced_filter : undefined,
     } as any);
   };
 
@@ -526,7 +556,7 @@ const AssetDataContent = () => {
       setSelectedTreeKeys([modelId]);
       fetchData();
     }
-  }, [pagination?.current, pagination?.pageSize, queryList, organization]);
+  }, [pagination?.current, pagination?.pageSize, queryList, organization, storeAdvancedFilter]);
 
   useEffect(() => {
     const validClassificationIds = modelGroup.map((item) => item.classification_id);
@@ -577,6 +607,11 @@ const AssetDataContent = () => {
       setPagination(prev => ({ ...prev, total: data.count }));
     } catch (error) {
       if ((error as { name?: string })?.name === 'CanceledError') return;
+      if (useAssetDataStore.getState().advanced_filter) {
+        const failed = error as { message?: string; response?: { data?: { message?: string } } };
+        message.error(failed.response?.data?.message || failed.message || t('AdvancedFilter.queryFailed'));
+        setAdvancedOpen(true);
+      }
     } finally {
       setTableLoading(false);
     }
@@ -585,6 +620,7 @@ const AssetDataContent = () => {
   const getModelGroup = async () => {
     try {
       setLoading(true);
+      setLoadError(false);
       const [groupData, assoType, instCount] = await Promise.all([
         getClassificationList(),
         getModelAssociationTypes(),
@@ -616,6 +652,7 @@ const AssetDataContent = () => {
       getInitData(defaultModelId, initialQueryList);
       updateUrl(defaultModelId, defaultGroupId, urlQueryList);
     } catch {
+      setLoadError(true);
       setLoading(false);
     }
   };
@@ -644,6 +681,7 @@ const AssetDataContent = () => {
       finalQueryList = orgCondition;
     }
 
+    const advancedFilter = useAssetDataStore.getState().advanced_filter;
     return {
       query_list: finalQueryList,
       page: overridePage ?? pagination.current,
@@ -652,6 +690,7 @@ const AssetDataContent = () => {
       model_id: modelId,
       role: '',
       case_sensitive: caseSensitive,
+      ...(advancedFilter ? { advanced_filter: advancedFilter } : {}),
     };
   };
 
@@ -663,6 +702,7 @@ const AssetDataContent = () => {
       .catch(() => message.error(t('common.loadFailed')));
 
     setLoading(true);
+    setLoadError(false);
     Promise.all([
       getModelAttrList(id),
       searchInstances({ ...tableParams, model_id: id }),
@@ -674,8 +714,8 @@ const AssetDataContent = () => {
         setPropertyList(attrList);
         setTableData(instData.insts);
         setPagination(prev => ({ ...prev, total: instData.count }));
-
       })
+      .catch(() => setLoadError(true))
       .finally(() => {
         setLoading(false);
         requestAnimationFrame(() => {
@@ -690,6 +730,8 @@ const AssetDataContent = () => {
 
   const rowSelection = {
     selectedRowKeys,
+    // 列表是服务端分页，当前页数据源里没有上一页的行。保留已选 key，翻页后再勾选才会累加。
+    preserveSelectedRowKeys: true,
     onChange: onSelectChange,
   };
 
@@ -744,17 +786,13 @@ const AssetDataContent = () => {
       centered: true,
       async onOk() {
         try {
-          const summary = await batchPushToMonitor(instUuids);
-          const counts = pickBatchPushCounts(summary);
-          const level = resolveBatchPushSummaryLevel(counts);
-          const text = t('Model.systemLinkageBatchSummary', '', counts);
-          if (level === 'success') {
-            message.success(text);
-          } else if (level === 'warning') {
-            message.warning(text);
-          } else {
-            message.error(text);
+          const task = await createCmdbMonitorTask(instUuids);
+          const taskId = String(task?.id || '').trim();
+          if (!taskId) {
+            message.error(t('Model.systemLinkageSyncFailed'));
+            return;
           }
+          router.push(`/module-link/cmdb-monitor/tasks/${taskId}`);
         } catch {
           message.error(t('Model.systemLinkageSyncFailed'));
         }
@@ -898,6 +936,10 @@ const AssetDataContent = () => {
     setQueryList(newQueryList);
     setPagination((prev) => resetListPaginationToFirstPage(prev));
   }, [storeQueryList]);
+
+  useEffect(() => {
+    setPagination((prev) => resetListPaginationToFirstPage(prev));
+  }, [storeAdvancedFilter]);
 
   useEffect(() => {
     if (!urlQueryInitialized.current || !modelId) return;
@@ -1076,6 +1118,7 @@ const AssetDataContent = () => {
 
   const onSelectUnified = (selectedKeys: React.Key[]) => {
     useAssetDataStore.getState().clear();
+    useAssetDataStore.getState().setAdvancedFilter(null);
     useAssetDataStore.setState((state) => ({ ...state, searchAttr: '' }));
     urlQueryInitialized.current = true;
 
@@ -1220,7 +1263,22 @@ const AssetDataContent = () => {
         </div>
       ),
     };
-    const tableColumns = [...columnsWithFollow, ...(externalIdColumn ? [externalIdColumn] : []), actionColumn];
+    const uuidColumn: ColumnItem = {
+      title: t('Model.instanceUuid'),
+      key: INST_UUID_COLUMN_KEY,
+      dataIndex: INST_UUID_COLUMN_KEY,
+      width: 240,
+      ellipsis: true,
+      render: (value: unknown) => (
+        <InstUuidCopy value={value ? String(value) : ''} className="font-mono text-[12px]" />
+      ),
+    };
+    const tableColumns = [
+      ...columnsWithFollow,
+      uuidColumn,
+      ...(externalIdColumn ? [externalIdColumn] : []),
+      actionColumn,
+    ];
     setColumns(tableColumns);
 
     const orderedColumns = tableColumns
@@ -1229,7 +1287,7 @@ const AssetDataContent = () => {
     setCurrentColumns([...orderedColumns, actionColumn]);
   }, [propertyList, displayFieldKeys, propertyListGroups, modelId, followPendingKey, handleFollowToggle, isFollowed, t, userList]);
 
-  const showBatchSyncMonitor = canSyncMonitor(modelId) && isMonitorSold(clientData);
+  const showBatchSyncMonitor = canOpenMonitorLink(clientData, clientLoading, modelId);
   const batchSyncMonitorItem: NonNullable<MenuProps['items']>[number] = {
     key: 'batchSyncMonitor',
     label: (
@@ -1316,6 +1374,22 @@ const AssetDataContent = () => {
 
   return (
     <div className={assetDataStyle.assetLoading}>
+      {loading && modelGroup.length === 0 ? (
+        <AssetDataWorkspaceSkeleton />
+      ) : loadError && modelGroup.length === 0 ? (
+        <div className="h-full p-3">
+          <Alert
+            type="error"
+            showIcon
+            message={t('common.loadFailed')}
+            action={(
+              <Button size="small" onClick={() => void getModelGroup()}>
+                {t('common.retry')}
+              </Button>
+            )}
+          />
+        </div>
+      ) : (
       <div className={assetDataStyle.assetData}>
         {/* 左侧树形选择器 */}
         <div className={`${assetDataStyle.groupSelector}`}>
@@ -1378,6 +1452,12 @@ const AssetDataContent = () => {
               trailing={(
                 <>
                   <div ref={leftActionsRef} className="flex min-w-0 shrink items-center gap-2">
+                    <span className="shrink-0">
+                      <RefreshIconButton
+                        loading={loading}
+                        onClick={() => fetchData()}
+                      />
+                    </span>
                     <GroupTreeSelector
                       style={{
                         width: '200px',
@@ -1390,20 +1470,6 @@ const AssetDataContent = () => {
                         selectedGroup?.id ? Number(selectedGroup.id) : undefined
                       }
                     />
-                    <SearchFilter
-                      key={modelId}
-                      allowShrink
-                      proxyOptions={proxyOptions}
-                      userList={userList}
-                      modelId={modelId}
-                      displayFieldKeys={displayFieldKeys}
-                      attrList={propertyList.filter(
-                        (item) => item.attr_type !== 'organization'
-                      )}
-                      onSearch={handleSearch}
-                      onChange={handleFilterBarChange}
-                      onFilterChange={handleFilterBarChange}
-                    />
                     {modelId === 'ip' && (
                       <Tag
                         color={isConflictFilterActive ? 'error' : 'default'}
@@ -1413,22 +1479,30 @@ const AssetDataContent = () => {
                         {t('IPAM.conflictFilter')}
                       </Tag>
                     )}
-                    <span className="shrink-0">
-                      <RefreshIconButton
-                        loading={loading}
-                        onClick={() => fetchData()}
-                      />
-                    </span>
-                  </div>
-                  <div className="shrink-0">
-                    <Dropdown menu={{ items: exportItems }} placement="bottom">
-                      <Button>
-                        <Space>
-                          {t('export')}
-                          <DownOutlined />
-                        </Space>
-                      </Button>
-                    </Dropdown>
+                    <SearchFilter
+                      key={modelId}
+                      allowShrink
+                      proxyOptions={proxyOptions}
+                      userList={userList}
+                      modelId={modelId}
+                      displayFieldKeys={displayFieldKeys}
+                      attrList={
+                        displayFieldKeys.includes(INST_UUID_COLUMN_KEY)
+                          ? [
+                            ...propertyList.filter((item) => item.attr_type !== 'organization'),
+                            instanceUuidFilterAttr(t('Model.instanceUuid')),
+                          ]
+                          : propertyList.filter((item) => item.attr_type !== 'organization')
+                      }
+                      onSearch={handleSearch}
+                      onChange={handleFilterBarChange}
+                      onFilterChange={handleFilterBarChange}
+                      beforeExactSearch={(
+                        <Button className="shrink-0" onClick={() => setAdvancedOpen(true)}>
+                          {t('AdvancedFilter.title')}
+                        </Button>
+                      )}
+                    />
                   </div>
                   <Dropdown
                     menu={{ items: moreItems }}
@@ -1441,6 +1515,16 @@ const AssetDataContent = () => {
                       </Space>
                     </Button>
                   </Dropdown>
+                  <div className="shrink-0">
+                    <Dropdown menu={{ items: exportItems }} placement="bottom">
+                      <Button>
+                        <Space>
+                          {t('export')}
+                          <DownOutlined />
+                        </Space>
+                      </Button>
+                    </Dropdown>
+                  </div>
                   {secondaryActionsCollapsed ? null : (
                     <Button
                       className="shrink-0"
@@ -1468,9 +1552,9 @@ const AssetDataContent = () => {
           </div>
           <div ref={actionSizerRef} className={assetDataStyle.actionSizer}>
             <Space>
-              <Button type="primary">
+              <Button>
                 <Space>
-                  {t('common.new')}
+                  {t('more')}
                   <DownOutlined aria-hidden="true" />
                 </Space>
               </Button>
@@ -1480,9 +1564,9 @@ const AssetDataContent = () => {
                   <DownOutlined aria-hidden="true" />
                 </Space>
               </Button>
-              <Button>
+              <Button type="primary">
                 <Space>
-                  {t('more')}
+                  {t('common.new')}
                   <DownOutlined aria-hidden="true" />
                 </Space>
               </Button>
@@ -1493,8 +1577,16 @@ const AssetDataContent = () => {
           </div>
 
           <div className="w-full">
-            <FilterBar
+            <AdvancedFilterChips
+              modelId={modelId}
+              filter={storeAdvancedFilter}
               attrList={propertyList}
+              assoTypes={assoTypes}
+              models={originModels}
+              onChange={(filter) => useAssetDataStore.getState().setAdvancedFilter(filter)}
+            />
+            <FilterBar
+              attrList={[...propertyList, instanceUuidFilterAttr(t('Model.instanceUuid'))]}
               userList={userList}
               proxyOptions={proxyOptions}
               modelId={modelId}
@@ -1503,29 +1595,39 @@ const AssetDataContent = () => {
             />
           </div>
 
-          <CustomTable
-            style={{ marginTop: '-1px' }}
-            size="small"
-            rowSelection={rowSelection}
-            dataSource={tableData}
-            columns={currentColumns}
-            pagination={pagination}
-            loading={loading || tableLoading}
-            scroll={{
-              x: 'max-content',
-              y: storeQueryList.length > 0
-                ? 'calc(100vh - 320px)'
-                : 'calc(100vh - 300px)'
-            }}
-            fieldSetting={{
-              showSetting: true,
-              displayFieldKeys,
-              choosableFields: columns.filter((item) => item.key !== 'action'),
-            }}
-            onSelectFields={onSelectFields}
-            rowKey="inst_uuid"
-            onChange={handleTableChange}
-          />
+          <div className={assetDataStyle.tableArea}>
+            {loadError ? (
+              <Alert
+                type="error"
+                showIcon
+                message={t('common.loadFailed')}
+                action={(
+                  <Button size="small" onClick={() => getInitData(modelId)}>
+                    {t('common.retry')}
+                  </Button>
+                )}
+              />
+            ) : (
+              <CustomTable
+                style={{ marginTop: '-1px' }}
+                size="small"
+                rowSelection={rowSelection}
+                dataSource={tableData}
+                columns={currentColumns}
+                pagination={pagination}
+                loading={loading || tableLoading}
+                scroll={{ x: 'max-content' }}
+                fieldSetting={{
+                  showSetting: true,
+                  displayFieldKeys,
+                  choosableFields: columns.filter((item) => item.key !== 'action'),
+                }}
+                onSelectFields={onSelectFields}
+                rowKey="inst_uuid"
+                onChange={handleTableChange}
+              />
+            )}
+          </div>
           <FieldModal
             ref={fieldRef}
             userList={userList}
@@ -1540,6 +1642,20 @@ const AssetDataContent = () => {
             models={originModels}
             assoTypes={assoTypes}
             needFetchAssoInstIds
+          />
+          <AdvancedFilterDrawer
+            open={advancedOpen}
+            modelId={modelId}
+            applied={storeAdvancedFilter}
+            attrList={propertyList}
+            userList={userList}
+            assoTypes={assoTypes}
+            models={originModels}
+            onClose={() => setAdvancedOpen(false)}
+            onApply={(filter) => {
+              useAssetDataStore.getState().setAdvancedFilter(filter);
+              setAdvancedOpen(false);
+            }}
           />
           <ExportModal
             ref={exportRef}
@@ -1614,6 +1730,7 @@ const AssetDataContent = () => {
           </Modal>
         </div>
       </div>
+      )}
     </div>
   );
 };

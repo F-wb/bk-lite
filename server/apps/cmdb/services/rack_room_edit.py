@@ -317,6 +317,7 @@ def _execute_room_action(
             rack_unplace_attrs(),
             operator,
             allowed_org_ids=allowed_org_ids,
+            audit_source="机柜",
         )
         return {"action": ACTION_UNPLACE, "instance": updated}
 
@@ -334,7 +335,7 @@ def _execute_room_action(
         payload.pop("row", None)
         payload.pop("col", None)
         payload.update(attrs)
-        created = InstanceManage.instance_create("rack", payload, operator, allowed_org_ids=allowed_org_ids)
+        created = InstanceManage.instance_create("rack", payload, operator, allowed_org_ids=allowed_org_ids, audit_source="机柜")
         _ensure_association(room, created, ROOM_RACK_ASST_ID, operator)
         return {"action": ACTION_PLACE_CREATE, "instance": created}
 
@@ -353,12 +354,57 @@ def _execute_room_action(
         attrs,
         operator,
         allowed_org_ids=allowed_org_ids,
+        audit_source="机柜",
     )
     _ensure_association(room, updated, ROOM_RACK_ASST_ID, operator)
     return {"action": ACTION_PLACE_EXISTING, "instance": updated}
 
 
+def _rack_layout_lock_key(rack: dict) -> str:
+    inst_uuid = str((rack or {}).get("inst_uuid") or "").strip()
+    if not inst_uuid:
+        raise RackRoomEditError("实例缺少 inst_uuid，无法锁定机柜布局")
+    return f"cmdb:rack-layout:{inst_uuid}"
+
+
 def _execute_rack_action(
+    *,
+    action,
+    rack,
+    operator,
+    allowed_org_ids,
+    user_groups,
+    roles,
+    existing,
+    instance_info,
+    model_id,
+    u_start,
+    u_size,
+    get_rack_layout,
+    InstanceManage,
+):
+    from apps.cmdb.services.unique_write_lock import UniqueWriteLockService
+
+    # 先拿机柜锁，再进入实例更新里的模型唯一键锁。锁内重读布局，避免并发放置写到同一段 U。
+    with UniqueWriteLockService.hold([_rack_layout_lock_key(rack)]):
+        return _execute_rack_action_locked(
+            action=action,
+            rack=rack,
+            operator=operator,
+            allowed_org_ids=allowed_org_ids,
+            user_groups=user_groups,
+            roles=roles,
+            existing=existing,
+            instance_info=instance_info,
+            model_id=model_id,
+            u_start=u_start,
+            u_size=u_size,
+            get_rack_layout=get_rack_layout,
+            InstanceManage=InstanceManage,
+        )
+
+
+def _execute_rack_action_locked(
     *,
     action,
     rack,
@@ -391,6 +437,7 @@ def _execute_rack_action(
             device_unplace_attrs(),
             operator,
             allowed_org_ids=allowed_org_ids,
+            audit_source="机柜",
         )
         return {"action": ACTION_UNPLACE, "instance": updated}
 
@@ -415,7 +462,7 @@ def _execute_rack_action(
             raise RackRoomEditError("该模型不能放置到机柜 U 位")
         payload = dict(instance_info or {})
         payload.update(attrs)
-        created = InstanceManage.instance_create(target_model, payload, operator, allowed_org_ids=allowed_org_ids)
+        created = InstanceManage.instance_create(target_model, payload, operator, allowed_org_ids=allowed_org_ids, audit_source="机柜")
         _ensure_association(rack, created, RACK_DEVICE_ASST_ID, operator)
         return {"action": ACTION_PLACE_CREATE, "instance": created}
 
@@ -436,6 +483,7 @@ def _execute_rack_action(
         attrs,
         operator,
         allowed_org_ids=allowed_org_ids,
+        audit_source="机柜",
     )
     _ensure_association(rack, updated, RACK_DEVICE_ASST_ID, operator)
     return {"action": ACTION_PLACE_EXISTING, "instance": updated}

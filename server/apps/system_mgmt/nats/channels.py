@@ -557,9 +557,17 @@ def dispatch_notification(
         )
     except Exception:
         logger.exception("Public notification dispatch failed")
-        return _notification_failure("provider_unavailable", "通知传输暂不可用。", retryable=True)
+        return _notification_failure(
+            "provider_unavailable",
+            system_mgmt_message(None, "error.notification_provider_unavailable"),
+            retryable=True,
+        )
     if not isinstance(response, dict):
-        return _notification_failure("invalid_provider_response", "通知渠道返回格式无效。", retryable=True)
+        return _notification_failure(
+            "invalid_provider_response",
+            system_mgmt_message(None, "error.notification_invalid_provider_response"),
+            retryable=True,
+        )
     if response.get("result") is False:
         if capability["delivery_mode"] == "alert_event_copy" and ack_mode == "per_event_v1":
             event_results = (response.get("data") or {}).get("event_results") or []
@@ -568,12 +576,12 @@ def dispatch_notification(
                     "result": False,
                     "code": str(response.get("code") or "alert_copy_partial"),
                     "retryable": any(bool(item.get("retryable", True)) for item in event_results if isinstance(item, dict)),
-                    "message": str(response.get("message") or "告警中心仅接受了部分事件副本。")[:512],
+                    "message": str(response.get("message") or system_mgmt_message(None, "error.alert_copy_partial_accepted"))[:512],
                     "data": {"event_results": event_results},
                 }
         return _notification_failure(
             str(response.get("code") or "delivery_failed"),
-            str(response.get("message") or "通知渠道投递失败。")[:512],
+            str(response.get("message") or system_mgmt_message(None, "error.notification_delivery_failed"))[:512],
             retryable=bool(response.get("retryable", True)),
         )
     if capability["delivery_mode"] == "alert_event_copy":
@@ -581,7 +589,11 @@ def dispatch_notification(
         if ingestion and (
             int(ingestion.get("errored", 0) or 0) > 0 or int(ingestion.get("accepted", 0) or 0) + int(ingestion.get("skipped", 0) or 0) < 1
         ):
-            return _notification_failure("alert_copy_rejected", "告警中心未接受事件副本。", retryable=True)
+            return _notification_failure(
+                "alert_copy_rejected",
+                system_mgmt_message(None, "error.alert_copy_rejected"),
+                retryable=True,
+            )
     result = {"result": True, "code": "delivered", "retryable": False, "message": "success"}
     if capability["delivery_mode"] == "alert_event_copy":
         event_results = (response.get("data") or {}).get("event_results") or []
@@ -687,10 +699,10 @@ OPSPILOT_NATS_NAMESPACE = os.getenv("NATS_NAMESPACE", "bklite")
 OPSPILOT_NATS_METHOD = "trigger_workflow_by_nats"
 
 
-WORKFLOW_ORCHESTRATION_CHANNEL_SOURCE = "workflow_orchestration"
+WORKFLOW_CHANNEL_SOURCE = "workflow"
 
 
-WORKFLOW_ORCHESTRATION_NATS_METHOD = "trigger_orchestration_workflow_by_nats"
+WORKFLOW_NATS_METHOD = "trigger_orchestration_workflow_by_nats"
 
 
 def _list_opspilot_nats_channels(bot_id):
@@ -786,18 +798,18 @@ def delete_opspilot_nats_channels(bot_id):
     return {"result": True, "data": {"deleted": deleted}}
 
 
-def _list_workflow_orchestration_nats_channels(workflow_id):
+def _list_workflow_nats_channels(workflow_id):
     """返回单个编排流程名下的托管 NATS 通道。"""
     result = []
     for channel in Channel.objects.filter(channel_type=ChannelChoices.NATS):
         config = channel.config or {}
-        if config.get("source") == WORKFLOW_ORCHESTRATION_CHANNEL_SOURCE and str(config.get("workflow_id")) == str(workflow_id):
+        if config.get("source") == WORKFLOW_CHANNEL_SOURCE and str(config.get("workflow_id")) == str(workflow_id):
             result.append(channel)
     return result
 
 
 @nats_client.register
-def sync_workflow_orchestration_nats_channels(workflow_id, workflow_name, team, nodes, active, timeout=60):
+def sync_workflow_nats_channels(workflow_id, workflow_name, team, nodes, active, timeout=60):
     """对账编排中心某个流程的 NATS 触发通道（增、改、删）。"""
     try:
         workflow_id = int(workflow_id)
@@ -808,7 +820,7 @@ def sync_workflow_orchestration_nats_channels(workflow_id, workflow_name, team, 
 
     team = team or []
     nodes = nodes or []
-    existing_by_node = {(channel.config or {}).get("node_key"): channel for channel in _list_workflow_orchestration_nats_channels(workflow_id)}
+    existing_by_node = {(channel.config or {}).get("node_key"): channel for channel in _list_workflow_nats_channels(workflow_id)}
     incoming_node_keys = set()
     created = updated = 0
     for node in nodes:
@@ -821,13 +833,13 @@ def sync_workflow_orchestration_nats_channels(workflow_id, workflow_name, team, 
         label = str((node or {}).get("name") or node_key).strip()
         config = {
             "namespace": OPSPILOT_NATS_NAMESPACE,
-            "method_name": WORKFLOW_ORCHESTRATION_NATS_METHOD,
+            "method_name": WORKFLOW_NATS_METHOD,
             "workflow_id": workflow_id,
             "trigger_id": trigger_id,
             "node_key": node_key,
             "subject": subject,
             "timeout": timeout,
-            "source": WORKFLOW_ORCHESTRATION_CHANNEL_SOURCE,
+            "source": WORKFLOW_CHANNEL_SOURCE,
             "active": active,
         }
         values = {
@@ -855,21 +867,21 @@ def sync_workflow_orchestration_nats_channels(workflow_id, workflow_name, team, 
 
 
 @nats_client.register
-def delete_workflow_orchestration_nats_channels(workflow_id):
+def delete_workflow_nats_channels(workflow_id):
     """删除单个编排流程的全部托管 NATS 通道。"""
     try:
         workflow_id = int(workflow_id)
     except (TypeError, ValueError):
         return {"result": False, "message": "workflow_id must be an integer"}
     deleted = 0
-    for channel in _list_workflow_orchestration_nats_channels(workflow_id):
+    for channel in _list_workflow_nats_channels(workflow_id):
         channel.delete()
         deleted += 1
     return {"result": True, "data": {"deleted": deleted}}
 
 
 @nats_client.register
-def search_workflow_orchestration_nats_channels(teams=None, workflow_id=None, include_children=False, active_only=True):
+def search_workflow_nats_channels(teams=None, workflow_id=None, include_children=False, active_only=True):
     """查询编排中心托管的 NATS 触发通道。"""
     normalized_team_ids = None
     if teams:
@@ -888,7 +900,7 @@ def search_workflow_orchestration_nats_channels(teams=None, workflow_id=None, in
     data = []
     for channel in Channel.objects.filter(channel_type=ChannelChoices.NATS):
         config = channel.config or {}
-        if config.get("source") != WORKFLOW_ORCHESTRATION_CHANNEL_SOURCE:
+        if config.get("source") != WORKFLOW_CHANNEL_SOURCE:
             continue
         if workflow_id is not None and str(config.get("workflow_id")) != str(workflow_id):
             continue

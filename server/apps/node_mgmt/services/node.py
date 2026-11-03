@@ -2,7 +2,8 @@ import ipaddress
 import os
 from datetime import datetime, timedelta, timezone
 
-from django.db.models import Exists, OuterRef, Q
+from django.db.models import Exists, OuterRef, Q, Value
+from django.db.models.functions import Concat
 from django.utils import timezone as dj_timezone
 
 from apps.core.exceptions.base_app_exception import BaseAppException
@@ -469,7 +470,9 @@ class NodeService:
             qs = qs.filter(ip__icontains=ip)
         keyword = NodeService._normalize_keyword(keyword)
         if keyword:
-            qs = qs.filter(Q(name__icontains=keyword) | Q(ip__icontains=keyword))
+            qs = qs.annotate(
+                _display_label=Concat("name", Value(" ("), "ip", Value(")")),
+            ).filter(Q(name__icontains=keyword) | Q(ip__icontains=keyword) | Q(_display_label__icontains=keyword))
         if os:
             qs = qs.filter(operating_system__icontains=os)
 
@@ -567,24 +570,63 @@ class NodeService:
             qs = qs.filter(nodeorganization__organization__in=organization_ids).distinct()
         if cloud_region_id:
             qs = qs.filter(cloud_region_id=cloud_region_id)
-        nodes = list(qs.filter(ip__in=normalized_ips).order_by("ip", "id").values("id", "ip", "operating_system"))
+        rows = qs.filter(ip__in=normalized_ips).order_by("ip", "id").values("id", "ip", "operating_system", "status")
+        nodes = [
+            {
+                "id": row["id"],
+                "ip": row["ip"],
+                "operating_system": row["operating_system"],
+                "nats_executor_online": NodeService._nats_executor_online(row.get("status")),
+            }
+            for row in rows
+        ]
         return {"nodes": nodes}
+
+    @staticmethod
+    def _nats_executor_online(status):
+        """节点状态里 NATS-Executor 的运行标记。0 表示 Running。"""
+        collectors = status.get("collectors") if isinstance(status, dict) else None
+        if not isinstance(collectors, list):
+            return False
+        for collector in collectors:
+            if not isinstance(collector, dict):
+                continue
+            collector_id = str(collector.get("collector_id") or "").strip().lower()
+            if collector_id.startswith("natsexecutor") and collector.get("status") == 0:
+                return True
+        return False
 
     @staticmethod
     def get_nodes_with_child_config(node_ids, collector, collect_type):
         """返回关联了指定采集器子配置的节点 ID。"""
-        normalized_node_ids = list({str(node_id) for node_id in node_ids if node_id not in (None, "")})
+        return sorted({assignment["node_id"] for assignment in NodeService.get_child_config_assignments(node_ids, collector, collect_type)})
+
+    @staticmethod
+    def get_child_config_assignments(node_ids, collector, collect_type):
+        """返回节点上指定采集器子配置的分配。"""
+        if not isinstance(collector, str) or not collector.strip():
+            raise BaseAppException("collector 非法")
+        if not isinstance(collect_type, str) or not collect_type.strip():
+            raise BaseAppException("collect_type 非法")
+        normalized_node_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids if node_id not in (None, "")))
         if not normalized_node_ids:
             return []
         if len(normalized_node_ids) > NodeService.NODE_LIST_PAGE_SIZE_MAX:
             raise BaseAppException(f"单次最多查询 {NodeService.NODE_LIST_PAGE_SIZE_MAX} 个节点")
 
-        configured_node_ids = ChildConfig.objects.filter(
-            collector_config__nodes__id__in=normalized_node_ids,
-            collector_config__collector__name=collector,
-            collect_type=collect_type,
-        ).values_list("collector_config__nodes__id", flat=True)
-        return sorted(set(configured_node_ids))
+        rows = (
+            ChildConfig.objects.filter(
+                collector_config__nodes__id__in=normalized_node_ids,
+                collector_config__collector__name=collector.strip(),
+                collect_type=collect_type.strip(),
+            )
+            .values_list("id", "collector_config__nodes__id")
+            .distinct()
+            .order_by("id", "collector_config__nodes__id")
+        )
+        return [
+            {"id": str(child_id), "node_id": str(node_id)} for child_id, node_id in rows if child_id not in (None, "") and node_id not in (None, "")
+        ]
 
     @staticmethod
     def _normalize_keyword(keyword):
@@ -611,10 +653,13 @@ class NodeService:
 
     @staticmethod
     def _apply_configured_sink_order(qs, sink_child_config):
-        """将已绑定指定子配置的节点整块沉到过滤结果末尾，再交给分页。"""
+        """将已绑定指定子配置的节点整块沉到过滤结果末尾，再交给分页。
+
+        没有沉底规则时按 id 排序，保证 page_size 上限下的翻页不会漏行或重复。
+        """
         normalized = NodeService._normalize_sink_child_config(sink_child_config)
         if normalized is None:
-            return qs
+            return qs.order_by("id")
         collector, collect_type = normalized
         configured = ChildConfig.objects.filter(
             collector_config__collector__name=collector,

@@ -60,6 +60,7 @@ import {
   resolveMonitorObjectQueryId,
   resolveMonitorObjectTreeKey
 } from '@/app/monitor/utils/monitorObjectQuery';
+import { buildMonitorObjectSidebarTree } from '@/app/monitor/utils/monitorObject';
 const { Option } = Select;
 
 const alertLevelTone = (level: string): StatusTone => {
@@ -140,6 +141,7 @@ const Alert: React.FC = () => {
   const [defaultSelectObj, setDefaultSelectObj] = useState<React.Key>('');
   const [myAlert, setMyAlert] = useState(false);
   const { syncObjectId, searchParams } = useMonitorObjectQuery();
+  const instanceIdFilter = String(searchParams.get('instanceId') || '').trim();
 
   const columns: ColumnItem[] = [
     {
@@ -279,7 +281,8 @@ const Alert: React.FC = () => {
     objectId,
     searchText,
     pagination.current,
-    pagination.pageSize
+    pagination.pageSize,
+    instanceIdFilter
   ]);
 
   useEffect(() => {
@@ -290,13 +293,14 @@ const Alert: React.FC = () => {
     timeValues,
     objectId,
     pagination.current,
-    pagination.pageSize
+    pagination.pageSize,
+    instanceIdFilter
   ]);
 
   useEffect(() => {
     if (isLoading || !objectId) return;
     getChartData('refresh');
-  }, [isLoading, timeValues, objectId]);
+  }, [isLoading, timeValues, objectId, instanceIdFilter]);
 
   useEffect(() => {
     if (isLoading) return;
@@ -348,33 +352,20 @@ const Alert: React.FC = () => {
   };
 
   const getTreeData = (data: ObjectItem[]): TreeItem[] => {
-    const groupedData = data.reduce(
-      (acc, item) => {
-        if (!acc[item.type]) {
-          acc[item.type] = {
-            title: item.display_type || '--',
-            key: item.type,
-            children: []
-          };
-        }
-        acc[item.type].children.push({
-          title: item.display_name || '--',
-          label: item.name || '--',
-          key: item.id,
-          icon: item.icon,
-          children: []
-        });
-        return acc;
-      },
-      {} as Record<string, TreeItem>
-    );
+    const tree = buildMonitorObjectSidebarTree(data, (item) => ({
+      title: item.display_name || '--',
+      label: item.name || '--',
+      key: item.id,
+      icon: item.icon,
+      children: []
+    }));
     return [
       {
         title: t('common.all'),
         key: 'all',
         children: []
       },
-      ...Object.values(groupedData)
+      ...tree
     ];
   };
 
@@ -397,7 +388,8 @@ const Alert: React.FC = () => {
       page_size: pagination.pageSize,
       created_at_after: isActive ? '' : dayjs(recentTimeRange[0]).toISOString(),
       created_at_before: isActive ? '' : dayjs(recentTimeRange[1]).toISOString(),
-      ...(mine ? { my_alert: 1 } : {})
+      ...(mine ? { my_alert: 1 } : {}),
+      ...(instanceIdFilter ? { monitor_instance_id: instanceIdFilter } : {})
     };
     return params;
   };

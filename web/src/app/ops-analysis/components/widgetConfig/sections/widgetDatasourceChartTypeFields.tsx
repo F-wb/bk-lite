@@ -25,10 +25,7 @@ import type {
 import type { DatasourceItem, InputOption, ParamItem } from '@/app/ops-analysis/types/dataSource';
 import DataSourceParamsConfig from '@/app/ops-analysis/components/paramsConfig';
 import { FilterBindingPanel } from '@/app/ops-analysis/components/unifiedFilter';
-import {
-  ConfigGroupTitle,
-  ConfigSectionTitle,
-} from '../configTitles';
+import { ConfigSectionTitle } from '../configTitles';
 
 const CHART_TYPE_CHIP =
   '!m-0 !inline-flex !h-8 !items-center !justify-center !rounded-md !px-2.5 !leading-none before:!hidden [&>span:last-child]:inline-flex [&>span:last-child]:h-full [&>span:last-child]:items-center [&>span:last-child]:gap-1.5 [&>span:last-child]:leading-none';
@@ -90,30 +87,18 @@ interface WidgetDatasourceChartTypeFieldsProps {
 }
 
 export const WidgetDatasourceChartTypeFields: React.FC<
-  WidgetDatasourceChartTypeFieldsProps
+  Pick<WidgetDatasourceChartTypeFieldsProps,
+    't' | 'selectedDataSource' | 'chartType' | 'chartTypes' |
+    'onChartTypeChange' | 'onOpenDataSourceSelector'>
 > = ({
   t,
   selectedDataSource,
-  effectiveDataSource,
-  hasQueryParams,
-  shouldShowUnifiedFilterSection,
-  hasUnifiedFilterBindings,
-  previewFilterDefinitions,
-  filterBindings,
   chartType,
   chartTypes,
-  onFilterBindingsChange,
   onChartTypeChange,
   onOpenDataSourceSelector,
-  onEditInputConfig,
-  onParamOptionsResolved,
-  children,
 }) => (
-  <section>
-    <ConfigSectionTitle>
-      {t('dashboard.chartConfigSection', '图表配置')}
-    </ConfigSectionTitle>
-
+  <>
     <Form.Item
       label={t('dashboard.dataSource')}
       name="dataSource"
@@ -182,11 +167,35 @@ export const WidgetDatasourceChartTypeFields: React.FC<
       </Radio.Group>
     </Form.Item>
 
+  </>
+);
+
+export const WidgetQueryFields: React.FC<
+  Pick<WidgetDatasourceChartTypeFieldsProps,
+    't' | 'selectedDataSource' | 'effectiveDataSource' | 'hasQueryParams' |
+    'shouldShowUnifiedFilterSection' | 'hasUnifiedFilterBindings' |
+    'previewFilterDefinitions' | 'filterBindings' | 'onFilterBindingsChange' |
+    'onEditInputConfig' | 'onParamOptionsResolved' | 'children'>
+> = ({
+  t,
+  selectedDataSource,
+  effectiveDataSource,
+  hasQueryParams,
+  shouldShowUnifiedFilterSection,
+  hasUnifiedFilterBindings,
+  previewFilterDefinitions,
+  filterBindings,
+  onFilterBindingsChange,
+  onEditInputConfig,
+  onParamOptionsResolved,
+  children,
+}) => (
+  <section>
     {hasQueryParams ? (
       <div className="mb-6">
-        <ConfigGroupTitle>
+        <ConfigSectionTitle>
           {t('dashboard.queryParams')}
-        </ConfigGroupTitle>
+        </ConfigSectionTitle>
         <DataSourceParamsConfig
           selectedDataSource={effectiveDataSource}
           includeFilterTypes={['params', 'fixed']}
@@ -200,7 +209,7 @@ export const WidgetDatasourceChartTypeFields: React.FC<
 
     {shouldShowUnifiedFilterSection && hasUnifiedFilterBindings ? (
       <div className="mb-6">
-        <ConfigGroupTitle
+        <ConfigSectionTitle
           extra={
             <Tooltip
               title={
@@ -208,15 +217,15 @@ export const WidgetDatasourceChartTypeFields: React.FC<
                   {t('dashboard.unifiedFilterBindingTip')}
                 </span>
               }
-              overlayInnerStyle={{ maxWidth: 480, width: 480 }}
-              styles={{ body: { maxWidth: 480, width: 480 } }}
+              overlayInnerStyle={{ maxWidth: 340, width: 340 }}
+              styles={{ body: { maxWidth: 340, width: 340 } }}
             >
               <QuestionCircleOutlined className="cursor-help text-(--color-text-3)" />
             </Tooltip>
           }
         >
           {t('dashboard.unifiedFilterLinkage')}
-        </ConfigGroupTitle>
+        </ConfigSectionTitle>
         <FilterBindingPanel
           definitions={previewFilterDefinitions}
           dataSourceParams={selectedDataSource!.params}

@@ -2,7 +2,9 @@
 import './register-list-pilot';
 import React, { useEffect, useState, useRef } from 'react';
 import {
+  Alert,
   Button,
+  Spin,
   Tooltip,
   message,
   Modal,
@@ -41,7 +43,11 @@ import Permission from '@/components/permission';
 import MoreActionsDropdown from '@/components/more-actions-dropdown';
 import type { MoreActionsDropdownItem } from '@/components/more-actions-dropdown';
 import { OBJECT_DEFAULT_ICON } from '@/app/monitor/constants';
-import { isDerivativeObject } from '@/app/monitor/utils/monitorObject';
+import {
+  buildMonitorObjectSidebarTree,
+  isCloudFamilySidebarType,
+  UNIFIED_CLOUD_ROOT_TYPE
+} from '@/app/monitor/utils/monitorObject';
 import { sameMonitorId, toMonitorIdString } from '@/app/monitor/utils/monitorIds';
 import { cloneDeep } from 'lodash';
 import CreateTemplateModal from './createTemplateModal';
@@ -61,6 +67,59 @@ import { resolvePluginSourceBadge } from '@/app/monitor/utils/pluginSourceBadge'
 import { downloadPluginConfig } from './exportDownload';
 
 const { confirm } = Modal;
+
+const resolveInitialObjectSelection = (
+  searchParams: Pick<URLSearchParams, 'get'> | null
+) => {
+  const key = resolveMonitorObjectQueryId({
+    searchParams,
+    allowAll: true,
+    allowTypeKeys: true,
+    fallback: 'all'
+  });
+  if (!key || key === 'all') {
+    return { objectId: '' as React.Key, objectType: '' };
+  }
+  if (isMonitorObjectTypeQueryKey(key)) {
+    return {
+      objectId: '' as React.Key,
+      objectType: isCloudFamilySidebarType(key) ? UNIFIED_CLOUD_ROOT_TYPE : key
+    };
+  }
+  return { objectId: key as React.Key, objectType: '' };
+};
+
+const expandCloudFamilySortData = (
+  sortData: TreeSortData[],
+  objectItems: ObjectItem[]
+): TreeSortData[] => {
+  const byName = new Map(objectItems.map((item) => [item.name, item]));
+  const expanded: TreeSortData[] = [];
+  for (const item of sortData) {
+    if (item.type === 'all') {
+      continue;
+    }
+    if (!isCloudFamilySidebarType(item.type)) {
+      expanded.push(item);
+      continue;
+    }
+    const lists = new Map<string, string[]>();
+    for (const name of item.object_list || []) {
+      const originalType = byName.get(name)?.type || UNIFIED_CLOUD_ROOT_TYPE;
+      const list = lists.get(originalType) || [];
+      list.push(name);
+      lists.set(originalType, list);
+    }
+    if (!lists.size) {
+      expanded.push({ type: UNIFIED_CLOUD_ROOT_TYPE, object_list: [] });
+      continue;
+    }
+    for (const [type, object_list] of lists) {
+      expanded.push({ type, object_list });
+    }
+  }
+  return expanded;
+};
 
 const Integration = () => {
   const { isLoading } = useApiClient();
@@ -83,6 +142,7 @@ const Integration = () => {
   const pluginRequestIdRef = useRef<number>(0);
   const searchParams = useSearchParams();
   const { syncObjectId } = useMonitorObjectQuery();
+  const initialSelection = resolveInitialObjectSelection(searchParams);
   const [pageLoading, setPageLoading] = useState<boolean>(false);
   const [searchText, setSearchText] = useState<string>('');
   const [exportDisabled, setExportDisabled] = useState<boolean>(true);
@@ -92,8 +152,10 @@ const Integration = () => {
   const [objects, setObjects] = useState<ObjectItem[]>([]);
   const [pluginList, setPluginList] = useState<ObjectItem[]>([]);
   const [treeLoading, setTreeLoading] = useState<boolean>(false);
-  const [objectId, setObjectId] = useState<React.Key>('');
-  const [objectType, setObjectType] = useState<string>('');
+  const [objectId, setObjectId] = useState<React.Key>(initialSelection.objectId);
+  const [objectType, setObjectType] = useState<string>(
+    initialSelection.objectType
+  );
   const [pagination, setPagination] = useState<Pagination>({
     current: 1,
     total: 0,
@@ -120,7 +182,7 @@ const Integration = () => {
   const handleNodeDrag = async (data: TreeSortData[]) => {
     try {
       setTreeLoading(true);
-      await updateMonitorObject(data);
+      await updateMonitorObject(expandCloudFamilySortData(data, objects));
       message.success(t('common.updateSuccess'));
       invalidateMonitorObjectsCache();
       getObjects({ force: true });
@@ -137,7 +199,11 @@ const Integration = () => {
 
   const handleObjectChange = async (id: string) => {
     const nextObjectType =
-      id && id !== 'all' && isTypeNodeKey(String(id)) ? String(id) : '';
+      id && id !== 'all' && isTypeNodeKey(String(id))
+        ? isCloudFamilySidebarType(String(id))
+          ? UNIFIED_CLOUD_ROOT_TYPE
+          : String(id)
+        : '';
     const nextObjectId = !id || id === 'all' || nextObjectType ? '' : id;
     // URL 回写同一节点时不要 abort 刚发出的插件列表请求，否则右侧会停在上一对象。
     if (
@@ -148,6 +214,8 @@ const Integration = () => {
       return;
     }
     cancelAllRequests();
+    setPluginList([]);
+    setPageLoading(true);
     setPagination((prev) => ({ ...prev, current: 1 }));
     syncObjectId(id || 'all');
     setObjectId(nextObjectId);
@@ -167,7 +235,7 @@ const Integration = () => {
     pluginAbortControllerRef.current = abortController;
     const currentRequestId = ++pluginRequestIdRef.current;
     const page = params.page ?? pagination.current;
-    // 翻页保留旧列表,仅 Spin overlay,避免闪 Empty
+    // 翻页保留旧列表，仅 Spin overlay，避免闪 Empty；切对象已在 handleObjectChange 清空。
     setSelectedApp(null);
     setExportDisabled(true);
     setPageLoading(true);
@@ -180,6 +248,8 @@ const Integration = () => {
         params.monitor_object_type !== undefined
           ? params.monitor_object_type
           : objectType;
+      // 点「云」根只发 1 个请求。BE filter_monitor_object_type 已把 Cloud /
+      // Tencent Cloud / Aliyun Cloud 收成同一组，SCP/CNware 本身 type=Cloud。
       const data = await getMonitorPlugin(
         {
           ...(monitorObjectId ? { monitor_object_id: monitorObjectId } : {}),
@@ -234,27 +304,16 @@ const Integration = () => {
   };
 
   const getTreeData = (data: ObjectItem[]): TreeItem[] => {
-    const groupedData = data.reduce(
-      (acc, item) => {
-        if (!acc[item.type]) {
-          acc[item.type] = {
-            title: item.display_type || '--',
-            key: item.type,
-            children: []
-          };
-        }
-        if (!isDerivativeObject(item, data)) {
-          acc[item.type].children.push({
-            title: item.display_name || '--',
-            label: item.name || '--',
-            key: toMonitorIdString(item.id),
-            icon: item.icon,
-            children: []
-          });
-        }
-        return acc;
-      },
-      {} as Record<string, TreeItem>
+    const tree = buildMonitorObjectSidebarTree(
+      data,
+      (item) => ({
+        title: item.display_name || '--',
+        label: item.name || '--',
+        key: toMonitorIdString(item.id),
+        icon: item.icon,
+        children: []
+      }),
+      { attachCloudDerivatives: false }
     );
     return [
       {
@@ -262,7 +321,7 @@ const Integration = () => {
         key: 'all',
         children: []
       },
-      ...Object.values(groupedData)
+      ...tree
     ];
   };
 
@@ -297,7 +356,10 @@ const Integration = () => {
   };
 
   const onTxtPressEnter = () => {
-    setPagination((prev) => ({ ...prev, current: 1 }));
+    if (pagination.current !== 1) {
+      setPagination((prev) => ({ ...prev, current: 1 }));
+      return;
+    }
     getPluginList({
       monitor_object_id: objectId,
       monitor_object_type: objectType,
@@ -308,7 +370,10 @@ const Integration = () => {
 
   const onTxtClear = () => {
     setSearchText('');
-    setPagination((prev) => ({ ...prev, current: 1 }));
+    if (pagination.current !== 1) {
+      setPagination((prev) => ({ ...prev, current: 1 }));
+      return;
+    }
     getPluginList({
       monitor_object_id: objectId,
       monitor_object_type: objectType,
@@ -390,10 +455,12 @@ const Integration = () => {
       return;
     }
     const icon = getPluginBrandIcon(app.name) || result.context.objectIcon;
+    const cmdbDraft = searchParams.get('cmdb_draft');
     router.push(
       buildIntegrationConfigureUrl(
         { ...result.context, objectIcon: icon },
-        OBJECT_DEFAULT_ICON
+        OBJECT_DEFAULT_ICON,
+        cmdbDraft ? { cmdb_draft: cmdbDraft } : undefined
       )
     );
   };
@@ -484,6 +551,14 @@ const Integration = () => {
         </div>
       </ResizableSidebar>
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[var(--color-bg-1)] p-5">
+        {searchParams.get('cmdb_draft') ? (
+          <Alert
+            className="mb-3"
+            type="info"
+            showIcon
+            message={t('monitor.integrations.cmdbDraftHint')}
+          />
+        ) : null}
         <SearchActionBar
           searchProps={{
             placeholder: t('common.searchPlaceHolder'),
@@ -510,11 +585,16 @@ const Integration = () => {
             {t('common.export')}
           </Button>
         </div>
-        {pageLoading && !pluginList.length ? (
-          <CardGridSkeleton className="grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4" />
-        ) : !pluginList.length ? (
-          <CompactEmptyState description={t('common.noData')} />
-        ) : (
+        <div className="flex min-h-0 flex-1 flex-col">
+          <Spin
+            spinning={pageLoading}
+            wrapperClassName="flex h-full min-h-0 flex-1 flex-col [&_.ant-spin-container]:flex [&_.ant-spin-container]:h-full [&_.ant-spin-container]:min-h-0 [&_.ant-spin-container]:flex-1 [&_.ant-spin-container]:flex-col"
+          >
+          {pageLoading && !pluginList.length ? (
+            <CardGridSkeleton className="grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4" />
+          ) : !pluginList.length ? (
+            <CompactEmptyState description={t('common.noData')} />
+          ) : (
             <div className="flex min-h-0 flex-1 flex-col">
               <div
                 className="grid min-h-0 w-full flex-1 gap-4 overflow-y-auto"
@@ -729,7 +809,9 @@ const Integration = () => {
                 />
               </div>
             </div>
-        )}
+          )}
+          </Spin>
+        </div>
       </div>
       <ImportModal ref={importRef} onSuccess={onTxtClear} />
       <CreateTemplateModal

@@ -12,6 +12,15 @@ import { ReloadOutlined } from "@ant-design/icons";
 import { useParams } from "next/navigation";
 import { useTranslation } from "@/utils/i18n";
 import { useShareMode } from "@/app/ops-analysis/context/shareMode";
+import InteractionDataMenu from "@/app/ops-analysis/components/interactionDataMenu";
+import { InteractionMenuScaleProvider } from "@/app/ops-analysis/context/interactionMenuScale";
+import { resolvePortaledMenuScale } from "@/app/ops-analysis/utils/interactionMenuScale";
+import { resolveRoom3DReadableScale } from "./readableScale";
+import { useWidgetDataLink } from "@/app/ops-analysis/components/interactionTitleIcon";
+import {
+  sceneLinkPoint,
+  type ChartLinkPoint,
+} from "@/app/ops-analysis/utils/interactionLink";
 import { useRoom3DApi } from "@/app/ops-analysis/api/room3D";
 import { isSceneWidgetAllowedOnSurface } from "@/app/ops-analysis/types/sceneWidgetCapability";
 import type { OpsAnalysisWidgetSurface } from "@/app/ops-analysis/utils/chartTypeSurface";
@@ -25,6 +34,7 @@ import type {
 } from "@/app/ops-analysis/types/dashBoard";
 import {
   aggregateRackAlarmSummary,
+  canOpenRoom3DRackLink,
   formatRoom3DDeviceAlarmCountValue,
   formatRoom3DSeverityLabel,
   getRoom3DDisplayOptions,
@@ -90,6 +100,36 @@ const Room3D: React.FC<Room3DProps> = ({
 }) => {
   const { t } = useTranslation();
   const shareMode = useShareMode();
+  const {
+    active: dataLinkActive,
+    link: dataLink,
+    openPoint,
+  } = useWidgetDataLink(config);
+  const [linkMenu, setLinkMenu] = useState<{
+    x: number;
+    y: number;
+    point: ChartLinkPoint;
+  } | null>(null);
+  const linkMenuRef = useRef<(hit: {
+    rack: Room3DRack;
+    device?: Room3DRenderableDevice;
+    x: number;
+    y: number;
+  } | null) => void>(() => undefined);
+  linkMenuRef.current = (hit) => {
+    if (!dataLinkActive || !hit || !canOpenRoom3DRackLink(hit.rack)) {
+      setLinkMenu(null);
+      return;
+    }
+    setLinkMenu({
+      x: hit.x,
+      y: hit.y,
+      point: sceneLinkPoint({
+        cabinet: hit.rack,
+        device: hit.device,
+      }),
+    });
+  };
   const params = useParams<{ sessionId?: string }>();
   const { getRooms, getLayout } = useRoom3DApi(
     shareMode ? params.sessionId : undefined,
@@ -149,23 +189,15 @@ const Room3D: React.FC<Room3DProps> = ({
   const [sceneRenderVersion, setSceneRenderVersion] = useState(0);
 
   const isCompact = (screenRenderContext?.widgetDensity || 0) > 0.5;
-  const readableOverlayScale = useMemo(() => {
-    if (!screenRenderContext?.enabled) {
-      return 1;
-    }
-
-    const fitScale =
-      Number.isFinite(screenRenderContext.fitScale) &&
-      screenRenderContext.fitScale > 0
-        ? screenRenderContext.fitScale
-        : 1;
-    const uiScale =
-      screenRenderContext.widgetUiScale ||
-      screenRenderContext.screenUiScale ||
-      1;
-
-    return Math.max(uiScale, 1 / fitScale, 1);
-  }, [screenRenderContext]);
+  const readableOverlayScale = useMemo(
+    () => resolveRoom3DReadableScale(screenRenderContext),
+    [screenRenderContext],
+  );
+  // 悬停卡在画布 transform 里。菜单在 body 上，倍数要乘回画布倍数，屏幕字号才一致。
+  const linkMenuScale = useMemo(
+    () => resolvePortaledMenuScale(readableOverlayScale, screenRenderContext),
+    [readableOverlayScale, screenRenderContext],
+  );
 
   const onErrorRef = useRef(onError);
   const onRawDataRef = useRef(onRawData);
@@ -266,6 +298,7 @@ const Room3D: React.FC<Room3DProps> = ({
           }
         },
         onDeviceSelect: setSelectedDevice,
+        onContextMenu: (hit) => linkMenuRef.current(hit),
       },
       rackTopLines,
     );
@@ -333,9 +366,7 @@ const Room3D: React.FC<Room3DProps> = ({
   const selectedConflictRacks = selectedRack?.is_conflict
     ? (selectedRack.conflict_racks ?? [])
     : [];
-  const shouldShowHoverTooltip = Boolean(
-    hoverState && !selectedDevice,
-  );
+  const hoverPopupVisible = Boolean(hoverState && !selectedDevice);
   const shouldShowRackPanel = Boolean(
     selectedRack?.is_conflict && !selectedDevice,
   );
@@ -394,7 +425,7 @@ const Room3D: React.FC<Room3DProps> = ({
     return fields;
   }, [hoverState?.rack, t]);
   useLayoutEffect(() => {
-    if (!shouldShowHoverTooltip) {
+    if (!hoverPopupVisible) {
       return undefined;
     }
 
@@ -424,7 +455,7 @@ const Room3D: React.FC<Room3DProps> = ({
       resizeObserver.disconnect();
       window.removeEventListener("resize", updateTooltipSize);
     };
-  }, [hoverRackFields, shouldShowHoverTooltip]);
+  }, [hoverPopupVisible, hoverRackFields]);
   const hoverTooltipStyle = useMemo<React.CSSProperties | undefined>(() => {
     if (!hoverState) {
       return undefined;
@@ -605,6 +636,16 @@ const Room3D: React.FC<Room3DProps> = ({
       } as React.CSSProperties}
     >
       <div ref={mountRef} className={styles.canvas} />
+      <InteractionMenuScaleProvider scale={linkMenuScale}>
+        <InteractionDataMenu
+          open={Boolean(linkMenu)}
+          x={linkMenu?.x ?? 0}
+          y={linkMenu?.y ?? 0}
+          label={dataLink?.name || t("dashboard.interactionOpen", "打开链接")}
+          onSelect={() => openPoint(linkMenu?.point)}
+          onClose={() => setLinkMenu(null)}
+        />
+      </InteractionMenuScaleProvider>
       <div className={styles.topBar}>
         <div className={styles.roomTitle} title={roomSummaryText}>
           <strong className={styles.roomTitleName}>{roomData.room.name}</strong>
@@ -641,7 +682,7 @@ const Room3D: React.FC<Room3DProps> = ({
           ))}
         </div>
       )}
-      {shouldShowHoverTooltip && hoverState && (
+      {hoverPopupVisible && hoverState && (
         <div
           ref={tooltipRef}
           className={styles.tooltip}

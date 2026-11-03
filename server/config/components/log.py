@@ -178,7 +178,8 @@ FILE_HANDLER_FILES = {
     "openapi": "openapi.log",
     "mlops": "mlops.log",
     "patch-mgmt": "patch-mgmt.log",
-    "workflow-orchestration": "workflow-orchestration.log",
+    "workflow": "workflow.log",
+    "module-link": "module-link.log",
 }
 
 APP_LOGGER_FILE_HANDLERS = {
@@ -200,7 +201,8 @@ APP_LOGGER_FILE_HANDLERS = {
     "openapi": "openapi",
     "mlops": "mlops",
     "patch-mgmt": "patch-mgmt",
-    "workflow-orchestration": "workflow-orchestration",
+    "workflow": "workflow",
+    "module-link": "module-link",
 }
 
 

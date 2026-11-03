@@ -214,7 +214,6 @@ class PolicyGroupRule(TimeInfo, MaintainerInfo):
         verbose_name="对应监控策略",
     )
     name = models.CharField(max_length=100, verbose_name="规则名称")
-    push_alert_center = models.BooleanField(default=True, verbose_name="推送告警中心")
 
     class Meta:
         verbose_name = "策略组规则"
@@ -243,10 +242,12 @@ class PolicyGroupMembership(TimeInfo, MaintainerInfo):
     STATE_MEMBER = "member"
     STATE_DECLINED = "declined"
     STATE_SKIPPED = "skipped"
+    STATE_FAILED = "failed"
     STATE_CHOICES = (
         (STATE_MEMBER, "在组"),
         (STATE_DECLINED, "不自动入组"),
         (STATE_SKIPPED, "未入组"),
+        (STATE_FAILED, "加入失败"),
     )
 
     monitor_instance = models.OneToOneField(

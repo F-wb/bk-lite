@@ -4,6 +4,7 @@
 """
 
 import datetime
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,29 @@ def test_load_params_fills_defaults():
     assert params["grace_period"] == 0
     assert params["auto_recovery"] is True
     assert params["alert_template"] == {}
+
+
+def test_heartbeat_cron_uses_creator_timezone(monkeypatch):
+    monkeypatch.setattr(
+        "apps.alerts.notification_templates.timefmt.resolve_display_timezone",
+        lambda _usernames: "America/New_York",
+    )
+    strategy = SimpleNamespace(
+        id=1,
+        created_by="ny-user",
+        created_at=datetime.datetime(2026, 3, 20, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    params = {
+        "cron_expr": "0 9 * * *",
+        "grace_period": 0,
+        "activation_mode": "immediate",
+        "last_heartbeat_time": None,
+    }
+    now = datetime.datetime(2026, 3, 20, 12, 0, tzinfo=datetime.timezone.utc)
+
+    deadline = AggregationProcessor()._calculate_deadline(strategy, params, now)
+
+    assert deadline.astimezone(datetime.timezone.utc) == datetime.datetime(2026, 3, 20, 13, 0, tzinfo=datetime.timezone.utc)
 
 
 def test_load_params_preserves_existing():
@@ -103,7 +127,7 @@ def test_get_events_for_strategy_within_window(source):
     now = timezone.now()
     Event.objects.create(source=source, raw_data={}, title="t", level="0", start_time=now, event_id="E1", action=EventAction.CREATED)
     strategy = AlarmStrategy.objects.create(name="s", strategy_type="smart_denoise", params={"window_size": 60})
-    events = AggregationProcessor.get_events_for_strategy(strategy, now)
+    events = AggregationProcessor.get_events_for_strategy(strategy, timezone.now())
     assert events.filter(event_id="E1").exists()
 
 
@@ -136,7 +160,7 @@ def test_get_events_for_strategy_excludes_event_linked_to_closed_alert_of_same_s
     )
     alert.events.add(event)
 
-    events = AggregationProcessor.get_events_for_strategy(strategy, now)
+    events = AggregationProcessor.get_events_for_strategy(strategy, timezone.now())
 
     assert not events.filter(pk=event.pk).exists()
 
@@ -169,7 +193,7 @@ def test_get_events_for_strategy_keeps_event_linked_to_active_alert_of_same_stra
     )
     alert.events.add(event)
 
-    events = AggregationProcessor.get_events_for_strategy(strategy, now)
+    events = AggregationProcessor.get_events_for_strategy(strategy, timezone.now())
 
     assert events.filter(pk=event.pk).exists()
 
@@ -207,7 +231,7 @@ def test_get_events_for_strategy_keeps_event_linked_to_closed_alert_of_other_str
     )
     alert.events.add(event)
 
-    events = AggregationProcessor.get_events_for_strategy(current_strategy, now)
+    events = AggregationProcessor.get_events_for_strategy(current_strategy, timezone.now())
 
     assert events.filter(pk=event.pk).exists()
 
@@ -262,14 +286,8 @@ def test_duckdb_load_empty_returns_none(source):
     conn.close()
 
 
-def test_duckdb_load_with_future_infer_string():
-    """回归：pandas 3.0 的 future.infer_string=True 会把字符串列建成 'str' dtype，
-    而 duckdb 1.1.x 不识别该 dtype，register 会抛 NotImplementedException，
-    导致每条聚合策略整链失败、Alert 一条都生不出来。
-    load_events_to_memory 必须把扩展 string 列降级为 object，保证聚合正常装载。
-    用假 queryset 避免依赖 DB（与本用例无关的迁移状态）。"""
-    import pandas as pd
-
+def test_duckdb_load_string_values_without_pandas():
+    """字符串列必须能直接装入 DuckDB，不再经过 Pandas dtype。"""
     from apps.alerts.aggregation.engine.connection import DuckDBConnection
 
     class _FakeQS:
@@ -281,31 +299,21 @@ def test_duckdb_load_with_future_infer_string():
 
     rows = [
         {
+            "pk": 1,
             "event_id": "E1",
             "title": "主机 10.36.0.60-weopsx 磁盘使用率过高",
             "description": None,
             "level": "2",
             "resource_name": "10.36.0.60-weopsx",
-            "resource_id": "('YTFlY2Y3YWVjZGU5',)",
-            "resource_type": None,
-            "item": None,
             "external_id": "9",
             "received_at": timezone.now(),
             "action": EventAction.CREATED,
-            "source_id": 1,
-            "push_source_id": "lite-monitor",
-            "labels": {"k": "v"},
-            "service": "svc",
-            "location": None,
-            "event_type": 0,
-            "tags": {},
         }
     ]
     conn = DuckDBConnection()
-    with pd.option_context("future.infer_string", True):
-        ok = conn.load_events_to_memory(_FakeQS(rows))
+    ok = conn.load_events_to_memory(_FakeQS(rows), dimensions=["resource_name"])
     assert ok is True
-    assert conn.execute_query("SELECT count(*) AS c FROM events_table")[0]["c"] == 1
+    assert conn.execute_query("SELECT title FROM events_table")[0]["title"] == rows[0]["title"]
     conn.close()
 
 
@@ -400,6 +408,109 @@ def test_process_aggregation_reports_alert_creation_failure(source, mocker):
 
     with pytest.raises(RuntimeError, match="聚合轮次部分失败"):
         AggregationProcessor().process_aggregation()
+
+    strategy.refresh_from_db()
+    assert strategy.last_execute_time is None
+
+
+def _alert_traceback_errors(records):
+    return [
+        record
+        for record in records
+        if record.name == "alert"
+        and record.levelno == logging.ERROR
+        and record.exc_info
+        and record.exc_info[2] is not None
+    ]
+
+
+@pytest.mark.django_db
+def test_query_failure_logs_one_traceback_on_strategy_boundary(source, mocker, caplog):
+    """一次 DuckDB 查询失败只在策略隔离边界保留一份 traceback。"""
+    from apps.alerts.constants.constants import LevelType
+    from apps.alerts.models.models import Level
+
+    for lid in (0, 1, 2):
+        Level.objects.create(
+            level_id=lid,
+            level_name=f"L{lid}",
+            level_display_name=f"等级{lid}",
+            level_type=LevelType.ALERT,
+        )
+
+    Event.objects.create(
+        source=source,
+        raw_data={},
+        title="CPU高",
+        level="1",
+        start_time=timezone.now(),
+        event_id="E-query-fails",
+        action=EventAction.CREATED,
+        service="svc-a",
+        resource_name="host1",
+        item="cpu",
+        external_id="ext-query-fails",
+    )
+    strategy = AlarmStrategy.objects.create(
+        name="查询失败降噪",
+        strategy_type="smart_denoise",
+        is_active=True,
+        team=[1],
+        dispatch_team=[1],
+        match_rules=[[{"key": "title", "operator": "eq", "value": "CPU高"}]],
+        params={"window_size": 60, "group_by": ["service"]},
+    )
+    mocker.patch(
+        "apps.alerts.aggregation.engine.connection.DuckDBConnection.execute_query",
+        side_effect=RuntimeError("aggregation-probe"),
+    )
+
+    mocker.patch(
+        "apps.alerts.aggregation.recovery.timeout_checker.TimeoutChecker.check_session_timeouts",
+        return_value=0,
+    )
+    from apps.alerts.tasks.tasks import event_aggregation_alert
+
+    with caplog.at_level(logging.ERROR, logger="alert"):
+        with pytest.raises(RuntimeError, match="聚合轮次部分失败"):
+            AggregationProcessor().process_aggregation()
+
+        strategy.refresh_from_db()
+        assert strategy.last_execute_time is None
+
+        traced = _alert_traceback_errors(caplog.records)
+        assert len(traced) == 1
+        owner = traced[0]
+        assert owner.msg == "[AlertAggregation] strategy_failed strategy_id=%s name=%s duration_ms=%s"
+        assert owner.args[0] == strategy.id
+        assert owner.args[1] == strategy.name
+        assert f"strategy_id={strategy.id}" in owner.getMessage()
+        exc_type, exc, tb = owner.exc_info
+        assert exc_type is RuntimeError
+        assert str(exc) == "aggregation-probe"
+        assert tb is exc.__traceback__
+
+        round_summaries = [
+            record for record in caplog.records if record.name == "alert" and "聚合处理失败" in record.getMessage()
+        ]
+        assert len(round_summaries) == 1
+        assert round_summaries[0].exc_info is None
+
+        recorded = len(caplog.records)
+        with pytest.raises(RuntimeError, match="聚合轮次部分失败"):
+            event_aggregation_alert()
+
+        added = list(caplog.records[recorded:])
+        added_traced = _alert_traceback_errors(added)
+        assert len(added_traced) == 1
+        assert added_traced[0].funcName != "event_aggregation_alert"
+        assert f"strategy_id={strategy.id}" in added_traced[0].getMessage()
+        task_summaries = [
+            record for record in added if record.name == "alert" and record.funcName == "event_aggregation_alert"
+        ]
+        assert len(task_summaries) == 1
+        assert task_summaries[0].exc_info is None
+        assert "告警聚合任务执行失败" in task_summaries[0].getMessage()
 
     strategy.refresh_from_db()
     assert strategy.last_execute_time is None
@@ -697,7 +808,7 @@ def test_get_events_for_strategy_excludes_shielded(source):
     )
     strategy = AlarmStrategy.objects.create(name="s", strategy_type="smart_denoise", params={"window_size": 60})
 
-    events = AggregationProcessor.get_events_for_strategy(strategy, now)
+    events = AggregationProcessor.get_events_for_strategy(strategy, timezone.now())
     ids = set(events.values_list("event_id", flat=True))
 
     assert "E-ok" in ids

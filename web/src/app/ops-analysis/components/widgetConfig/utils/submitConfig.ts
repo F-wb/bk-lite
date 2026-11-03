@@ -10,6 +10,7 @@ import type {
 } from '@/app/ops-analysis/types/dashBoard';
 import type { ParamItem } from '@/app/ops-analysis/types/dataSource';
 import type { OpsChartThemeMode } from '@/app/ops-analysis/utils/chartTheme';
+import { normalizeInteractionLink } from '@/app/ops-analysis/utils/interactionLink';
 import {
   isFiniteNumber,
   type ThresholdColorConfig,
@@ -38,6 +39,11 @@ import {
   resolveApplication3DWallConfig,
   type Application3DWallConfig,
 } from '@/app/ops-analysis/utils/application3DWallConfig';
+import { persistLineBarFormFields } from '@/app/ops-analysis/utils/lineBarFieldMapping';
+import {
+  persistSingleValueStyle,
+  type SingleValueStyleConfig,
+} from '@/app/ops-analysis/utils/singleValueStyle';
 
 export interface WidgetConfigFormValues {
   name: string;
@@ -60,8 +66,14 @@ export interface WidgetConfigFormValues {
   descriptionField?: string;
   topNLabelField?: string;
   topNValueField?: string;
+  topNScalarFields?: Array<{ field?: string; label?: string }>;
+  barMode?: 'relative' | 'absolute';
+  barMax?: number;
   dimensionField?: string;
   valueField?: string;
+  valueFields?: string[];
+  seriesField?: string;
+  pieScalarFields?: Array<{ field?: string; label?: string }>;
   multiValueLabelField?: string;
   multiValueValueField?: string;
   nodeGraphIdentityMode?: 'ip' | 'service';
@@ -94,12 +106,23 @@ export interface WidgetConfigFormValues {
     layout?: 'list' | 'grid';
   };
   actions?: DashboardActionConfig[];
+  singleStyle?: SingleValueStyleConfig;
+  interaction?: {
+    kind: 'none' | 'title' | 'data';
+    name: string;
+    url: string;
+    openMode: 'sameTab' | 'newTab';
+  };
   appearance?: ValueConfig['appearance'];
 }
 
 type SubmitDisplayColumn = TableColumnConfigItem & {
   id: string;
   isDefault?: boolean;
+};
+
+type DataSubmitColumn = Omit<SubmitDisplayColumn, 'columnType'> & {
+  columnType?: 'data';
 };
 
 type SubmitFilterField = TableFilterFieldConfig & {
@@ -114,6 +137,7 @@ export type WidgetSubmitError =
   | 'cardListLeadingFieldRequired'
   | 'chartRoleFieldsRequired'
   | 'chartRoleFieldPairRequired'
+  | 'lineBarSeriesFieldConflict'
   | 'relatedTopologyInstUuidRequired'
   | 'relatedTopologyModelIdRequired'
   | 'applicationTopologyInstUuidRequired'
@@ -130,9 +154,15 @@ export interface BuildWidgetSubmitConfigInput {
   filterBindings: FilterBindings;
   displayColumns: SubmitDisplayColumn[];
   filterFields: SubmitFilterField[];
-  actions: DashboardActionConfig[];
+  /** 旧操作列。提交忽略它，保存时由 applyInteractionLink 删掉 valueConfig.actions。 */
+  actions?: DashboardActionConfig[];
   /** 预览组装：映射与提交相同，但不因未填必填项拦截。 */
   forPreview?: boolean;
+  /**
+   * 大屏样式在检查器里直接改画布，数据表单提交不能带上 singleStyle，
+   * 否则会把已保存的样式覆盖或清掉。
+   */
+  includeSingleStyle?: boolean;
 }
 
 export interface BuildWidgetSubmitConfigResult {
@@ -160,6 +190,20 @@ export const persistRelatedTopologyConfig = (
     ...(modelId ? { modelId } : {}),
     ...(instUuid ? { instUuid } : {}),
   };
+};
+
+const applyInteractionLink = (
+  result: WidgetConfig,
+  values: WidgetConfigFormValues,
+  chartType: string,
+) => {
+  const link = normalizeInteractionLink(values.interaction, chartType);
+  if (link) {
+    result.interaction = link;
+  } else {
+    delete result.interaction;
+  }
+  delete result.actions;
 };
 
 const buildWidgetConfigBase = (
@@ -274,7 +318,9 @@ const buildTableConfig = ({
       key: column.key.trim(),
       title: column.title?.trim() || column.key.trim(),
     }))
-    .filter((column) => column.key);
+    .filter((column): column is DataSubmitColumn => (
+      Boolean(column.key) && column.columnType !== 'actions'
+    ));
 
   const duplicateKeySet = new Set<string>();
   const hasDuplicateKeys = validDisplayColumns.some((column) => {
@@ -307,7 +353,7 @@ const buildTableConfig = ({
       if (columnWidth !== undefined) {
         next.width = columnWidth;
       }
-      if (column.columnType === 'actions' || !includeCellStyle) {
+      if (!includeCellStyle) {
         return next;
       }
       if (column.cellType === 'colorBackground') {
@@ -336,6 +382,7 @@ const applySingleValueConfig = (
   values: WidgetConfigFormValues,
   selectedFields: string[],
   thresholdColors: ThresholdColorConfig[],
+  includeSingleStyle: boolean,
 ) => {
   result.selectedFields = selectedFields;
   result.thresholdColors = thresholdColors;
@@ -347,6 +394,9 @@ const applySingleValueConfig = (
   }
   applyValueFormatFields(result, values);
   result.valueMappings = values.valueMappings || undefined;
+  if (!includeSingleStyle) return;
+  // 显式写入，包含 undefined，仪表盘合并时才能清掉已关闭的样式。
+  result.singleStyle = persistSingleValueStyle(values.singleStyle);
 };
 
 const trimOptionalField = (value?: string) => {
@@ -363,8 +413,13 @@ const CARD_LIST_FOREIGN_KEYS = [
   'descriptionField',
   'topNLabelField',
   'topNValueField',
+  'topNScalarFields',
+  'barMode',
+  'barMax',
   'dimensionField',
   'valueField',
+  'valueFields',
+  'seriesField',
   'multiValueLabelField',
   'multiValueValueField',
   'nodeGraphIdentityMode',
@@ -408,6 +463,7 @@ const VALUE_FORMAT_CHART_TYPES = new Set([
   'pie',
   'multiValue',
   'nodeGraph',
+  'topN',
 ]);
 
 const stripUnsetOptionalNumericDisplayFields = <T extends object>(
@@ -434,6 +490,17 @@ export const omitForeignChartTypeFields = <T extends object>(
   } else {
     delete next.cardList;
   }
+  delete next.actions;
+  if (chartType !== 'single') {
+    delete next.singleStyle;
+  } else if (
+    !next.singleStyle
+    || typeof next.singleStyle !== 'object'
+    || Array.isArray(next.singleStyle)
+    || Object.keys(next.singleStyle).length === 0
+  ) {
+    delete next.singleStyle;
+  }
   if (chartType === 'multiValue') {
     if (!Array.isArray(next.thresholdColors) || next.thresholdColors.length === 0) {
       delete next.thresholdColors;
@@ -446,9 +513,8 @@ export const omitForeignChartTypeFields = <T extends object>(
 };
 
 /**
- * Dashboard 编辑保存边界：先合并旧 valueConfig 与本次提交字段，
- * 再按最终 chartType 去掉其它图表专属配置。
- * 与 Screen 侧 omitForeignChartTypeFields(...) 语义一致，固定走 ValueConfig。
+ * Dashboard 编辑保存边界：调用方会把本次表单字段逐项写入 nextFields，
+ * 清空的项以 undefined 覆盖旧值。再按最终 chartType 去掉其它图表专属配置。
  */
 export const mergeSanitizedWidgetValueConfig = (
   existingValueConfig: ValueConfig | undefined,
@@ -462,6 +528,58 @@ export const mergeSanitizedWidgetValueConfig = (
     },
     chartType,
   );
+
+/**
+ * 提交结果故意不带这些键，表示用户清空了。大屏用对象展开合并时，
+ * 缺键不会覆盖旧值，所以要在这里删掉。
+ */
+const SCREEN_OPTIONAL_KEYS_CLEARED_WHEN_ABSENT = [
+  'descriptionField',
+  'dimensionField',
+  'valueField',
+  'valueFields',
+  'seriesField',
+  'nodeGraphTargetPortField',
+] as const;
+
+const isBlankOptionalValue = (value: unknown) => {
+  if (value == null) {
+    return true;
+  }
+  if (typeof value === 'string') {
+    return value.trim() === '';
+  }
+  if (Array.isArray(value)) {
+    return value.every((item) => typeof item !== 'string' || item.trim() === '');
+  }
+  return false;
+};
+
+/** 大屏组件数据配置保存：新提交覆盖旧 valueConfig，并丢掉已清空的可选项。 */
+export const mergeScreenWidgetValueConfig = (
+  existingValueConfig: ValueConfig | undefined,
+  submitted: WidgetConfig,
+  chartType: string,
+): ValueConfig => {
+  const merged = {
+    ...(existingValueConfig || {}),
+    ...submitted,
+    interaction: submitted.interaction,
+    actions: submitted.actions,
+    chartType,
+  } as ValueConfig & Record<string, unknown>;
+
+  for (const key of SCREEN_OPTIONAL_KEYS_CLEARED_WHEN_ABSENT) {
+    if (
+      !Object.prototype.hasOwnProperty.call(submitted, key)
+      || isBlankOptionalValue(merged[key])
+    ) {
+      delete merged[key];
+    }
+  }
+
+  return omitForeignChartTypeFields(merged, chartType);
+};
 
 const applyCardListConfig = (
   result: WidgetConfig,
@@ -551,6 +669,8 @@ const applyGaugeConfig = (
   if (values.gaugeMin !== undefined) result.gaugeMin = values.gaugeMin;
   if (values.gaugeMax !== undefined) result.gaugeMax = values.gaugeMax;
   if (values.gaugeShape !== undefined) result.gaugeShape = values.gaugeShape;
+  result.compare = !!values.compare;
+  result.compareMode = values.compareMode || 'percent';
 };
 
 export const buildWidgetSubmitConfig = ({
@@ -563,8 +683,8 @@ export const buildWidgetSubmitConfig = ({
   filterBindings,
   displayColumns,
   filterFields,
-  actions,
   forPreview = false,
+  includeSingleStyle = true,
 }: BuildWidgetSubmitConfigInput): BuildWidgetSubmitConfigResult => {
   if (values.sceneWidgetType) {
     if (values.sceneWidgetType === 'relatedTopology' && !forPreview) {
@@ -577,7 +697,9 @@ export const buildWidgetSubmitConfig = ({
         return { error: 'relatedTopologyInstUuidRequired' };
       }
     }
-    return { config: buildSceneWidgetConfig(values) };
+    const config = buildSceneWidgetConfig(values);
+    applyInteractionLink(config, values, values.sceneWidgetType);
+    return { config };
   }
 
   const result: WidgetConfig = buildWidgetConfigBase(values, chartType);
@@ -607,22 +729,16 @@ export const buildWidgetSubmitConfig = ({
     result.chartThemeMode = values.chartThemeMode;
   }
 
-  if (chartType === 'table') {
-    const displayColumnKeys = new Set(
-      displayColumns.map((column) => (column.key || '').trim()).filter(Boolean),
-    );
-    const validActions = actions.filter((action) =>
-      displayColumnKeys.has(action.columnKey),
-    );
-    if (validActions.length > 0) {
-      result.actions = validActions;
-    } else {
-      delete result.actions;
-    }
-  }
+  applyInteractionLink(result, values, chartType);
 
   if (chartType === 'single') {
-    applySingleValueConfig(result, values, selectedFields, thresholdColors);
+    applySingleValueConfig(
+      result,
+      values,
+      selectedFields,
+      thresholdColors,
+      includeSingleStyle,
+    );
   }
 
   if (chartType === 'gauge') {
@@ -631,6 +747,21 @@ export const buildWidgetSubmitConfig = ({
 
   if (VALUE_FORMAT_CHART_TYPES.has(chartType)) {
     applyValueFormatFields(result, values);
+  }
+
+  if (chartType === 'line' || chartType === 'bar') {
+    const persisted = persistLineBarFormFields(values, forPreview);
+    if ('error' in persisted) {
+      return {
+        error: persisted.error === 'conflict'
+          ? 'lineBarSeriesFieldConflict'
+          : 'chartRoleFieldsRequired',
+      };
+    }
+    result.dimensionField = persisted.fields.dimensionField;
+    result.valueField = persisted.fields.valueField;
+    result.valueFields = persisted.fields.valueFields;
+    result.seriesField = persisted.fields.seriesField;
   }
 
   if (chartType === 'pie') {
@@ -644,6 +775,21 @@ export const buildWidgetSubmitConfig = ({
     }
     if (valueField) {
       result.valueField = valueField;
+    }
+    const scalarFields: Array<{ field: string; label?: string }> = [];
+    (values.pieScalarFields || []).forEach((item) => {
+      const field = trimOptionalField(item?.field);
+      if (!field) {
+        return;
+      }
+      const label = trimOptionalField(item?.label);
+      scalarFields.push(label ? { field, label } : { field });
+    });
+    if (scalarFields.length === 1 && !forPreview) {
+      return { error: 'chartRoleFieldPairRequired' };
+    }
+    if (scalarFields.length >= 2) {
+      result.pieScalarFields = scalarFields;
     }
   }
 
@@ -664,8 +810,33 @@ export const buildWidgetSubmitConfig = ({
   }
 
   if (chartType === 'topN') {
-    result.topNLabelField = values.topNLabelField;
-    result.topNValueField = values.topNValueField;
+    const scalarFields: Array<{ field: string; label?: string }> = [];
+    (values.topNScalarFields || []).forEach((item) => {
+      const field = trimOptionalField(item?.field);
+      if (!field) {
+        return;
+      }
+      const label = trimOptionalField(item?.label);
+      scalarFields.push(label ? { field, label } : { field });
+    });
+    if (scalarFields.length > 0) {
+      result.topNScalarFields = scalarFields;
+      result.topNLabelField = undefined;
+      result.topNValueField = undefined;
+    } else {
+      result.topNLabelField = values.topNLabelField;
+      result.topNValueField = values.topNValueField;
+      result.topNScalarFields = undefined;
+    }
+    if (values.barMode === 'absolute') {
+      result.barMode = 'absolute';
+      result.barMax = isFiniteNumber(values.barMax) && values.barMax > 0
+        ? values.barMax
+        : undefined;
+    } else {
+      result.barMode = undefined;
+      result.barMax = undefined;
+    }
   }
 
   if (chartType === 'nodeGraph') {

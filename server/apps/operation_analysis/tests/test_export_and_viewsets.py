@@ -185,6 +185,45 @@ def test_normalize_screen_keeps_custom_image_background_through_yaml_rewrite():
     assert imported["viewport"]["background"] == {"type": "image", "src": src}
 
 
+def test_normalize_screen_keeps_text_title_link():
+    from apps.operation_analysis.services.canvas_draft.validation import validate_projectable
+
+    interaction = {
+        "kind": "title",
+        "name": "查看告警",
+        "url": "/alerts?source=$source$",
+        "openMode": "newTab",
+    }
+    payload = {
+        "viewport": {"width": 1920, "height": 1080},
+        "items": [
+            {
+                "id": "label-alert-source-event-top",
+                "kind": "text",
+                "content": "告警关联事件来源 TOP10",
+                "x": 44,
+                "y": 1036,
+                "w": 1212,
+                "h": 42,
+                "zIndex": 5,
+                "interaction": interaction,
+            }
+        ],
+        "decorations": {},
+    }
+
+    stored = vs.normalize_canvas_view_sets_for_storage(payload, ObjectType.SCREEN)
+    assert stored["items"][0]["interaction"] == interaction
+
+    exported = vs.rewrite_canvas_view_sets_refs_for_yaml(stored, ObjectType.SCREEN, {})
+    assert exported["items"][0]["interaction"] == interaction
+
+    imported = vs.rewrite_canvas_view_sets_refs_for_storage(exported, ObjectType.SCREEN, {})
+    assert imported["items"][0]["interaction"] == interaction
+
+    validate_projectable(ObjectType.SCREEN, payload)
+
+
 def test_validate_screen_allows_chrome_items_without_chart_type():
     from apps.operation_analysis.services.canvas_draft.validation import validate_projectable
 
@@ -255,6 +294,93 @@ def test_normalize_report_rejects_unregistered_component_type():
             },
             ObjectType.REPORT,
         )
+
+
+def test_architecture_import_keeps_cmdb_binding():
+    from apps.operation_analysis.schemas.import_export_schema import ArchitectureItem
+
+    payload = {
+        "key": "arch-binding",
+        "name": "绑定往返",
+        "view_sets": {
+            "items": [{"id": "model-item"}],
+            "views": [
+                {
+                    "id": "view-1",
+                    "name": "主视图",
+                    "items": [
+                        {
+                            "id": "node-1",
+                            "tile": {"x": 1, "y": 2},
+                            "bkBinding": {"inst_uuid": "uuid-host", "model_id": "host"},
+                        }
+                    ],
+                    "rectangles": [
+                        {
+                            "id": "rect-1",
+                            "from": {"x": 0, "y": 0},
+                            "to": {"x": 3, "y": 3},
+                            "bkBinding": {"inst_uuid": "uuid-switch", "model_id": "switch"},
+                            "bkFollowAlert": True,
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    item = ArchitectureItem.model_validate(payload)
+    view = item.view_sets["views"][0]
+    assert view["items"][0]["bkBinding"] == {"inst_uuid": "uuid-host", "model_id": "host"}
+    assert "bkBinding" not in view["rectangles"][0]
+    assert view["rectangles"][0]["bkFollowAlert"] is True
+    rewritten = vs.rewrite_canvas_view_sets_refs_for_yaml(item.view_sets, ObjectType.ARCHITECTURE, {})
+    stored = vs.rewrite_canvas_view_sets_refs_for_storage(rewritten, ObjectType.ARCHITECTURE, {})
+    assert stored["views"][0]["items"][0]["bkBinding"]["model_id"] == "host"
+    assert "bkBinding" not in stored["views"][0]["rectangles"][0]
+    assert stored["views"][0]["rectangles"][0]["bkFollowAlert"] is True
+
+
+def test_architecture_serializer_drops_rectangle_binding_only():
+    from apps.operation_analysis.serializers.directory_serializers import ArchitectureModelSerializer
+
+    original = {
+        "name": "绑定",
+        "view_sets": {
+            "title": "kept",
+            "items": [{"id": "model-item"}],
+            "views": [
+                {
+                    "id": "view-1",
+                    "extra": True,
+                    "items": [
+                        {"id": "node-1", "bkBinding": {"inst_uuid": "uuid-host", "model_id": "host"}},
+                    ],
+                    "rectangles": [
+                        {
+                            "id": "rect-1",
+                            "bkBinding": "legacy-region-binding",
+                            "bkFollowAlert": True,
+                        },
+                        {"id": "rect-plain"},
+                        "not-a-rectangle",
+                    ],
+                }
+            ],
+        },
+    }
+    source_rectangle = original["view_sets"]["views"][0]["rectangles"][0]
+    serializer = ArchitectureModelSerializer.__new__(ArchitectureModelSerializer)
+    serializer.instance = None
+    validated = ArchitectureModelSerializer.validate(serializer, original)
+    view = validated["view_sets"]["views"][0]
+    assert validated["view_sets"]["title"] == "kept"
+    assert view["extra"] is True
+    assert view["items"][0]["bkBinding"]["inst_uuid"] == "uuid-host"
+    assert "bkBinding" not in view["rectangles"][0]
+    assert view["rectangles"][0]["bkFollowAlert"] is True
+    assert view["rectangles"][1] == {"id": "rect-plain"}
+    assert view["rectangles"][2] == "not-a-rectangle"
+    assert source_rectangle["bkBinding"] == "legacy-region-binding"
 
 
 def test_normalize_architecture_fills_keys():

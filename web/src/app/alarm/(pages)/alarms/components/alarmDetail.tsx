@@ -1,5 +1,7 @@
 'use client';
 
+import ItsmTicket from '@/app/alarm/components/itsm-ticket';
+
 import BaseInfo from './baseInfo';
 import EventTable from '@/app/alarm/components/eventTable';
 import ActionTimeline from './actionTimeline';
@@ -36,7 +38,8 @@ import {
   EventItem,
   AlarmTableDataItem,
 } from '@/app/alarm/types/alarms';
-import { CopyOutlined, ClockCircleOutlined } from '@ant-design/icons';
+import { CopyOutlined, ClockCircleOutlined, LinkOutlined } from '@ant-design/icons';
+import { buildAlarmDetailUrl } from '../alarmDetailLink';
 import React, {
   useState,
   forwardRef,
@@ -468,6 +471,15 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
                   className="cursor-pointer ml-2"
                   onClick={() => copyToClipboard(formData.alert_id || '')}
                 />
+                <Tooltip title={t('alarms.copyDetailLink')}>
+                  <LinkOutlined
+                    className="cursor-pointer ml-2"
+                    onClick={() => {
+                      if (!formData.alert_id) return;
+                      copyToClipboard(buildAlarmDetailUrl(window.location.origin, formData.alert_id));
+                    }}
+                  />
+                </Tooltip>
               </Tag>
             </li>
             <li>
@@ -504,6 +516,7 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
             <div className="min-h-0 flex-1 overflow-auto">
               <div className="flex flex-col gap-4">
                 <BaseInfo detail={formData} />
+                {formData.alert_id && <ItsmTicket alertId={String(formData.alert_id)} alertStatus={formData.status} readonly={readonly} />}
                 <RelatedAlertsPanel alert={formData} onRefresh={handleAction} />
               </div>
             </div>

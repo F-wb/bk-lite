@@ -65,6 +65,7 @@ export const ruleList = [
   { name: 'level', verbose_name: '级别' },
   { name: 'resource_type', verbose_name: '类型对象' },
   { name: 'resource_id', verbose_name: '对象实例' },
+  { name: 'cmdb_id', verbose_name: 'CMDB实例ID' },
   { name: 'content', verbose_name: '内容' },
   { name: 'service', verbose_name: '服务' },
   { name: 'location', verbose_name: '位置' },
@@ -116,10 +117,10 @@ export const ACTION_TRIGGER_EVENTS = [
 ];
 export const ACTION_TYPES = [
   { value: 'job', labelKey: 'settings.actionTypeJob', disabled: false },
-  { value: 'itsm', labelKey: 'settings.actionTypeItsm', disabled: true },
-  { value: 'webhook', labelKey: 'settings.actionTypeWebhook', disabled: true },
+  { value: 'itsm', labelKey: 'settings.actionTypeItsm', disabled: false },
 ];
 export const ACTION_EXEC_STATUS: Record<string, { textKey: string; color: string }> = {
+  unknown: { textKey: 'settings.actionExecUnknown', color: 'warning' },
   pending: { textKey: 'settings.actionExecPending', color: 'default' },
   running: { textKey: 'settings.actionExecRunning', color: 'processing' },
   success: { textKey: 'settings.actionExecSuccess', color: 'success' },

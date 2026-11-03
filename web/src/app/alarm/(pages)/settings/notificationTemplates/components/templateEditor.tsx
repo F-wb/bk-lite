@@ -6,7 +6,7 @@ import dynamic from 'next/dynamic';
 import { useScreenAwareRouter } from '@/console-layout';
 import DOMPurify from 'dompurify';
 import MarkdownIt from 'markdown-it';
-import { Alert, Button, Card, Form, Input, InputRef, Modal, Select, Space, Spin, Tabs, Tag, Typography, message } from 'antd';
+import { Alert, Button, Card, Form, Input, InputRef, Modal, Select, Space, Spin, Tabs, Tag, Tooltip, Typography, message } from 'antd';
 import { ArrowLeftOutlined, EyeOutlined, SaveOutlined } from '@ant-design/icons';
 import { useSettingApi } from '@/app/alarm/api/settings';
 import { useAlarmApi } from '@/app/alarm/api/alarms';
@@ -22,15 +22,20 @@ import {
 import { useTranslation } from '@/utils/i18n';
 import { HandledRequestError } from '@/utils/request';
 import { channelOptionValue } from '@/app/alarm/utils/channelIdentity';
+import { colorizeFeishuMarkdownPreview, FEISHU_MARKDOWN_PREVIEW_STYLE } from '@/app/alarm/utils/colorizeFeishuMarkdownPreview';
+import { colorizeWecomMarkdownPreview, WECOM_MARKDOWN_PREVIEW_STYLE } from '@/app/alarm/utils/colorizeWecomMarkdownPreview';
 import {
   getNotificationTemplateChannel,
   NOTIFICATION_TEMPLATE_CHANNELS,
 } from '@/app/alarm/utils/notificationTemplateChannels';
 import {
   DEFAULT_ALERT_OPERATION_TEMPLATE_CONTENTS,
+  insertAlertDetailExample,
   DEFAULT_NOTIFICATION_TEMPLATE_CONTENTS as DEFAULT_CONTENTS,
   formatLegacyAlertOperationContent,
 } from '@/app/alarm/utils/defaultNotificationTemplateContents';
+import { buildAlarmDetailTemplateHint } from '@/app/alarm/(pages)/alarms/alarmDetailLink';
+import ChannelColorTip from './channelColorTip';
 import EventBlockInsert, { EventBlockCatalog } from './eventBlockInsert';
 
 const AceEditor = dynamic(
@@ -123,6 +128,7 @@ export default function TemplateEditor({ templateId }: TemplateEditorProps) {
   const [testAlerts, setTestAlerts] = useState<AlarmTableDataItem[]>([]);
   const [testAlertsLoading, setTestAlertsLoading] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [alertDetailHint, setAlertDetailHint] = useState('');
   const previewSequence = useRef(0);
 
   useEffect(() => {
@@ -174,6 +180,7 @@ export default function TemplateEditor({ templateId }: TemplateEditorProps) {
         if (active) setLoading(false);
       }
     };
+    setAlertDetailHint(buildAlarmDetailTemplateHint(window.location.origin));
     void loadSupportingData();
     void loadDetail();
     return () => {
@@ -187,6 +194,7 @@ export default function TemplateEditor({ templateId }: TemplateEditorProps) {
   );
   const activeChannelConfig = getNotificationTemplateChannel(activeChannel) || NOTIFICATION_TEMPLATE_CHANNELS[0];
   const isOperationTemplate = templateScope === 'alert_operation';
+  const showAlertDetailHint = templateScope !== 'unassigned_summary';
   const visibleVariables = useMemo(
     () => variables.filter((variable) => !variable.scopes || variable.scopes.includes(templateScope)),
     [templateScope, variables],
@@ -308,9 +316,19 @@ export default function TemplateEditor({ templateId }: TemplateEditorProps) {
   const updateOperationChannel = (selectedChannelId: number) => {
     const channel = operationChannels.find((item) => item.id === selectedChannelId);
     if (!channel) return;
-    const nextContent = contents.find((item) => item.channel_type === channel.channel_type)
-      || DEFAULT_ALERT_OPERATION_TEMPLATE_CONTENTS.find((item) => item.channel_type === channel.channel_type)
-      || { channel_type: channel.channel_type, subject_template: '', body_template: '' };
+    const saved = contents.find((item) => item.channel_type === channel.channel_type);
+    const fallback = DEFAULT_ALERT_OPERATION_TEMPLATE_CONTENTS.find((item) => item.channel_type === channel.channel_type);
+    const nextContent = saved
+      || (fallback
+        ? {
+          ...fallback,
+          body_template: insertAlertDetailExample(
+            fallback.body_template,
+            window.location.origin,
+            channel.channel_type === 'email',
+          ),
+        }
+        : { channel_type: channel.channel_type, subject_template: '', body_template: '' });
     setChannelId(selectedChannelId);
     setTestChannelId(channelOptionValue(channel));
     setContents([nextContent]);
@@ -385,12 +403,22 @@ export default function TemplateEditor({ templateId }: TemplateEditorProps) {
     }
   };
 
-  const previewHtml = activeChannelConfig.previewMode === 'html'
+  const renderedPreview = activeChannelConfig.previewMode === 'html'
     ? DOMPurify.sanitize(preview.body)
     : activeChannelConfig.previewMode === 'markdown'
       ? DOMPurify.sanitize(markdown.render(preview.body))
       : `<pre>${markdown.utils.escapeHtml(preview.body)}</pre>`;
-  const previewDocument = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"></head><body>${previewHtml}</body></html>`;
+  const previewHtml = activeChannel === 'enterprise_wechat_bot'
+    ? colorizeWecomMarkdownPreview(renderedPreview)
+    : activeChannel === 'feishu_bot'
+      ? colorizeFeishuMarkdownPreview(renderedPreview)
+      : renderedPreview;
+  const previewStyle = activeChannel === 'enterprise_wechat_bot'
+    ? `<style>${WECOM_MARKDOWN_PREVIEW_STYLE}</style>`
+    : activeChannel === 'feishu_bot'
+      ? `<style>${FEISHU_MARKDOWN_PREVIEW_STYLE}</style>`
+      : '';
+  const previewDocument = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">${previewStyle}</head><body>${previewHtml}</body></html>`;
 
   const openTestModal = async () => {
     const activeChannelItem = channels.find((channel) => channel.channel_type === activeChannel);
@@ -661,6 +689,7 @@ export default function TemplateEditor({ templateId }: TemplateEditorProps) {
               )}
               <div className="mb-3 flex flex-wrap items-center gap-2">
                 <Typography.Text type="secondary">{t('settings.notificationTemplate.variables')}：</Typography.Text>
+                <ChannelColorTip channelType={activeChannel} onInsert={insertVariable} />
                 {visibleVariables.map((variable) => {
                   const used = usedVariablePaths.has(variable.path);
                   return (
@@ -676,6 +705,25 @@ export default function TemplateEditor({ templateId }: TemplateEditorProps) {
                     </Button>
                   );
                 })}
+                {showAlertDetailHint && (
+                  <Tooltip
+                    title={alertDetailHint}
+                    styles={{
+                      root: { maxWidth: 520 },
+                      body: { userSelect: 'text', whiteSpace: 'normal', wordBreak: 'break-all' },
+                    }}
+                  >
+                    <Button
+                      size="small"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => {
+                        if (alertDetailHint) insertVariable(alertDetailHint);
+                      }}
+                    >
+                      {t('settings.notificationTemplate.alertDetailLinkHint')}
+                    </Button>
+                  </Tooltip>
+                )}
                 {eventBlock && (
                   <EventBlockInsert
                     catalog={eventBlock}

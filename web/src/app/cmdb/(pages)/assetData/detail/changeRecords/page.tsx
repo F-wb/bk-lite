@@ -29,6 +29,7 @@ import {
   STAT_KEYS,
   getChangeRecordRelationInfo,
 } from './changeRecordView';
+import { localizedEnumLabel } from '@/app/cmdb/utils/changeRecordLabel';
 
 const { RangePicker } = DatePicker;
 
@@ -220,10 +221,10 @@ const ChangeRecords: React.FC = () => {
   };
 
   const scenarioLabel = (key: string) =>
-    scenarioEnum[key] || t(`OperationLog.scenarioOpts.${key}`) || key;
+    localizedEnumLabel(t, 'OperationLog.scenarioOpts', key, scenarioEnum);
 
   const typeLabel = (key: string) =>
-    typeEnum[key] || t(`OperationLog.operationOpts.${key}`) || key;
+    localizedEnumLabel(t, 'OperationLog.operationOpts', key, typeEnum);
 
   const showModelName = (id: string) =>
     modelList.find((model: any) => model.model_id === id)?.model_name || id;
@@ -359,7 +360,7 @@ const ChangeRecords: React.FC = () => {
               {Array.from({ length: 8 }).map((_, index) => (
                 <div
                   key={index}
-                  className="h-12 animate-pulse rounded-md bg-[var(--color-fill-2)]"
+                  className="h-12 animate-neutral-pulse rounded-md bg-[var(--color-fill-2)]"
                 />
               ))}
             </div>

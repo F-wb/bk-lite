@@ -40,11 +40,12 @@ import TagCapsuleGroup from '@/components/tag-capsule-group';
 import {
   canSyncMonitor,
   showNodeId,
-  isMonitorSold,
+  canOpenMonitorLink,
   resolveMonitorLinkMessage,
 } from '@/app/cmdb/utils/systemLinkage';
 import MonitorBindModal from './MonitorBindModal';
 import SshTerminalButton from '@/app/cmdb/components/SshTerminalButton';
+import InstUuidCopy from '../../instUuidCopy';
 import { HandledRequestError } from '@/utils/request';
 
 const InfoList: React.FC<AssetDataFieldProps> = ({
@@ -67,9 +68,9 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
   const [bindModalOpen, setBindModalOpen] = useState(false);
   const { t } = useTranslation();
   const { flatGroups } = useUserInfoContext();
-  const { clientData } = useClientData();
+  const { clientData, loading: clientLoading } = useClientData();
 
-  const { updateInstance, getInstanceProxys, pushToMonitor, unbindMonitor } = useInstanceApi();
+  const { updateInstance, getInstanceProxys, pushToMonitor, unbindMonitor, restoreCollect } = useInstanceApi();
 
   const searchParams = useSearchParams();
   const modelId: string =
@@ -274,6 +275,21 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0 flex-1">
               {item.attr_name}
+              {Array.isArray(instDetail.manual_fields) && instDetail.manual_fields.includes(item.attr_id) ? (
+                <Button
+                  type="link"
+                  size="small"
+                  className="!h-auto !p-0 ml-1 text-xs"
+                  onClick={async (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    await restoreCollect(instUuid, [item.attr_id]);
+                    onsuccessEdit?.();
+                  }}
+                >
+                  {t('Collection.reconcileManual')} · {t('Collection.reconcileRestore')}
+                </Button>
+              ) : null}
               {item.is_required ? (
                 <span className={informationList.required}></span>
               ) : null}
@@ -595,7 +611,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
 
   const isMonitorLinked = Boolean(String(instDetail?.monitor_id || '').trim());
   const canOperateMonitor =
-    canSyncMonitor(modelId) && isMonitorSold(clientData);
+    canSyncMonitor(modelId) && canOpenMonitorLink(clientData, clientLoading, modelId);
   const showManualBind = canOperateMonitor && !isMonitorLinked;
   const showRebind = canOperateMonitor && isMonitorLinked;
   const showUnbind = canOperateMonitor && isMonitorLinked;
@@ -691,6 +707,15 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
           )}
         </div>
       )}
+      {instUuid ? (
+        <InstUuidCopy
+          value={instUuid}
+          showLabel
+          wrap
+          className="font-mono text-xs leading-4"
+          rowClassName="mb-3"
+        />
+      ) : null}
       {displayGroups && displayGroups.length > 0 && (
         <Collapse
           bordered={false}

@@ -47,6 +47,13 @@ from apps.cmdb.models.config_file_version import ConfigFileVersion, ConfigFileVe
 from apps.cmdb.openapi_serializers import CmdbModuleDataQuerySerializer
 from apps.cmdb.services import rack_room
 from apps.cmdb.services.application_system import build_application_system_row
+from apps.cmdb.services.asset_overview_query import (
+    AssetOverviewQueryError,
+    build_classification_count_items,
+    list_model_association_options,
+    normalize_text_list,
+    query_cloud_region_resource_counts,
+)
 from apps.cmdb.services.classification import ClassificationManage
 from apps.cmdb.services.config_file_service import ConfigFileService
 from apps.cmdb.services.host_zombie_whitelist import ensure_host_zombie_whitelist_attr
@@ -66,6 +73,7 @@ from apps.core.openapi.decorators import openapi_expose
 from apps.core.utils.permission_utils import get_permission_rules
 from apps.core.utils.time_util import parse_rfc3339_utc
 from apps.core.utils.trend_granularity import resolve_trend_group_by_from_range
+from apps.node_mgmt.services.module_push_contract import EVENT_LIFECYCLE
 from apps.system_mgmt.models import Group, User
 from apps.system_mgmt.models.role import Role
 from apps.system_mgmt.utils.group_utils import GroupUtils
@@ -602,29 +610,77 @@ def search_instances(params):
     return _serialize_instance_for_transport(result)
 
 
+def _instance_org_ids(instance):
+    org_ids = set()
+    for org_id in (instance or {}).get("organization") or []:
+        try:
+            org_ids.add(int(org_id))
+        except (TypeError, ValueError):
+            continue
+    return org_ids
+
+
+def _select_instance_for_orgs(instances, allowed_org_ids):
+    for instance in instances or []:
+        if allowed_org_ids & _instance_org_ids(instance):
+            return _serialize_instance_for_transport(instance)
+    return None
+
+
 @nats_client.register
 @_accept_legacy_rpc_kwargs
 def search_instances_batch(params):
-    """批量查询实例。params={"model_id":..,"inst_uuids":[..],"inst_names":[..]}。"""
+    """批量查询实例。
+
+    带 model_id 时按 inst_uuids / inst_names 查该模型。
+    不带 model_id 时，inst_uuids 按实例 UUID 查，monitor_ids 按实例属性 monitor_id 查。
+    """
     _require_uuid_protocol(params)
     _reject_legacy_numeric_locators(params, "ids", "_id", "inst_ids")
     allowed_org_ids = set(_normalize_allowed_org_ids_for_scope(params.get("organization_ids")))
     if not allowed_org_ids:
         return {}
+    model_id = params.get("model_id")
+    inst_uuids = params.get("inst_uuids") or []
+    monitor_ids = params.get("monitor_ids") or []
+    if not model_id and monitor_ids and not inst_uuids:
+        grouped = InstanceManage.search_inst_by_monitor_ids(monitor_ids)
+        selected = {}
+        for key, instances in grouped.items():
+            chosen = _select_instance_for_orgs(instances, allowed_org_ids)
+            if chosen:
+                selected[key] = chosen
+        return selected
+    if not model_id and inst_uuids:
+        from apps.cmdb.services.instance_identity import optional_inst_uuid
+
+        valid = []
+        seen = set()
+        for value in inst_uuids:
+            parsed = optional_inst_uuid(value)
+            if parsed and parsed not in seen:
+                seen.add(parsed)
+                valid.append(parsed)
+        instances = InstanceManage.query_entity_by_uuids(valid) if valid else []
+        grouped = {}
+        for instance in instances:
+            key = optional_inst_uuid(instance.get("inst_uuid"))
+            if key:
+                grouped.setdefault(key, []).append(instance)
+        selected = {}
+        for key, matches in grouped.items():
+            chosen = _select_instance_for_orgs(matches, allowed_org_ids)
+            if chosen:
+                selected[key] = chosen
+        return selected
     result = InstanceManage.search_inst_batch(
         model_id=params["model_id"],
-        inst_uuids=params.get("inst_uuids"),
+        inst_uuids=inst_uuids,
         inst_names=params.get("inst_names"),
     )
     filtered = {}
     for key, instance in result.items():
-        instance_org_ids = set()
-        for org_id in instance.get("organization") or []:
-            try:
-                instance_org_ids.add(int(org_id))
-            except (TypeError, ValueError):
-                continue
-        if allowed_org_ids & instance_org_ids:
+        if allowed_org_ids & _instance_org_ids(instance):
             filtered[key] = _serialize_instance_for_transport(instance)
     return filtered
 
@@ -738,6 +794,7 @@ def update_instance(params):
         operator=params.get("operator", ""),
         allowed_org_ids=allowed_org_ids,
         skip_permission_check=False,
+        audit_source="接口调用",
     )
     return _serialize_instance_for_transport(result)
 
@@ -773,6 +830,7 @@ def create_instance(params):
             instance_info=instance_info,
             operator=params.get("operator", ""),
             allowed_org_ids=allowed_org_ids,
+            audit_source="接口调用",
         )
     )
 
@@ -785,7 +843,13 @@ def ingest_from_source(params):
       allowed_org_ids / service_scope.allowed_org_ids / user_info
     """
     params = dict(params or {})
-    params["allowed_org_ids"] = _resolve_allowed_org_ids(params)
+    event_type = str(params.get("event_type") or "")
+    try:
+        params["allowed_org_ids"] = _resolve_allowed_org_ids(params)
+    except ValueError:
+        if event_type != EVENT_LIFECYCLE:
+            raise
+        params["allowed_org_ids"] = []
     return CmdbModuleIngestService.ingest(params)
 
 
@@ -818,6 +882,7 @@ def delete_instance(params):
         roles=[],
         inst_uuids=inst_uuids,
         operator=params.get("operator", ""),
+        audit_source="接口调用",
     )
     return {"result": True, "deleted": inst_uuids}
 
@@ -1718,26 +1783,34 @@ def get_monitor_ids_by_inst_uuids(inst_uuids=None, user_info=None, **kwargs):
         }
 
     if not unique:
-        return {"result": True, "data": {"items": []}, "message": ""}
+        return {"result": True, "data": {"items": [], "forbidden_inst_uuids": []}, "message": ""}
 
     permission_map = _build_nats_permission_map(user_info)
+    # 没有可用权限上下文时不读取实例，避免带出名称。调用方已持有这些 uuid，
+    # 统一记为无权，而不是把「查不到」说成已删除。
     if permission_map is None:
-        return {"result": True, "data": {"items": []}, "message": ""}
+        return {"result": True, "data": {"items": [], "forbidden_inst_uuids": list(unique)}, "message": ""}
     user = _normalize_permission_user((user_info or {}).get("user"), domain=(user_info or {}).get("domain"))
     entities = InstanceManage.query_entity_by_uuids(unique)
     items = []
+    forbidden = []
     for entity in entities:
+        inst_uuid = entity.get("inst_uuid")
         if not InstanceManage._has_topology_view_permission(entity, permission_map, user=user):
+            if inst_uuid not in (None, ""):
+                forbidden.append(inst_uuid)
             continue
         monitor_id = entity.get("monitor_id")
+        inst_name = entity.get("inst_name")
         items.append(
             {
-                "inst_uuid": entity.get("inst_uuid"),
+                "inst_uuid": inst_uuid,
                 "model_id": entity.get("model_id"),
                 "monitor_id": "" if monitor_id in (None, "") else str(monitor_id),
+                "inst_name": "" if inst_name in (None, "") else str(inst_name),
             }
         )
-    return {"result": True, "data": {"items": items}, "message": ""}
+    return {"result": True, "data": {"items": items, "forbidden_inst_uuids": forbidden}, "message": ""}
 
 
 @nats_client.register
@@ -2298,13 +2371,153 @@ def get_instance_group_by(model_id=None, field=None, user_info=None, **kwargs):
     return {"result": True, "data": result_data, "message": ""}
 
 
+_DIRECTORY_MAIL_SUMMARY_MODELS = (
+    ("domain_controller_count", "ad_domain_controller"),
+    ("site_count", "ad_site"),
+    ("forest_count", "ad_exchange"),
+    ("domain_count", "ad_domain"),
+    ("trust_count", "ad_trust"),
+    ("exchange_server_count", "exchange_server"),
+    ("database_count", "exchange_database"),
+    ("dag_count", "exchange_dag"),
+    ("accepted_domain_count", "exchange_accepted_domain"),
+    ("certificate_total", "exchange_certificate"),
+)
+
+
+def _parse_certificate_not_after(value):
+    if value in (None, ""):
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = _datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_timezone.utc)
+    return parsed
+
+
+def _list_model_instances(model_id, user_info, page_size=5000):
+    permission_map = _build_nats_permission_map(user_info, model_id=model_id)
+    if permission_map is None:
+        return []
+    rows, _count = InstanceManage.instance_list(
+        model_id=model_id,
+        params=[],
+        page=1,
+        page_size=page_size,
+        order="",
+        permission_map=permission_map,
+    )
+    return rows or []
+
+
+def _certificate_window_counts(user_info=None):
+    now = timezone.now()
+    expired = within_30 = between_30_90 = later = 0
+    for row in _list_model_instances("exchange_certificate", user_info):
+        not_after = _parse_certificate_not_after(row.get("not_after"))
+        if not_after is None:
+            continue
+        if not_after < now:
+            expired += 1
+        elif not_after < now + datetime.timedelta(days=30):
+            within_30 += 1
+        elif not_after < now + datetime.timedelta(days=90):
+            between_30_90 += 1
+        else:
+            later += 1
+    return {
+        "certificate_expired": expired,
+        "certificate_within_30_days": within_30,
+        "certificate_within_90_days": within_30 + between_30_90,
+        "certificate_later": later,
+        "expired": expired,
+        "within_30": within_30,
+        "within_90": within_30 + between_30_90,
+        "later": later,
+    }
+
+
+@nats_client.register
+def get_directory_mail_summary(user_info=None, **kwargs):
+    """目录与邮件配置数量：仪表盘 KPI 单值字段。"""
+    permission_map = _build_nats_permission_map(user_info)
+    empty = {key: 0 for key, _model in _DIRECTORY_MAIL_SUMMARY_MODELS}
+    empty.update(
+        {
+            "dns_zone_count": 0,
+            "forwarder_count": 0,
+            "certificate_expired": 0,
+            "certificate_within_90_days": 0,
+        }
+    )
+    if permission_map is None:
+        return {"result": True, "data": [empty], "message": ""}
+
+    counts = InstanceManage.model_inst_count(permissions_map=permission_map)
+    summary = {key: int(counts.get(model_id, 0) or 0) for key, model_id in _DIRECTORY_MAIL_SUMMARY_MODELS}
+    window = _certificate_window_counts(user_info)
+    summary["certificate_expired"] = window["certificate_expired"]
+    summary["certificate_within_90_days"] = window["certificate_within_90_days"]
+    summary["dns_zone_count"] = int(counts.get("ad_dns_zone", 0) or 0)
+    summary["forwarder_count"] = int(counts.get("ad_dns_forwarder", 0) or 0)
+    if summary["dns_zone_count"] == 0:
+        summary["dns_zone_count"] = sum(
+            len(str(row.get("dns_zones") or "").split(","))
+            for row in _list_model_instances("ad_domain_controller", user_info)
+            if str(row.get("dns_zones") or "").strip()
+        )
+    if summary["forwarder_count"] == 0:
+        summary["forwarder_count"] = sum(
+            len(str(row.get("dns_forwarders") or "").split(","))
+            for row in _list_model_instances("ad_domain_controller", user_info)
+            if str(row.get("dns_forwarders") or "").strip()
+        )
+    return {"result": True, "data": [summary], "message": ""}
+
+
+@nats_client.register
+def get_directory_mail_certificate_window(user_info=None, **kwargs):
+    """证书到期窗口分布。"""
+    window = _certificate_window_counts(user_info)
+    data = [
+        {"name": "已过期", "value": window["expired"]},
+        {"name": "30天内", "value": window["within_30"]},
+        {"name": "90天内", "value": window["within_90"]},
+        {"name": "90天以上", "value": window["later"]},
+    ]
+    return {"result": True, "data": data, "message": ""}
+
+
+@nats_client.register
+def get_directory_mail_runtime_gaps(scope=None, user_info=None, **kwargs):
+    """目录/邮件/主机采集空态。无数据时返回可渲染的占位，避免查询失败。"""
+    permission_map = _build_nats_permission_map(user_info)
+    counts = InstanceManage.model_inst_count(permissions_map=permission_map) if permission_map else {}
+    scope = str(scope or "").strip().lower()
+    if scope == "ad":
+        models = ("ad_exchange", "ad_domain", "ad_domain_controller", "ad_site")
+    elif scope == "exchange":
+        models = ("exchange_server", "exchange_database", "exchange_dag", "exchange_certificate")
+    else:
+        models = ("exchange_server", "ad_domain_controller")
+    missing = [model_id for model_id in models if int(counts.get(model_id, 0) or 0) == 0]
+    if not missing:
+        data = [{"name": "采集完整", "value": 1}]
+    else:
+        data = [{"name": f"{model_id} 无实例", "value": 1} for model_id in missing]
+    return {"result": True, "data": data, "message": ""}
+
+
 @nats_client.register
 def get_model_classification_options(user_info=None, **kwargs):
     """获取当前用户有权查看的可见模型分类，供数据源参数选项使用。"""
     language = _resolve_nats_cmdb_language(user_info)
     model_permissions = _build_nats_model_permission_map(user_info)
     if model_permissions is None:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
 
     models = ModelManage.search_model(
         language=language,
@@ -2313,14 +2526,16 @@ def get_model_classification_options(user_info=None, **kwargs):
     allowed_classification_ids = {model.get("classification_id") for model in models if model.get("classification_id")}
     classifications = ClassificationManage.search_model_classification(language=language)
     return {
-        "items": [
+        "result": True,
+        "data": [
             {
                 "classification_id": item["classification_id"],
                 "classification_name": item["classification_name"],
             }
             for item in classifications
             if item.get("classification_id") in allowed_classification_ids
-        ]
+        ],
+        "message": "",
     }
 
 
@@ -2331,19 +2546,21 @@ def get_classification_model_instance_counts(
     **kwargs,
 ):
     """按模型分类返回当前用户可见且实例数大于零的模型统计。"""
+    # 与 get_room_list 一致：data 是行列表。
+    # 裸 {"items": ...} 没有 result，datasource_view._normalize_downstream_result 会判非标准。
     classification_id = str(classification_id or "").strip()
     if not classification_id:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
 
     language = _resolve_nats_cmdb_language(user_info)
     visible_classification_ids = {item.get("classification_id") for item in ClassificationManage.search_model_classification(language=language)}
     if classification_id not in visible_classification_ids:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
 
     model_permissions = _build_nats_model_permission_map(user_info)
     instance_permissions = _build_nats_permission_map(user_info)
     if model_permissions is None or instance_permissions is None:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
 
     models = ModelManage.search_model(
         language=language,
@@ -2360,45 +2577,156 @@ def get_classification_model_instance_counts(
     ]
     items = [item for item in items if item["value"] > 0]
     items.sort(key=lambda item: (-item["value"], item["label"]))
-    return {"items": items}
+    return {"result": True, "data": items, "message": ""}
 
 
 @nats_client.register
 def get_region_options(user_info=None, **kwargs):
     """Return region tag candidates visible to the current user."""
+    # 与 get_room_list 一致：data 是行列表。
+    # 裸 {"items": ...} 没有 result，datasource_view._normalize_downstream_result 会判非标准。
     language = _resolve_nats_cmdb_language(user_info)
     model_permissions = _build_nats_model_permission_map(user_info)
     if model_permissions is None:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
     models = ModelManage.search_model(language=language, permissions_map=model_permissions)
     classifications = ClassificationManage.search_model_classification(language=language)
     visible_ids = {item.get("classification_id") for item in classifications if item.get("classification_id")}
-    return {"items": extract_region_options(models, visible_ids)}
+    return {"result": True, "data": extract_region_options(models, visible_ids), "message": ""}
 
 
 @nats_client.register
 def get_region_resource_overview(region=None, user_info=None, **kwargs):
     """Return classification instance totals for one region value."""
+    # 与 get_room_list 一致：data 是行列表。
+    # 裸 {"items": ...} 没有 result，datasource_view._normalize_downstream_result 会判非标准。
     region = str(region or "").strip()
     if not region:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
     language = _resolve_nats_cmdb_language(user_info)
     model_permissions = _build_nats_model_permission_map(user_info)
     instance_permissions = _build_nats_permission_map(user_info)
     if model_permissions is None or instance_permissions is None:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
     models = ModelManage.search_model(language=language, permissions_map=model_permissions)
     classifications = ClassificationManage.search_model_classification(language=language)
     visible_ids = {item.get("classification_id") for item in classifications if item.get("classification_id")}
     allowed_regions = extract_region_options(models, visible_ids)
     if region not in {item["value"] for item in allowed_regions}:
-        return {"items": []}
+        return {"result": True, "data": [], "message": ""}
     counts = InstanceManage.group_inst_count(
         group_by_attr="model_id",
         permissions_map=instance_permissions,
         params=[{"field": "tag", "type": "list[]", "value": [f"region:{region}"]}],
     )
-    return {"items": build_region_resource_items(models, classifications, counts)}
+    return {"result": True, "data": build_region_resource_items(models, classifications, counts), "message": ""}
+
+
+@nats_client.register
+def get_cloud_region_options(user_info=None, **kwargs):
+    """云区域选项。数据来自节点管理，值是云区域 ID。"""
+    del user_info, kwargs
+    from apps.rpc.node_mgmt import NodeMgmt
+
+    items = []
+    for item in NodeMgmt().cloud_region_list() or []:
+        if not isinstance(item, dict) or item.get("id") is None or item.get("name") is None:
+            continue
+        items.append({"id": item["id"], "name": item["name"]})
+    return {"result": True, "data": items, "message": ""}
+
+
+@nats_client.register
+def get_model_association_options(model_id=None, user_info=None, **kwargs):
+    """返回一端为指定模型的业务关联。选项源把该模型固定为 host。"""
+    del kwargs
+    language = _resolve_nats_cmdb_language(user_info)
+    return {"result": True, "data": list_model_association_options(language, model_id), "message": ""}
+
+
+def _classification_all_visible(value):
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, (int, float)) and value == 1:
+        return True
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+@nats_client.register
+def get_classification_instance_counts(classification_ids=None, user_info=None, all_visible=None, **kwargs):
+    """按传入顺序返回所选分类的可见实例总数，包含 0。
+
+    classification_ids 为空时，只有显式 all_visible 才返回当前可见的全部分类。
+    显式传入的分类仍然优先，不会被 all_visible 扩成全量。
+    """
+    del kwargs
+    selected = normalize_text_list(classification_ids)
+    expand_visible = _classification_all_visible(all_visible)
+    if not selected and not expand_visible:
+        raise AssetOverviewQueryError("分类不能为空")
+
+    language = _resolve_nats_cmdb_language(user_info)
+    model_permissions = _build_nats_model_permission_map(user_info)
+    if model_permissions is None:
+        return {"result": True, "data": [], "message": ""}
+    instance_permissions = _build_nats_permission_map(user_info)
+    if instance_permissions is None:
+        return {"result": True, "data": [], "message": ""}
+
+    models = ModelManage.search_model(language=language, permissions_map=model_permissions)
+    classifications = ClassificationManage.search_model_classification(language=language)
+    model_classification_ids = {model.get("classification_id") for model in models if model.get("classification_id")}
+    visible_classifications = [item for item in classifications if item.get("classification_id") in model_classification_ids]
+    known = {item.get("classification_id") for item in visible_classifications}
+    if not selected:
+        selected = [item.get("classification_id") for item in visible_classifications if item.get("classification_id")]
+    missing = [item for item in selected if item not in known]
+    if missing:
+        raise AssetOverviewQueryError(f"分类不存在或不可见: {', '.join(missing)}")
+
+    counts = InstanceManage.model_inst_count(permissions_map=instance_permissions)
+    return {
+        "result": True,
+        "data": build_classification_count_items(
+            selected,
+            visible_classifications,
+            models,
+            {str(key): value for key, value in counts.items()},
+        ),
+        "message": "",
+    }
+
+
+@nats_client.register
+def get_cloud_region_resource_counts(
+    cloud_region_ids=None,
+    model_asst_ids=None,
+    supplement_tag_key=None,
+    supplement_tag_value=None,
+    user_info=None,
+    **kwargs,
+):
+    """云区域主机、指定主机关联和未挂主机的标签实例，按模型去重计数。"""
+    del kwargs
+    model_permissions = _build_nats_model_permission_map(user_info)
+    if model_permissions is None:
+        return {"result": True, "data": [], "message": ""}
+    instance_permissions = _build_nats_permission_map(user_info)
+    if instance_permissions is None:
+        return {"result": True, "data": [], "message": ""}
+    language = _resolve_nats_cmdb_language(user_info)
+    models = ModelManage.search_model(language=language, permissions_map=model_permissions)
+    items = query_cloud_region_resource_counts(
+        cloud_region_ids,
+        model_asst_ids,
+        supplement_tag_key,
+        supplement_tag_value,
+        instance_permission_map=instance_permissions,
+        visible_models=models,
+    )
+    return {"result": True, "data": items, "message": ""}
 
 
 @nats_client.register
@@ -2983,6 +3311,7 @@ def batch_update_instances(params):
         update_attr,
         params.get("operator", ""),
         allowed_org_ids=allowed_org_ids,
+        audit_source="接口调用",
     )
     return {"result": True, "updated": inst_uuids}
 

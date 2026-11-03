@@ -3,7 +3,78 @@ from rest_framework import serializers
 
 from apps.opspilot.enum import SkillChannelChoices
 from apps.opspilot.models import SkillChannel
+from apps.opspilot.services.skill_channel_feishu import normalize_feishu_channel_config
 from apps.opspilot.services.skill_channel_service import copy_usage_team_for_channel
+
+
+def _credential_ready(submitted, stored) -> bool:
+    if submitted == "******":
+        return isinstance(stored, str) and bool(stored.strip())
+    return isinstance(submitted, str) and bool(submitted.strip())
+
+
+def _validate_aibot_channel_config(serializer, channel_type):
+    if channel_type != SkillChannelChoices.ENTERPRISE_WECHAT_AIBOT:
+        return
+    raw = serializer.initial_data.get("channel_config") if isinstance(serializer.initial_data, dict) else None
+    if not isinstance(raw, dict):
+        return
+    mode = raw.get("connectionMode")
+    if mode not in {"webhook", "websocket"}:
+        return
+    existing = dict(getattr(serializer.instance, "channel_config", None) or {})
+    if mode == "websocket":
+        submitted = raw.get("websocket") if isinstance(raw.get("websocket"), dict) else {}
+        stored = existing.get("websocket") if isinstance(existing.get("websocket"), dict) else {}
+        if not _credential_ready(submitted.get("botId"), stored.get("botId")):
+            raise serializers.ValidationError({"channel_config": "长连接需要填写 BotID"})
+        if not _credential_ready(submitted.get("secret"), stored.get("secret")):
+            raise serializers.ValidationError({"channel_config": "长连接需要填写 Secret"})
+        return
+    submitted = raw.get("webhook") if isinstance(raw.get("webhook"), dict) else {}
+    stored = existing.get("webhook") if isinstance(existing.get("webhook"), dict) else {}
+    if not _credential_ready(submitted.get("token"), stored.get("token") or existing.get("token")):
+        raise serializers.ValidationError({"channel_config": "短连接需要填写 Token"})
+    if not _credential_ready(submitted.get("encodingAESKey"), stored.get("encodingAESKey") or existing.get("encodingAESKey")):
+        raise serializers.ValidationError({"channel_config": "短连接需要填写 EncodingAESKey"})
+
+
+def _submitted_feishu_value(submitted, stored, key: str) -> str:
+    raw = submitted.get(key)
+    if raw == "******":
+        raw = stored.get(key)
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip()
+
+
+def _validate_feishu_channel_config(serializer, channel_type):
+    if channel_type != SkillChannelChoices.FEISHU:
+        return
+    raw = serializer.initial_data.get("channel_config") if isinstance(serializer.initial_data, dict) else None
+    if not isinstance(raw, dict) or not raw:
+        return
+    existing = normalize_feishu_channel_config(getattr(serializer.instance, "channel_config", None))
+    submitted = normalize_feishu_channel_config(raw)
+    mode = "websocket" if raw.get("connectionMode") == "websocket" else "webhook"
+    app_id = _submitted_feishu_value(submitted, existing, "app_id")
+    app_secret = _submitted_feishu_value(submitted, existing, "app_secret")
+    if mode == "websocket":
+        if not app_id:
+            raise serializers.ValidationError({"channel_config": "长连接需要填写 App ID"})
+        if not app_secret:
+            raise serializers.ValidationError({"channel_config": "长连接需要填写 App Secret"})
+    elif not _submitted_feishu_value(submitted, existing, "verification_token"):
+        raise serializers.ValidationError({"channel_config": "URL 回调需要填写 Verification Token"})
+    if not app_id:
+        return
+    qs = SkillChannel.objects.filter(channel_type=SkillChannelChoices.FEISHU)
+    if serializer.instance is not None:
+        qs = qs.exclude(pk=serializer.instance.pk)
+    for other in qs.only("id", "channel_config"):
+        other_id = normalize_feishu_channel_config(other.channel_config).get("app_id") or ""
+        if other_id and other_id == app_id:
+            raise serializers.ValidationError({"channel_config": "该 App ID 已被发布，重复发布会导致系统混乱"})
 
 
 def _mask_config(config: dict) -> dict:
@@ -72,6 +143,8 @@ class SkillChannelSerializer(serializers.ModelSerializer):
                 qs = qs.exclude(pk=self.instance.pk)
             if qs.exists():
                 raise serializers.ValidationError({"name": "同一智能体下，同渠道类型不能使用重复名称"})
+        _validate_aibot_channel_config(self, channel_type)
+        _validate_feishu_channel_config(self, channel_type)
         return attrs
 
     def create(self, validated_data):

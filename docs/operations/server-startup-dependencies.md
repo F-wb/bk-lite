@@ -35,13 +35,19 @@
 6. `supervisord -n`
 7. Supervisor 才启动 Django API、默认 Celery Worker、独立 Dashboard Report
    Render Worker、Celery Beat、`nats_listener` 和 SNMP Bridge 等运行期进程。
-   若 `INSTALL_APPS` 为空（全装）或包含 `workflow_orchestration`，还会启动编排中心
+   若 `INSTALL_APPS` 为空（全装）或包含 `workflow`，还会启动编排中心
    的 Conductor Worker、触发调度器与产物清理调度器；它们只在运行期访问 Conductor，
    不进入 `batch_init`，也不创建编排专属 Celery 队列。未安装时启动脚本删除对应配置。
    若 `INSTALL_APPS` 为空（全装）或包含 `opspilot`，另有独立 OpsPilot Celery
    Worker 消费 `opspilot_channel` / `opspilot_wiki` / `opspilot_maintenance` / `opspilot_chat_parse`；
    未安装 opspilot 时 `startup.sh` 删除该 supervisor 配置，不拉起该进程。
    默认 Celery Worker 只听默认队列，不消费上述 OpsPilot 队列。
+   同一条件下还有企微智能机器人长连接进程 `run_wecom_aibot_long_connection`，
+   以及飞书长连接进程 `run_feishu_long_connection`。
+   它们只在 `supervisord` 拉起后运行，不进入 `batch_init`，也不等待握手成功。
+   连不上对端或暂时拿不到 Redis 选主锁时只重试，失败不阻断 API 与其它 Worker。
+   未安装 opspilot 时 `startup.sh` 一并删除 `opspilot_wecom_aibot_long_connection.conf`
+   和 `opspilot_feishu_long_connection.conf`。
 
 迁移失败时，启动脚本保留 `manage.py migrate` 的标准错误与退出码并停止容器，
 不会执行缓存表、静态资源、批量初始化或 Supervisor。运维应先按迁移原始错误修复
@@ -142,6 +148,17 @@ startup.sh
 
 增加重试、延长超时或捕获异常都不会消除这条循环依赖。正确处理方式是把对账
 操作移到运行期，或由启动期仅记录待处理状态，再由运行期任务幂等接管。
+
+## CMDB 显示字段回填（运行期收敛，非启动硬依赖）
+
+实例 `_display` 是由 organization、user、enum、tag 原值算出的派生字段。新建和修改实例时，保存逻辑已经写入这份文本。存量回填只补历史实例，失败不影响实例读写。
+
+- 启动期：`batch_init` 只执行 `init_display_fields --models-only`，给模型补 `_display` 字段定义。
+- 启动期入队：`ensure_display_field_backfill_periodic_task()` 并 `backfill_cmdb_display_fields.delay(force=True)`。Broker 不可达只记告警，不让 `startup.sh` 退出。
+- 运行期：Worker 按页扫描。计算值和已有 `_display` 相同则不写；有差异时按字段批量写入。单次任务有实例数上限，未扫完则 1 秒后继续。查询失败停在游标上，由 `*/5` 周期任务重试。
+- 手动补偿：`python manage.py init_display_fields` 仍可在运行期扫完全部实例，同样跳过未变化的值。
+
+禁止把实例全量重写放回 `batch_init`。端口要等 `batch_init` 结束才开，实例扫描留在启动期会把健康检查挡在监听之前。
 
 ## CMDB 实例 UUID 清洗（运行期收敛，非启动硬依赖）
 

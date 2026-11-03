@@ -245,7 +245,7 @@ class TestSkillBackendSources:
         finally:
             os.environ.pop("DB_PASSWORD", None)
         assert "DB_PASSWORD" not in env
-        allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR", "HOME", "KUBECONFIG"}
+        allowed = {"PATH", "LANG", "LC_ALL", "TMPDIR", "HOME", "KUBECONFIG", "PYTHONIOENCODING", "PYTHONUTF8"}
         allowed.update(n._WINDOWS_SOCKET_ENV_KEYS)
         assert set(env).issubset(allowed)
         assert env["TMPDIR"] == "/tmp/run-xyz"
@@ -362,6 +362,7 @@ class TestBuildDeepagentNodes:
         direct_reply_content=None,
         agent_reply=None,
         agent_replies=None,
+        agent_step_tool_results=None,
     ):
         gb = _FakeGraphBuilder()
 
@@ -411,6 +412,24 @@ class TestBuildDeepagentNodes:
             else:
                 reply_text = agent_reply or f"执行结果 {call_index}"
             appended_messages = [AIMessage(content=reply_text)]
+            tool_result = (agent_step_tool_results or {}).get(call_index)
+            if tool_result is not None:
+                from langchain_core.messages import ToolMessage
+
+                tool_name, tool_content = tool_result
+                tool_call_id = f"step-tool-{call_index}"
+                appended_messages = [
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"id": tool_call_id, "name": tool_name, "args": {}}],
+                    ),
+                    ToolMessage(
+                        content=tool_content,
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    ),
+                    *appended_messages,
+                ]
             if call_index in failing_agent_calls:
                 from langchain_core.messages import ToolMessage
 
@@ -615,6 +634,44 @@ class TestBuildDeepagentNodes:
         assert "execute" in visibility._always_visible_tools
         skill_guard = next(m for m in kwargs["middleware"] if isinstance(m, SkillExecutionGuardMiddleware))
         assert skill_guard.enabled is True
+
+    def test_ppt_master_skill_step_keeps_filesystem_and_disables_probe_guard(self):
+        from apps.opspilot.metis.llm.middleware.planned_execution_limits import PlannedExecutionLimitMiddleware
+        from apps.opspilot.services.ppt_master_runtime import PPT_AUTHORING_MIN_MODEL_CALLS
+
+        node = ToolsNodes()
+        node.all_tools = []
+        node._extra_config = SimpleNamespace(matched_skill_packages=[{"package_id": "ppt-master"}])
+        req = _request(user_message="帮我写个广州美食介绍的ppt", run_model_call_limit=10)
+        captured = {}
+        pkgs = [{"package_id": "ppt-master", "name": "PPT Master Skill", "description": "演示文稿"}]
+        fake_backend = MagicMock()
+
+        with (
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+            patch.object(ToolsNodes, "_resolve_skill_packages", return_value=pkgs),
+            patch.object(ToolsNodes, "_build_skill_backend_and_sources", return_value=(fake_backend, ["/skills/"], None)),
+        ):
+            self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "生成演示文稿",
+                    "steps": [{"objective": "按 ppt-master 读取技能、写页面并导出原生 pptx", "tools": ["__use_skills__"]}],
+                },
+            )
+
+        kwargs = captured["create_kwargs"]
+        visibility = next(m for m in kwargs["middleware"] if isinstance(m, ToolVisibilityMiddleware))
+        skill_guard = next(m for m in kwargs["middleware"] if isinstance(m, SkillExecutionGuardMiddleware))
+        limit = next(m for m in kwargs["middleware"] if isinstance(m, PlannedExecutionLimitMiddleware))
+        assert skill_guard.enabled is False
+        assert "read_file" in visibility._always_visible_tools
+        assert "write_file" in visibility._always_visible_tools
+        assert "execute" in visibility._always_visible_tools
+        assert "execute" not in visibility._hidden_tools
+        assert limit.run_limit >= PPT_AUTHORING_MIN_MODEL_CALLS
 
     def test_context_overflow_skips_current_step_and_continues_remaining(self):
         node = ToolsNodes()
@@ -1074,6 +1131,74 @@ class TestBuildDeepagentNodes:
         assert call_limit.run_limit == 10
         assert call_limit.token_budget == 0
         assert call_limit.enforce_limits is False  # 总结轮关闭硬限制
+
+    def test_model_call_limit_asks_to_continue_instead_of_summarizing(self):
+        import json
+
+        from apps.opspilot.metis.llm.middleware.planned_execution_limits import LIMIT_MARKER_MODEL_CALLS, build_limit_exceeded_message
+        from apps.opspilot.utils.pending_question import consume_pending_question, deserialize_evidence
+
+        node = ToolsNodes()
+        node._dynamic_mode = True
+        node.all_tools = [_tool("current_time"), _tool("monitor_list_object_instances")]
+        node.active_tools = []
+        req = _request(user_message="确认当前时间")
+        captured = {}
+        limit_text = build_limit_exceeded_message("model_calls", used=10, limit=10)
+        instance_id = "3f0e6d2a-1c2b-4a5d-9e8f-7a6b5c4d3e2f"
+        tool_payload = json.dumps(
+            {
+                "success": True,
+                "data": [{"instance_id": instance_id, "name": "bj-web-server-01"}],
+            },
+            ensure_ascii=False,
+        )
+
+        from django.test import override_settings
+
+        _locmem = {
+            "default": {
+                "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+                "LOCATION": "deepagent-limit-continue-test",
+            }
+        }
+
+        with (
+            override_settings(CACHES=_locmem),
+            patch.object(ToolsNodes, "_build_knowledge_retrieve_tool", return_value=None),
+        ):
+            result = self._run_wrapper(
+                node,
+                req,
+                captured,
+                plan_payload={
+                    "goal": "确认当前时间",
+                    "steps": [{"objective": "确认当前时间", "tools": ["current_time"]}],
+                },
+                agent_replies={1: limit_text},
+                agent_step_tool_results={
+                    1: ("monitor_list_object_instances", tool_payload),
+                },
+            )
+
+            assert len(captured["ainvoke_messages"]) == 1
+            assert captured.get("direct_reply_calls") in (None, [])
+            text = "\n".join(str(getattr(message, "content", "") or "") for message in result["messages"])
+            assert "已达模型调用次数上限，是否继续执行" in text
+            assert "已有结论：" in text
+            assert instance_id in text
+            assert LIMIT_MARKER_MODEL_CALLS not in text
+            assert "1. 继续" in text
+            assert "2. 结束本步骤" in text
+            assert "暂时停止" not in text
+
+            pending = consume_pending_question("thread:thread-ut-1")
+            assert pending is not None
+            assert pending["kind"] == "limit_continue"
+            evidence = deserialize_evidence(pending.get("evidence_messages"))
+            tool_names = {str(getattr(message, "name", "") or "") for message in evidence}
+            assert "monitor_list_object_instances" in tool_names
+            assert any(instance_id in str(getattr(message, "content", "") or "") for message in evidence)
 
     def test_tool_failure_replans_only_unfinished_steps(self):
         # 不用 namespace 反查类工具，避免规划硬校验改写步骤顺序。
@@ -2220,6 +2345,68 @@ def test_summarize_planned_step_keeps_tool_result_not_investigation_dump():
     assert "调查结论" not in summary
 
 
+def test_summarize_planned_step_for_limit_continue_keeps_carry_over():
+    import json
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    from apps.opspilot.metis.llm.middleware.planned_execution_limits import build_limit_exceeded_message
+
+    instances = json.dumps(
+        {
+            "success": True,
+            "data": [
+                {
+                    "instance_id": "3f0e6d2a-1c2b-4a5d-9e8f-7a6b5c4d3e2f",
+                    "name": "bj-web-server-01",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "monitor_list_object_instances", "args": {}}]),
+        ToolMessage(content=instances, tool_call_id="1", name="monitor_list_object_instances"),
+        AIMessage(content="已获取 1 个主机实例。"),
+        AIMessage(content=build_limit_exceeded_message("model_calls", used=10, limit=10)),
+    ]
+    summary = ToolsNodes._summarize_planned_step_for_limit_continue(messages)
+    assert "3f0e6d2a-1c2b-4a5d-9e8f-7a6b5c4d3e2f" in summary
+    assert "[OPSPILOT_LIMIT:" not in summary
+    assert "暂时停止" not in summary
+
+
+def test_summarize_planned_step_for_limit_continue_stitches_carry_over_on_tool_bits_path():
+    """无结论文案且工具原文超过 400 字时，tool_bits 路径也必须带上结构化 carry-over。"""
+    import json
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    from apps.opspilot.metis.llm.chain.deepagent_assembly import _CARRY_OVER_MARKER
+    from apps.opspilot.metis.llm.middleware.planned_execution_limits import build_limit_exceeded_message
+
+    instance_id = "9a8b7c6d-5e4f-3a2b-1c0d-ef9876543210"
+    padding = "x" * 500
+    instances = json.dumps(
+        {
+            "success": True,
+            "padding": padding,
+            "data": [{"instance_id": instance_id, "name": "host-far"}],
+        },
+        ensure_ascii=False,
+    )
+    assert instance_id not in instances[:400]
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "1", "name": "monitor_list_object_instances", "args": {}}]),
+        ToolMessage(content=instances, tool_call_id="1", name="monitor_list_object_instances"),
+        AIMessage(content=build_limit_exceeded_message("model_calls", used=10, limit=10)),
+    ]
+    summary = ToolsNodes._summarize_planned_step_for_limit_continue(messages)
+    assert _CARRY_OVER_MARKER in summary
+    assert f"instance_id={instance_id}" in summary
+    assert "[OPSPILOT_LIMIT:" not in summary
+
+
 def test_summarize_planned_step_carries_instance_id_into_next_step():
     """查全部主机时第 3 步要用第 2 步查到的 instance_id，摘要只留正文会把它丢掉。"""
     import json
@@ -2416,7 +2603,8 @@ def test_planned_tool_step_guidance_is_policy_not_skill_scan():
     assert "Missing parameters" in guidance
     assert "查不到再查" in guidance
     assert "monitor_list_object_metrics" in guidance
-    assert "cpu.util" in guidance
+    assert "不要改成类别词" in guidance
+    assert "目录里没有的指标名" in guidance
     assert "空矩阵" in guidance
     assert "instance_ids" in guidance
     assert "禁止用 name" in guidance or "禁止用实例名" in guidance

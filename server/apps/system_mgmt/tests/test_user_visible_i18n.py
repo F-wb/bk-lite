@@ -12,7 +12,23 @@ from apps.system_mgmt.utils.i18n import system_mgmt_message
         ("error.initial_password_required", {}, "请设置初始密码", "Set an initial password"),
         ("error.otp_whitelist_must_be_user_ids", {}, "OTP 白名单必须是用户 ID 列表", "OTP allowlist must be a list of user IDs"),
         ("error.no_permission_access_team", {}, "无权访问该团队数据", "You do not have permission to access this organization's data"),
-        ("error.builtin_entry_immutable", {"label": "10.0.0.0/8"}, "内置条目不可修改或删除: 10.0.0.0/8", "Built-in entries cannot be modified or deleted: 10.0.0.0/8"),
+        ("error.im_group_channel_unavailable", {}, "IM 群协作渠道不存在或已禁用", "IM collaboration channel does not exist or is disabled"),
+        ("error.im_group_channel_not_ready", {}, "IM 群协作渠道尚未就绪", "IM collaboration channel is not ready"),
+        ("error.im_group_provider_unsupported", {}, "当前 IM 平台不支持群协作", "This IM platform does not support group collaboration"),
+        ("error.im_group_instance_not_ready", {}, "IM 群协作集成实例尚未就绪", "IM collaboration integration instance is not ready"),
+        ("error.im_group_capability_not_ready", {}, "IM 群协作能力尚未就绪", "IM collaboration capability is not ready"),
+        (
+            "error.builtin_entry_immutable",
+            {"label": "10.0.0.0/8"},
+            "内置条目不可修改或删除: 10.0.0.0/8",
+            "Built-in entries cannot be modified or deleted: 10.0.0.0/8",
+        ),
+        (
+            "error.forbidden_network_supernet",
+            {},
+            "禁止添加 0.0.0.0/0 或 ::/0（等于关闭全部防护）",
+            "Adding 0.0.0.0/0 or ::/0 is forbidden because it disables all protection",
+        ),
         ("error.opspilot_channel_readonly", {}, "OpsPilot 工作流自动创建的通道不可编辑或删除", "Channels created by an OpsPilot workflow cannot be edited or deleted"),
         ("error.email_recipient_missing_or_unknown", {}, "用户邮箱为空或用户不存在", "The user has no email address or does not exist"),
         ("error.password_strength_insufficient", {}, "密码强度不够", "Password does not meet the strength requirements"),
@@ -39,7 +55,24 @@ from apps.system_mgmt.utils.i18n import system_mgmt_message
         ),
         ("error.current_team_archived_or_missing", {}, "current_team 对应组织已归档或不存在", "The current organization is archived or does not exist"),
         ("error.channel_id_not_found", {}, "传入的channel_id无法匹配到channel", "No channel matches the given channel_id"),
+        ("error.notification_provider_unavailable", {}, "通知传输暂不可用。", "Notification transport is temporarily unavailable."),
+        ("error.notification_invalid_provider_response", {}, "通知渠道返回格式无效。", "The notification channel returned an invalid response."),
+        ("error.alert_copy_partial_accepted", {}, "告警中心仅接受了部分事件副本。", "The alert center accepted only some event copies."),
+        ("error.notification_delivery_failed", {}, "通知渠道投递失败。", "Notification channel delivery failed."),
+        ("error.alert_copy_rejected", {}, "告警中心未接受事件副本。", "The alert center did not accept the event copy."),
+        (
+            "error.vault_secret_key_not_configured",
+            {},
+            "SECRET_KEY 未配置,无法加解密 vault",
+            "SECRET_KEY is not configured; cannot encrypt or decrypt the vault",
+        ),
         ("channel.opspilot_nats_trigger_description", {}, "OpsPilot 工作流自动创建的 NATS 触发通道", "NATS trigger channel created by an OpsPilot workflow"),
+        (
+            "export.too_many_rows",
+            {"limit": 10000, "count": 10001},
+            "导出行数超过上限 10000（当前 10001 行）。请缩小筛选条件，或使用 selected_ids 导出已选记录。",
+            "Export exceeds the limit of 10000 rows (current count is 10001). Narrow the filters, or export the selected rows with selected_ids.",
+        ),
         ("export.login_log_sheet", {}, "用户登录日志", "User login logs"),
         ("export.operation_log_filename", {}, "用户操作日志", "user_operation_logs"),
     ],
@@ -56,10 +89,6 @@ def test_opspilot_channel_description_stays_language_neutral_until_read():
     from apps.system_mgmt.utils.i18n import OPSPILOT_NATS_DESCRIPTION_MARKER, localized_channel_description
 
     assert OPSPILOT_NATS_DESCRIPTION_MARKER == "opspilot_nats_trigger"
-    assert localized_channel_description(OPSPILOT_NATS_DESCRIPTION_MARKER, "en") == (
-        "NATS trigger channel created by an OpsPilot workflow"
-    )
-    assert localized_channel_description("OpsPilot 工作流自动创建的 NATS 触发通道", "zh-Hans") == (
-        "OpsPilot 工作流自动创建的 NATS 触发通道"
-    )
+    assert localized_channel_description(OPSPILOT_NATS_DESCRIPTION_MARKER, "en") == ("NATS trigger channel created by an OpsPilot workflow")
+    assert localized_channel_description("OpsPilot 工作流自动创建的 NATS 触发通道", "zh-Hans") == ("OpsPilot 工作流自动创建的 NATS 触发通道")
     assert localized_channel_description("manual description", "en") == "manual description"

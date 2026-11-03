@@ -1,11 +1,17 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { Empty } from "antd";
 import { Rnd } from "react-rnd";
+import {
+  FilterTemplateProvider,
+  FilterTemplateTextBridge,
+  FilterTemplateTitleGate,
+} from "@/app/ops-analysis/context/filterTemplate";
 import { useTranslation } from "@/utils/i18n";
 import type {
   FilterValue,
+  ScreenLayoutMode,
   UnifiedFilterDefinition,
 } from "@/app/ops-analysis/types/dashBoard";
 import type { DatasourceItem } from "@/app/ops-analysis/types/dataSource";
@@ -20,9 +26,19 @@ import type { DashboardWidgetRenderResult } from "@/app/ops-analysis/renderContr
 import type { CanvasRuntimeRefreshCause } from "@/app/ops-analysis/utils/canvasRefreshTimer";
 import type { OpsChartThemeMode } from "@/app/ops-analysis/utils/chartTheme";
 import { getScreenRndNodeClassName } from "../utils/classNames";
-import { calculateScreenVisualMetrics } from "../utils/metrics";
+import {
+  getScreenResizeEnablement,
+  screenGeometryFromResize,
+} from "../utils/screenResizeHandles";
+import {
+  calculateScreenVisualMetrics,
+  mapDesignBoxToViewportPixels,
+  resolveChromeFontDensity,
+  resolvePresentedUiScale,
+} from "../utils/metrics";
 import { resolveScreenCanvasBackgroundStyle } from "../utils/screenBackground";
 import {
+  collectScreenFilterTemplateTexts,
   isScreenDecorationItem,
   isScreenWidgetItem,
   readScreenChromeDrag,
@@ -30,9 +46,15 @@ import {
   type ScreenChromeDragPayload,
 } from "../utils/screenItems";
 import { getScreenTheme } from "../utils/screenTheme";
-import { resolveScreenDisplayAdapter } from "../utils/viewport";
+import {
+  resolveScreenDisplayAdapter,
+  shouldUseViewportPixelLayout,
+} from "../utils/viewport";
 import ScreenChromeRenderer from "./screenChromeRenderer";
-import { ScreenChromeSkinStyles } from "./screenChromeSkins";
+import {
+  ChromeFontDensityProvider,
+  ScreenChromeSkinStyles,
+} from "./screenChromeSkins";
 import ScreenWidgetRenderer from "./screenWidgetRenderer";
 
 const RndComponent = Rnd as unknown as React.ComponentType<any>;
@@ -78,6 +100,8 @@ interface ScreenCanvasProps {
     >,
   ) => void;
   onDismissInspector?: () => void;
+  onFilterTemplateSettled?: () => void;
+  resolveFilterTextRef?: MutableRefObject<(text?: string | null) => string>;
 }
 
 interface CanvasSize {
@@ -113,6 +137,7 @@ interface ScreenRndItemProps {
   editable: boolean;
   selected: boolean;
   scale: number;
+  scaleY?: number;
   minWidth?: number;
   minHeight?: number;
   children: React.ReactNode;
@@ -160,6 +185,7 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
     editable,
     selected,
     scale,
+    scaleY = scale,
     minWidth = 160,
     minHeight = 110,
     children,
@@ -200,6 +226,19 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
         h: Math.round(nextGeometry.h),
       });
     };
+
+    const liveResizeEnablement = getScreenResizeEnablement({
+      editable,
+      selected,
+      width: geometry.w,
+      height: geometry.h,
+      scaleX: scale,
+      scaleY,
+    });
+    const resizeEnablementRef = useRef(liveResizeEnablement);
+    if (!interactingRef.current) {
+      resizeEnablementRef.current = liveResizeEnablement;
+    }
 
     useEffect(() => {
       return () => {
@@ -344,16 +383,7 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
         minHeight={minHeight}
         dragHandleClassName="screen-widget-frame__drag-handle"
         cancel="button,input,textarea,.ant-select"
-        enableResizing={{
-          top: false,
-          right: false,
-          bottom: false,
-          left: false,
-          topRight: editable && selected,
-          bottomRight: editable && selected,
-          bottomLeft: editable && selected,
-          topLeft: editable && selected,
-        }}
+        enableResizing={resizeEnablementRef.current}
         resizeHandleClasses={{
           top: "screen-rnd-handle screen-rnd-handle--n",
           right: "screen-rnd-handle screen-rnd-handle--e",
@@ -399,31 +429,21 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
           onSelectItem?.(item.id);
         }}
         onResize={(_, __, ref, ___, position) => {
-          updateGeometry({
-            x: position.x,
-            y: position.y,
-            w: ref.offsetWidth,
-            h: ref.offsetHeight,
-          });
+          updateGeometry(screenGeometryFromResize(ref, position));
         }}
         onResizeStop={(_, __, ref, ___, position) => {
-          const nextGeometry = {
-            x: position.x,
-            y: position.y,
-            w: ref.offsetWidth,
-            h: ref.offsetHeight,
-          };
+          const nextGeometry = screenGeometryFromResize(ref, position);
           updateGeometry(nextGeometry);
           interactingRef.current = false;
           ref.style.zIndex = String(item.zIndex);
           ref.classList.remove("screen-rnd-node--interacting");
           onResizeItem?.(item.id, {
-            w: Math.round(nextGeometry.w),
-            h: Math.round(nextGeometry.h),
+            w: nextGeometry.w,
+            h: nextGeometry.h,
           });
           onMoveItem?.(item.id, {
-            x: Math.round(nextGeometry.x),
-            y: Math.round(nextGeometry.y),
+            x: nextGeometry.x,
+            y: nextGeometry.y,
           });
         }}
       >
@@ -464,6 +484,7 @@ interface ScreenCanvasNodeProps {
   fitScale: number;
   screenDensity: number;
   screenUiScale: number;
+  layoutMode: ScreenLayoutMode;
   chartThemeMode: OpsChartThemeMode;
   refreshVersion: number;
   refreshCause?: CanvasRuntimeRefreshCause;
@@ -495,6 +516,7 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
   fitScale,
   screenDensity,
   screenUiScale,
+  layoutMode,
   chartThemeMode,
   refreshVersion,
   refreshCause,
@@ -515,6 +537,14 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
   layoutEditable,
 }: ScreenCanvasNodeProps) {
   const isWidget = isScreenWidgetItem(item);
+  const viewportPixels = layoutMode === "viewportPixels";
+  const displayItem = useMemo(() => {
+    if (!viewportPixels) return item;
+    const box = mapDesignBoxToViewportPixels(item, scale, scaleY);
+    return { ...item, x: box.x, y: box.y, w: box.w, h: box.h };
+  }, [item, scale, scaleY, viewportPixels]);
+  const rndScale = viewportPixels ? 1 : scale;
+  const rndScaleY = viewportPixels ? 1 : scaleY;
   const content = isWidget ? (
     <ScreenWidgetRenderer
       item={item}
@@ -528,6 +558,7 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
       scaleY={scaleY}
       screenDensity={screenDensity}
       screenUiScale={screenUiScale}
+      layoutMode={layoutMode}
       dataSourceResolver={dataSourceResolver}
       chartThemeMode={chartThemeMode}
       filterDefinitions={filterDefinitions}
@@ -551,10 +582,11 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
 
   return (
     <ScreenRndItem
-      item={item}
+      item={displayItem}
       editable={editable}
       selected={editable && selected}
-      scale={scale}
+      scale={rndScale}
+      scaleY={rndScaleY}
       minWidth={
         isScreenWidgetItem(item) ? (item.chartType === 'single' ? 72 : 160) : 24
       }
@@ -597,6 +629,8 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
   onDropChrome,
   onTopologyLayoutChange,
   onDismissInspector,
+  onFilterTemplateSettled,
+  resolveFilterTextRef,
   forceContain = false,
 }) => {
   const { t } = useTranslation();
@@ -669,7 +703,32 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
   ]);
 
   const scale = screenMetrics.scaleX;
+  const viewportPixelLayout = shouldUseViewportPixelLayout({
+    adapter: viewSets.viewport.adapter,
+    fullscreen,
+    shareMode,
+    forceContain,
+  });
+  const layoutMode: ScreenLayoutMode = viewportPixelLayout
+    ? "viewportPixels"
+    : "designTransform";
+  const presentedUiScale = resolvePresentedUiScale(
+    layoutMode,
+    screenMetrics.screenDensity,
+    screenMetrics.screenUiScale,
+  );
+  const chromeFontDensity = resolveChromeFontDensity(
+    layoutMode,
+    screenMetrics.fitScale,
+  );
+  const chromeBorderDensity = viewportPixelLayout ? screenMetrics.fitScale : 1;
   const resolveDataSource = dataSourceResolver ?? unresolvedDataSource;
+  const filterTemplateTexts = useMemo(
+    () => collectScreenFilterTemplateTexts(viewSets.items),
+    [viewSets.items],
+  );
+  const resolveEnabled = !editMode || fullscreen || Boolean(shareMode);
+  const canvasKey = screenId == null ? '' : String(screenId);
   const editable = Boolean(editMode && !fullscreen);
   const workbenchAlign =
     displayAdapter === "fitHeight"
@@ -679,6 +738,20 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
         : "items-center justify-center overflow-hidden";
 
   return (
+    <FilterTemplateProvider
+      definitions={filterDefinitions ?? []}
+      appliedValues={unifiedFilterValues ?? {}}
+      resolveEnabled={resolveEnabled}
+      canvasId={canvasKey}
+    >
+    <FilterTemplateTitleGate
+      texts={filterTemplateTexts}
+      active={resolveEnabled}
+      onSettled={() => onFilterTemplateSettled?.()}
+    />
+    {resolveFilterTextRef ? (
+      <FilterTemplateTextBridge textRef={resolveFilterTextRef} />
+    ) : null}
     <div
       ref={containerRef}
       className={`screen-canvas-workbench flex h-full min-h-0 w-full ${workbenchAlign} ${
@@ -715,9 +788,20 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           height: screenMetrics.renderedHeight,
         }}
       >
+        <ChromeFontDensityProvider
+          density={chromeFontDensity}
+          borderDensity={chromeBorderDensity}
+          geometryScaleX={viewportPixelLayout ? screenMetrics.scaleX : 1}
+          geometryScaleY={viewportPixelLayout ? screenMetrics.scaleY : 1}
+        >
         <div
           className={`screen-tech-canvas relative overflow-hidden ${
             editMode && !fullscreen ? "screen-tech-canvas--editing" : ""
+          } ${
+            !viewportPixelLayout &&
+            Math.abs(screenMetrics.scaleX - screenMetrics.scaleY) > 0.001
+              ? "screen-tech-canvas--stretched"
+              : ""
           }`}
           data-screen-theme={screenTheme.id}
           onClick={() => editMode && onSelectItem?.(null)}
@@ -745,13 +829,17 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
             });
           }}
           style={{
-            width,
-            height,
-            transform: `scale(${screenMetrics.scaleX}, ${screenMetrics.scaleY})`,
+            width: viewportPixelLayout ? screenMetrics.renderedWidth : width,
+            height: viewportPixelLayout ? screenMetrics.renderedHeight : height,
+            transform: viewportPixelLayout
+              ? "none"
+              : `scale(${screenMetrics.scaleX}, ${screenMetrics.scaleY})`,
             ...canvasBackground,
             "--screen-fit-scale": screenMetrics.fitScale,
+            "--screen-scale-x": screenMetrics.scaleX,
+            "--screen-scale-y": screenMetrics.scaleY,
             "--screen-density": screenMetrics.screenDensity,
-            "--screen-ui-scale": screenMetrics.screenUiScale,
+            "--screen-ui-scale": presentedUiScale,
           } as React.CSSProperties}
         >
           {editMode && !fullscreen && (
@@ -778,6 +866,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
                 fitScale={screenMetrics.fitScale}
                 screenDensity={screenMetrics.screenDensity}
                 screenUiScale={screenMetrics.screenUiScale}
+                layoutMode={layoutMode}
                 chartThemeMode={screenTheme.chartThemeMode}
                 refreshVersion={refreshVersion ?? 0}
                 refreshCause={refreshCause}
@@ -800,6 +889,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
             ))
           )}
         </div>
+        </ChromeFontDensityProvider>
       </div>
       <ScreenChromeSkinStyles />
       <style>{`
@@ -823,6 +913,22 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           border-radius: 0;
           background: var(--screen-stage-bg);
           box-shadow: var(--screen-stage-shadow);
+        }
+
+        .screen-tech-canvas--stretched .screen-uniform-text {
+          transform: scale(
+            calc(var(--screen-fit-scale) / var(--screen-scale-x)),
+            calc(var(--screen-fit-scale) / var(--screen-scale-y))
+          );
+          transform-origin: left center;
+        }
+
+        .screen-tech-canvas--stretched .screen-uniform-text[data-align="center"] {
+          transform-origin: center center;
+        }
+
+        .screen-tech-canvas--stretched .screen-uniform-text[data-align="right"] {
+          transform-origin: right center;
         }
 
         .screen-tech-canvas {
@@ -917,6 +1023,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           width: 8px !important;
           height: 8px !important;
           left: calc(50% - 4px) !important;
+          cursor: ns-resize !important;
         }
 
         .screen-rnd-handle--e,
@@ -924,6 +1031,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           width: 8px !important;
           height: 8px !important;
           top: calc(50% - 4px) !important;
+          cursor: ew-resize !important;
         }
 
         .screen-rnd-handle--n {
@@ -985,10 +1093,18 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           bottom: -4px !important;
         }
 
+        .screen-rnd-node--selected:hover .screen-rnd-handle--n,
+        .screen-rnd-node--selected:hover .screen-rnd-handle--e,
+        .screen-rnd-node--selected:hover .screen-rnd-handle--s,
+        .screen-rnd-node--selected:hover .screen-rnd-handle--w,
         .screen-rnd-node--selected:hover .screen-rnd-handle--nw,
         .screen-rnd-node--selected:hover .screen-rnd-handle--ne,
         .screen-rnd-node--selected:hover .screen-rnd-handle--sw,
         .screen-rnd-node--selected:hover .screen-rnd-handle--se,
+        .screen-rnd-node--interacting .screen-rnd-handle--n,
+        .screen-rnd-node--interacting .screen-rnd-handle--e,
+        .screen-rnd-node--interacting .screen-rnd-handle--s,
+        .screen-rnd-node--interacting .screen-rnd-handle--w,
         .screen-rnd-node--interacting .screen-rnd-handle--nw,
         .screen-rnd-node--interacting .screen-rnd-handle--ne,
         .screen-rnd-node--interacting .screen-rnd-handle--sw,
@@ -1080,6 +1196,86 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           font-weight: 700;
           letter-spacing: 0;
           text-shadow: var(--screen-widget-title-shadow);
+        }
+
+        .screen-widget-frame__title-row {
+          display: flex;
+          align-items: center;
+          gap: calc(6px * var(--screen-widget-ui-scale));
+          min-width: 0;
+          width: 100%;
+        }
+
+        .screen-widget-frame__header:has(.screen-widget-frame__title-link) .screen-widget-frame__title {
+          width: auto;
+          flex: 1 1 auto;
+        }
+
+        .screen-widget-frame--editable:hover .screen-widget-frame__header:has(.screen-widget-frame__title-link),
+        .screen-widget-frame--editable:focus-within .screen-widget-frame__header:has(.screen-widget-frame__title-link) {
+          padding-right: calc((var(--screen-widget-title-padding, 10px) + 8px) * var(--screen-widget-ui-scale));
+        }
+
+        .screen-widget-frame__title-link {
+          display: inline-flex;
+          flex-shrink: 0;
+          align-items: center;
+          justify-content: center;
+          margin-left: calc(-6px * var(--screen-widget-ui-scale));
+          width: 0;
+          height: calc(14px * var(--screen-widget-ui-scale));
+          padding: 0;
+          border: 0;
+          background: transparent;
+          color: color-mix(in srgb, var(--screen-chrome-accent) 68%, var(--screen-widget-title-color));
+          font-size: calc(14px * var(--screen-widget-ui-scale));
+          line-height: 1;
+          cursor: pointer;
+          overflow: hidden;
+          opacity: 0;
+          pointer-events: none;
+        }
+
+        .screen-rnd-node:hover .screen-widget-frame__title-link,
+        .screen-rnd-node:focus-within .screen-widget-frame__title-link,
+        .screen-widget-frame:hover .screen-widget-frame__title-link,
+        .screen-widget-frame:focus-within .screen-widget-frame__title-link {
+          width: calc(14px * var(--screen-widget-ui-scale));
+          margin-left: auto;
+          overflow: visible;
+          opacity: 1;
+          pointer-events: auto;
+        }
+
+        .screen-widget-frame__title-link .anticon {
+          font-size: 1em;
+        }
+
+        .screen-widget-frame__title-link:hover {
+          color: var(--screen-chrome-accent);
+          filter: drop-shadow(0 0 calc(6px * var(--screen-widget-ui-scale)) var(--screen-chrome-glow));
+        }
+
+        .screen-text-item__title-link {
+          width: 0;
+          margin-left: -0.4em;
+          height: 1em;
+          flex-shrink: 0;
+          font-size: 1em;
+          outline: none;
+          box-shadow: none;
+        }
+
+        .screen-rnd-node:hover .screen-text-item__title-link,
+        .screen-rnd-node:focus-within .screen-text-item__title-link {
+          width: 1em;
+          margin-left: 0;
+        }
+
+        .screen-text-item__title-link:focus,
+        .screen-text-item__title-link:focus-visible {
+          outline: none;
+          box-shadow: none;
         }
 
         .screen-widget-frame__body {
@@ -1181,6 +1377,18 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           padding: var(--ops-screen-table-cell-padding-y, calc(12px * var(--screen-widget-ui-scale))) var(--ops-screen-table-cell-padding-x, calc(18px * var(--screen-widget-ui-scale))) !important;
         }
 
+        .screen-tech-canvas .ant-table-tbody > tr > td .ant-btn-link {
+          height: auto !important;
+          padding: 0 !important;
+          font-size: inherit !important;
+          line-height: inherit !important;
+          color: var(--screen-chrome-accent) !important;
+        }
+
+        .screen-tech-canvas .ant-table-tbody > tr > td .ant-btn-link:not(:disabled):hover {
+          color: color-mix(in srgb, var(--screen-chrome-accent) 72%, white) !important;
+        }
+
         .screen-tech-canvas .ant-table-tbody > tr:nth-child(even) > td {
           background: var(--screen-table-row-even-bg) !important;
         }
@@ -1238,6 +1446,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
         }
       `}</style>
     </div>
+    </FilterTemplateProvider>
   );
 };
 

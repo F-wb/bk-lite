@@ -31,6 +31,9 @@ export const useInstanceApi = () => {
       }`
     );
 
+  const getNetworkTopoAmong = (instUuids: string[]) =>
+    post('/cmdb/api/instance/network_topo/among/', { inst_uuids: instUuids });
+
   const getRoomLayout = (modelId: string, instUuid: string) =>
     get(`/cmdb/api/instance/room_layout/${modelId}/${instUuid}/`);
 
@@ -126,6 +129,9 @@ export const useInstanceApi = () => {
   // 更新实例
   const updateInstance = (instUuid: string, params: any) =>
     patch(`/cmdb/api/instance/${instUuid}/`, params);
+
+  const restoreCollect = (instUuid: string, fields?: string[]) =>
+    post(`/cmdb/api/instance/${instUuid}/restore_collect/`, { fields });
 
   // 批量更新实例
   const batchUpdateInstances = (params: {
@@ -290,6 +296,7 @@ export const useInstanceApi = () => {
     topoSearchInstances,
     getTopoThemes,
     getNetworkTopo,
+    getNetworkTopoAmong,
     getRoomLayout,
     getRackLayout,
     getApplicationResourceApps,
@@ -311,6 +318,7 @@ export const useInstanceApi = () => {
     getInstanceDetail,
     createInstance,
     updateInstance,
+    restoreCollect,
     batchUpdateInstances,
     deleteInstance,
     batchDeleteInstances,

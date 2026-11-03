@@ -24,6 +24,7 @@ import type {
 import type { Application3DWallConfig } from '@/app/ops-analysis/utils/application3DWallConfig';
 import type { OpsAnalysisWidgetSurface } from '@/app/ops-analysis/utils/chartTypeSurface';
 import type { DateRangeValue } from './dateRange';
+import type { SingleValueStyleConfig } from '@/app/ops-analysis/utils/singleValueStyle';
 
 export type FilterType = 'selector' | 'fixed';
 
@@ -46,6 +47,13 @@ export interface TimeConfig {
 
 export interface OtherConfig {
   timeSelector?: TimeConfig;
+  /**
+   * 仪表盘横向格数。缺省或 12 表示按旧 12 列保存的 x/w；
+   * 当前运行时为 24，打开旧盘时换算一次后写入 24。
+   */
+  gridCols?: number;
+  /** 仪表盘行高（px）。缺省为旧版 60，当前为 30；换算后的布局保存时写入。 */
+  gridRowHeight?: number;
   [key: string]: unknown;
 }
 
@@ -131,8 +139,20 @@ export interface ValueConfig {
   descriptionField?: string;
   topNLabelField?: string;
   topNValueField?: string;
+  /** 从单个对象的多个数值字段拆成多行，并保持配置顺序。未配置时仍按数组排名。 */
+  topNScalarFields?: Array<{ field: string; label?: string }>;
+  /** 缺省 relative：条宽按当前列表最大值。absolute：按 barMax，没有则用 gaugeMax。 */
+  barMode?: 'relative' | 'absolute';
+  /** absolute 模式下的满分。条宽为 clamp(value, 0, barMax) / barMax。 */
+  barMax?: number;
   dimensionField?: string;
   valueField?: string;
+  /** 折线/柱状多选数值。有值时优先于 valueField；只选一个时与 valueField 同时写入。 */
+  valueFields?: string[];
+  /** 折线/柱状按该字段取值拆系列。与两个及以上数值字段不能同时使用。 */
+  seriesField?: string;
+  /** 从标量对象取两个及以上字段合成饼图；已有数组饼图不受影响。 */
+  pieScalarFields?: Array<{ field: string; label?: string }>;
   multiValueLabelField?: string;
   multiValueValueField?: string;
   nodeGraphIdentityMode?: 'ip' | 'service';
@@ -172,11 +192,18 @@ export interface ValueConfig {
     arrayValueField?: string;
   };
   cardList?: CardListConfig;
+  /** 旧表格操作列。读取时迁成 interaction，保存不再写回。 */
   actions?: DashboardActionConfig[];
+  interaction?: WidgetInteractionLink;
   appearance?: ScreenWidgetAppearance;
+  /** 单值样式。缺省字段保持旧外观，不需要迁移。 */
+  singleStyle?: SingleValueStyleConfig;
 }
 
 export type ScreenWidgetFrame = 'panel' | 'bare';
+
+/** 设计画布外层 transform，或全屏/分享铺满后的视口像素。缺省是设计画布。 */
+export type ScreenLayoutMode = 'designTransform' | 'viewportPixels';
 
 export interface ScreenWidgetAppearance {
   frame?: ScreenWidgetFrame;
@@ -185,15 +212,25 @@ export interface ScreenWidgetAppearance {
 export interface ScreenRenderContext {
   enabled: boolean;
   fitScale: number;
-  /** 大屏画布相对设计尺寸的横向、纵向拉伸。铺满适配时两者可以不同。 */
+  /**
+   * 大屏相对设计尺寸的横向、纵向比例。铺满时两者可以不同。
+   * designTransform 下它们是外层 CSS scale；viewportPixels 下几何已经乘过这两轴，
+   * 这里只保留比例，不再表示外层 transform。
+   */
   scaleX?: number;
   scaleY?: number;
   screenDensity: number;
   screenUiScale: number;
   widgetDensity: number;
   widgetUiScale: number;
+  /**
+   * fill 视口像素布局：几何已是屏幕 px，补偿按「无外层 transform」计算。
+   * 缺省视为 designTransform。
+   */
+  layoutMode?: ScreenLayoutMode;
 }
 
+/** 旧操作列参数映射。只在读取时转成 interaction，配置界面不再编辑。 */
 export interface DashboardActionParamMapping {
   key: string;
   source: 'rowField' | 'fixed';
@@ -201,12 +238,25 @@ export interface DashboardActionParamMapping {
   value?: string | number | boolean | null;
 }
 
+/** 旧操作列。读取时只保留第一条并迁成 interaction，保存时删除。 */
 export interface DashboardActionConfig {
   columnKey: string;
   text: string;
   url?: string;
   openMode?: 'sameTab' | 'newTab';
   params?: DashboardActionParamMapping[];
+}
+
+/** 组件只保留一条交互链接：标题行最右侧 >，或点击数据。 */
+export type WidgetInteractionKind = 'title' | 'data';
+
+export type WidgetInteractionOpenMode = 'sameTab' | 'newTab';
+
+export interface WidgetInteractionLink {
+  kind: WidgetInteractionKind;
+  name: string;
+  url: string;
+  openMode: WidgetInteractionOpenMode;
 }
 
 export interface WidgetConfig extends ValueConfig {
@@ -257,8 +307,25 @@ export interface ViewConfigProps {
   builtinNamespaceId?: number;
   showChartThemeMode?: boolean;
   surface?: OpsAnalysisWidgetSurface;
+  /** 拓扑不插入统一筛选变量，名称和描述保持普通输入框。 */
+  filterTemplateTokens?: boolean;
+  /** 拓扑和大屏数据表单不提供单值样式。仪表盘抽屉默认开启。 */
+  showSingleValueStyle?: boolean;
   variant?: 'drawer' | 'panel';
+  /** 大屏检查器切换数据/交互时复用同一份表单。 */
+  configSection?: 'data' | 'interaction';
+  /** 面板模式的页签在外部，交互校验失败时切回交互页。 */
+  onConfigSectionChange?: (section: 'data' | 'interaction') => void;
+  /** 大屏当前容器样式。样式页切换时单独传入，避免整表重开。 */
+  screenFrame?: ScreenWidgetFrame;
   onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * 样式页已经写在组件上的单值样式。只盖到预览配置。
+   * 数据表单 includeSingleStyle 仍为 false，提交不会带上它。
+   */
+  previewSingleStyle?: SingleValueStyleConfig;
+  /** 面板模式把预览传送到这个节点。抽屉模式忽略。 */
+  previewHost?: HTMLElement | null;
 }
 
 export interface ComponentSelectorConfigItem extends DatasourceItem {

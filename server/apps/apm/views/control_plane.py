@@ -1,5 +1,7 @@
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Count, Prefetch, Q, QuerySet
@@ -10,7 +12,14 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.generics import get_object_or_404
 from rest_framework.response import Response
 
-from apps.apm.adapters import SystemMgmtNotificationDispatcher, TelemetryStoreUnavailable, VictoriaTracesTelemetryStore, telemetry_error_payload
+from apps.apm.adapters import (
+    SystemMgmtNotificationDispatcher,
+    TelemetryQueryTooLarge,
+    TelemetryStoreUnavailable,
+    VictoriaTracesTelemetryStore,
+    telemetry_error_payload,
+)
+from apps.apm.adapters.errors import QUERY_TOO_LARGE_CODE, TELEMETRY_UNAVAILABLE_CODE
 from apps.apm.models import (
     ApmAlert,
     ApmAlertOutbox,
@@ -18,8 +27,8 @@ from apps.apm.models import (
     ApmApplicationOrganization,
     ApmEventSnapshot,
     ApmPolicy,
-    ApmPolicyOrganization,
     ApmPolicyNotificationTarget,
+    ApmPolicyOrganization,
     ApmService,
     ApmServiceInstance,
     ApmServiceInstanceOrganization,
@@ -28,7 +37,6 @@ from apps.apm.models import (
 )
 from apps.apm.pagination import ApmCatalogPagination
 from apps.apm.renderers import ApmRenderer
-from apps.apm.utils.locale_text import public_detail, request_text
 from apps.apm.serializers import (
     ApmAlertAssignSerializer,
     ApmAlertQuerySerializer,
@@ -65,13 +73,21 @@ from apps.apm.services import (
     DjangoTelemetryQueryService,
     NotificationChannelDirectory,
 )
+from apps.apm.services.access import (
+    current_organization_id,
+    filter_current_organization,
+    scope_catalog_queryset,
+    validate_assignable_organizations,
+    visible_organization_ids,
+)
 from apps.apm.services.alerts import AlertHandlerConflict, AlertHandlerForbidden, AlertHandlerInvalid
-from apps.apm.services.access import current_organization_id, filter_current_organization, scope_catalog_queryset, validate_assignable_organizations, visible_organization_ids
 from apps.apm.services.contracts import IngestSnippetRequest, MetricDataState, ServiceErrorBreakdownQuery, ServiceMetricQuery
 from apps.apm.services.integration_configuration import CloudRegionConfigurationError
 from apps.apm.services.probe_artifacts import LANGUAGE_PROBE_ARTIFACTS, ProbeArtifactNotFound
 from apps.apm.services.status import ACTIVE_WINDOW, ARCHIVE_WINDOW
+from apps.apm.utils.locale_text import public_detail, request_text
 from apps.core.decorators.api_permission import HasPermission
+from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.core.logger import apm_logger as logger
 from apps.core.utils.user_group import normalize_user_group_ids
 from apps.rpc.node_mgmt import NodeMgmt
@@ -179,8 +195,10 @@ class ApmApplicationViewSet(viewsets.GenericViewSet):
     service = DjangoApmApplicationService()
 
     def get_queryset(self) -> QuerySet[ApmApplication]:
-        queryset = ApmApplication.objects.prefetch_related("organization_links").annotate(service_count=Count("services", distinct=True)).filter(
-            is_builtin=False
+        queryset = (
+            ApmApplication.objects.prefetch_related("organization_links")
+            .annotate(service_count=Count("services", distinct=True))
+            .filter(is_builtin=False)
         )
         return scope_catalog_queryset(
             queryset,
@@ -599,6 +617,50 @@ class ApmServiceViewSet(viewsets.ReadOnlyModelViewSet):
             }
         )
 
+    @action(methods=("get",), detail=True, url_path="client-rollups")
+    @HasPermission("services-View")
+    def client_rollups(self, request, *args, **kwargs):
+        service = self.get_object()
+        serializer = ServiceMetricQuerySerializer(data=request.query_params, context={"request": request})
+        if not serializer.is_valid():
+            return Response(
+                {"code": "invalid_query", "detail": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        data = serializer.validated_data
+        try:
+            rows = VictoriaTracesTelemetryStore().client_db_rollups(
+                service.namespace,
+                service.name,
+                data["environment"],
+                data["started_at"],
+                data["ended_at"],
+            )
+        except ValueError:
+            return Response(
+                {"code": "invalid_query", "detail": "invalid_query"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except TelemetryQueryTooLarge:
+            return Response(
+                {"code": QUERY_TOO_LARGE_CODE, "detail": "query_too_large"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except TelemetryStoreUnavailable:
+            return Response(
+                {"code": TELEMETRY_UNAVAILABLE_CODE, "detail": "telemetry_unavailable"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response(
+            {
+                "service_id": str(service.id),
+                "environment": data["environment"],
+                "started_at": data["started_at"],
+                "ended_at": data["ended_at"],
+                "rows": rows,
+            }
+        )
+
 
 class ApmServiceInstanceViewSet(viewsets.ReadOnlyModelViewSet):
     renderer_classes = (ApmRenderer,)
@@ -645,7 +707,7 @@ class ApmServiceInstanceViewSet(viewsets.ReadOnlyModelViewSet):
             ApmServiceInstanceOrganization,
             fk_name="instance_id",
             for_list=self.action == "list",
-        ).order_by("-last_seen_at", "id")
+        ).order_by("-created_at", "id")
 
     @HasPermission("integration_instances-View")
     def list(self, request, *args, **kwargs):
@@ -722,12 +784,7 @@ class ApmSloViewSet(viewsets.GenericViewSet):
         service = self._service()
         evaluated_at = timezone.now()
         evaluations = service.evaluate_many(slos, evaluated_at=evaluated_at)
-        return Response(
-            [
-                self._serialize(slo, evaluation=evaluations.get(slo.id), evaluated_at=evaluated_at, service=service)
-                for slo in slos
-            ]
-        )
+        return Response([self._serialize(slo, evaluation=evaluations.get(slo.id), evaluated_at=evaluated_at, service=service) for slo in slos])
 
     @HasPermission("services-View")
     def retrieve(self, request, *args, **kwargs):
@@ -771,7 +828,10 @@ class ApmSloViewSet(viewsets.GenericViewSet):
 
     @HasPermission("services-Operate")
     def destroy(self, request, *args, **kwargs):
-        self.get_object().delete()
+        slo = self.get_object()
+        with transaction.atomic():
+            DjangoApmPolicyService(None, None).retire_policies_for_slo(slo, evaluated_at=timezone.now())
+            slo.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     def _set_enabled(self, request, *, enabled):
@@ -790,6 +850,67 @@ class ApmSloViewSet(viewsets.GenericViewSet):
     @HasPermission("services-Operate")
     def disable(self, request, *args, **kwargs):
         return self._set_enabled(request, enabled=False)
+
+
+class ApmPolicyDryRunError(BaseAppException):
+    """试算失败。日志由视图持有，构造时不再写第二条。"""
+
+    ERROR_CODE = "5001601"
+    MESSAGE = "试算失败"
+    STATUS_CODE = 500
+    LOG_LEVEL = logging.WARNING
+
+    def __init__(self):
+        self.message = self.MESSAGE
+        self.data = None
+        Exception.__init__(self, self.message)
+
+
+def _metric_text(value):
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return DjangoApmPolicyService._decimal_text(value)
+    return str(value)
+
+
+def _series_payload(series):
+    return [
+        {
+            "timestamp": point.timestamp,
+            "request_rate": point.request_rate,
+            "error_rate": point.error_rate,
+            "p95_ms": point.p95_ms,
+            "p99_ms": point.p99_ms,
+            "avg_ms": point.avg_ms,
+            "max_ms": point.max_ms,
+            "p50_ms": point.p50_ms,
+            "p75_ms": point.p75_ms,
+            "p90_ms": point.p90_ms,
+            "slow_count": point.slow_count,
+            "satisfied_count": point.satisfied_count,
+            "tolerating_count": point.tolerating_count,
+            "error_count": point.error_count,
+            "request_count": point.request_count,
+        }
+        for point in series or ()
+    ]
+
+
+def _policy_query_payload(result) -> dict:
+    return {
+        "value": _metric_text(getattr(result, "value", None)),
+        "breached": result.breached,
+        "evaluated_at": result.evaluated_at,
+        "data_state": str(result.data_state),
+        "threshold": getattr(result, "threshold", None),
+        "series": _series_payload(getattr(result, "series", ())),
+        "current_value": _metric_text(getattr(result, "current_value", None)),
+        "baseline_value": _metric_text(getattr(result, "baseline_value", None)),
+        "baseline_series": _series_payload(getattr(result, "baseline_series", ())),
+        "result_unit": getattr(result, "result_unit", "") or "",
+        "reason": getattr(result, "reason", "") or "",
+    }
 
 
 class ApmPolicyViewSet(viewsets.GenericViewSet):
@@ -1027,25 +1148,7 @@ class ApmPolicyViewSet(viewsets.GenericViewSet):
             result = self._service().test_query(policy, evaluated_at=timezone.now())
         except TelemetryStoreUnavailable as exc:
             return Response(telemetry_error_payload(exc), status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        return Response(
-            {
-                "value": str(result.value) if result.value is not None else None,
-                "breached": result.breached,
-                "evaluated_at": result.evaluated_at,
-                "data_state": str(result.data_state),
-                "threshold": getattr(result, "threshold", None),
-                "series": [
-                    {
-                        "timestamp": point.timestamp,
-                        "request_rate": point.request_rate,
-                        "error_rate": point.error_rate,
-                        "p95_ms": point.p95_ms,
-                        "p99_ms": point.p99_ms,
-                    }
-                    for point in getattr(result, "series", ())
-                ],
-            }
-        )
+        return Response(_policy_query_payload(result))
 
     @action(methods=("post",), detail=False)
     @HasPermission("policies-Operate")
@@ -1063,25 +1166,52 @@ class ApmPolicyViewSet(viewsets.GenericViewSet):
             result = self._service().test_query(policy, evaluated_at=timezone.now())
         except TelemetryStoreUnavailable as exc:
             return Response(telemetry_error_payload(exc), status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        return Response(
-            {
-                "value": str(result.value) if result.value is not None else None,
-                "breached": result.breached,
-                "evaluated_at": result.evaluated_at,
-                "data_state": str(result.data_state),
-                "threshold": result.threshold,
-                "series": [
-                    {
-                        "timestamp": point.timestamp,
-                        "request_rate": point.request_rate,
-                        "error_rate": point.error_rate,
-                        "p95_ms": point.p95_ms,
-                        "p99_ms": point.p99_ms,
-                    }
-                    for point in result.series
-                ],
-            }
-        )
+        return Response(_policy_query_payload(result))
+
+    @action(methods=("post",), detail=False, url_path="dry-run")
+    @HasPermission("policies-Operate")
+    def dry_run(self, request, *args, **kwargs):
+        payload = dict(request.data)
+        policy_id = payload.pop("policy_id", None) or None
+        payload["notification_targets"] = []
+        serializer = self.get_serializer(data=payload)
+        serializer.is_valid(raise_exception=True)
+        values = dict(serializer.validated_data)
+        service_id = values.pop("service_id")
+        values.pop("notification_targets", None)
+        values.pop("organizations", None)
+        service = self._visible_service(service_id)
+        saved_policy = get_object_or_404(self.get_queryset(), id=policy_id) if policy_id else None
+        try:
+            policy = ApmPolicy(service=service, **values)
+            organizations = payload.get("organizations")
+            if organizations is not None:
+                policy._scope_organization_ids = organizations
+            elif saved_policy is not None:
+                policy._scope_organization_ids = list(saved_policy.organization_links.values_list("organization", flat=True))
+            result = self._service().dry_run(
+                policy,
+                evaluated_at=timezone.now(),
+                saved_policy=saved_policy,
+                replay_hours=int(payload.get("replay_hours") or 0),
+            )
+        except TelemetryStoreUnavailable as exc:
+            return Response(telemetry_error_payload(exc), status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except Exception as exc:
+            proxy = RuntimeError(type(exc).__name__)
+            logger.warning(
+                "event=apm_policy_dry_run_failed policy_id=%s failed_stage=%s error_type=%s",
+                "" if policy_id is None else str(policy_id),
+                "dry_run",
+                type(exc).__name__,
+                exc_info=(type(proxy), proxy, exc.__traceback__),
+            )
+            failure = ApmPolicyDryRunError()
+            return Response(
+                {"data": failure.render_data() or {}, "result": False, "message": failure.message},
+                status=failure.STATUS_CODE,
+            )
+        return Response(result)
 
 
 class ApmEventViewSet(viewsets.GenericViewSet):

@@ -135,6 +135,51 @@ class TestSkillChannelCrud:
         assert resp.data["data"]["public_id"] == str(ch.public_id)
         assert resp.data["data"]["callback_path"] == (f"/api/v1/opspilot/skill_channel/{ch.public_id}/{SkillChannelChoices.ENTERPRISE_WECHAT_AIBOT}/")
 
+    def test_create_aibot_long_connection_stores_bot_credentials(self):
+        skill = _skill(usage_team=[1])
+        factory = APIRequestFactory()
+        user = _superuser("su_aibot_ws")
+        request = factory.post(
+            "/",
+            {
+                "skill": skill.id,
+                "channel_type": SkillChannelChoices.ENTERPRISE_WECHAT_AIBOT,
+                "enabled": True,
+                "channel_config": {
+                    "connectionMode": "websocket",
+                    "websocket": {"botId": "bot-1", "secret": "sec-1"},
+                },
+            },
+            format="json",
+        )
+        force_authenticate(request, user=user)
+        request.COOKIES["current_team"] = "1"
+        resp = SkillChannelViewSet.as_view({"post": "create"})(request)
+        assert resp.status_code == 201
+        ch = SkillChannel.objects.get(skill=skill, channel_type=SkillChannelChoices.ENTERPRISE_WECHAT_AIBOT)
+        assert ch.channel_config["connectionMode"] == "websocket"
+        assert ch.channel_config["websocket"]["botId"] == "bot-1"
+        assert ch.channel_config["websocket"]["secret"] == "sec-1"
+        assert resp.data["data"]["channel_config"]["websocket"]["secret"] == "******"
+
+    def test_create_aibot_long_connection_requires_secret(self):
+        skill = _skill(usage_team=[1])
+        factory = APIRequestFactory()
+        user = _superuser("su_aibot_ws_bad")
+        request = factory.post(
+            "/",
+            {
+                "skill": skill.id,
+                "channel_type": SkillChannelChoices.ENTERPRISE_WECHAT_AIBOT,
+                "channel_config": {"connectionMode": "websocket", "websocket": {"botId": "bot-1"}},
+            },
+            format="json",
+        )
+        force_authenticate(request, user=user)
+        request.COOKIES["current_team"] = "1"
+        resp = SkillChannelViewSet.as_view({"post": "create"})(request)
+        assert resp.status_code == 400
+
     def test_create_keeps_client_public_id(self):
         skill = _skill(usage_team=[1])
         public_id = uuid.uuid4()
@@ -302,6 +347,102 @@ class TestSkillChannelCrud:
         assert not SkillChannel.objects.filter(skill_id=skill_id).exists()
         assert not SkillConversation.objects.filter(session_id="sess-1").exists()
         assert not SkillConversationMessage.objects.filter(content="hi").exists()
+
+    def _post_feishu(self, skill, user, config, username="su_feishu"):
+        factory = APIRequestFactory()
+        request = factory.post(
+            "/",
+            {
+                "skill": skill.id,
+                "channel_type": SkillChannelChoices.FEISHU,
+                "enabled": True,
+                "channel_config": config,
+            },
+            format="json",
+        )
+        force_authenticate(request, user=user)
+        request.COOKIES["current_team"] = "1"
+        return SkillChannelViewSet.as_view({"post": "create"})(request)
+
+    def test_create_feishu_long_connection_stores_credentials(self):
+        skill = _skill(usage_team=[1])
+        user = _superuser("su_feishu_ws")
+        resp = self._post_feishu(
+            skill,
+            user,
+            {"connectionMode": "websocket", "app_id": "cli_a", "app_secret": "sec-a"},
+        )
+        assert resp.status_code == 201
+        ch = SkillChannel.objects.get(skill=skill, channel_type=SkillChannelChoices.FEISHU)
+        assert ch.channel_config["connectionMode"] == "websocket"
+        assert ch.channel_config["app_id"] == "cli_a"
+        assert ch.channel_config["app_secret"] == "sec-a"
+        assert resp.data["data"]["channel_config"]["app_secret"] == "******"
+
+    def test_create_feishu_long_connection_requires_secret(self):
+        skill = _skill(usage_team=[1])
+        user = _superuser("su_feishu_ws_bad")
+        resp = self._post_feishu(skill, user, {"connectionMode": "websocket", "app_id": "cli_a"})
+        assert resp.status_code == 400
+
+    def test_create_feishu_webhook_requires_verification_token(self):
+        skill = _skill(usage_team=[1])
+        user = _superuser("su_feishu_hook")
+        resp = self._post_feishu(
+            skill,
+            user,
+            {"connectionMode": "webhook", "app_id": "cli_hook", "app_secret": "sec"},
+        )
+        assert resp.status_code == 400
+
+    def test_duplicate_feishu_app_id_is_rejected_even_when_disabled(self):
+        first_skill = _skill(name="s-feishu-1", usage_team=[1])
+        other_skill = _skill(name="s-feishu-2", usage_team=[1])
+        SkillChannel.objects.create(
+            skill=first_skill,
+            channel_type=SkillChannelChoices.FEISHU,
+            enabled=False,
+            usage_team=[1],
+            channel_config={"connectionMode": "webhook", "app_id": "cli_same", "app_secret": "sec", "verification_token": "tok"},
+        )
+        user = _superuser("su_feishu_dup")
+        resp = self._post_feishu(
+            other_skill,
+            user,
+            {"connectionMode": "websocket", "app_id": "cli_same", "app_secret": "sec-2"},
+        )
+        assert resp.status_code == 400
+        assert "已被发布" in str(resp.data)
+
+    def test_update_same_feishu_channel_keeps_app_id(self):
+        skill = _skill(usage_team=[1])
+        ch = SkillChannel.objects.create(
+            skill=skill,
+            channel_type=SkillChannelChoices.FEISHU,
+            enabled=True,
+            usage_team=[1],
+            channel_config={"connectionMode": "websocket", "app_id": "cli_keep", "app_secret": "sec-keep"},
+        )
+        factory = APIRequestFactory()
+        user = _superuser("su_feishu_keep")
+        request = factory.put(
+            "/",
+            {
+                "channel_config": {
+                    "connectionMode": "websocket",
+                    "app_id": "cli_keep",
+                    "app_secret": "******",
+                }
+            },
+            format="json",
+        )
+        force_authenticate(request, user=user)
+        request.COOKIES["current_team"] = "1"
+        resp = SkillChannelViewSet.as_view({"put": "update"})(request, pk=ch.id)
+        assert resp.status_code == 200
+        ch.refresh_from_db()
+        assert ch.channel_config["app_id"] == "cli_keep"
+        assert ch.channel_config["app_secret"] == "sec-keep"
 
 
 class TestPlatformListAndEmbeddedGate:

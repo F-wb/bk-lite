@@ -9,7 +9,7 @@ ROOT_URLCONF = "urls"
 _db_engine = os.getenv("DB_ENGINE", "postgresql").lower()
 _migrate_patch_db_engines = {"dameng", "gaussdb", "goldendb", "oceanbase", "mysql"}
 # 显式 INSTALL_APPS 裁剪时仍须装入的 always-on 业务 app（与 extra.py 保持一致）
-_ALWAYS_ON_SCAN_APPS = frozenset({"system_mgmt", "console_mgmt"})
+_ALWAYS_ON_SCAN_APPS = frozenset({"system_mgmt", "console_mgmt", "module_link"})
 
 # 模板页面配置
 TEMPLATES = [
@@ -68,8 +68,18 @@ AUTHENTICATION_BACKENDS = (
 
 AUTH_USER_MODEL = "base.User"
 
+
+def _gm_transport_middleware():
+    """企业包在运行目录里才挂国密中间件。没有这个文件时请求保持明文。"""
+    middleware_file = os.path.join(BASE_DIR, "apps", "core", "enterprise", "gm_transport_middleware.py")
+    if not os.path.isfile(middleware_file):
+        return ()
+    return ("apps.core.enterprise.gm_transport_middleware.GmTransportMiddleware",)
+
+
 MIDDLEWARE = (
     "django.middleware.security.SecurityMiddleware",
+    *_gm_transport_middleware(),
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "apps.core.middlewares.request_timing_middleware.RequestTimingMiddleware",  # 请求耗时记录
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -98,6 +108,7 @@ _enterprise_status = detect_enterprise_footprint(BASE_DIR)
 if _enterprise_status.should_enable_license_mgmt:
     INSTALLED_APPS += ("apps.license_mgmt",)
     MIDDLEWARE += (
+        "apps.module_link.middleware.ModuleLinkLicenseInheritMiddleware",
         "apps.license_mgmt.middleware.license_guard.LicenseAppGuardMiddleware",
         "apps.license_mgmt.middleware.license_guard.LicenseCreateGuardMiddleware",
         "apps.license_mgmt.middleware.license_guard.LicenseCapacityGuardMiddleware",
@@ -160,6 +171,11 @@ else:
     app_folders = []
 
 INSTALLED_APPS += tuple(f"apps.{app}" for app in app_folders if f"apps.{app}" not in INSTALLED_APPS)
+
+# optional：与 license_mgmt 一样条件追加。opspilot 未装入时不得引用其模块。
+_RETURNED_MESSAGE_LOCALE_MIDDLEWARE = "apps.opspilot.middlewares.returned_message_middleware.ReturnedMessageLocaleMiddleware"
+if "apps.opspilot" in INSTALLED_APPS and _RETURNED_MESSAGE_LOCALE_MIDDLEWARE not in MIDDLEWARE:
+    MIDDLEWARE += (_RETURNED_MESSAGE_LOCALE_MIDDLEWARE,)
 
 # 文件上传数量限制
 DATA_UPLOAD_MAX_NUMBER_FILES = 100

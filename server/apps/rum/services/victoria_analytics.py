@@ -3,14 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from apps.rum.services import logsql_stats
-from apps.rum.services.victoria_client import (
-    VictoriaClient,
-    funnel_reached,
-    health_from_events,
-    parse_event,
-    rum_apps_filter,
-    sparkline_layout,
-)
+from apps.rum.services.victoria_client import VictoriaClient, funnel_reached, parse_event, sparkline_layout
 
 # Align with web/src/app/rum/lib/cwv.ts good / needs-improvement upper bounds.
 _CWV_BOUNDS = {
@@ -73,31 +66,25 @@ class VictoriaAnalytics:
     def _tenant(self, tenant_id: str) -> str:
         return (tenant_id or "").strip() or "core"
 
-    def _load_events(
-        self,
-        tenant_id: str,
-        apps: list[str],
-        start: datetime,
-        end: datetime,
-        extra: str = "",
-        limit: int = 5000,
-    ) -> list[dict]:
-        if limit <= 0:
-            limit = 5000
-        if not apps:
-            # No enabled/requested application: nothing to read. Never fall back
-            # to a tenant-wide query.
-            return []
-        query = rum_apps_filter(self._tenant(tenant_id), apps)
-        if extra:
-            query = f"{query} {extra}"
-        rows = self.client.query_logs(query, start, end, limit)
-        return [parse_event(row) for row in rows]
-
     def applications_page(self, tenant_id: str, start: datetime, end: datetime, enabled_apps: list[str]) -> tuple[list[dict], dict[str, list[float]]]:
-        events = self._load_events(tenant_id, enabled_apps, start, end, limit=8000)
-        _, buckets = sparkline_layout(start, end)
-        return health_from_events(events, enabled_apps, start, end, buckets)
+        if not enabled_apps:
+            return [], {}
+        interval, buckets = sparkline_layout(start, end)
+        tenant = self._tenant(tenant_id)
+        opts = {"from": start, "to": end}
+        rows = self._stats(
+            tenant,
+            logsql_stats.catalog_health_query(tenant, enabled_apps),
+            opts,
+            limit=max(len(enabled_apps), 1),
+        )
+        spark_rows = self._stats(
+            tenant,
+            logsql_stats.catalog_spark_query(tenant, enabled_apps, interval),
+            opts,
+            limit=max(len(enabled_apps) * max(buckets, 1), 1),
+        )
+        return logsql_stats.map_catalog_health(rows, spark_rows, enabled_apps, start, end, buckets)
 
     def application_overview(self, tenant_id: str, application: str, start: datetime, end: datetime) -> dict:
         rows, sparks = self.applications_page(tenant_id, start, end, [application])
@@ -111,52 +98,33 @@ class VictoriaAnalytics:
                 "traffic": "all",
             },
         )
-        events = self._load_events(tenant_id, [application], start, end, limit=8000)
-        countries: dict[str, dict] = {}
-        devices = {"mobile": 0, "desktop": 0}
-        envs: dict[str, dict] = {}
-        releases: dict[str, dict] = {}
-        country_sessions: dict[str, set[str]] = {}
-        env_sessions: dict[str, set[str]] = {}
-        rel_sessions: dict[str, set[str]] = {}
-        for event in events:
-            if event.get("eventType") == "view":
-                country = event.get("country") or ""
-                countries.setdefault(country, {"country": country, "views": 0, "sessions": 0})
-                countries[country]["views"] += 1
-                country_sessions.setdefault(country, set()).add(event.get("sessionId") or "")
-            ua = (event.get("userAgent") or "").lower()
-            if "mobile" in ua or "android" in ua:
-                devices["mobile"] += 1
-            elif event.get("userAgent"):
-                devices["desktop"] += 1
-            if event.get("environment"):
-                key = event["environment"]
-                envs.setdefault(key, {"key": key, "views": 0, "sessions": 0})
-                if event.get("eventType") == "view":
-                    envs[key]["views"] += 1
-                env_sessions.setdefault(key, set()).add(event.get("sessionId") or "")
-            if event.get("release"):
-                key = event["release"]
-                releases.setdefault(key, {"key": key, "views": 0, "sessions": 0})
-                if event.get("eventType") == "view":
-                    releases[key]["views"] += 1
-                rel_sessions.setdefault(key, set()).add(event.get("sessionId") or "")
-        for key, row in countries.items():
-            row["sessions"] = len({sid for sid in country_sessions.get(key, set()) if sid})
-        for key, row in envs.items():
-            row["sessions"] = len({sid for sid in env_sessions.get(key, set()) if sid})
-        for key, row in releases.items():
-            row["sessions"] = len({sid for sid in rel_sessions.get(key, set()) if sid})
+        tenant = self._tenant(tenant_id)
+        opts = {"from": start, "to": end}
+        countries = logsql_stats.map_named_counts(
+            self._stats(tenant, logsql_stats.overview_country_query(tenant, application), opts, limit=500),
+            "geo.country.iso_code",
+            "country",
+        )
+        environments = logsql_stats.map_named_counts(
+            self._stats(tenant, logsql_stats.overview_facet_query(tenant, application, "rum.environment"), opts, limit=100),
+            "rum.environment",
+            "key",
+        )
+        releases = logsql_stats.map_named_counts(
+            self._stats(tenant, logsql_stats.overview_facet_query(tenant, application, "rum.release"), opts, limit=100),
+            "rum.release",
+            "key",
+        )
+        devices = logsql_stats.map_device_counts(self._stats(tenant, logsql_stats.overview_device_query(tenant, application), opts, limit=1))
         return {
             "application": application,
             "kpi": kpi,
             "sparkline": sparks.get(application) or [],
             "trend": trend.get("points") or [],
-            "countries": list(countries.values()),
+            "countries": countries,
             "devices": devices,
-            "environments": list(envs.values()),
-            "releases": list(releases.values()),
+            "environments": environments,
+            "releases": releases,
         }
 
     def list_sessions(self, tenant_id: str, opts: dict) -> dict:
@@ -282,11 +250,24 @@ class VictoriaAnalytics:
             return {"mode": mode, "summary": {"lcpP75": 0.0, "inpP75": 0.0, "clsP75": 0.0}, "releases": [], "rows": [], "truncated": False}
         rows = self._stats(tenant_id, logsql_stats.view_stats_query(self._tenant(tenant_id), opts), opts, limit=500)
         mapped = [logsql_stats.map_view_row(row, mode) for row in rows]
+        start = opts.get("from")
+        end = opts.get("to")
+        if isinstance(start, datetime) and isinstance(end, datetime):
+            step, buckets = sparkline_layout(start, end)
+            spark_rows = self._stats(
+                tenant_id,
+                logsql_stats.view_spark_query(self._tenant(tenant_id), opts, step),
+                opts,
+                limit=10000,
+            )
+            logsql_stats.fill_view_sparks(mapped, spark_rows, start, step, buckets, mode)
         mapped.sort(key=lambda row: row["impact"], reverse=True)
         releases = sorted({row["release"] for row in mapped if row.get("release")})
+
         def _avg(name: str) -> float:
             values = [row[name] for row in mapped if row[name]]
             return sum(values) / len(values) if values else 0.0
+
         return {
             "mode": mode,
             "summary": {"lcpP75": _avg("lcpP75"), "inpP75": _avg("inpP75"), "clsP75": _avg("clsP75")},
@@ -387,23 +368,23 @@ class VictoriaAnalytics:
             "truncated": bool(getattr(rows, "truncated", False)) or bool(getattr(first_seen, "truncated", False)),
         }
 
-    def monitor_metric(self, tenant_id: str, opts: dict) -> float:
+    def monitor_metric(self, tenant_id: str, opts: dict) -> float | None:
         apps = list(opts.get("applications") or [])
         if not apps and not (opts.get("application") or "").strip():
-            return 0.0
+            return None
         metric = (opts.get("metric") or "").strip()
         rows = self._stats(tenant_id, logsql_stats.monitor_metric_query(self._tenant(tenant_id), opts), opts, limit=1)
         if not rows:
-            return 0.0
+            return None
         row = rows[0]
         if metric == "error_rate":
             sessions = float(row.get("sessions") or 0)
             if sessions <= 0:
-                return 0.0
+                return None
             return float(row.get("errored") or 0) / sessions
-        value = row.get("value") or ""
-        if value == "":
-            return 0.0
+        value = row.get("value")
+        if value is None or value == "":
+            return None
         return float(value)
 
     def metric_series(self, tenant_id: str, opts: dict) -> list[dict]:
@@ -488,7 +469,4 @@ def _trend_points(rows, start: datetime, interval: timedelta, buckets: int) -> l
             idx = n - 1
         totals[idx] = int(float(row.get("total") or 0))
         errored[idx] = int(float(row.get("errored") or 0))
-    return [
-        {"atMs": int((start_ts + i * sec) * 1000), "total": totals[i], "errored": errored[i]}
-        for i in range(n)
-    ]
+    return [{"atMs": int((start_ts + i * sec) * 1000), "total": totals[i], "errored": errored[i]} for i in range(n)]

@@ -22,10 +22,12 @@ import type {
   ApmServiceInstance,
   ApmServiceRed,
   ApmServiceRedBatchItem,
+  ApmClientRollups,
   ApmServiceErrorBreakdown,
   ApmSlo,
   ApmSloInput,
   ApmPolicy,
+  ApmPolicyDryRunResult,
   ApmPolicyInput,
   ApmPolicyQueryResult,
   ApmPage,
@@ -197,6 +199,12 @@ const useApmApi = () => {
     [post]
   );
 
+  const getServiceClientRollups = useCallback(
+    (serviceId: string, params: { environment: string; started_at?: string; ended_at?: string }) =>
+      get<ApmClientRollups>(`/apm/services/${serviceId}/client-rollups/`, { params }),
+    [get]
+  );
+
   const getServiceErrorBreakdown = useCallback(
     (serviceId: string, params: { environment: string; started_at?: string; ended_at?: string; sample_limit?: number }) =>
       get<ApmServiceErrorBreakdown>(`/apm/services/${serviceId}/error-breakdown/`, { params }),
@@ -300,6 +308,12 @@ const useApmApi = () => {
     [post]
   );
 
+  const dryRunPolicy = useCallback(
+    (payload: ApmPolicyInput & { policy_id?: string; replay_hours?: 0 | 24 }) =>
+      post<ApmPolicyDryRunResult>('/apm/policies/dry-run/', payload),
+    [post]
+  );
+
   const getEvents = useCallback(
     (params: ApmEventQuery = {}) => get<ApmEvent[]>('/apm/events/', { params }),
     [get]
@@ -398,6 +412,7 @@ const useApmApi = () => {
     getDashboard,
     getServiceRed,
     getServiceRedBatch,
+    getServiceClientRollups,
     getServiceErrorBreakdown,
     getSlos,
     createSlo,
@@ -417,6 +432,7 @@ const useApmApi = () => {
     setPolicyEnabled,
     testPolicy,
     previewPolicy,
+    dryRunPolicy,
     getEvents,
     getAlerts,
     getAlertDistribution,

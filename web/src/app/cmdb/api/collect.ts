@@ -66,9 +66,35 @@ export const useCollectApi = () => {
   const getNetworkConfigBrands = () =>
     get('/cmdb/api/collect/network_config_file_supported_brands/');
 
+  const saveUnknownSoidMappings = (
+    collectId: string,
+    params: { items: Array<{ soid: string; device_type: string; brand: string; model: string }> }
+  ) => post(`/cmdb/api/collect/${collectId}/unknown_soid_mappings/`, params);
+
+  const writeUnknownDevices = (collectId: string, params: { ip_addrs: string[] }) =>
+    post(`/cmdb/api/collect/${collectId}/write_unknown_devices/`, params);
+
   // PC 发现连接测试（未落库表单直连，不写 CMDB）
   const pcTestConnection = (params: any) =>
     post('/cmdb/api/collect/pc_test_connection/', params);
+
+  const listCollectReconcile = (modelId: string) =>
+    get('/cmdb/api/collect_reconcile/', { params: { model_id: modelId } });
+  const getCollectReconcile = (id: number) => get(`/cmdb/api/collect_reconcile/${id}/`);
+  const createCollectReconcile = (params: {
+    name: string;
+    model_id: string;
+    task_ids: number[];
+    field_orders?: Record<string, number[]>;
+  }) => post('/cmdb/api/collect_reconcile/', params);
+  const updateCollectReconcile = (id: number, params: Record<string, unknown>) =>
+    put(`/cmdb/api/collect_reconcile/${id}/`, params);
+  const deleteCollectReconcile = (id: number) =>
+    del(`/cmdb/api/collect_reconcile/${id}/`);
+  const getReconcileCandidates = (modelId: string) =>
+    get(`/cmdb/api/collect_reconcile/candidates/?model_id=${encodeURIComponent(modelId)}`);
+  const saveReconcileStaleDays = (days: number) =>
+    post('/cmdb/api/collect_reconcile/stale_days/', { days });
 
   return {
     getCollectList,
@@ -87,6 +113,15 @@ export const useCollectApi = () => {
     getTaskOverview,
     getCollectTaskNames,
     getNetworkConfigBrands,
+    saveUnknownSoidMappings,
+    writeUnknownDevices,
     pcTestConnection,
+    listCollectReconcile,
+    getCollectReconcile,
+    createCollectReconcile,
+    updateCollectReconcile,
+    deleteCollectReconcile,
+    getReconcileCandidates,
+    saveReconcileStaleDays,
   };
 };

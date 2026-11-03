@@ -9,6 +9,7 @@ from django.utils import timezone
 from apps.alerts.constants.constants import AlertOperate, AlertStatus, LogAction, LogTargetType
 from apps.alerts.models.alert_operator import AlertAssignment
 from apps.alerts.models.models import Alert
+from apps.alerts.notification_templates.timefmt import format_template_datetime, resolve_display_timezone
 from apps.alerts.utils.operator_log import record_operator_log
 from apps.alerts.utils.operator_scope import validate_alert_assignees, validate_usernames_in_groups
 from apps.core.logger import alert_logger as logger
@@ -540,11 +541,7 @@ class AlertOperator(object):
             previous_status = alert.status
 
             # 更新告警状态
-            alert.status = AlertStatus.CLOSED
-            alert.operate = AlertOperate.CLOSE
-            alert.updated_at = timezone.now()
-            Alert.stamp_closed_at(alert, alert.updated_at)
-            alert.save()
+            _set_alert_closed(alert)
 
             from apps.alerts.action.engine import ActionEngine
 
@@ -685,9 +682,7 @@ class AlertOperator(object):
             action_summary = f"该告警已由 {actor_name} 分派给 {receiver_names}，请及时认领并处理。"
         action_time = getattr(alert, "updated_at", None)
         if action_time:
-            if timezone.is_aware(action_time):
-                action_time = timezone.localtime(action_time)
-            action_time = action_time.strftime("%Y-%m-%d %H:%M:%S")
+            action_time = format_template_datetime(action_time, resolve_display_timezone(assignee))
         return build_channel_params(
             list(assignee),
             [selected_channel],
@@ -738,3 +733,36 @@ class AlertOperator(object):
         :param log_data: 日志数据字典
         """
         record_operator_log(**log_data)
+
+
+def _set_alert_closed(alert):
+    """共享关闭状态语义；权限校验由人工入口或锁内后台入口负责。"""
+    alert.status = AlertStatus.CLOSED
+    alert.operate = AlertOperate.CLOSE
+    alert.updated_at = timezone.now()
+    Alert.stamp_closed_at(alert, alert.updated_at)
+    alert.save()
+
+
+def close_alert_from_itsm(alert, link_id):
+    """仅供已验证关联与规则权限的后台同步调用，必须持有 Alert 行锁。"""
+    if alert.status not in AlertStatus.ACTIVATE_STATUS:
+        return False
+    from apps.alerts.action.engine import ActionEngine
+    from apps.alerts.service.escalation_service import EscalationService
+    from apps.alerts.service.reminder_service import ReminderService
+    from apps.alerts.utils.operator_log import record_operator_log_deferred_mirror as record_operator_log
+
+    _set_alert_closed(alert)
+    ReminderService.stop_reminder_task(alert)
+    EscalationService.stop_escalation_task(alert)
+    record_operator_log(
+        action=LogAction.MODIFY,
+        target_type=LogTargetType.ALERT,
+        operator="system",
+        operator_object="ITSM 工单关闭回写",
+        target_id=alert.alert_id,
+        overview=f"ITSM 工单关闭后关闭告警，关联记录 {link_id}",
+    )
+    ActionEngine.dispatch_async(alert.alert_id, "closed")
+    return True

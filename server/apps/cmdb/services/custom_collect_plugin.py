@@ -1,4 +1,6 @@
 # -- coding: utf-8 --
+from django.db.models import Q
+
 from apps.cmdb.models.collect_model import CollectModels
 from apps.cmdb.models.custom_collect_plugin import (
     ALLOWED_OS_TYPES,
@@ -11,12 +13,51 @@ from apps.cmdb.models.custom_collect_plugin import (
 from apps.core.exceptions.base_app_exception import BaseAppException
 
 
+def _is_k8s_model(model_id: str) -> bool:
+    """K8S 分类下的模型都由内置采集维护，不能作为自定义脚本目标。"""
+    return str(model_id or "").startswith("k8s_")
+
+
 def referencing_tasks(plugin_pk):
     return CollectModels.objects.filter(params__contains={"custom_plugin_pk": int(plugin_pk)})
 
 
 def reference_count(plugin_pk) -> int:
     return referencing_tasks(plugin_pk).count()
+
+
+def attach_list_reference_counts(plugins):
+    """给本批列表对象填上 reference_count，序列化时不再逐行 COUNT。"""
+    plugin_ids = []
+    for plugin in plugins:
+        plugin_id = getattr(plugin, "id", None)
+        if not plugin_id:
+            continue
+        plugin_ids.append(int(plugin_id))
+    counts = _reference_counts(plugin_ids)
+    for plugin in plugins:
+        plugin_id = getattr(plugin, "id", None)
+        if not plugin_id:
+            continue
+        plugin.reference_count = counts.get(int(plugin_id), 0)
+
+
+def _reference_counts(plugin_ids):
+    unique_ids = list(dict.fromkeys(plugin_ids))
+    if not unique_ids:
+        return {}
+    query = Q()
+    for plugin_id in unique_ids:
+        query |= Q(params__contains={"custom_plugin_pk": plugin_id})
+    counts = {plugin_id: 0 for plugin_id in unique_ids}
+    referenced = CollectModels.objects.filter(query).values_list("params", flat=True)
+    for params in referenced:
+        if not isinstance(params, dict):
+            continue
+        raw_pk = params.get("custom_plugin_pk")
+        if type(raw_pk) is int and raw_pk in counts:
+            counts[raw_pk] += 1
+    return counts
 
 
 def ensure_deletable(plugin: CustomCollectPlugin):
@@ -61,6 +102,8 @@ def validate_plugin_payload(data, *, instance=None):
     model_id = str(data.get("model_id") or (instance.model_id if instance else "")).strip()
     if not model_id:
         raise BaseAppException("目标模型不能为空")
+    if _is_k8s_model(model_id) and (instance is None or instance.model_id != model_id):
+        raise BaseAppException("K8S 下的模型不能作为自定义插件的目标模型")
     if instance is not None and "model_id" in data and model_id != instance.model_id and reference_count(instance.id):
         raise BaseAppException("插件已被采集任务引用，不能修改目标模型")
 

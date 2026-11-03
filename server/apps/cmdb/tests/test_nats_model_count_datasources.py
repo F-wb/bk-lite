@@ -28,10 +28,12 @@ class TestModelClassificationOptions:
         result = nats.get_model_classification_options(user_info=USER_INFO)
 
         assert result == {
-            "items": [
+            "result": True,
+            "data": [
                 {"classification_id": "host", "classification_name": "主机"},
                 {"classification_id": "middleware", "classification_name": "中间件"},
-            ]
+            ],
+            "message": "",
         }
         permission_mock.assert_called_once_with(USER_INFO)
         classifications_mock.assert_called_once_with(language="zh-Hans")
@@ -39,7 +41,11 @@ class TestModelClassificationOptions:
 
     @patch.object(nats, "_build_nats_model_permission_map", return_value=None)
     def test_returns_empty_items_without_model_permission(self, permission_mock):
-        assert nats.get_model_classification_options(user_info=USER_INFO) == {"items": []}
+        assert nats.get_model_classification_options(user_info=USER_INFO) == {
+            "result": True,
+            "data": [],
+            "message": "",
+        }
         permission_mock.assert_called_once_with(USER_INFO)
 
 
@@ -70,11 +76,13 @@ class TestClassificationModelInstanceCounts:
         result = nats.get_classification_model_instance_counts(classification_id="middleware", user_info=USER_INFO)
 
         assert result == {
-            "items": [
+            "result": True,
+            "data": [
                 {"label": "Apache", "value": 100},
                 {"label": "Nginx", "value": 10},
                 {"label": "Tomcat", "value": 10},
-            ]
+            ],
+            "message": "",
         }
         model_permission_mock.assert_called_once_with(USER_INFO)
         instance_permission_mock.assert_called_once_with(USER_INFO)
@@ -88,7 +96,11 @@ class TestClassificationModelInstanceCounts:
 
     @pytest.mark.parametrize("classification_id", [None, "", "   "])
     def test_returns_empty_items_for_blank_classification(self, classification_id):
-        assert nats.get_classification_model_instance_counts(classification_id=classification_id, user_info=USER_INFO) == {"items": []}
+        assert nats.get_classification_model_instance_counts(classification_id=classification_id, user_info=USER_INFO) == {
+            "result": True,
+            "data": [],
+            "message": "",
+        }
 
     @patch.object(nats.ModelManage, "search_model")
     @patch.object(
@@ -97,7 +109,11 @@ class TestClassificationModelInstanceCounts:
         return_value=[{"classification_id": "host", "classification_name": "主机"}],
     )
     def test_returns_empty_items_for_unknown_or_hidden_classification(self, classifications_mock, models_mock):
-        assert nats.get_classification_model_instance_counts(classification_id="middleware", user_info=USER_INFO) == {"items": []}
+        assert nats.get_classification_model_instance_counts(classification_id="middleware", user_info=USER_INFO) == {
+            "result": True,
+            "data": [],
+            "message": "",
+        }
         classifications_mock.assert_called_once_with(language="zh-Hans")
         models_mock.assert_not_called()
 
@@ -109,7 +125,11 @@ class TestClassificationModelInstanceCounts:
     @patch.object(nats, "_build_nats_permission_map", return_value=INSTANCE_PERMISSIONS)
     @patch.object(nats, "_build_nats_model_permission_map", return_value=None)
     def test_returns_empty_items_without_model_permission(self, model_permission_mock, instance_permission_mock, classifications_mock):
-        assert nats.get_classification_model_instance_counts(classification_id="middleware", user_info=USER_INFO) == {"items": []}
+        assert nats.get_classification_model_instance_counts(classification_id="middleware", user_info=USER_INFO) == {
+            "result": True,
+            "data": [],
+            "message": "",
+        }
         model_permission_mock.assert_called_once_with(USER_INFO)
         instance_permission_mock.assert_called_once_with(USER_INFO)
 
@@ -121,7 +141,11 @@ class TestClassificationModelInstanceCounts:
     @patch.object(nats, "_build_nats_permission_map", return_value=None)
     @patch.object(nats, "_build_nats_model_permission_map", return_value=MODEL_PERMISSIONS)
     def test_returns_empty_items_without_instance_permission(self, model_permission_mock, instance_permission_mock, classifications_mock):
-        assert nats.get_classification_model_instance_counts(classification_id="middleware", user_info=USER_INFO) == {"items": []}
+        assert nats.get_classification_model_instance_counts(classification_id="middleware", user_info=USER_INFO) == {
+            "result": True,
+            "data": [],
+            "message": "",
+        }
         model_permission_mock.assert_called_once_with(USER_INFO)
         instance_permission_mock.assert_called_once_with(USER_INFO)
 

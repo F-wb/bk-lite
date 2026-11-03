@@ -8,6 +8,7 @@ import { useTranslation } from '@/utils/i18n';
 
 const SOID_PATH = '/cmdb/assetManage/autoDiscovery/featureLibrary/soid';
 const PORT_PATH = '/cmdb/assetManage/autoDiscovery/featureLibrary/port';
+const PROCESS_PATH = '/cmdb/assetManage/autoDiscovery/featureLibrary/process';
 
 export default function FeatureLibraryLayout({
   children,
@@ -20,15 +21,18 @@ export default function FeatureLibraryLayout({
 
   const isFeatureLibrary =
     pathname?.includes('/featureLibrary/soid') ||
-    pathname?.includes('/featureLibrary/port');
+    pathname?.includes('/featureLibrary/port') ||
+    pathname?.includes('/featureLibrary/process');
 
   if (!isFeatureLibrary) {
     return <>{children}</>;
   }
 
-  const activeKey = pathname?.includes('/featureLibrary/port')
-    ? PORT_PATH
-    : SOID_PATH;
+  const activeKey = pathname?.includes('/featureLibrary/process')
+    ? PROCESS_PATH
+    : pathname?.includes('/featureLibrary/port')
+      ? PORT_PATH
+      : SOID_PATH;
 
   const handleTabChange = (key: string) => {
     router.push(key);
@@ -36,11 +40,11 @@ export default function FeatureLibraryLayout({
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <div className="shrink-0 mb-3 border-b border-[var(--color-border-2)] bg-[var(--color-bg-1)]">
+      <div className="shrink-0 px-4">
         <Tabs
           activeKey={activeKey}
           onChange={handleTabChange}
-          className="!mb-0"
+          className="[&>.ant-tabs-nav]:!mb-0 [&>.ant-tabs-content-holder]:hidden"
           items={[
             {
               key: SOID_PATH,
@@ -49,6 +53,10 @@ export default function FeatureLibraryLayout({
             {
               key: PORT_PATH,
               label: t('OidLibrary.portTab'),
+            },
+            {
+              key: PROCESS_PATH,
+              label: t('OidLibrary.processTab'),
             },
           ]}
         />

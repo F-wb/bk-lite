@@ -43,12 +43,14 @@ from apps.opspilot.serializers.llm_serializer import (
     SkillRequestLogSerializer,
     SkillToolsSerializer,
 )
+from apps.opspilot.services.asset_tags import apply_fallback_tool_tags
 from apps.opspilot.services.builtin_tools import (
     BUILTIN_ACTIVEDIRECTORY_TOOL_NAME,
     BUILTIN_ALERTS_TOOL_NAME,
     BUILTIN_ATTACHMENT_FILE_TOOL_NAME,
     BUILTIN_CMDB_TOOL_NAME,
     BUILTIN_LOG_TOOL_NAME,
+    BUILTIN_MLOPS_TOOL_NAME,
     BUILTIN_MONITOR_TOOL_NAME,
     BUILTIN_MSSQL_TOOL_NAME,
     BUILTIN_MYSQL_TOOL_NAME,
@@ -59,6 +61,7 @@ from apps.opspilot.services.builtin_tools import (
     build_builtin_attachment_file_tool,
     build_builtin_cmdb_tool,
     build_builtin_log_tool,
+    build_builtin_mlops_tool,
     build_builtin_monitor_tool,
     build_builtin_mssql_tool,
     build_builtin_mysql_tool,
@@ -145,6 +148,7 @@ class LLMViewSet(PinMixin, AuthViewSet):
             "force_wiki_grounded",
             "memory_space_id",
             "memory_write_rounds",
+            "run_model_call_limit",
         }
     )
 
@@ -258,6 +262,20 @@ class LLMViewSet(PinMixin, AuthViewSet):
             log_operation(request, "update", "opspilot", f"编辑智能体技能包参数: {instance.name} 变量: {','.join(param_names)}")
         return None
 
+    def _normalize_run_model_call_limit(self, params):
+        """校验每步调用次数；失败返回 JsonResponse，成功返回 None。"""
+        if "run_model_call_limit" not in params:
+            return None
+        try:
+            run_model_call_limit = int(params.get("run_model_call_limit"))
+        except (TypeError, ValueError):
+            run_model_call_limit = 0
+        if not 1 <= run_model_call_limit <= 100:
+            message = self.loader.get("error.run_model_call_limit_range") if self.loader else "每步调用次数须在 1 到 100 之间"
+            return JsonResponse({"result": False, "message": message or "每步调用次数须在 1 到 100 之间"})
+        params["run_model_call_limit"] = run_model_call_limit
+        return None
+
     @HasPermission("skill_setting-Edit")
     def update(self, request, *args, **kwargs):
         instance: LLMSkill = self.get_object()
@@ -315,6 +333,9 @@ class LLMViewSet(PinMixin, AuthViewSet):
                 params["memory_write_rounds"] = normalize_write_rounds(params.get("memory_write_rounds"))
             except SkillMemoryConfigError as exc:
                 return JsonResponse({"result": False, "message": str(exc)})
+        limit_error = self._normalize_run_model_call_limit(params)
+        if limit_error is not None:
+            return limit_error
         for tool in params.get("tools", []):
             for i in tool.get("kwargs", []):
                 if i.get("type") == "password":
@@ -431,7 +452,7 @@ class LLMViewSet(PinMixin, AuthViewSet):
             params["enable_query_rewrite"] = False
             params["show_think"] = False
             params["temperature"] = DEFAULT_CHAT_TEMPERATURE
-            params["locale"] = getattr(request.user, "locale", "en")  # 用户语言设置
+            params["locale"] = self.loader.default_lang if self.loader else (getattr(request.user, "locale", "en") or "en")
             params["user_timezone"] = getattr(request.user, "timezone", "") or ""
             # 透传技能绑定的 Wiki 知识库,触发 format_chat_server_kwargs 的检索增强;
             # 否则智能体对话不会引用知识库内容,易凭 LLM 自身知识作答(幻觉)。
@@ -517,7 +538,7 @@ class LLMViewSet(PinMixin, AuthViewSet):
             params["enable_query_rewrite"] = False
             params["show_think"] = False
             params["temperature"] = DEFAULT_CHAT_TEMPERATURE
-            params["locale"] = getattr(request.user, "locale", "en")  # 用户语言设置
+            params["locale"] = self.loader.default_lang if self.loader else (getattr(request.user, "locale", "en") or "en")
             params["user_timezone"] = getattr(request.user, "timezone", "") or ""
             params["browser_use_force_task"] = True
             # 同 execute:透传 Wiki 知识库以触发检索增强,避免智能体不查知识库而凭空作答。
@@ -1184,6 +1205,32 @@ class SkillToolsViewSet(AuthViewSet):
             if server:
                 SSRFValidator.validate(str(server).strip())
 
+    @action(detail=False, methods=["get"], url_path="timeseries_predict_servings")
+    @HasPermission("tool_list-View")
+    def timeseries_predict_servings(self, request):
+        """列出当前组织可选的时序预测服务，供智能体绑定。"""
+        # 延迟导入：mlops.nats_api 会拉起时序预测视图，避免 OpsPilot 启动时加载。
+        from apps.mlops.nats_api import get_mlops_module_data
+
+        team_id = get_current_team(request)
+        if not team_id:
+            return Response({"result": False, "message": "当前组织不能为空"}, status=status.HTTP_400_BAD_REQUEST)
+        actor_context = {
+            "is_superuser": bool(getattr(request.user, "is_superuser", False)),
+            "group_list": getattr(request.user, "group_list", None) or [],
+            "locale": getattr(request.user, "locale", None) or "zh-Hans",
+        }
+        result = get_mlops_module_data(
+            "serving",
+            "timeseries_predict_serving",
+            1,
+            500,
+            team_id,
+            actor_context=actor_context,
+            predictable_only=True,
+        )
+        return Response(result)
+
     @HasPermission("tool_list-View")
     def list(self, request, *args, **kwargs):
         response = super().list(request, *args, **kwargs)
@@ -1209,6 +1256,11 @@ class SkillToolsViewSet(AuthViewSet):
                 response.data.append(build_builtin_mssql_tool(loader))
             if not any(item.get("name") == BUILTIN_ACTIVEDIRECTORY_TOOL_NAME for item in response.data):
                 response.data.append(build_builtin_activedirectory_tool(loader))
+            if not any(item.get("name") == BUILTIN_MLOPS_TOOL_NAME for item in response.data):
+                response.data.append(build_builtin_mlops_tool(loader))
+            for item in response.data:
+                if isinstance(item, dict) and isinstance(item.get("id"), int) and item["id"] < 0:
+                    apply_fallback_tool_tags(item)
         return response
 
     @HasPermission("tool_list-Add")

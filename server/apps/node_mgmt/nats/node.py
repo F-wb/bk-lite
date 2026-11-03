@@ -920,13 +920,18 @@ def _collect_task_organization_ids(collect_task_id):
         raise BaseAppException("collect_task_id 参数非法")
 
     from apps.cmdb.models import CollectModels
+    from apps.cmdb.models.scan_model import ScanExecution
 
     task = CollectModels.objects.filter(id=task_id, driver_type="job").only("team").first()
-    if task is None:
-        raise BaseAppException("Job 采集任务不存在")
-    if not task.team:
+    team = task.team if task is not None else None
+    if team is None:
+        execution = ScanExecution.objects.select_related("task").filter(id=task_id).only("id", "task__team").first()
+        if execution is None:
+            raise BaseAppException("Job 采集任务不存在")
+        team = execution.task.team
+    if not team:
         raise BaseAppException("Job 采集任务缺少组织范围")
-    organization_ids = list(_normalize_organization_ids(task.team))
+    organization_ids = list(_normalize_organization_ids(team))
     if not organization_ids:
         raise BaseAppException("Job 采集任务缺少组织范围")
     return organization_ids
@@ -936,6 +941,12 @@ def _collect_task_organization_ids(collect_task_id):
 def get_nodes_with_child_config(node_ids: list, collector: str, collect_type: str):
     """查询关联了指定采集器子配置的节点。"""
     return NodeService.get_nodes_with_child_config(node_ids, collector, collect_type)
+
+
+@nats_client.register
+def get_child_config_assignments(node_ids: list, collector: str, collect_type: str):
+    """查询节点上指定采集器子配置的分配。"""
+    return NodeService.get_child_config_assignments(node_ids, collector, collect_type)
 
 
 @nats_client.register

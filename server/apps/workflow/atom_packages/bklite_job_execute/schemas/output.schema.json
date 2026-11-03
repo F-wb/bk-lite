@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "properties": {
+    "data": {
+      "type": "array", "title": "主机列表", "items": {
+        "type": "object",
+        "properties": {
+          "target": {"type": "object", "title": "目标"},
+          "status": {"type": "string", "enum": ["SUCCESS", "FAILED"], "title": "状态"},
+          "exit_code": {"type": "integer", "title": "退出码"},
+          "stdout": {"type": "string", "title": "标准输出"},
+          "stderr": {"type": "string", "title": "错误输出"},
+          "result": {"title": "业务 JSON"},
+          "error": {"type": ["string", "null"], "title": "错误"}
+        },
+        "required": ["target", "status", "exit_code", "stdout", "stderr", "result", "error"]
+      }
+    },
+    "summary": {
+      "type": "object", "title": "执行汇总",
+      "properties": {
+        "total": {"type": "integer", "title": "总数"},
+        "succeeded": {"type": "integer", "title": "成功数"},
+        "failed": {"type": "integer", "title": "失败数"}
+      },
+      "required": ["total", "succeeded", "failed"]
+    },
+    "job_task_ids": {"type": "array", "title": "作业实例", "items": {"type": "integer"}}
+  },
+  "required": ["data", "summary", "job_task_ids"]
+}

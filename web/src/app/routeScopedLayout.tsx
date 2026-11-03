@@ -11,12 +11,10 @@ import { ClientProvider } from '@/context/client';
 import { MenusProvider } from '@/context/menus';
 import { PermissionsProvider } from '@/context/permissions';
 import { isDashboardExecutionRenderRoute } from '@/app/routeScope';
+import { EffectiveHomepageProvider } from '@/app/ops-analysis/context/effectiveHomepage';
+import { HomepagePreferenceProvider } from '@/app/ops-analysis/context/homepagePreference';
 
-const Loader = () => (
-  <div className="flex justify-center items-center h-screen">
-    <Spin />
-  </div>
-);
+const Loader = () => <Spin fullscreen />;
 
 const DashboardExecutionRenderLayout = ({ children }: { children: ReactNode }) => {
   const { status } = useSession();
@@ -60,13 +58,17 @@ export const RouteScopedLayout = ({
 
   return (
     <UserInfoProvider>
-      <ClientProvider>
-        <MenusProvider>
-          <PermissionsProvider>
-            <StandardLayout>{children}</StandardLayout>
-          </PermissionsProvider>
-        </MenusProvider>
-      </ClientProvider>
+      <EffectiveHomepageProvider>
+        <HomepagePreferenceProvider>
+          <ClientProvider>
+            <MenusProvider>
+              <PermissionsProvider>
+                <StandardLayout>{children}</StandardLayout>
+              </PermissionsProvider>
+            </MenusProvider>
+          </ClientProvider>
+        </HomepagePreferenceProvider>
+      </EffectiveHomepageProvider>
     </UserInfoProvider>
   );
 };

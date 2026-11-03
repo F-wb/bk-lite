@@ -7,7 +7,6 @@ from apps.alerts.extensions.outbox import outbox_handlers
 from apps.alerts.models.outbox import AlertOutbox
 from apps.core.logger import alert_logger as logger
 
-
 OUTBOX_LEASE_TIMEOUT = timedelta(minutes=5)
 
 
@@ -36,6 +35,31 @@ def _schedule_delivery(record_id: int) -> None:
 def _deliver_payload(kind: str, payload: dict, *, delivery_claim=None) -> None:
     if outbox_handlers.deliver(kind, payload, delivery_claim=delivery_claim):
         return
+    if kind == "itsm_evaluate":
+        from apps.alerts.itsm.service import evaluate_creation
+
+        evaluate_creation(delivery_claim["record_id"])
+        return
+    if kind == "itsm_create":
+        from apps.alerts.itsm.service import execute_creation
+
+        execute_creation(payload["execution_id"])
+        return
+    if kind == "itsm_sync":
+        from apps.alerts.itsm.sync import sync_ticket
+
+        sync_ticket(payload["link_id"])
+        return
+    if kind == "itsm_comment":
+        from apps.alerts.itsm.comments import deliver_comment
+
+        deliver_comment(payload["link_id"], payload["event_name"])
+        return
+    if kind == "itsm_failure":
+        from apps.alerts.itsm.notification import notify_failure
+
+        notify_failure(payload["execution_id"], fault_key=payload.get("fault_key"))
+        return
     if kind == "action":
         from apps.alerts.tasks.action_tasks import process_alert_actions
 
@@ -45,6 +69,11 @@ def _deliver_payload(kind: str, payload: dict, *, delivery_claim=None) -> None:
         from apps.alerts.tasks.tasks import async_auto_assignment_for_alerts
 
         async_auto_assignment_for_alerts(payload.get("alert_ids") or [])
+        return
+    if kind == "recovery_reattach":
+        from apps.alerts.aggregation.recovery.recovery_checker import deliver_recovery_reattach
+
+        deliver_recovery_reattach(payload)
         return
     raise ValueError(f"unsupported alert outbox kind: {kind}")
 
@@ -65,26 +94,18 @@ def deliver_outbox_record(record_id: int) -> bool:
         record = AlertOutbox.objects.select_for_update().filter(pk=record_id).first()
         if not record or record.status == AlertOutbox.Status.DELIVERED:
             return False
-        if (
-            record.status == AlertOutbox.Status.DELIVERING
-            and record.updated_at > now - OUTBOX_LEASE_TIMEOUT
-        ):
+        if record.status == AlertOutbox.Status.DELIVERING and record.updated_at > now - OUTBOX_LEASE_TIMEOUT:
             return False
         if record.status == AlertOutbox.Status.FAILED and record.attempts >= record.max_attempts:
             return False
         kind = record.kind
         payload = record.payload
-        if (
-            record.status == AlertOutbox.Status.DELIVERING
-            and record.attempts >= record.max_attempts
-        ):
+        if record.status == AlertOutbox.Status.DELIVERING and record.attempts >= record.max_attempts:
             error = "delivery lease expired after retries exhausted"
             record.status = AlertOutbox.Status.FAILED
             record.next_retry_at = None
             record.last_error = error
-            record.save(
-                update_fields=["status", "next_retry_at", "last_error", "updated_at"]
-            )
+            record.save(update_fields=["status", "next_retry_at", "last_error", "updated_at"])
             lease_exhausted = True
         else:
             record.status = AlertOutbox.Status.DELIVERING
@@ -110,9 +131,7 @@ def deliver_outbox_record(record_id: int) -> bool:
                 },
             )
             if not handled:
-                from apps.alerts.service.notification_delivery import (
-                    ensure_notification_deliveries,
-                )
+                from apps.alerts.service.notification_delivery import ensure_notification_deliveries
 
                 notification_delivery_ids = ensure_notification_deliveries(record_id)
         else:
@@ -125,11 +144,7 @@ def deliver_outbox_record(record_id: int) -> bool:
                 },
             )
     except Exception as exc:
-        next_status = (
-            AlertOutbox.Status.FAILED
-            if claim_generation >= max_attempts
-            else AlertOutbox.Status.PENDING
-        )
+        next_status = AlertOutbox.Status.FAILED if claim_generation >= max_attempts else AlertOutbox.Status.PENDING
         delay_seconds = min(3600, 2 ** min(claim_generation, 10) * 15)
         finalized = AlertOutbox.objects.filter(
             pk=record_id,
@@ -160,9 +175,7 @@ def deliver_outbox_record(record_id: int) -> bool:
         updated_at=delivered_at,
     )
     if finalized and kind == "notification":
-        from apps.alerts.service.notification_delivery import (
-            schedule_notification_deliveries,
-        )
+        from apps.alerts.service.notification_delivery import schedule_notification_deliveries
 
         schedule_notification_deliveries(notification_delivery_ids)
     return bool(finalized)

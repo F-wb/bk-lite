@@ -12,7 +12,13 @@ import {
   Spin,
   Alert,
 } from 'antd';
-import { ExclamationCircleFilled, MinusCircleOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
+import {
+  ExclamationCircleFilled,
+  FormatPainterOutlined,
+  MinusCircleOutlined,
+  PlusOutlined,
+  SyncOutlined
+} from '@ant-design/icons';
 import CodeEditor from '@/components/code-editor';
 import {
   ScriptBodyEditor,
@@ -25,6 +31,7 @@ import Password from '@/components/password';
 import GroupTreeSelector from '@/components/group-tree-select';
 import { useTranslation } from '@/utils/i18n';
 import FieldGuideTip from '@/components/field-guide-tip';
+import MonitorNodeSelect from './MonitorNodeSelect';
 import { applyTableChangeHandler } from './tableChangeHandler';
 import { isDependencySatisfied } from './formFieldDependency';
 import {
@@ -53,6 +60,35 @@ type SelectWithRefreshProps = React.ComponentProps<typeof Select> & {
   regionLoading?: boolean;
 };
 
+// 更新配置弹窗 zIndex=2000。两种挂载都写 2100：在弹窗内容根里只参与弹层堆叠，
+// 落到 body 时高于遮罩，避免被盖住。
+const CLOUD_REGION_SELECT_POPUP_Z_INDEX = 2100;
+
+// 只给云地域 SelectWithRefresh 用。挂到弹窗内容根，避免窄 inline-flex 把浮层撑出窗外；
+// 不在弹窗内（接入页）时落到 body。
+function cloudRegionSelectPopupContainer(triggerNode?: HTMLElement | null): HTMLElement {
+  const modalContent = triggerNode?.closest?.('.ant-modal-content');
+  if (modalContent instanceof HTMLElement) {
+    return modalContent;
+  }
+  return document.body;
+}
+
+function withCloudRegionPopupZIndex(
+  styles: SelectWithRefreshProps['styles']
+): SelectWithRefreshProps['styles'] {
+  return {
+    ...styles,
+    popup: {
+      ...styles?.popup,
+      root: {
+        ...styles?.popup?.root,
+        zIndex: CLOUD_REGION_SELECT_POPUP_Z_INDEX,
+      },
+    },
+  };
+}
+
 // Form.Item 只把 value/onChange 注入直接子节点。刷新按钮必须放在转发包装里，
 // 否则选中地域只改 Select 内部展示，表单仍为空，必填校验会误报。
 const SelectWithRefresh = React.forwardRef<any, SelectWithRefreshProps>(
@@ -60,21 +96,17 @@ const SelectWithRefresh = React.forwardRef<any, SelectWithRefreshProps>(
     { onRefresh, refreshLabel, refreshTip, regionLoading, ...selectProps },
     ref
   ) {
-    const popupWrapRef = React.useRef<HTMLDivElement>(null);
     return (
       <div
-        ref={popupWrapRef}
-        className="relative z-[20] mr-[10px] inline-flex items-center gap-1"
+        className="mr-[10px] inline-flex items-center gap-1"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <Select
           ref={ref}
           {...selectProps}
           virtual={selectProps.virtual ?? false}
-          getPopupContainer={
-            selectProps.getPopupContainer ||
-            (() => popupWrapRef.current || document.body)
-          }
+          getPopupContainer={cloudRegionSelectPopupContainer}
+          styles={withCloudRegionPopupZIndex(selectProps.styles)}
         />
         <Tooltip title={refreshTip}>
           <Button
@@ -908,7 +940,17 @@ export const useConfigRenderer = () => {
     columnConfig: any,
     dataSource: any[],
     onTableDataChange: (data: any[]) => void,
-    externalOptions?: Record<string, any[]>
+    externalOptions?: Record<string, any[]>,
+    columnExtras?: {
+      onApplyNodeToEmptyRows?: (nodeIds: unknown) => void;
+      loadMonitorNodes?: (query: {
+        page: number;
+        pageSize: number;
+        keyword: string;
+      }) => Promise<{ count?: number; nodes?: any[] }>;
+      monitorNodeCacheScope?: string;
+      onMonitorNodesLoaded?: (nodes: any[]) => void;
+    }
   ) => {
     const {
       name,
@@ -926,6 +968,11 @@ export const useConfigRenderer = () => {
     } = columnConfig;
     const { width: columnWidth, ...componentProps } = widget_props;
     const guideTip = guide_short || tooltip || description;
+    const showBatchApply =
+      name === 'node_ids' &&
+      !enable_row_filter &&
+      typeof columnExtras?.onApplyNodeToEmptyRows === 'function';
+    const batchApplyLabel = t('monitor.integrations.batchApplyNode', '批量生效');
 
     let options = columnConfig.options || [];
     if (!options?.length && externalOptions) {
@@ -949,7 +996,8 @@ export const useConfigRenderer = () => {
       ),
       dataIndex: name,
       key: name,
-      width: columnWidth || 200
+      ellipsis: false,
+      width: columnWidth || (showBatchApply ? 280 : 200)
     };
 
     // 验证函数
@@ -1079,44 +1127,124 @@ export const useConfigRenderer = () => {
             name
           );
 
+          const hasSelectedNode = !(
+            text === undefined ||
+            text === null ||
+            text === '' ||
+            (Array.isArray(text) && text.length === 0)
+          );
+          const selectedOption = (options || []).find((option: any) => {
+            if (Array.isArray(text)) {
+              return text.some((item) => String(item) === String(option.value));
+            }
+            return String(option.value) === String(text);
+          });
+          const selectedLabel = selectedOption?.label || selectedOption?.name;
+
+          if (name === 'node_ids' && columnExtras?.loadMonitorNodes) {
+            const excludedValues = enable_row_filter
+              ? dataSource.flatMap((row, rowIndex) => {
+                if (rowIndex === index) return [];
+                const rowValue = row[name];
+                return Array.isArray(rowValue) ? rowValue : rowValue ? [rowValue] : [];
+              })
+              : [];
+            return (
+              <div className="flex w-full min-w-0 items-center gap-1">
+                <div className="min-w-0 flex-1 overflow-hidden">
+                  <MonitorNodeSelect
+                    value={text}
+                    onChange={(next) => handleChange(next, record, index)}
+                    placeholder={componentProps.placeholder || label}
+                    status={errorMsg ? 'error' : ''}
+                    cacheScope={columnExtras.monitorNodeCacheScope}
+                    loadNodes={columnExtras.loadMonitorNodes}
+                    onNodesLoaded={columnExtras.onMonitorNodesLoaded}
+                    excludeValues={excludedValues}
+                    componentProps={componentProps}
+                  />
+                </div>
+                {showBatchApply && (
+                  <Tooltip title={batchApplyLabel}>
+                    <span className="inline-flex shrink-0">
+                      <Button
+                        type="text"
+                        size="small"
+                        className="px-1 text-[var(--color-text-3)]"
+                        disabled={!hasSelectedNode}
+                        aria-label={batchApplyLabel}
+                        icon={<FormatPainterOutlined />}
+                        onClick={() => columnExtras?.onApplyNodeToEmptyRows?.(text)}
+                      />
+                    </span>
+                  </Tooltip>
+                )}
+                {errorMsg && (
+                  <Tooltip title={errorMsg}>
+                    <ExclamationCircleFilled className="text-[14px] text-[var(--color-fail)]" />
+                  </Tooltip>
+                )}
+              </div>
+            );
+          }
+
           return (
-            <div className="flex items-center gap-2">
-              <Select
-                value={text}
-                onChange={(value) => handleChange(value, record, index)}
-                placeholder={componentProps.placeholder || label}
-                className="flex-1"
-                status={errorMsg ? 'error' : ''}
-                showSearch
-                optionFilterProp="label"
-                {...componentProps}
-              >
-                {filteredOptions.map((option: any) => (
-                  <Select.Option
-                    key={option.value}
-                    value={option.value}
-                    label={option.label}
-                    disabled={option.disabled}
+            <div className="flex w-full min-w-0 items-center gap-1">
+              <Tooltip title={hasSelectedNode ? selectedLabel : undefined}>
+                <div className="min-w-0 flex-1 overflow-hidden">
+                  <Select
+                    {...componentProps}
+                    value={text}
+                    onChange={(value) => handleChange(value, record, index)}
+                    placeholder={componentProps.placeholder || label}
+                    className="w-full"
+                    status={errorMsg ? 'error' : ''}
+                    showSearch
+                    optionFilterProp="label"
                   >
-                    <Tooltip
-                      title={
-                        option.disabledReason
-                          ? `${option.label} · ${option.disabledReason}`
-                          : option.label
-                      }
-                    >
-                      <span className="flex w-full min-w-0 items-center justify-between gap-2">
-                        <span className="min-w-0 truncate">{option.label}</span>
-                        {option.disabledReason && (
-                          <span className="shrink-0 text-[12px] text-[var(--color-text-3)]">
-                            {option.disabledReason}
+                    {filteredOptions.map((option: any) => (
+                      <Select.Option
+                        key={option.value}
+                        value={option.value}
+                        label={option.label}
+                        disabled={option.disabled}
+                      >
+                        <Tooltip
+                          title={
+                            option.disabledReason
+                              ? `${option.label} · ${option.disabledReason}`
+                              : option.label
+                          }
+                        >
+                          <span className="flex w-full min-w-0 items-center justify-between gap-2">
+                            <span className="min-w-0 truncate">{option.label}</span>
+                            {option.disabledReason && (
+                              <span className="shrink-0 text-[12px] text-[var(--color-text-3)]">
+                                {option.disabledReason}
+                              </span>
+                            )}
                           </span>
-                        )}
-                      </span>
-                    </Tooltip>
-                  </Select.Option>
-                ))}
-              </Select>
+                        </Tooltip>
+                      </Select.Option>
+                    ))}
+                  </Select>
+                </div>
+              </Tooltip>
+              {showBatchApply && (
+                <Tooltip title={batchApplyLabel}>
+                  <span className="inline-flex shrink-0">
+                    <Button
+                      type="text"
+                      size="small"
+                      className="px-1 text-[var(--color-text-3)]"
+                      disabled={!hasSelectedNode}
+                      aria-label={batchApplyLabel}
+                      icon={<FormatPainterOutlined />}
+                      onClick={() => columnExtras?.onApplyNodeToEmptyRows?.(text)}
+                    />
+                  </span>
+                </Tooltip>
+              )}
               {errorMsg && (
                 <Tooltip title={errorMsg}>
                   <ExclamationCircleFilled className="text-[14px] text-[var(--color-fail)]" />

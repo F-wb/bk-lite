@@ -16,6 +16,8 @@ import type {
   GridStackWidget,
 } from 'gridstack';
 
+import { useFilterTemplateText } from '@/app/ops-analysis/context/filterTemplate';
+import InteractionTitleIcon from '@/app/ops-analysis/components/interactionTitleIcon';
 import { useTranslation } from '@/utils/i18n';
 import type {
   DashboardLayoutItem,
@@ -26,6 +28,10 @@ import type {
 import type { DatasourceItem } from '@/app/ops-analysis/types/dataSource';
 import PermissionWrapper from '@/components/permission';
 import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import { resolveDashboardChrome } from '@/app/ops-analysis/utils/homepageDashboardSurface';
+import { DASHBOARD_GRID_COLS } from '@/app/ops-analysis/utils/dashboardGridColumns';
+import { DASHBOARD_GRID_ROW_HEIGHT } from '@/app/ops-analysis/utils/dashboardGridRows';
+import { restoreGridStackMeasurableMinHeight } from '@/app/ops-analysis/utils/prepareDashboardPrintLayout';
 import {
   buildDashboardGridStackLayout,
   buildDashboardGridStackStructureKey,
@@ -42,6 +48,8 @@ import {
   isDashboardWidgetItem,
   sortDashboardLayoutItems,
 } from '@/app/ops-analysis/utils/dashboardGroups';
+import { deriveDashboardGridDisplayLayout } from '@/app/ops-analysis/utils/dashboardGroupViewVisibility';
+import { useDashboardViewAuth } from '@/app/ops-analysis/context/dashboardViewAuth';
 import {
   activateAllRuntimeWidgets,
   mergeRuntimeActivationStates,
@@ -54,20 +62,27 @@ import type { CanvasRuntimeRefreshCause } from '@/app/ops-analysis/utils/canvasR
 import { WidgetHeaderRuntimeSlotProvider } from '@/app/ops-analysis/components/widgetHeaderRuntimeSlot';
 import WidgetWrapper from '@/app/ops-analysis/components/widgetDataRenderer';
 import WidgetCsvHoverButton from '@/app/ops-analysis/components/widgetCsvHoverButton';
-import { notifyWidgetCsvExportNotStarted, useWidgetCsvExportRegistry, WidgetCsvExportRegistryProvider } from '@/app/ops-analysis/context/widgetCsvExportRegistry';
+import { notifyWidgetCsvExportNotStarted, useWidgetCsvExportRegistry, useWidgetCsvExportRegistryState, WidgetCsvExportRegistryProvider } from '@/app/ops-analysis/context/widgetCsvExportRegistry';
 import { buildAnalysisWidgetMenuItems, buildDashboardWidgetMenuKeys, resolveWidgetCsvExportEntry } from '@/app/ops-analysis/utils/widgetCsvMenu';
 import { DashboardRuntimeSchedulerProvider, useDashboardRuntimeScheduler } from '@/app/ops-analysis/context/dashboardRuntimeScheduler';
 import type { DashboardRuntimeScheduler, RuntimeRequestPriority } from '@/app/ops-analysis/utils/dashboardRuntimeScheduler';
 
 import 'gridstack/dist/gridstack.min.css';
 import type { DashboardWidgetRenderResult } from '@/app/ops-analysis/renderContract';
+import {
+  DASHBOARD_HIDE_EW_EDGE_CLASS,
+  DASHBOARD_HIDE_NS_EDGE_CLASS,
+  syncDashboardEdgeHandleVisibility,
+} from './dashboardEdgeHandles';
 
-const DASHBOARD_GRID_COLS = 12;
-const DASHBOARD_GRID_ROW_HEIGHT = 60;
 const DASHBOARD_GRID_MARGIN: [number, number] = [4, 4];
 const DASHBOARD_GRID_CONTAINER_PADDING: [number, number] = [6, 2];
-const DASHBOARD_WIDGET_RESIZE_HANDLES = 'se,sw,ne,nw';
+const DASHBOARD_WIDGET_RESIZE_HANDLES = 'se,sw,ne,nw,n,e,s,w';
 const DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE = 14;
+// 角点 SVG 是 6px 的 L，臂宽 6-4.2。边中点改成与边平行的短线，长度略长于这条臂。
+const DASHBOARD_EDGE_HANDLE_LINE_LENGTH = 14;
+const DASHBOARD_EDGE_HANDLE_LINE_THICKNESS = 1.8;
+const DASHBOARD_EDGE_HANDLE_LINE_INSET = 1;
 
 const acceptOnlyWidgetNodes = (element: Element) =>
   element instanceof HTMLElement && element.dataset.nodeKind === 'widget';
@@ -122,6 +137,7 @@ interface DashboardWidgetCardProps {
   onWidgetRenderStatus?: DashboardCanvasProps['onWidgetRenderStatus'];
   renderMode?: boolean;
   pdfExportPreparing?: boolean;
+  csvExportHidden?: boolean;
 }
 
 const DashboardWidgetCard = React.memo(function DashboardWidgetCard({
@@ -150,8 +166,11 @@ const DashboardWidgetCard = React.memo(function DashboardWidgetCard({
   onWidgetRenderStatus,
   renderMode = false,
   pdfExportPreparing = false,
+  csvExportHidden = false,
 }: DashboardWidgetCardProps) {
   const { t } = useTranslation();
+  const title = useFilterTemplateText(item.name);
+  const description = useFilterTemplateText(item.description);
   const csvExportRegistry = useWidgetCsvExportRegistry();
   const [exportRawData, setExportRawData] = useState<unknown>(undefined);
   const chartType = item.valueConfig?.chartType;
@@ -167,7 +186,7 @@ const DashboardWidgetCard = React.memo(function DashboardWidgetCard({
     sceneWidgetType: item.valueConfig?.sceneWidgetType,
     rawData: exportRawData,
   });
-  const showHoverExport = resolveWidgetCsvExportEntry({
+  const showHoverExport = !csvExportHidden && resolveWidgetCsvExportEntry({
     surface: 'dashboard',
     chartType,
     editMode: isEditMode,
@@ -177,7 +196,7 @@ const DashboardWidgetCard = React.memo(function DashboardWidgetCard({
     rawData: exportRawData,
   }) === 'hover';
   const exportCsv = () => {
-    void csvExportRegistry?.run(item.i, { title: item.name || '' }).then((started) => {
+    void csvExportRegistry?.run(item.i, { title: title || '' }).then((started) => {
       notifyWidgetCsvExportNotStarted(started, t);
     });
   };
@@ -200,14 +219,16 @@ const DashboardWidgetCard = React.memo(function DashboardWidgetCard({
             border: `1px solid ${chartTheme.panelBorderColor}`,
           }}
         >
-          <div className="widget-header mb-2 flex min-w-0 items-start gap-2">
+          <div className="widget-header flex min-w-0 items-start gap-2">
             <div className="min-w-0 flex-1">
-              <h4 className="truncate text-[14px] font-medium leading-5 text-(--color-text-2)">
-                {item.name}
-              </h4>
+              <div className="flex min-w-0 items-center gap-1">
+                <h4 className="truncate text-[14px] font-medium leading-5 text-(--color-text-2)">
+                  {title}
+                </h4>
+              </div>
               {item.description?.trim() && (
                 <p className="mt-0.5 text-[11px] leading-4 text-(--color-text-3) wrap-break-word whitespace-normal">
-                  {item.description}
+                  {description}
                 </p>
               )}
             </div>
@@ -221,6 +242,7 @@ const DashboardWidgetCard = React.memo(function DashboardWidgetCard({
                 onClick={exportCsv}
               />
             )}
+            <InteractionTitleIcon config={item.valueConfig} />
             {menuItems.length > 0 && (
               <div data-export-hidden="true" className="no-drag shrink-0">
                 <MoreActionsDropdown
@@ -314,6 +336,9 @@ interface DashboardCanvasProps {
   ) => void;
   renderMode?: boolean;
   pdfExportPreparing?: boolean;
+  csvExportHidden?: boolean;
+  /** 浅色首页透出系统背景。运营分析模块不走这套。 */
+  homepageSurface?: boolean;
   scrollRootRef: RefObject<HTMLDivElement | null>;
   onWidgetRenderStatus?: (result: DashboardWidgetRenderResult) => void;
 }
@@ -350,10 +375,15 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
   onTopologyLayoutChange,
   renderMode = false,
   pdfExportPreparing = false,
+  csvExportHidden = false,
+  homepageSurface = false,
   scrollRootRef,
   onWidgetRenderStatus,
 }) => {
   const { t } = useTranslation();
+  const parentCsvRegistry = useWidgetCsvExportRegistry();
+  const ownedCsvRegistry = useWidgetCsvExportRegistryState();
+  const csvRegistry = parentCsvRegistry ?? ownedCsvRegistry;
   const gridRootRef = useRef<HTMLDivElement>(null);
   const rootGridRef = useRef<GridStackInstance | null>(null);
   const subGridRefs = useRef<Map<string, GridStackInstance>>(new Map());
@@ -371,13 +401,25 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
     dashboardId,
   );
 
+  const viewAuth = useDashboardViewAuth();
+  const displayLayout = useMemo(() => {
+    if (isEditMode || !viewAuth) {
+      return layout;
+    }
+    return deriveDashboardGridDisplayLayout({
+      items: layout,
+      mode: 'view',
+      isWidgetUnauthorized: viewAuth.isWidgetUnauthorized,
+    });
+  }, [isEditMode, layout, viewAuth]);
+
   const gridStackLayout = useMemo(
-    () => buildDashboardGridStackLayout(layout),
-    [layout],
+    () => buildDashboardGridStackLayout(displayLayout),
+    [displayLayout],
   );
   const gridStructureKey = useMemo(
-    () => buildDashboardGridStackStructureKey(layout),
-    [layout],
+    () => buildDashboardGridStackStructureKey(displayLayout),
+    [displayLayout],
   );
   const dashboardInstanceKey = useMemo(
     () => `${dashboardId ?? 'dashboard'}:${gridStructureKey}`,
@@ -386,6 +428,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
   const dashboardScopeKey = String(dashboardId ?? 'dashboard');
   const layoutRef = useRef(layout);
   const collapsedGroupsRef = useRef(collapsedGroups);
+  const isEditModeRef = useRef(isEditMode);
   const gridStackLayoutRef = useRef(gridStackLayout);
   const emitLayoutChangeRef = useRef<() => void>(() => undefined);
   const handleWidgetMutationStopRef = useRef<
@@ -401,7 +444,14 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
         .filter((node) => node.kind === 'widget')
         .map((node) => node.id)
         .concat(gridStackLayout.groupNodes.flatMap((node) => node.children.map((child) => child.id)));
-      setRuntimeStates(activateAllRuntimeWidgets(widgetIds));
+      setRuntimeStates((previous) => {
+        const previousKey = Object.keys(previous).sort().join('|');
+        const nextKey = [...widgetIds].sort().join('|');
+        if (previousKey === nextKey && widgetIds.every((widgetId) => previous[widgetId]?.active)) {
+          return previous;
+        }
+        return activateAllRuntimeWidgets(widgetIds);
+      });
       return undefined;
     }
 
@@ -452,8 +502,9 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
   useEffect(() => {
     layoutRef.current = layout;
     collapsedGroupsRef.current = collapsedGroups;
+    isEditModeRef.current = isEditMode;
     gridStackLayoutRef.current = gridStackLayout;
-  }, [layout, collapsedGroups, gridStackLayout]);
+  }, [layout, collapsedGroups, gridStackLayout, isEditMode]);
 
   useEffect(() => {
     const root = scrollRootRef.current;
@@ -566,21 +617,15 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
       const cardElement = document.createElement('div');
       cardElement.className =
         'flex min-h-0 flex-col overflow-hidden rounded-lg border';
-      cardElement.style.backgroundColor = isDarkTheme
-        ? 'rgba(255,255,255,0.02)'
-        : '#f7f8fa';
-      cardElement.style.borderColor = isDarkTheme
-        ? 'rgba(255,255,255,0.12)'
-        : 'rgba(61,79,104,0.14)';
+      const groupSurface = resolveDashboardChrome(homepageSurface, isDarkTheme);
+      cardElement.style.backgroundColor = groupSurface.groupBackground;
+      cardElement.style.borderColor = groupSurface.groupBorderColor;
+      cardElement.style.backdropFilter = groupSurface.groupBackdrop;
 
       const headerElement = document.createElement('div');
       headerElement.className = 'shrink-0 overflow-hidden rounded-t-lg';
-      headerElement.style.backgroundColor = isDarkTheme
-        ? 'rgba(255,255,255,0.03)'
-        : '#f1f3f8';
-      headerElement.style.borderBottom = isDarkTheme
-        ? '1px solid rgba(255,255,255,0.08)'
-        : '1px solid rgba(61,79,104,0.08)';
+      headerElement.style.backgroundColor = groupSurface.groupHeaderBackground;
+      headerElement.style.borderBottom = groupSurface.groupHeaderBorder;
 
       const headerHost = document.createElement('div');
       headerHost.dataset.groupHeaderHost = node.id;
@@ -605,7 +650,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
 
       return itemElement;
     },
-    [isDarkTheme],
+    [homepageSurface, isDarkTheme],
   );
 
   const buildCurrentLayout = useCallback((): DashboardLayoutItem[] => {
@@ -787,11 +832,12 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
         return;
       }
 
+      const fitToContent = isEditModeRef.current && !isCollapsed;
       const nextOptions = options?.preservePosition
         ? {
           id: node.id,
           h: isCollapsed ? node.item.h : node.h,
-          sizeToContent: !isCollapsed,
+          sizeToContent: fitToContent,
         }
         : {
           id: node.id,
@@ -799,12 +845,12 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
           y: node.y,
           w: node.w,
           h: isCollapsed ? node.item.h : node.h,
-          sizeToContent: !isCollapsed,
+          sizeToContent: fitToContent,
         };
 
       rootGrid.update(groupElement, nextOptions);
 
-      if (!isCollapsed) {
+      if (fitToContent) {
         rootGrid.resizeToContent(groupElement as GridItemHTMLElement);
       }
     },
@@ -829,7 +875,10 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
         y: node.y,
         w: node.w,
         h: node.kind === 'group' && isCollapsedGroup ? node.item.h : node.h,
-        sizeToContent: node.kind === 'group' && !isCollapsedGroup,
+        sizeToContent:
+          isEditModeRef.current &&
+          node.kind === 'group' &&
+          !isCollapsedGroup,
       });
     },
     [],
@@ -879,11 +928,34 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
   }, [emitLayoutChange, handleWidgetMutationStop]);
 
   useEffect(() => {
-    if (!gridRootRef.current) {
+    // 加载态不挂载 grid 根节点。若这次 effect 在 loading 时直接返回，
+    // 布局 key 不变时 loading 结束不会再进这里，查看态会一直空白。
+    if (loading || !gridRootRef.current) {
       return;
     }
 
     let cancelled = false;
+    let edgeResizeObserver: ResizeObserver | null = null;
+    let edgeGridObserver: MutationObserver | null = null;
+
+    const syncEdgeHandles = () => {
+      const root = gridRootRef.current;
+      if (!root) return;
+      syncDashboardEdgeHandleVisibility(root);
+    };
+
+    const observeEdgeHandleItems = () => {
+      const root = gridRootRef.current;
+      if (!root || !edgeResizeObserver) return;
+      root.querySelectorAll<HTMLElement>('.grid-stack').forEach((grid) => {
+        grid
+          .querySelectorAll<HTMLElement>(':scope > .grid-stack-item')
+          .forEach((item) => {
+            edgeResizeObserver?.observe(item);
+          });
+      });
+      syncEdgeHandles();
+    };
 
     const destroyGrids = () => {
       subGridRefs.current.forEach((grid) => grid.destroy(false));
@@ -934,6 +1006,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
         gridRootRef.current?.appendChild(itemElement);
       });
 
+      restoreGridStackMeasurableMinHeight(gridRootRef.current);
       const rootGrid = GridStack.init(
         {
           column: DASHBOARD_GRID_COLS,
@@ -963,7 +1036,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
           y: node.y,
           w: node.w,
           h: node.kind === 'group' && isCollapsedGroup ? node.item.h : node.h,
-          sizeToContent: node.kind === 'group' && !isCollapsedGroup,
+          sizeToContent: isEditModeRef.current && node.kind === 'group' && !isCollapsedGroup,
           noMove: false,
           noResize: node.kind === 'group',
         });
@@ -974,7 +1047,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
           y: node.y,
           w: node.w,
           h: node.kind === 'group' && isCollapsedGroup ? node.item.h : node.h,
-          sizeToContent: node.kind === 'group' && !isCollapsedGroup,
+          sizeToContent: isEditModeRef.current && node.kind === 'group' && !isCollapsedGroup,
         });
       });
       const bindGridMutationEvents = (
@@ -990,6 +1063,9 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
           if (options?.rootGrid) {
             emitLayoutChangeRef.current();
           }
+        });
+        grid.on('resize', () => {
+          syncEdgeHandles();
         });
         grid.on(
           'resizestop',
@@ -1041,9 +1117,12 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
           return;
         }
 
+        restoreGridStackMeasurableMinHeight(subGridRoot);
         const subGrid = GridStack.init(
           {
-            column: 'auto',
+            // 手动 init 时若写 auto，GridStack 会删掉该选项并回落默认 12；
+            // 子项 x/w 已按 DASHBOARD_GRID_COLS 存，必须显式对齐，否则分组内错乱。
+            column: DASHBOARD_GRID_COLS,
             cellHeight: DASHBOARD_GRID_ROW_HEIGHT,
             margin: DASHBOARD_GRID_MARGIN[0],
             float: false,
@@ -1083,6 +1162,21 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
 
       setPortalVersion((previous) => previous + 1);
 
+      if (typeof ResizeObserver !== 'undefined' && gridRootRef.current) {
+        edgeResizeObserver = new ResizeObserver(() => {
+          syncEdgeHandles();
+        });
+        edgeGridObserver = new MutationObserver(() => {
+          observeEdgeHandleItems();
+        });
+        gridRootRef.current
+          .querySelectorAll<HTMLElement>('.grid-stack')
+          .forEach((grid) => {
+            edgeGridObserver?.observe(grid, { childList: true });
+          });
+        observeEdgeHandleItems();
+      }
+
       scheduleScrollRestore(() => cancelled);
     };
 
@@ -1091,6 +1185,8 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
     return () => {
       cancelled = true;
       syncingRef.current = true;
+      edgeResizeObserver?.disconnect();
+      edgeGridObserver?.disconnect();
       if (commitFrameRef.current !== null) {
         window.cancelAnimationFrame(commitFrameRef.current);
         commitFrameRef.current = null;
@@ -1103,6 +1199,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
     createWidgetShell,
     dashboardInstanceKey,
     dashboardScopeKey,
+    loading,
     scheduleScrollRestore,
     syncGroupPresentation,
   ]);
@@ -1123,7 +1220,11 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
       subGrid.enableMove(isEditMode);
       subGrid.enableResize(isEditMode);
     });
-  }, [isEditMode]);
+
+    gridStackLayout.groupNodes.forEach((node) => {
+      syncGroupPresentation(node, { preservePosition: true });
+    });
+  }, [isEditMode, gridStackLayout.groupNodes, syncGroupPresentation]);
 
   useEffect(() => {
     if (!rootGridRef.current) {
@@ -1286,6 +1387,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
         onWidgetRenderStatus={onWidgetRenderStatus}
         renderMode={renderMode}
         pdfExportPreparing={pdfExportPreparing}
+        csvExportHidden={csvExportHidden}
       />,
       host,
       `widget:${id}`,
@@ -1293,7 +1395,7 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
   });
 
   return (
-    <WidgetCsvExportRegistryProvider>
+    <WidgetCsvExportRegistryProvider registry={csvRegistry}>
     <DashboardRuntimeSchedulerProvider>
       <SchedulerRefBinder schedulerRef={runtimeSchedulerRef} />
       <div
@@ -1349,6 +1451,109 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
           transform: rotate(270deg);
         }
 
+        .grid-stack-item > .ui-resizable-n,
+        .grid-stack-item > .ui-resizable-e,
+        .grid-stack-item > .ui-resizable-s,
+        .grid-stack-item > .ui-resizable-w {
+          background-image: none !important;
+          transform: none !important;
+        }
+
+        .grid-stack-item > .ui-resizable-n,
+        .grid-stack-item > .ui-resizable-s {
+          width: ${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px !important;
+          height: ${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px !important;
+          left: 50% !important;
+          right: auto !important;
+          margin-top: 0 !important;
+          margin-right: 0 !important;
+          margin-bottom: 0 !important;
+          margin-left: calc(${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px / -2) !important;
+          cursor: ns-resize !important;
+        }
+
+        .grid-stack-item > .ui-resizable-n {
+          top: var(--gs-item-margin-top) !important;
+          bottom: auto !important;
+        }
+
+        .grid-stack-item > .ui-resizable-s {
+          top: auto !important;
+          bottom: var(--gs-item-margin-bottom) !important;
+        }
+
+        .grid-stack-item > .ui-resizable-e,
+        .grid-stack-item > .ui-resizable-w {
+          width: ${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px !important;
+          height: ${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px !important;
+          top: 50% !important;
+          bottom: auto !important;
+          margin-left: 0 !important;
+          margin-right: 0 !important;
+          margin-bottom: 0 !important;
+          margin-top: calc(${DASHBOARD_WIDGET_RESIZE_HANDLE_SIZE}px / -2) !important;
+          cursor: ew-resize !important;
+        }
+
+        .grid-stack-item > .ui-resizable-e {
+          right: calc(var(--gs-item-margin-right) + 2px) !important;
+          left: auto !important;
+        }
+
+        .grid-stack-item > .ui-resizable-w {
+          left: calc(var(--gs-item-margin-left) + 2px) !important;
+          right: auto !important;
+        }
+
+        .grid-stack-item > .ui-resizable-n::after,
+        .grid-stack-item > .ui-resizable-s::after,
+        .grid-stack-item > .ui-resizable-e::after,
+        .grid-stack-item > .ui-resizable-w::after {
+          content: '';
+          position: absolute;
+          background: rgba(0, 0, 0, 0.302);
+          pointer-events: none;
+        }
+
+        .grid-stack-item > .ui-resizable-n::after,
+        .grid-stack-item > .ui-resizable-s::after {
+          left: 50%;
+          width: ${DASHBOARD_EDGE_HANDLE_LINE_LENGTH}px;
+          height: ${DASHBOARD_EDGE_HANDLE_LINE_THICKNESS}px;
+          margin-left: calc(${DASHBOARD_EDGE_HANDLE_LINE_LENGTH}px / -2);
+        }
+
+        .grid-stack-item > .ui-resizable-n::after {
+          top: ${DASHBOARD_EDGE_HANDLE_LINE_INSET}px;
+        }
+
+        .grid-stack-item > .ui-resizable-s::after {
+          bottom: ${DASHBOARD_EDGE_HANDLE_LINE_INSET}px;
+        }
+
+        .grid-stack-item > .ui-resizable-e::after,
+        .grid-stack-item > .ui-resizable-w::after {
+          top: 50%;
+          width: ${DASHBOARD_EDGE_HANDLE_LINE_THICKNESS}px;
+          height: ${DASHBOARD_EDGE_HANDLE_LINE_LENGTH}px;
+          margin-top: calc(${DASHBOARD_EDGE_HANDLE_LINE_LENGTH}px / -2);
+        }
+
+        .grid-stack-item > .ui-resizable-e::after {
+          right: ${DASHBOARD_EDGE_HANDLE_LINE_INSET}px;
+        }
+
+        .grid-stack-item > .ui-resizable-w::after {
+          left: ${DASHBOARD_EDGE_HANDLE_LINE_INSET}px;
+        }
+
+        .grid-stack-item.${DASHBOARD_HIDE_NS_EDGE_CLASS} > .ui-resizable-n,
+        .grid-stack-item.${DASHBOARD_HIDE_NS_EDGE_CLASS} > .ui-resizable-s,
+        .grid-stack-item.${DASHBOARD_HIDE_EW_EDGE_CLASS} > .ui-resizable-e,
+        .grid-stack-item.${DASHBOARD_HIDE_EW_EDGE_CLASS} > .ui-resizable-w {
+          display: none !important;
+        }
+
         .grid-stack-item[data-node-kind='group'] > .ui-resizable-handle {
           display: none !important;
         }
@@ -1356,13 +1561,6 @@ const DashboardCanvas: React.FC<DashboardCanvasProps> = ({
         .dark .grid-stack-item > .ui-resizable-handle,
         [data-theme='dark'] .grid-stack-item > .ui-resizable-handle {
           filter: invert(1) opacity(0.65);
-        }
-
-        .grid-stack-item > .ui-resizable-n,
-        .grid-stack-item > .ui-resizable-e,
-        .grid-stack-item > .ui-resizable-s,
-        .grid-stack-item > .ui-resizable-w {
-          display: none !important;
         }
       `}</style>
       <div ref={gridRootRef} className="grid-stack relative z-10 w-full" />

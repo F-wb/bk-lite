@@ -14,6 +14,7 @@ from apps.opspilot.models import SkillPackage
 from apps.opspilot.serializers.llm_serializer import SkillPackageSerializer
 from apps.opspilot.services.skill_package.builtin_seed import seed_all_builtin_skill_packages, seed_builtin_skill_package
 from apps.opspilot.viewsets.llm_view import SkillPackageViewSet
+from apps.system_mgmt.models.user import Group
 
 pytestmark = pytest.mark.django_db
 
@@ -104,6 +105,9 @@ class TestBuiltinSkillPackageSeed:
         assert first.created is True
         assert second.created is False
         assert SkillPackage.objects.filter(package_id="demo-k8s", version="9.9.9").count() == 1
+        pkg = SkillPackage.objects.get(package_id="demo-k8s")
+        assert pkg.system_tags == []
+        assert pkg.category == "infrastructure"
 
     def test_seed_all_includes_repo_kubernetes_package(self, tmp_path):
         assert SUPPORT_PACKAGE.is_dir(), "support-files kubernetes-configuration 缺失"
@@ -116,7 +120,26 @@ class TestBuiltinSkillPackageSeed:
         assert "kubernetes-configuration" in ids
         pkg = SkillPackage.objects.get(package_id="kubernetes-configuration", is_build_in=True)
         assert pkg.version == "1.1.1"
+        assert pkg.system_tags == ["container"]
+        assert pkg.user_tags == []
+        assert pkg.category != "container"
+        default_group = Group.objects.filter(name="Default", parent_id=0).only("id").first()
+        assert pkg.team == ([default_group.id] if default_group else [1])
         assert (Path(pkg.storage_path) / "extracted" / "SKILL.md").is_file()
+
+        pkg.user_tags = ["值班"]
+        pkg.system_tags = ["stale"]
+        pkg.team = [99]
+        pkg.save(update_fields=["user_tags", "system_tags", "team"])
+        seed_all_builtin_skill_packages(
+            support_root=SUPPORT_PACKAGE.parent,
+            storage_root=storage_root,
+        )
+        pkg.refresh_from_db()
+        assert pkg.system_tags == ["container"]
+        assert pkg.user_tags == ["值班"]
+        assert pkg.team == [99]
+        assert pkg.category != "container"
 
     def test_init_skill_packages_command(self, tmp_path, mocker):
         storage_root = tmp_path / "storage"
@@ -160,6 +183,33 @@ class TestSkillPackageSerializerI18n:
         assert "Kubernetes" in zh_data["description_tr"]
         assert en_data["display_name"] == "Kubernetes Configuration"
         assert "Kubernetes" in en_data["description_tr"]
+
+    def test_ppt_master_display_fields_use_language_yaml(self, mocker):
+        mocker.patch(
+            "apps.core.utils.serializers.get_permission_rules",
+            return_value={"instance": [], "team": [1]},
+        )
+        pkg = SkillPackage.objects.create(
+            package_id="ppt-master",
+            name="PPT Master Skill",
+            version="6.7.2",
+            description="AI-driven presentation workflow for generating editable PPTX decks and slides",
+            domain="domain.com",
+            is_build_in=True,
+            source_type="builtin",
+        )
+        factory = APIRequestFactory()
+        zh_request = factory.get("/")
+        zh_request.user = _user(username="ppt_pkg_zh", locale="zh-Hans")
+        en_request = factory.get("/")
+        en_request.user = _user(username="ppt_pkg_en", locale="en")
+        zh_data = SkillPackageSerializer(pkg, context={"request": zh_request}).data
+        en_data = SkillPackageSerializer(pkg, context={"request": en_request}).data
+        assert zh_data["display_name"] == "PPT Master"
+        assert "演示文稿" in zh_data["description_tr"]
+        assert "AI-driven" not in zh_data["description_tr"]
+        assert en_data["display_name"] == "PPT Master"
+        assert "native PPTX" in en_data["description_tr"]
 
     def test_display_fields_fallback_to_db(self, mocker):
         mocker.patch(

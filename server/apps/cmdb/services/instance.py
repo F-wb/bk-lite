@@ -51,7 +51,12 @@ from apps.cmdb.services.instance_identity import (
 )
 from apps.cmdb.services.model import ModelManage
 from apps.cmdb.services.unique_rule import build_unique_rule_context, collect_instance_unique_conflicts
-from apps.cmdb.utils.change_record import batch_create_change_record, create_change_record, create_change_record_by_asso
+from apps.cmdb.utils.change_record import (
+    batch_create_change_record,
+    create_change_record,
+    create_change_record_by_asso,
+    format_instance_audit_message,
+)
 from apps.cmdb.utils.export import Export
 from apps.cmdb.utils.Import import Import
 from apps.cmdb.utils.permission_util import CmdbRulesFormatUtil
@@ -96,6 +101,17 @@ class InstanceBatchError(BaseAppException):
             if value is not None
         }
         super().__init__(message, data=data)
+
+
+class StaleMonitorBinding(Exception):
+    """锁内读到的 monitor_id 已不是解绑开始时的值，拒绝清空。"""
+
+
+def _normalized_monitor_id(value) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _normalize_batch_instance_ids(inst_ids: list) -> list[int]:
@@ -433,6 +449,29 @@ class InstanceManage(object):
         if inst_names:
             _run({"field": "inst_name", "type": "str[]", "value": list(set(inst_names))})
         return result
+
+    @staticmethod
+    def search_inst_by_monitor_ids(monitor_ids) -> dict:
+        """按实例属性 monitor_id 批量查询，不限模型。返回 {monitor_id: [instance, ...]}。"""
+        normalized = []
+        seen = set()
+        for value in monitor_ids or []:
+            text = str(value).strip() if value not in (None, "") else ""
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        if not normalized:
+            return {}
+        with GraphClient() as ag:
+            inst_list, _ = ag.query_entity(INSTANCE, [{"field": "monitor_id", "type": "str[]", "value": normalized}])
+        grouped = {}
+        for inst in inst_list:
+            key = str(inst.get("monitor_id") or "").strip()
+            if not key:
+                continue
+            grouped.setdefault(key, []).append(inst)
+        return grouped
 
     @staticmethod
     def query_entity_page_by_ids(
@@ -989,6 +1028,8 @@ class InstanceManage(object):
         permission_map: dict,
         creator: str = None,
         case_sensitive: bool = True,
+        advanced_filter: dict = None,
+        permission_lookup=None,
     ):
         """实例列表"""
 
@@ -1001,6 +1042,22 @@ class InstanceManage(object):
         if order and order.startswith("-"):
             order = order[1:]
             order_type = "DESC"
+
+        if advanced_filter:
+            from apps.cmdb.services.advanced_instance_query import run_advanced_instance_query
+
+            return run_advanced_instance_query(
+                model_id=model_id,
+                params=params,
+                advanced_filter=advanced_filter,
+                permission_map=permission_map,
+                creator=creator,
+                permission_lookup=permission_lookup,
+                page=_page,
+                order=order,
+                order_type=order_type,
+                case_sensitive=case_sensitive,
+            )
 
         with GraphClient() as ag:
             query = dict(
@@ -1025,6 +1082,7 @@ class InstanceManage(object):
         record_change: bool = True,
         operation_id: str | None = None,
         schedule_post_actions: bool = True,
+        audit_source: str = "",
     ):
         """创建实例"""
         instance_info = apply_model_cloud_id(model_id, dict(instance_info))
@@ -1075,7 +1133,12 @@ class InstanceManage(object):
                 after_data=result,
                 operator=operator,
                 model_object=OPERATOR_INSTANCE,
-                message=f"创建模型实例. 模型:{result['model_id']} 实例:{result.get('inst_name') or result.get('ip_addr', '')}",
+                message=format_instance_audit_message(
+                    "创建模型实例",
+                    result["model_id"],
+                    result.get("inst_name") or result.get("ip_addr", ""),
+                    source=audit_source,
+                ),
                 scenario=scenario,
             )
 
@@ -1145,6 +1208,8 @@ class InstanceManage(object):
         instances: list,
         operator: str,
         allowed_org_ids: list | None = None,
+        *,
+        audit_source: str = "",
     ):
         """批量创建实例，任一图写失败时回滚本批已创建节点。"""
         attrs = ModelManage.search_model_attr(model_id)
@@ -1154,6 +1219,7 @@ class InstanceManage(object):
             for_update=False,
         )
         prepared = []
+        subnet_batch_state = {} if model_id == "subnet" else None
         for index, item in enumerate(instances):
             try:
                 instance_info = prepare_new_instance_identity({**item, "model_id": model_id})
@@ -1167,7 +1233,7 @@ class InstanceManage(object):
                 if model_id == "subnet":
                     from apps.cmdb.services.ipam_subnet import validate_subnet_no_overlap
 
-                    validate_subnet_no_overlap(instance_info)
+                    validate_subnet_no_overlap(instance_info, batch_state=subnet_batch_state)
                 instance_info = get_instance_enterprise_extension().normalize_file_fields(
                     model_id,
                     instance_info,
@@ -1277,7 +1343,12 @@ class InstanceManage(object):
                 "model_id": model_id,
                 "after_data": item,
                 "model_object": OPERATOR_INSTANCE,
-                "message": (f"创建模型实例. 模型:{model_id} " f"实例:{item.get('inst_name') or item.get('ip_addr', '')}"),
+                "message": format_instance_audit_message(
+                    "创建模型实例",
+                    model_id,
+                    item.get("inst_name") or item.get("ip_addr", ""),
+                    source=audit_source,
+                ),
             }
             for item in created
         ]
@@ -1321,13 +1392,16 @@ class InstanceManage(object):
         record_change: bool = True,
         operation_id: str | None = None,
         schedule_post_actions: bool = True,
+        expected_monitor_id: str | None = None,
+        audit_source: str = "",
     ):
         """修改实例属性"""
         from apps.cmdb.services.module_ingest import strip_system_link_fields
 
         update_attr = dict(update_attr)
         ensure_instance_identity_immutable(update_attr)
-        # 用户写路径剔除系统联动字段；IoC 回填走 skip_permission_check=True 时保留
+        # 用户改 IP/名称/组织不断开既有绑定，也不允许把 monitor_id/node_id 改写成别的对象。
+        # IoC 回填走 skip_permission_check=True 时保留系统联动字段。
         if not skip_permission_check:
             update_attr = strip_system_link_fields(update_attr)
         inst_info = InstanceManage.query_entity_by_id(inst_id)
@@ -1380,7 +1454,19 @@ class InstanceManage(object):
         validation_item = {**inst_info, **update_attr}
         check_attr_map["validation_items"] = [validation_item]
         unique_lock_keys = UniqueWriteLockService.build_lock_keys(inst_info["model_id"], validation_item, check_attr_map)
+        if not skip_permission_check:
+            from apps.cmdb.collection.field_reconcile import COLLECT_SOURCES_ATTR, stamp_manual_sources
+
+            stamped = stamp_manual_sources(inst_info, update_attr)
+            if stamped is not None:
+                update_attr[COLLECT_SOURCES_ATTR] = stamped
+                check_attr_map.setdefault("editable", {})[COLLECT_SOURCES_ATTR] = COLLECT_SOURCES_ATTR
         with UniqueWriteLockService.hold(unique_lock_keys):
+            if expected_monitor_id is not None:
+                current_entity = InstanceManage.query_entity_by_id(inst_id)
+                current_monitor_id = _normalized_monitor_id(current_entity.get("monitor_id") if isinstance(current_entity, dict) else None)
+                if current_monitor_id != expected_monitor_id:
+                    raise StaleMonitorBinding()
             with GraphClient() as ag:
                 exist_items = InstanceManage._query_unique_rule_candidates(ag, inst_info["model_id"], validation_item, check_attr_map)
                 exist_items = [i for i in exist_items if i["_id"] != inst_id]
@@ -1408,7 +1494,12 @@ class InstanceManage(object):
                     after_data=result[0],
                     operator=operator,
                     model_object=OPERATOR_INSTANCE,
-                    message=f"修改模型实例属性. 模型:{model_info['model_name']} 实例:{result[0]['inst_name']}",
+                    message=format_instance_audit_message(
+                        "修改模型实例属性",
+                        model_info["model_name"],
+                        result[0]["inst_name"],
+                        source=audit_source,
+                    ),
                     scenario=scenario,
                 )
 
@@ -1451,10 +1542,13 @@ class InstanceManage(object):
         update_attr: dict,
         operator: str,
         allowed_org_ids: list | None = None,
+        *,
+        audit_source: str = "",
     ):
         """批量修改实例属性"""
+        from apps.cmdb.services.module_ingest import strip_system_link_fields
 
-        update_attr = dict(update_attr)
+        update_attr = strip_system_link_fields(dict(update_attr))
         ensure_instance_identity_immutable(update_attr)
         inst_ids = _normalize_batch_instance_ids(inst_ids)
         inst_list = _require_complete_batch_instances(
@@ -1529,6 +1623,15 @@ class InstanceManage(object):
                 exist_items,
                 attrs=attrs,
             )
+            from apps.cmdb.collection.field_reconcile import COLLECT_SOURCES_ATTR, stamp_manual_sources
+
+            source_rows = []
+            for instance in inst_list:
+                stamped = stamp_manual_sources(instance, update_attr)
+                if stamped is not None:
+                    source_rows.append({"id": instance["_id"], "value": stamped})
+            if source_rows and hasattr(ag, "batch_update_node_property_values"):
+                ag.batch_update_node_property_values(INSTANCE, COLLECT_SOURCES_ATTR, source_rows)
 
         result_ids = {int(item["_id"]) for item in result if item.get("_id") is not None}
         missing_result_ids = [inst_id for inst_id in inst_ids if inst_id not in result_ids]
@@ -1560,7 +1663,12 @@ class InstanceManage(object):
                 before_data=i,
                 after_data=after_dict.get(i["_id"]),
                 model_object=OPERATOR_INSTANCE,
-                message=f"修改模型实例属性. 模型:{model_info['model_name']} 实例:{i.get('inst_name') or i.get('ip_addr', '')}",
+                message=format_instance_audit_message(
+                    "修改模型实例属性",
+                    model_info["model_name"],
+                    i.get("inst_name") or i.get("ip_addr", ""),
+                    source=audit_source,
+                ),
             )
             for i in inst_list
         ]
@@ -1571,7 +1679,30 @@ class InstanceManage(object):
         return result
 
     @staticmethod
-    def instance_batch_delete(user_groups: list, roles: list, inst_ids: list, operator: str):
+    def restore_auto_collect(inst_id: int, fields=None):
+        """清除人工来源。下一轮采集按字段顺序写入。"""
+        from apps.cmdb.collection.field_reconcile import COLLECT_SOURCES_ATTR, clear_manual_fields
+
+        inst_info = InstanceManage.query_entity_by_id(inst_id)
+        if not inst_info:
+            raise BaseAppException("实例不存在！")
+        sources = clear_manual_fields(inst_info, fields)
+        attrs = ModelManage.search_model_attr(inst_info["model_id"])
+        check_attr_map = InstanceManage._build_unique_rule_check_attr_map(inst_info["model_id"], attrs, for_update=True)
+        check_attr_map.setdefault("editable", {})[COLLECT_SOURCES_ATTR] = COLLECT_SOURCES_ATTR
+        with GraphClient() as ag:
+            result = ag.set_entity_properties(
+                INSTANCE,
+                [inst_id],
+                {COLLECT_SOURCES_ATTR: sources},
+                check_attr_map,
+                [],
+                attrs=attrs,
+            )
+        return result[0]
+
+    @staticmethod
+    def instance_batch_delete(user_groups: list, roles: list, inst_ids: list, operator: str, *, audit_source: str = ""):
         """批量删除实例"""
         inst_ids = _normalize_batch_instance_ids(inst_ids)
         inst_list = _require_complete_batch_instances(
@@ -1597,7 +1728,12 @@ class InstanceManage(object):
                 model_id=i["model_id"],
                 before_data=i,
                 model_object=OPERATOR_INSTANCE,
-                message=f"删除模型实例. 模型:{model_info['model_name']} 实例:{i.get('inst_name') or i.get('ip_addr', '')}",
+                message=format_instance_audit_message(
+                    "删除模型实例",
+                    model_info["model_name"],
+                    i.get("inst_name") or i.get("ip_addr", ""),
+                    source=audit_source,
+                ),
             )
             for i in inst_list
         ]
@@ -1636,6 +1772,8 @@ class InstanceManage(object):
         update_attr: dict,
         operator: str,
         allowed_org_ids: list | None = None,
+        *,
+        audit_source: str = "",
     ):
         inst_uuids = _normalize_batch_instance_uuids(inst_uuids)
         instances = _require_complete_batch_instances_by_uuid(
@@ -1650,6 +1788,7 @@ class InstanceManage(object):
                 update_attr,
                 operator,
                 allowed_org_ids,
+                audit_source=audit_source,
             )
         except InstanceBatchError as exc:
             uuid_by_id = {item["_id"]: item.get("inst_uuid") for item in instances}
@@ -1667,6 +1806,8 @@ class InstanceManage(object):
         roles: list,
         inst_uuids: list[str],
         operator: str,
+        *,
+        audit_source: str = "",
     ):
         inst_uuids = _normalize_batch_instance_uuids(inst_uuids)
         instances = _require_complete_batch_instances_by_uuid(
@@ -1679,6 +1820,7 @@ class InstanceManage(object):
                 roles,
                 [item["_id"] for item in instances],
                 operator,
+                audit_source=audit_source,
             )
         except InstanceBatchError as exc:
             uuid_by_id = {item["_id"]: item.get("inst_uuid") for item in instances}
@@ -2438,15 +2580,21 @@ class InstanceManage(object):
         file_stream: bytes,
         operator: str,
         allowed_org_ids: list = None,
+        matched_instance_permission_check=None,
     ):
         """实例导入-支持编辑"""
         attrs = ModelManage.search_model_attr_v2(model_id)
         model_info = ModelManage.search_model_info(model_id)
 
+        permission_check = matched_instance_permission_check
+        if permission_check is None:
+            permission_check = getattr(self, "matched_instance_permission_check", None)
+
         _import = Import(model_id, attrs, [], operator)
         add_results, update_results, asso_result = _import.import_inst_list_support_edit(
             file_stream,
             allowed_org_ids=allowed_org_ids,
+            matched_instance_permission_check=permission_check,
         )
 
         add_changes = [
@@ -2585,6 +2733,9 @@ class InstanceManage(object):
         creator: str = "",
         attr_list: list = [],
         association_list: list = [],
+        extra_query: list = None,
+        advanced_filter: dict = None,
+        permission_lookup=None,
         *,
         file_backed: bool = False,
         row_limit=None,
@@ -2599,12 +2750,13 @@ class InstanceManage(object):
         format_permission_dict = InstanceManage._build_format_permission_dict(permissions_map, creator)
         metadata_finished = perf_counter()
         if ids:
+            advanced_filter = None
             query_list = [
                 {"field": "id", "type": "id[]", "value": ids},
                 {"field": "model_id", "type": "str=", "value": model_id},
             ]
         else:
-            query_list = [{"field": "model_id", "type": "str=", "value": model_id}]
+            query_list = [{"field": "model_id", "type": "str=", "value": model_id}, *(extra_query or [])]
 
         association = [item for item in association if item["model_asst_id"] in association_list]
         model_name_map = {item[f"{side}_model_id"]: item[f"{side}_model_name"] for item in association for side in ("src", "dst")}
@@ -2630,16 +2782,33 @@ class InstanceManage(object):
                 params = list(query_list)
                 if cursor is not None:
                     params.append({"field": "inst_uuid", "type": "str>", "value": cursor})
-                with GraphClient() as ag:
-                    batch, _ = ag.query_entity(
-                        label=INSTANCE,
+                if advanced_filter:
+                    from apps.cmdb.services.advanced_instance_query import run_advanced_instance_query
+
+                    batch, _ = run_advanced_instance_query(
+                        model_id=model_id,
                         params=params,
-                        format_permission_dict=format_permission_dict,
+                        advanced_filter=advanced_filter,
+                        permission_map=permissions_map,
+                        creator=creator,
+                        permission_lookup=permission_lookup,
                         page={"skip": 0, "limit": EXPORT_BATCH_SIZE},
                         order="inst_uuid",
-                        include_count=False,
+                        order_type="ASC",
                         fields=fields,
+                        include_count=False,
                     )
+                else:
+                    with GraphClient() as ag:
+                        batch, _ = ag.query_entity(
+                            label=INSTANCE,
+                            params=params,
+                            format_permission_dict=format_permission_dict,
+                            page={"skip": 0, "limit": EXPORT_BATCH_SIZE},
+                            order="inst_uuid",
+                            include_count=False,
+                            fields=fields,
+                        )
                 instance_seconds += perf_counter() - query_started
                 if not batch:
                     break

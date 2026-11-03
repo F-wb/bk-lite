@@ -129,8 +129,16 @@ class BaseCollect(object):
         )
         result = metrics_cannula.collect_controller()
         format_data = self.format_collect_data(result)
+        self.attach_unresolved_groups(format_data, metrics_cannula.collect_plugin_instance)
         self.merge_task_format_data(format_data, metrics_cannula.collect_data)
         return metrics_cannula.collect_data, format_data
+
+    @staticmethod
+    def attach_unresolved_groups(format_data, plugin):
+        groups = getattr(plugin, "unresolved_groups", None) or []
+        if groups:
+            format_data["unresolved"] = groups
+        return format_data
 
     def format_collect_data(self, result):
         # 强加了一个原始数据，如果原始数据存在则删除，保留原有逻辑
@@ -145,8 +153,19 @@ class BaseCollect(object):
         blocked_reason = result.pop("__sync_blocked_reason__", None)
         if blocked_reason:
             format_data["__sync_blocked_reason__"] = blocked_reason
+        reconcile_stats = {"skipped_fields": 0, "org_conflicts": 0, "outside_owner_conflicts": 0, "concurrent_abandons": 0}
+        saw_reconcile = False
         for value in result.values():
+            if not isinstance(value, dict):
+                continue
+            model_stats = value.pop("reconcile_stats", None)
+            if isinstance(model_stats, dict):
+                saw_reconcile = True
+                for key in reconcile_stats:
+                    reconcile_stats[key] += int(model_stats.get(key) or 0)
             for operator, datas in value.items():
+                if operator not in ("add", "update", "delete") or not isinstance(datas, dict):
+                    continue
                 for status, data in datas.items():
                     for i in data:
                         assos_result = i.pop("assos_result", {})
@@ -164,6 +183,8 @@ class BaseCollect(object):
                             continue
                         _data.update(update_data)
                         format_data[operator].append(_data)
+        if saw_reconcile:
+            format_data["reconcile_stats"] = reconcile_stats
         if raw_data:
             format_data["__raw_data__"] = raw_data
         elif all_count:

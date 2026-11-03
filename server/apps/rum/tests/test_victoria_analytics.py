@@ -73,31 +73,29 @@ def test_rum_apps_filter_matches_wire_contract():
 
 def test_applications_page_queries_logsql():
     now = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
-    rows = [
-        {
-            "_time": (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
-            "rum.application": "storefront",
-            "rum.session.id": "s1",
-            "rum.event.type": "view",
-            "rum.environment": "production",
-            "rum.release": "2026.08.18",
-            "rum.sdk.version": "1.2.3",
-        },
-        {
-            "_time": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
-            "rum.application": "storefront",
-            "rum.session.id": "s1",
-            "rum.event.type": "vital",
-            "rum.measurement.lcp": 2400,
-        },
-        {
-            "_time": (now - timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
-            "rum.application": "storefront",
-            "rum.session.id": "s2",
-            "rum.event.type": "error",
-        },
-    ]
-    server, base = _serve(rows)
+
+    def choose(query: str):
+        assert "stats" in query
+        if "_time:" in query:
+            return []
+        assert "stats by (`rum.application`)" in query
+        assert "quantile(0.75, `rum.measurement.lcp`)" in query
+        return [
+            {
+                "rum.application": "storefront",
+                "sessions": "2",
+                "views": "1",
+                "errors": "1",
+                "errored_sessions": "1",
+                "lcp_measurement_p75": "2400",
+                "environment": '["production"]',
+                "release": '["2026.08.18"]',
+                "sdk_version": '["1.2.3"]',
+            }
+        ]
+
+    server, base = _serve([])
+    _VLHandler.choose = choose
     try:
         analytics = VictoriaAnalytics.open(logs_endpoint=base, traces_endpoint=base, ping=True)
         assert analytics.available() is True
@@ -110,6 +108,7 @@ def test_applications_page_queries_logsql():
         assert page_rows[0]["sessions"] == 2
         assert page_rows[0]["views"] == 1
         assert page_rows[0]["errors"] == 1
+        assert abs(page_rows[0]["errorRate"] - 0.5) < 0.01
         assert page_rows[0]["lcpP75"] == 2400.0
         assert page_rows[0]["sdkVersion"] == "1.2.3"
         assert len(sparks["storefront"]) == 12
@@ -337,6 +336,23 @@ def test_funnel_respects_window_seconds():
     assert funnel_reached(events, ["/a", "/b"], timedelta(minutes=15)) == [1, 1]
 
 
+def test_fill_view_sparks_places_counts_from_window_start():
+    from apps.rum.services.logsql_stats import fill_view_sparks
+
+    start = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+    rows = [{"route": "/cart", "release": "", "mom": {"hasDelta": False, "spark": []}}]
+    spark_rows = [
+        {
+            "rum.view.name": "/cart",
+            "_time": (start + timedelta(minutes=6)).isoformat().replace("+00:00", "Z"),
+            "views": "2",
+        }
+    ]
+    fill_view_sparks(rows, spark_rows, start, timedelta(minutes=5), 12, "route")
+    assert rows[0]["mom"]["spark"][1] == 2
+    assert rows[0]["mom"]["hasDelta"] is True
+
+
 def test_list_views_fills_cwv_device_and_spark_fields():
     """Views table needs INP/CLS/dist/deviceMix/mom — not only LCP P75."""
     now = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
@@ -432,7 +448,7 @@ def test_list_views_fills_cwv_device_and_spark_fields():
         assert row["dist"]["missing"] == 0
         assert row["deviceMix"]["mobile"] == 1
         assert row["deviceMix"]["desktop"] == 1
-        assert "quantile(0.75, `rum.vital.lcp`)" in _VLHandler.got_query
+        assert any("quantile(0.75, `rum.vital.lcp`) if (`rum.vital.lcp`:*)" in query for query in _VLHandler.queries)
         assert "stats by" in _VLHandler.got_query
         assert page["summary"]["inpP75"] == 120.0
     finally:
@@ -627,7 +643,65 @@ def test_list_error_issues_filters_by_release():
         assert issues[0]["count"] == 2
         assert issues[0]["affectedSessions"] == 2
         assert '"rum.release":"1.0.0"' in _VLHandler.got_query
-        assert "stats by (`rum.error.fingerprint`)" in _VLHandler.got_query
+        assert "stats by (`rum.error.fingerprint`, `rum.error.group_key`)" in _VLHandler.got_query
+    finally:
+        server.shutdown()
+
+
+def test_list_error_issues_keeps_group_key_when_client_fingerprint_is_absent():
+    now = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
+    group_key = "a" * 64
+    _VLHandler.rows = [
+        {
+            "rum.error.fingerprint": "",
+            "rum.error.group_key": group_key,
+            "message": "TypeError: failed",
+            "error_type": "TypeError",
+            "application": "storefront",
+            "count": "3",
+            "sessions": "2",
+            "users": "1",
+            "start_time": now.isoformat().replace("+00:00", "Z"),
+            "end_time": now.isoformat().replace("+00:00", "Z"),
+        }
+    ]
+    server, base = _serve(_VLHandler.rows)
+    try:
+        analytics = VictoriaAnalytics.open(logs_endpoint=base, traces_endpoint=base)
+        page = analytics.list_error_issues(
+            "core",
+            {
+                "from": now - timedelta(hours=1),
+                "to": now + timedelta(minutes=1),
+                "applications": ["storefront"],
+                "traffic": "all",
+                "limit": 100,
+            },
+        )
+        assert len(page["issues"]) == 1
+        assert page["issues"][0]["fingerprint"] == group_key
+        assert page["issues"][0]["count"] == 3
+    finally:
+        server.shutdown()
+
+
+def test_application_overview_counts_devices_by_session():
+    now = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    def choose(query: str):
+        assert "stats" in query
+        if "user_agent.original" in query:
+            return [{"mobile": "1", "sessions": "2"}]
+        return []
+
+    server, base = _serve([])
+    _VLHandler.choose = choose
+    try:
+        analytics = VictoriaAnalytics.open(logs_endpoint=base, traces_endpoint=base)
+        overview = analytics.application_overview("core", "storefront", now - timedelta(hours=1), now + timedelta(minutes=1))
+        assert overview["devices"] == {"mobile": 1, "desktop": 1}
+        assert _VLHandler.queries
+        assert all("stats" in query for query in _VLHandler.queries)
     finally:
         server.shutdown()
 

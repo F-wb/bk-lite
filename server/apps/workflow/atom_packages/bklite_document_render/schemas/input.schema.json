@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "template": {
+      "type": "object",
+      "title": "Word / Excel 模板",
+      "description": "设计流程时上传的模板。发布后固化到流程版本，运行时不再上传。"
+    },
+    "template_snapshot": {
+      "type": "object",
+      "title": "已发布模板快照"
+    },
+    "data": {
+      "type": "object",
+      "title": "文档数据",
+      "description": "用于填充模板占位符和循环的 JSON 对象。字段名需要和模板占位符一致。"
+    }
+  },
+  "required": ["data"],
+  "additionalProperties": false
+}

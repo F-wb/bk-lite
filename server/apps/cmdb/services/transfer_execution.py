@@ -53,6 +53,12 @@ class TransferExecution:
         if not token:
             return
         task = CmdbTransferTask.objects.select_related("owner").get(pk=task_id)
+        logger.info(
+            "event=cmdb_transfer_started task_id=%s kind=%s model_id=%s",
+            str(task.pk),
+            safe_log_value(task.kind, max_length=16),
+            safe_log_value(task.model_id, max_length=128),
+        )
         try:
             files = files or TransferFiles()
             with execution_heartbeat(task.pk, token):
@@ -108,6 +114,15 @@ class TransferExecution:
                 "执行已终止，已写入的数据保留",
                 execution_stopped=True,
             )
+            task.refresh_from_db()
+            logger.info(
+                "event=cmdb_transfer_finished task_id=%s kind=%s status=%s holds_slot=%s error_code=%s",
+                str(task.pk),
+                safe_log_value(task.kind, max_length=16),
+                safe_log_value(task.status, max_length=24),
+                "true" if task.holds_slot else "false",
+                safe_log_value(task.error_code, max_length=64) or "-",
+            )
 
     @staticmethod
     def export(task, token, context, files, prefix):
@@ -162,19 +177,36 @@ class TransferExecution:
                             ).encode()
                         )
 
-            with InstanceManage.inst_export(
-                task.model_id,
-                ids,
-                context.permission_map,
-                creator=context.actor.username,
-                attr_list=params["attr_list"],
-                association_list=params.get("association_list", []),
-                file_backed=True,
-                row_limit=100000,
-                progress=progress,
-                inspect_batch=inspect_batch,
-                byte_limit=files.MAX_BYTES,
-            ) as stream:
+            def permission_lookup(model_id):
+                if model_id == task.model_id:
+                    return context.permission_map
+                return TransferAuthorization.resolve(task.owner, task.team_id, task.include_children, model_id, "export").permission_map
+
+            try:
+                export_stream = InstanceManage.inst_export(
+                    task.model_id,
+                    ids,
+                    context.permission_map,
+                    creator=context.actor.username,
+                    attr_list=params["attr_list"],
+                    association_list=params.get("association_list", []),
+                    extra_query=[] if ids else params.get("query_list") or [],
+                    advanced_filter=None if ids else params.get("advanced_filter") or None,
+                    permission_lookup=permission_lookup,
+                    file_backed=True,
+                    row_limit=100000,
+                    progress=progress,
+                    inspect_batch=inspect_batch,
+                    byte_limit=files.MAX_BYTES,
+                )
+            except Exception as exc:
+                from apps.cmdb.graph.advanced_filter import AdvancedFilterError, AdvancedFilterTimeout
+
+                if isinstance(exc, (AdvancedFilterError, AdvancedFilterTimeout)):
+                    message = str(exc) if not isinstance(exc, AdvancedFilterError) or exc.index is None else f"第{exc.index}个条件：{exc}"
+                    raise TransferError("invalid_filter", message, 400) from exc
+                raise
+            with export_stream as stream:
                 TransferService.progress(task.pk, token, "uploading_result", exported, exported)
                 output = files.put(f"{prefix}/export.xlsx", stream)
             manifest.seek(0)

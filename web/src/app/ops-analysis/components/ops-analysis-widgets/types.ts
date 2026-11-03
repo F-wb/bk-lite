@@ -163,6 +163,7 @@ export interface TableConfig {
   columns?: TableColumnConfigItem[];
 }
 
+/** 旧操作列参数映射。只在读取时转成 interaction。 */
 export interface DashboardActionParamMapping {
   key: string;
   source: 'rowField' | 'fixed';
@@ -170,6 +171,7 @@ export interface DashboardActionParamMapping {
   value?: string | number | boolean | null;
 }
 
+/** 旧操作列。读取时迁成 interaction，保存不再写回。 */
 export interface DashboardActionConfig {
   columnKey: string;
   text: string;
@@ -178,11 +180,23 @@ export interface DashboardActionConfig {
   params?: DashboardActionParamMapping[];
 }
 
+export type WidgetInteractionKind = 'title' | 'data';
+
+export type WidgetInteractionOpenMode = 'sameTab' | 'newTab';
+
+export interface WidgetInteractionLink {
+  kind: WidgetInteractionKind;
+  name: string;
+  url: string;
+  openMode: WidgetInteractionOpenMode;
+}
+
 export interface ValueConfig {
   chartType?: string;
   chartThemeMode?: OpsChartThemeMode;
   dataSource?: string | number;
   compare?: boolean;
+  compareMode?: 'percent' | 'value';
   params?: Record<string, string | number | boolean | [number, number] | null>;
   dataSourceParams?: ParamItem[];
   tableConfig?: TableConfig;
@@ -190,8 +204,14 @@ export interface ValueConfig {
   selectedFields?: string[];
   topNLabelField?: string;
   topNValueField?: string;
+  topNScalarFields?: Array<{ field: string; label?: string }>;
+  barMode?: 'relative' | 'absolute';
+  barMax?: number;
   dimensionField?: string;
   valueField?: string;
+  valueFields?: string[];
+  seriesField?: string;
+  pieScalarFields?: Array<{ field: string; label?: string }>;
   multiValueLabelField?: string;
   multiValueValueField?: string;
   unit?: string;
@@ -225,7 +245,9 @@ export interface ValueConfig {
     arrayNameField?: string;
     arrayValueField?: string;
   };
+  /** 旧操作列。读取时迁成 interaction。 */
   actions?: DashboardActionConfig[];
+  interaction?: WidgetInteractionLink;
 }
 
 export interface OpsAnalysisWidgetContractPreview {

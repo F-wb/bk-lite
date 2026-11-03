@@ -34,6 +34,8 @@ from apps.opspilot.services.chat_attachment_service import (
     normalize_attachment_ids,
 )
 from apps.opspilot.services.history_service import HistoryService
+from apps.opspilot.services.ppt_master_runtime import remove_conversation_workspace
+from apps.opspilot.services.skill_channel_aibot import append_short_connection_file_links
 from apps.opspilot.services.skill_channel_service import channel_allows_team, resolve_ops_pilot_guest_id
 from apps.opspilot.services.skill_memory_service import (
     annotate_pending_memory_rounds,
@@ -63,26 +65,29 @@ PAGE_CONTEXT_MAX_IMAGES = 6
 PAGE_CONTEXT_MAX_IMAGE_CHARS = 500 * 1024
 PAGE_CONTEXT_GUIDE = (
     "以下是用户当前正在查看的页面快照，仅当问题与页面相关时参考。"
-    "只回答用户这一轮提出的问题，不要复述历史里已分析过、且本轮未点名的图表。"
-    "时间范围、横轴起止与 KPI 一律以 <current_page> 本轮快照为准，"
+    "快照只说明当前屏幕上的筛选项、对象和可见行，不是工具查询结果，也不能代替全量数据。"
+    "问题需要指标、趋势、告警、日志或全部对象时，仍须调用对应工具，禁止因已有快照就跳过工具。"
+    "快照里的时间范围和 KPI 只用于对齐用户正在看的图表；数值结论以工具结果为准。"
     "禁止沿用对话历史里过期的时间窗描述。"
     "若缺少查询对象、对象类型、时间范围或要看的指标/告警类型，必须调用 request_user_choice 让用户选择，"
     "禁止编造 uvx、CLI 或其它替代排查方案。"
 )
 PAGE_CONTEXT_FOCUSED_GUIDE = (
     "本轮用户问题是「{question}」，已定位到图表{names}。"
-    "只根据本轮 <current_page> 中的截图与文字回答这一问，"
-    "不要沿用上一问的结论、表格、图表名或时间范围。"
+    "只根据本轮问题回答这一问，不要沿用上一问的结论、表格、图表名或时间范围。"
+    "页面快照用来确认图表名、时间筛选和可见标签，不能代替工具查询；需要指标或全量数据时仍须调用工具。"
     "截图上可能没有标题，以这段文字中的图表名、KPI 快照与「时间筛选/横轴」说明为准。"
-    "问使用率或容量时优先用 KPI 快照里的「指标名: 数值」，不要把吞吐、流量或错误速率图当成占用百分比。"
+    "问使用率或容量时，若已调用工具，以工具结果为准；没有工具结果时才用 KPI 快照里的「指标名: 数值」，"
+    "不要把吞吐、流量或错误速率图当成占用百分比。"
     "禁止回答、复述或续写历史对话里已经分析过的其它图表。"
 )
 PAGE_CONTEXT_RANKING_GUIDE = (
     "本轮用户问题是「{question}」，已定位到图表{names}。"
-    "只根据本轮 <current_page> 中的截图与文字回答这一问，"
-    "不要沿用上一问的结论、表格、图表名或时间范围。"
+    "只根据本轮问题回答这一问，不要沿用上一问的结论、表格、图表名或时间范围。"
+    "页面快照用来确认图表名和可见标签，不能代替工具查询；需要全量排行时仍须调用工具。"
     "截图上可能没有标题，以这段文字中的图表名与「序列」里的排行项为准。"
-    "问 Top 或排行时按图表列出各挂载点或设备及其数值，不要只用 KPI 快照里的单一占用百分比代替排行。"
+    "问 Top 或排行时，有工具结果就用工具结果；否则按图表列出各挂载点或设备及其数值，"
+    "不要只用 KPI 快照里的单一占用百分比代替排行。"
     "禁止回答、复述或续写历史对话里已经分析过的其它图表。"
 )
 PAGE_CONTEXT_CREDENTIAL_GUIDE = "用户本轮在询问凭据或密钥。" "禁止回答、复述、猜测或生成密码、SNMP community、token、Access Key 或其它凭据内容。" "只能说明不能讨论凭据，可继续回答非密钥的接入事实。"
@@ -1124,6 +1129,7 @@ def delete_skill_session(*, session_id: str, external_user_id: str, keep_memory:
             owner.user_id,
         )
     conv.delete()
+    remove_conversation_workspace(session_id)
 
 
 def _request_user_timezone(request_user) -> str:
@@ -1232,8 +1238,55 @@ def _looks_like_planned_execution_delta(delta: str) -> bool:
     return phase in {"planning", "planned", "replanning", "idle", "start", "end"}
 
 
+_ATTACHMENT_RESULT_FILENAME_RE = re.compile(r"""['"]filename['"]\s*:\s*['"]([^'"]+)['"]""")
+
+
+def _generated_attachment_filename(content: Any) -> str:
+    """从附件工具结果取出文件名。跳过的调用和下载地址不进入下一轮正文。"""
+    text = content if isinstance(content, str) else str(content or "")
+    payload = None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        if payload.get("skipped") or not payload.get("file_url"):
+            return ""
+        return str(payload.get("filename") or "").strip()
+    if "file_url" not in text or re.search(r"""['"]skipped['"]\s*:\s*true""", text, re.IGNORECASE):
+        return ""
+    match = _ATTACHMENT_RESULT_FILENAME_RE.search(text)
+    return match.group(1).strip() if match else ""
+
+
+def _generated_attachment_note(events: list) -> str:
+    """本轮成功生成的文件名。下一轮只有可见正文，没有工具结果就无法再出一版。"""
+    names_by_call: dict[str, str] = {}
+    ordered: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "TOOL_CALL_START" and event.get("toolCallName") == "generate_attachment_file":
+            call_id = str(event.get("toolCallId") or "")
+            if call_id:
+                names_by_call[call_id] = ""
+            continue
+        if event.get("type") != "TOOL_CALL_RESULT":
+            continue
+        call_id = str(event.get("toolCallId") or "")
+        if call_id and call_id not in names_by_call:
+            continue
+        filename = _generated_attachment_filename(event.get("content") or "")
+        if not filename or filename in ordered:
+            continue
+        ordered.append(filename)
+    if not ordered:
+        return ""
+    return "已生成文件：" + "、".join(ordered)
+
+
 def visible_assistant_text(content: str) -> str:
-    """给模型的上下文只用可见正文，丢掉计划/工具等 AG-UI 事件。"""
+    """给模型的上下文只用可见正文，丢掉计划/工具等 AG-UI 事件。成功生成的文件名保留。"""
     if not content:
         return ""
     stripped = content.strip()
@@ -1256,7 +1309,11 @@ def visible_assistant_text(content: str) -> str:
             continue
         if delta:
             parts.append(str(delta))
-    return "".join(parts).strip()
+    text = "".join(parts).strip()
+    note = _generated_attachment_note(events)
+    if note and note.split("：", 1)[-1] not in text:
+        text = f"{text}\n{note}".strip() if text else note
+    return text
 
 
 def _history_from_conversation(
@@ -1351,6 +1408,7 @@ def execute_skill_channel_im_sync(
     user_message: str,
     external_user_id: str,
     session_id: str | None = None,
+    download_origin: str = "",
 ) -> str:
     """IM 异步任务内同步执行单 Agent，落库后返回纯文本回复。"""
     from apps.opspilot.services.chat_service import chat_service
@@ -1361,6 +1419,11 @@ def execute_skill_channel_im_sync(
 
     request_user = type("IMUser", (), {"username": external_user_id or "", "id": None, "locale": "en"})()
     params = build_skill_chat_params(skill, user_message, request_user)
+    execution_id = ""
+    if getattr(channel, "channel_type", "") == "enterprise_wechat_aibot":
+        params["reply_language"] = "match_user"
+        execution_id = str(uuid.uuid4())
+        params["execution_id"] = execution_id
     inject_skill_memory_prompt(params, skill, external_user_id, user_message)
     params["chat_history"] = _history_from_conversation(conversation, skill.conversation_window_size or 10)
     params["skill_session_id"] = conversation.session_id
@@ -1372,6 +1435,8 @@ def execute_skill_channel_im_sync(
         content = str(result).strip()
     if not content:
         content = "处理完成，但未产生可展示内容"
+    if execution_id:
+        content = append_short_connection_file_links(content, execution_id, channel.id, origin=download_origin)
     append_message(conversation, SkillConversationMessage.ROLE_ASSISTANT, content)
     maybe_schedule_skill_memory_write(conversation)
     return content
@@ -1409,6 +1474,9 @@ def stream_skill_channel_chat(
 
     user = identity_user or request.user
     params = build_skill_chat_params(skill, persist_text, user)
+    page_loader = getattr(request, "opspilot_language_loader", None)
+    if page_loader is not None:
+        params["locale"] = page_loader.default_lang
     inject_skill_memory_prompt(params, skill, external_user_id, persist_text)
     llm_model = getattr(skill, "llm_model", None)
     token_budget = attachment_token_budget(llm_model)

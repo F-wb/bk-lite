@@ -19,6 +19,9 @@ interface ViewWorkspaceProps {
   headerVisible?: boolean;
   filterBarVisible?: boolean;
   flushContent?: boolean;
+  /** 首页嵌入：不画盘名标题行，也不占工具条高度。 */
+  compactHeader?: boolean;
+  shellClassName?: string;
   children?: React.ReactNode;
 }
 
@@ -30,10 +33,12 @@ const ViewWorkspace: React.FC<ViewWorkspaceProps> = ({
   toolbar,
   filterBar,
   contentRef,
-  contentClassName = 'bg-[#f7f8fa]',
+  contentClassName = 'bg-[var(--color-bg-2)]',
   headerVisible = true,
   filterBarVisible = true,
   flushContent = false,
+  compactHeader = false,
+  shellClassName,
   children,
 }) => {
   if (!selectedItem) {
@@ -45,35 +50,37 @@ const ViewWorkspace: React.FC<ViewWorkspaceProps> = ({
   const resolvedDescription = resolveCanvasDescription(selectedItem.desc);
 
   return (
-    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-[var(--color-bg-2)]">
-      <div
-        className={`mb-2 w-full shrink-0 items-center justify-between border-b border-[var(--color-border-2)] bg-[var(--color-bg-1)] px-4 py-2 ${headerVisible ? 'flex' : 'hidden'}`}
-      >
-        <div className="mr-6 min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <h2 className="m-0 truncate text-base font-semibold leading-6 text-[var(--color-text-1)]">
-              {selectedItem.name || titleFallback}
-            </h2>
-            {selectedItem.is_build_in && (
-              <SourceOriginBadge
-                kind="builtin"
-                mode="inline"
-                className="shrink-0 rounded bg-[var(--color-fill-2)] px-1.5 py-0.5 font-medium leading-4"
+    <div className={`flex h-full min-h-0 w-full flex-col overflow-hidden ${shellClassName ?? 'bg-[var(--color-bg-2)]'}`}>
+      {!compactHeader && (
+        <div
+          className={`w-full shrink-0 items-center justify-between border-b border-[var(--color-border-2)] bg-[var(--color-bg-1)] px-4 py-2 ${headerVisible ? 'flex' : 'hidden'}`}
+        >
+          <div className="mr-6 min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <h2 className="m-0 truncate text-base font-semibold leading-6 text-[var(--color-text-1)]">
+                {selectedItem.name || titleFallback}
+              </h2>
+              {selectedItem.is_build_in && (
+                <SourceOriginBadge
+                  kind="builtin"
+                  mode="inline"
+                  className="shrink-0 rounded bg-[var(--color-fill-2)] px-1.5 py-0.5 font-medium leading-4"
+                />
+              )}
+            </div>
+            {resolvedDescription && (
+              <EllipsisWithTooltip
+                className="mt-0.5 block w-full min-w-0 truncate text-xs leading-4 text-(--color-text-3)"
+                text={resolvedDescription}
+                tooltipMaxWidth={480}
               />
             )}
           </div>
-          {resolvedDescription && (
-            <EllipsisWithTooltip
-              className="mt-0.5 block w-full min-w-0 truncate text-xs leading-4 text-(--color-text-3)"
-              text={resolvedDescription}
-              tooltipMaxWidth={480}
-            />
+          {toolbar && (
+            <div className="flex shrink-0 items-center gap-1.5">{toolbar}</div>
           )}
         </div>
-        {toolbar && (
-          <div className="flex shrink-0 items-center gap-1.5">{toolbar}</div>
-        )}
-      </div>
+      )}
 
       <div
         ref={contentRef}
@@ -87,12 +94,12 @@ const ViewWorkspace: React.FC<ViewWorkspaceProps> = ({
         <div className="flex h-full min-h-0 flex-col overflow-hidden">
           {filterBar && (
             <div
-              className={`shrink-0 bg-[var(--color-bg-1)] px-2.5 pb-2 pt-1 ${filterBarVisible ? '' : 'hidden'}`}
+              className={`shrink-0 bg-[var(--color-bg-1)] px-2.5 pb-2 pt-3 ${filterBarVisible ? '' : 'hidden'}`}
             >
               {filterBar}
             </div>
           )}
-          <div className={`min-h-0 flex-1 overflow-hidden ${flushContent ? '' : 'pt-1'}`}>{children}</div>
+          <div className={`min-h-0 flex-1 overflow-hidden ${flushContent || compactHeader ? '' : 'pt-1'}`}>{children}</div>
         </div>
       </div>
     </div>

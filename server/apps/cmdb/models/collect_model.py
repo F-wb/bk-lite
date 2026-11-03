@@ -188,6 +188,37 @@ class CollectModels(MaintainerInfo, TimeInfo):
         verbose_name = "采集任务"
         unique_together = ("name", "driver_type", "model_id")
 
+    def _unresolved_info(self):
+        raw = self.format_data.get("unresolved") if isinstance(self.format_data, dict) else None
+        groups = raw if isinstance(raw, list) else []
+        soids = []
+        kept = []
+        device_count = 0
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            devices = group.get("devices") if isinstance(group.get("devices"), list) else []
+            device_count += len(devices)
+            soids.append(group.get("soid") or "")
+            kept.append(group)
+        library = {}
+        if any(soids):
+            library = {row.oid: row for row in OidMapping.objects.filter(oid__in=[soid for soid in soids if soid])}
+        data = []
+        for group in kept:
+            row = library.get(group.get("soid"))
+            data.append(
+                {
+                    "soid": group.get("soid") or "",
+                    "devices": group.get("devices") or [],
+                    "mapped": row is not None,
+                    "device_type": row.device_type if row else "",
+                    "brand": (row.brand or "") if row else "",
+                    "model": (row.model or "") if row else "",
+                }
+            )
+        return {"data": data, "count": device_count}
+
     @property
     def info(self):
         # 详情
@@ -196,6 +227,7 @@ class CollectModels(MaintainerInfo, TimeInfo):
         delete_data = self.format_data.get("delete", [])
         relation_data = self.format_data.get("association", [])
         raw_data = self.format_data.get("__raw_data__", [])
+        unresolved = self._unresolved_info()
 
         # 拓扑摘要数据源：新流水线把解析后的链路存进 topology_snapshot，
         # 前端「拓扑摘要」面板据此渲染（旧的 network_topology_facts_info_gauge 指标已废弃，
@@ -208,6 +240,7 @@ class CollectModels(MaintainerInfo, TimeInfo):
             "delete": {"data": delete_data, "count": len(delete_data)},
             "relation": {"data": relation_data, "count": len(relation_data)},
             "raw_data": {"data": raw_data, "count": len(raw_data)},
+            "unresolved": unresolved,
             "topology": {
                 "summary": snapshot.get("summary", {}),
                 "links": snapshot.get("links", []),
@@ -373,7 +406,7 @@ class OidMapping(MaintainerInfo, TimeInfo):
 
 
 class PortFingerprint(MaintainerInfo, TimeInfo):
-    """端口指纹：同一端口可对应多种类型，扫描数据库白名单另算。"""
+    """端口指纹：同一端口可对应多种类型；一阶段扫描读启用行。"""
 
     PROTOCOL_TCP = "tcp"
 
@@ -381,8 +414,24 @@ class PortFingerprint(MaintainerInfo, TimeInfo):
     protocol = models.CharField(max_length=16, default=PROTOCOL_TCP, help_text="协议")
     target_type = models.CharField(max_length=128, help_text="CMDB 模型 ID")
     built_in = models.BooleanField(default=False, verbose_name="是否内置")
+    enabled = models.BooleanField(default=True, verbose_name="是否启用")
 
     class Meta:
         verbose_name = "端口指纹"
         verbose_name_plural = verbose_name
         unique_together = (("port", "target_type"),)
+
+
+class ProcessFingerprint(MaintainerInfo, TimeInfo):
+    """进程指纹：登录主机后按进程名/命令行匹配 CMDB 模型。"""
+
+    target_type = models.CharField(max_length=128, help_text="CMDB 模型 ID")
+    linux_process = models.CharField(max_length=256, blank=True, default="", help_text="Linux 进程名或命令行正则")
+    windows_image = models.CharField(max_length=256, blank=True, default="", help_text="Windows 映像名或服务名")
+    built_in = models.BooleanField(default=False, verbose_name="是否内置")
+    enabled = models.BooleanField(default=True, verbose_name="是否启用")
+
+    class Meta:
+        verbose_name = "进程指纹"
+        verbose_name_plural = verbose_name
+        unique_together = (("target_type", "linux_process", "windows_image"),)

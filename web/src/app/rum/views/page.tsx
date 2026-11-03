@@ -104,7 +104,7 @@ export default function RumViewsPage() {
   useRumAuthedEffect(
     authReady,
     (isCancelled) => {
-      void listApplications()
+      void listApplications(true)
         .then((items) => {
           if (!isCancelled()) setApps(items.map((item) => item.application).filter(Boolean));
         })
@@ -231,7 +231,7 @@ export default function RumViewsPage() {
     {
       title: t('rum.views.device.label', '终端占比'),
       key: 'device',
-      width: 120,
+      width: 168,
       render: (_, r) => <DeviceMixCell mix={r.deviceMix} />,
     },
   ];

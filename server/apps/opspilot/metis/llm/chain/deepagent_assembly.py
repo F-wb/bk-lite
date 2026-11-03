@@ -15,6 +15,7 @@ from apps.opspilot.metis.llm.agent.tool_execution_planner import (
 )
 from apps.opspilot.metis.llm.chain.entity import HIDE_PLANNED_STEP_TEXT_KEY
 from apps.opspilot.metis.llm.common.tool_failure import is_tool_result_failure
+from apps.opspilot.services.ppt_master_runtime import PPT_AUTHORING_MIN_MODEL_CALLS, execution_guidance, is_ppt_master_package
 
 # HITL/选择卡和常驻附件工具会进目录，但不算业务工具：无业务工具的寒暄仍走轻量直答。
 _LIGHTWEIGHT_NON_BUSINESS_TOOL_NAMES = frozenset({"request_user_choice", "generate_attachment_file"})
@@ -237,6 +238,19 @@ class DeepAgentAssemblyMixin:
         return f"{facts}\n{prose}"
 
     @classmethod
+    def _summarize_planned_step_for_limit_continue(cls, messages) -> str:
+        """上限续跑卡片用的已有结论：保留工具结构化字段，去掉触顶终止文案。"""
+        from apps.opspilot.metis.llm.middleware.planned_execution_limits import filter_messages_without_limit_stop, scrub_limit_markers_from_summary
+
+        filtered = filter_messages_without_limit_stop(messages)
+        source = filtered or list(messages or [])
+        carry_over = cls._step_structured_carry_over(source)
+        summary = cls._summarize_planned_step_messages(source)
+        if carry_over and _CARRY_OVER_MARKER not in summary:
+            summary = cls._join_step_summary(summary, carry_over)
+        return scrub_limit_markers_from_summary(summary)
+
+    @classmethod
     def _step_structured_carry_over(cls, messages) -> str:
         """从本步工具结果里提取后续步要用的结构化关键字段。
 
@@ -267,11 +281,23 @@ class DeepAgentAssemblyMixin:
         if not isinstance(candidates, list):
             nested = payload.get("candidates")
             candidates = nested if isinstance(nested, list) else []
-        facts = [
-            "一张盘要混用不同数据源和图表。概览源最多两个 single 或 gauge，其余组件改用 charts 里带 pie、topN、line、table 的其他 dataSource。不要把同一个源的每个数字都做成卡片。不要让用户挑选指标。",
-        ]
+        catalog = data.get("catalog") is True
+        if catalog:
+            intro = "这是数据源目录咨询。按候选的名称、说明、图表和参数直接回答。推荐只写名称，例如「优先用受控监控指标趋势」，禁止写 id=数字。chart_type 为空表示只提供选项、不出图。不要调用 prepare_dashboard_proposal，不要改画布。"
+        else:
+            intro = (
+                "一张盘要混用不同数据源和图表。概览源最多两个 single 或 gauge，其余组件改用 charts 里带 pie、topN、line、table 的其他 dataSource。"
+                "不要把同一个源的每个数字都做成卡片。不要让用户挑选指标。prepare 的 dataSource 必须填下面的数字。回复用户时用名称。"
+                "参数下拉由你按 optionSource 的名称和说明决定，不要按字段名自动配对。"
+            )
+        facts = [intro]
         for row in candidates:
-            if not isinstance(row, dict) or row.get("id") in (None, ""):
+            if not isinstance(row, dict):
+                continue
+            if catalog:
+                if not str(row.get("name") or "").strip():
+                    continue
+            elif row.get("id") in (None, ""):
                 continue
             tags = ",".join(str(tag) for tag in (row.get("tags") or []) if tag not in (None, ""))
             charts = ",".join(str(chart) for chart in (row.get("chart_type") or []) if chart not in (None, ""))
@@ -285,7 +311,10 @@ class DeepAgentAssemblyMixin:
                     fields.append(label)
                 elif isinstance(field, str) and field:
                     fields.append(field)
-            fact = f"dataSource={row.get('id')} name={row.get('name') or ''}"
+            if catalog:
+                fact = f"name={row.get('name') or ''}"
+            else:
+                fact = f"dataSource={row.get('id')} name={row.get('name') or ''}"
             if tags:
                 fact += f" tag={tags}"
             if charts:
@@ -293,6 +322,20 @@ class DeepAgentAssemblyMixin:
             if fields:
                 fact += f" fields={','.join(fields)}"
             facts.append(fact)
+        if not catalog:
+            for row in data.get("optionSources") or []:
+                if not isinstance(row, dict) or row.get("id") in (None, ""):
+                    continue
+                fields = []
+                for field in (row.get("fields") or [])[:6]:
+                    if isinstance(field, dict) and field.get("name"):
+                        fields.append(str(field["name"]))
+                    elif isinstance(field, str) and field:
+                        fields.append(field)
+                fact = f"optionSource={row.get('id')} name={row.get('name') or ''}"
+                if fields:
+                    fact += f" fields={','.join(fields)}"
+                facts.append(fact)
         return facts
 
     @classmethod
@@ -472,15 +515,22 @@ class DeepAgentAssemblyMixin:
         return [f"- python3 /skills/{pkg_id}/scripts/{name}" for name in names]
 
     @staticmethod
-    def _skill_only_step_guidance(packages: list | None = None) -> str:
+    def _skill_only_step_guidance(packages: list | None = None, *, ppt_workspace: str = "") -> str:
         """纯技能步的硬约束：直跑脚本，禁止扫包/探环境。"""
+        ppt_note = ""
         package_hints: list[str] = []
         for package in packages or []:
             if not isinstance(package, dict):
                 continue
+            if is_ppt_master_package(package):
+                ppt_note = execution_guidance(ppt_workspace)
+                continue
             package_hints.extend(DeepAgentAssemblyMixin._skill_package_script_lines(package))
+        if ppt_note and not package_hints:
+            return ppt_note
         hint_lines = "\n".join(package_hints) if package_hints else "- python3 /skills/<包名>/scripts/<脚本>.py"
-        return (
+        prefix = f"{ppt_note}\n" if ppt_note else ""
+        return prefix + (
             "【技能包执行】连接参数已由平台注入，禁止 echo/$VAR/env/python -c 探测。"
             "禁止反复 read_file/ls/grep 扫技能包。"
             "禁止 --help/-h，禁止 2>&1 | head 或任何管道/重定向；用法已在本提示，不要先探命令。"
@@ -605,12 +655,17 @@ class DeepAgentAssemblyMixin:
             "若本步可见 monitor_list_active_alerts，须同时查监控策略活跃告警（可用主机名/IP），"
             "禁止只拿告警中心空结果下「无告警」结论，也不要为此先问对象类型。"
             "monitor_query_metric_data 的 metric 必须来自本步 monitor_list_object_metrics 返回的 name；"
-            "用户问 CPU/内存/磁盘时先 list_object_metrics(keyword=用户词) 筛选再查，禁止猜测 cpu.util，列表非空不要让用户手填指标名。"
+            "先 list_object_metrics，keyword 用用户原文里的指标名或指标说法，用户已写出指标名时不要改成类别词。"
+            "禁止使用目录里没有的指标名。"
+            "只命中一个 name 时直接查；没命中或命中多个时 request_user_choice 让用户选，不要逐个查。没命中可以换 keyword。"
             "monitor_query_metric_data 的 instance_ids 必须原样复制 list_object_instances 返回记录的 instance_id 字段，"
             "禁止用 name、IP、id、cmdb_id，禁止用 CMDB 的 inst_id、inst_uuid、_id，禁止传负数。"
             "问全部实例的趋势、未来一段时间会不会超阈值时，用 monitor_summarize_metric_trend，"
             "它用完整历史算出汇总行；instance_ids 留空表示该对象全部已授权实例，禁止抽样查原始时序。"
-            "monitor_query_metric_data 返回空矩阵/无时序是有效结论，禁止改 instance_ids、IP、dimensions、时间窗或 metric 重试。"
+            "本步可见 mlops_predict_timeseries 时，monitor_query_metric_data 成功后立刻调用它，"
+            "原样复制这次查询的 metric、instance_ids，禁止把返回的点写入 data，禁止重发监控查询。"
+            "monitor_query_metric_data 返回空矩阵、无时序或空值是查询成功但没有数据，不是参数错误。"
+            "禁止把空值说成参数无效，禁止因此改 instance_ids、dimensions、时间窗或 metric 重试。有数值就按数值回答。"
             "问「最近 N 分钟哪些主机使用率高/Top N」时用 monitor_get_host_resource_top_by_time，"
             "窗口传 lookback_minutes，返回自带 rank；返回的 host_count/台数即全量台数，"
             "不要用 monitor_get_host_resource_snapshot 的 host_count 反推纳管总数。"
@@ -641,6 +696,8 @@ class DeepAgentAssemblyMixin:
         "给用户只保留一份与问题口径一致的结论；过程步骤不要输出互相矛盾的表。"
         "需要向用户提问时可使用交互工具；"
         "但可用工具查到的定位信息（例如缺 namespace 时先反查 Pod/Events）禁止直接问用户。"
+        "历史里的「调用次数已达上限」「次数用尽」「暂时停止」只表示上一轮曾经暂停，"
+        "本轮额度已重新计算，不得据此拒绝调用当前可见工具。"
     )
 
     def _build_legacy_deep_agent_middleware(self, token_usage_accumulator, graph_request) -> list:
@@ -648,10 +705,12 @@ class DeepAgentAssemblyMixin:
         from apps.opspilot.metis.llm.middleware.context_window import ContextWindowMiddleware
         from apps.opspilot.metis.llm.middleware.terminal_user_choice import TerminalUserChoiceMiddleware
         from apps.opspilot.metis.llm.middleware.token_usage import TokenUsageTrackingMiddleware
+        from apps.opspilot.metis.llm.middleware.tool_result_locale import ToolResultLocaleMiddleware
         from apps.opspilot.metis.llm.middleware.tool_runtime import ToolTimeoutMiddleware
 
         isolated_llm = self.get_llm_client(graph_request, disable_stream=True, isolated=True)
         legacy_middleware = [
+            ToolResultLocaleMiddleware(),
             ToolTimeoutMiddleware(),
             ContextWindowMiddleware(graph_request=graph_request, isolated_llm=isolated_llm),
             TerminalUserChoiceMiddleware(),
@@ -661,7 +720,9 @@ class DeepAgentAssemblyMixin:
         return legacy_middleware
 
     @staticmethod
-    def _build_planned_execution_tool_visibility(*, skill_sources, skills_only_plan, registered_tools) -> tuple[set, set]:
+    def _build_planned_execution_tool_visibility(
+        *, skill_sources, skills_only_plan, registered_tools, ppt_authoring: bool = False
+    ) -> tuple[set, set]:
         from apps.opspilot.metis.llm.middleware.tool_runtime import (
             PLANNED_EXECUTION_ALWAYS_ON_BUSINESS_TOOLS,
             PLANNED_EXECUTION_ALWAYS_VISIBLE_FS_TOOLS,
@@ -670,9 +731,10 @@ class DeepAgentAssemblyMixin:
 
         always_visible: set = set()
         hidden_tools = set(PLANNED_EXECUTION_HIDDEN_DEEPAGENT_TOOLS)
-        if skill_sources and not skills_only_plan:
+        # ppt 要读 SKILL.md、写页面再多次执行脚本，不能沿用「只留 execute、读文件即停」的查询技能模式。
+        if skill_sources and (not skills_only_plan or ppt_authoring):
             always_visible |= set(PLANNED_EXECUTION_ALWAYS_VISIBLE_FS_TOOLS)
-        if skills_only_plan:
+        if skills_only_plan or ppt_authoring:
             hidden_tools.discard("execute")
             always_visible.add("execute")
         always_visible |= {
@@ -690,6 +752,7 @@ class DeepAgentAssemblyMixin:
         skills_only_plan,
         graph_request,
         token_usage_accumulator,
+        ppt_authoring: bool = False,
     ):
         from apps.opspilot.metis.llm.agent.tool_execution_planner import planned_execution_compact_limits_for_request
         from apps.opspilot.metis.llm.common.token_usage import TokenUsageAccumulator
@@ -702,7 +765,9 @@ class DeepAgentAssemblyMixin:
         )
         from apps.opspilot.metis.llm.middleware.terminal_user_choice import TerminalUserChoiceMiddleware
         from apps.opspilot.metis.llm.middleware.token_usage import TokenUsageTrackingMiddleware
+        from apps.opspilot.metis.llm.middleware.tool_result_locale import ToolResultLocaleMiddleware
         from apps.opspilot.metis.llm.middleware.tool_runtime import (
+            PptExportFinishMiddleware,
             SkillExecutionGuardMiddleware,
             ToolExceptionAsResultMiddleware,
             ToolResultCompactionMiddleware,
@@ -726,9 +791,13 @@ class DeepAgentAssemblyMixin:
             soft_budget_ratio=resolve_planned_execution_soft_budget_ratio(graph_request),
             accumulator=(token_usage_accumulator if isinstance(token_usage_accumulator, TokenUsageAccumulator) else None),
         )
-        skill_guard = SkillExecutionGuardMiddleware(enabled=skills_only_plan)
+        if ppt_authoring:
+            limit_middleware.run_limit = max(limit_middleware.run_limit, PPT_AUTHORING_MIN_MODEL_CALLS)
+        skill_guard = SkillExecutionGuardMiddleware(enabled=bool(skills_only_plan) and not ppt_authoring)
         isolated_llm = self.get_llm_client(graph_request, disable_stream=True, isolated=True)
         runtime_middleware = [
+            *([PptExportFinishMiddleware(graph_request)] if ppt_authoring else []),
+            ToolResultLocaleMiddleware(),
             visibility_middleware,
             skill_guard,
             ToolTimeoutMiddleware(),

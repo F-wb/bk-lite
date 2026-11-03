@@ -9,6 +9,7 @@ from apps.system_mgmt.providers.runtime import CapabilityExecutionResult
 WECOM_DEFAULT_ACCESS_TOKEN_URL = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
 WECOM_DEFAULT_LOGIN_AUTH_AUTHORIZE_URL = "https://open.work.weixin.qq.com/wwopen/sso/qrConnect"
 WECOM_DEFAULT_LOGIN_AUTH_USER_INFO_URL = "https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo"
+WECOM_DEFAULT_LOGIN_AUTH_USER_GET_URL = "https://qyapi.weixin.qq.com/cgi-bin/user/get"
 WECOM_DEFAULT_USER_SYNC_DEPARTMENTS_URL = "https://qyapi.weixin.qq.com/cgi-bin/department/list"
 WECOM_DEFAULT_USER_SYNC_USERS_URL = "https://qyapi.weixin.qq.com/cgi-bin/user/list"
 WECOM_DEFAULT_IM_NOTIFICATION_USERS_URL = "https://qyapi.weixin.qq.com/cgi-bin/user/list"
@@ -104,7 +105,7 @@ def _sanitize_url_for_log(url):
     return f"{parsed.scheme}://{hostname}{port}{parsed.path}"
 
 
-def _get_access_token(config):
+def _get_access_token(config, captured_errors=None):
     """统一从基础连接读取 access_token_url,不再依赖 api_base_url 拼接。"""
     url = _resolved_url(config, "access_token_url", WECOM_DEFAULT_ACCESS_TOKEN_URL)
     kwargs = {
@@ -118,6 +119,8 @@ def _get_access_token(config):
         response = requests.get(url, **kwargs)
         data = _parse_json_response(response)
     except (KeyError, ValueError, requests.Timeout, requests.RequestException) as error:
+        if captured_errors is not None:
+            captured_errors.append(error)
         return None, _map_wecom_request_exception(
             error,
             timeout_message="WeCom access token request timed out",
@@ -132,6 +135,42 @@ def _get_access_token(config):
             external_code=str(data.get("errcode") or response.status_code),
         )
     return data["access_token"], None
+
+
+def fetch_member_profile(config, userid):
+    """按 userid 读取成员姓名、邮箱和手机。失败不记日志，把异常交回登录绑定。"""
+    error = _validate_credentials(config)
+    if error or not str(userid or "").strip():
+        return None, "invalid_config", None
+    captured_errors = []
+    token, token_error = _get_access_token(config, captured_errors)
+    if token_error:
+        code = token_error.errors[0].code if token_error.errors else "provider.request_failed"
+        error_type = {
+            "provider.timeout": "Timeout",
+            "provider.auth_failed": "auth_rejected",
+            "provider.invalid_response": "invalid_response",
+            "provider.invalid_config": "invalid_config",
+        }.get(code, "request_failed")
+        return None, error_type, captured_errors[0] if captured_errors else None
+    url = _resolved_url(config, "login_auth_user_get_url", WECOM_DEFAULT_LOGIN_AUTH_USER_GET_URL)
+    try:
+        data = _request_get(url, config, token, {"userid": userid})
+    except requests.Timeout as error:
+        return None, "Timeout", error
+    except ValueError as error:
+        return None, "invalid_response", error
+    except requests.RequestException as error:
+        return None, "request_failed", error
+    return (
+        {
+            "name": str(data.get("name") or "").strip(),
+            "email": str(data.get("email") or ""),
+            "mobile": str(data.get("mobile") or ""),
+        },
+        None,
+        None,
+    )
 
 
 def _fetch_visible_departments(config, token):
@@ -188,6 +227,66 @@ def _request_get(url, config, token, params=None, *, return_response=False):
     return (data, response) if return_response else data
 
 
+def _first_text(value):
+    if isinstance(value, list):
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                return text
+        return ""
+    return str(value or "").strip()
+
+
+_WECOM_RESERVED_USER_KEYS = frozenset(
+    {
+        "userid",
+        "name",
+        "email",
+        "mobile",
+        "position",
+        "direct_leader",
+        "status",
+        "department_ids",
+    }
+)
+
+
+def _wecom_profile(user):
+    status = user.get("status")
+    return {
+        "position": str(user.get("position") or ""),
+        "direct_leader": _first_text(user.get("direct_leader")),
+        "status": "" if status is None else str(status),
+    }
+
+
+def _wecom_custom_fields(user):
+    """成员扩展属性。官方 user/get：type 0 取 text.value，type 1 取 web.title，没有标题再取 web.url。"""
+    extattr = user.get("extattr") if isinstance(user.get("extattr"), dict) else {}
+    attrs = extattr.get("attrs")
+    if not isinstance(attrs, list):
+        return {}
+    fields = {}
+    for attr in attrs:
+        if not isinstance(attr, dict):
+            continue
+        name = str(attr.get("name") or "").strip()
+        if not name or name in _WECOM_RESERVED_USER_KEYS or name in fields:
+            continue
+        attr_type = attr.get("type")
+        if attr_type in (0, "0"):
+            text_value = attr.get("text") if isinstance(attr.get("text"), dict) else {}
+            text = str(text_value.get("value") or "").strip()
+        elif attr_type in (1, "1"):
+            web = attr.get("web") if isinstance(attr.get("web"), dict) else {}
+            text = str(web.get("title") or web.get("url") or "").strip()
+        else:
+            continue
+        if text:
+            fields[name] = text
+    return fields
+
+
 def _normalize_users(users):
     normalized = {}
     for user in users:
@@ -201,12 +300,15 @@ def _normalize_users(users):
                 "name": user.get("name", ""),
                 "email": user.get("email", ""),
                 "mobile": user.get("mobile", ""),
+                **_wecom_profile(user),
+                **_wecom_custom_fields(user),
                 "department_ids": [],
             },
         )
-        item["department_ids"] = sorted(
-            {*item["department_ids"], *(str(value) for value in user.get("department") or [])}
-        )
+        for key, value in {**_wecom_profile(user), **_wecom_custom_fields(user)}.items():
+            if value and not item.get(key):
+                item[key] = value
+        item["department_ids"] = sorted({*item["department_ids"], *(str(value) for value in user.get("department") or [])})
     return list(normalized.values())
 
 
@@ -293,8 +395,4 @@ def _department_tree(departments):
     def build(parent_id):
         return [{**node, "children": build(node["id"])} for node in children.get(parent_id, [])]
 
-    return [
-        {**node, "children": build(node["id"])}
-        for node in nodes.values()
-        if node["parent_id"] is None
-    ]
+    return [{**node, "children": build(node["id"])} for node in nodes.values() if node["parent_id"] is None]

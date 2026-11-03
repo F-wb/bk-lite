@@ -9,17 +9,17 @@ from apps.system_mgmt.management.commands.init_realm_resource import create_reso
 from apps.system_mgmt.models import App, Menu, Role
 
 MENU_PATH = Path("support-files/system_mgmt/menus/system-manager.json")
-USER_CHILD_IDS = ["user_group", "login_auth", "user_sync", "security_settings", "super_admin"]
+USER_CHILD_IDS = ["user_group", "user_fields", "login_auth", "user_sync", "security_settings", "super_admin"]
 SETTING_CHILD_IDS = [
     "audit_log",
     "error_logs",
     "network_white_list",
     "openapi_docs",
     "api_secret_key",
-    "system_api_secret",
 ]
 FROZEN_CHILD_IDS = {
     "user_group",
+    "user_fields",
     "user_sync",
     "login_auth",
     "security_settings",
@@ -29,7 +29,6 @@ FROZEN_CHILD_IDS = {
     "network_white_list",
     "openapi_docs",
     "api_secret_key",
-    "system_api_secret",
 }
 
 
@@ -52,8 +51,9 @@ def test_system_manager_menu_json_keeps_stable_ids_and_new_order():
     assert FROZEN_CHILD_IDS <= child_ids
 
     by_id = {child["id"]: child["name"] for child in setting["children"]}
+    token = next(child for child in setting["children"] if child["id"] == "api_secret_key")
     assert by_id["api_secret_key"] == "API Token"
-    assert by_id["system_api_secret"] == "System Token"
+    assert token["operation"] == ["View", "Add", "Delete"]
     assert by_id["openapi_docs"] == "API Documentation"
     assert by_id["network_white_list"] == "Network Whitelist"
 

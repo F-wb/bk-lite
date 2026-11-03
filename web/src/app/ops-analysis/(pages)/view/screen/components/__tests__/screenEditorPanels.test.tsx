@@ -10,6 +10,7 @@ import {
   createScreenClockItem,
   createScreenDecorationItem,
   createScreenShapeItem,
+  createScreenTextItem,
   createScreenTitleFrameItem,
 } from '../../utils/screenItems';
 import { createScreenWidgetItem } from '../../utils/layoutUtils';
@@ -20,6 +21,12 @@ vi.mock('@/utils/i18n', () => ({
     t: (key: string) => key,
   }),
 }));
+
+vi.mock('@/app/cmdb/(pages)/assetManage/management/list/selectIcon', () => {
+  const SelectIcon = React.forwardRef(() => null);
+  SelectIcon.displayName = 'SelectIcon';
+  return { default: SelectIcon };
+});
 
 beforeAll(() => {
   Object.defineProperty(window, 'matchMedia', {
@@ -254,8 +261,55 @@ describe('ScreenStyleInspector for Widgets', () => {
       'cursor-pointer',
     );
     expect(screen.getByText('opsAnalysis.screen.positionAndSize')).toBeTruthy();
+    expect(screen.getByText('dashboard.singleStyleIcon')).toBeTruthy();
+    expect(screen.getByText('dashboard.singleStyleAlign')).toBeTruthy();
+    expect(screen.queryByText('dashboard.singleStyleIconSource')).toBeNull();
     // Redundant header & headerVisibility should not be displayed
     expect(screen.queryByText('opsAnalysis.screen.headerVisibility')).toBeNull();
+  });
+
+  it('patches single-value style onto the canvas item without clearing other config', () => {
+    const widget = {
+      ...createScreenWidgetItem('single', []),
+      valueConfig: {
+        chartType: 'single' as const,
+        descriptionField: 'note',
+        singleStyle: { showIcon: true, iconKey: 'cc-host', align: 'center' as const },
+      },
+    };
+    const onChange = vi.fn();
+
+    render(
+      <ScreenStyleInspector
+        item={widget}
+        viewport={defaultViewport}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'dashboard.singleStyleAlignLeft' }));
+
+    const next = onChange.mock.calls.at(-1)?.[0];
+    expect(next.valueConfig.descriptionField).toBe('note');
+    expect(next.valueConfig.singleStyle).toEqual({
+      showIcon: true,
+      iconKey: 'cc-host',
+      align: 'left',
+    });
+    expect(next.valueConfig.chartType).toBe('single');
+  });
+
+  it('does not insert single-value style sections on other charts', () => {
+    const widget = createScreenWidgetItem('line', []);
+    render(
+      <ScreenStyleInspector
+        item={widget}
+        viewport={defaultViewport}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('dashboard.singleStyleIcon')).toBeNull();
+    expect(screen.queryByText('dashboard.singleStyleAlign')).toBeNull();
   });
 
   it('supports horizontal centering shortcut', () => {
@@ -441,5 +495,17 @@ describe('ScreenStyleInspector for Display Elements', () => {
     // Click to collapse
     fireEvent.click(screen.getByText('common.collapse'));
     expect(screen.queryByText('opsAnalysis.screen.panelFrame.border-22')).toBeNull();
+  });
+
+  it('puts a title-only link on the text inspector', () => {
+    const item = createScreenTextItem([], { id: 'text-1', content: '说明' });
+    render(
+      <ScreenStyleInspector item={item} viewport={defaultViewport} onChange={vi.fn()} />,
+    );
+
+    expect(screen.getByText('opsAnalysis.screen.interactionTab')).toBeTruthy();
+    expect(screen.getByText('dashboard.interactionNone')).toBeTruthy();
+    expect(screen.getByText('dashboard.interactionTitleLink')).toBeTruthy();
+    expect(screen.queryByText('dashboard.interactionDataLink')).toBeNull();
   });
 });

@@ -1,11 +1,19 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import InteractionTitleIcon from '@/app/ops-analysis/components/interactionTitleIcon';
+import { useFilterTemplateText } from '@/app/ops-analysis/context/filterTemplate';
+import { useInteractionSurface } from '@/app/ops-analysis/context/interactionSurface';
 import type {
   ScreenClockItem,
   ScreenItem,
+  ScreenTextItem,
   ScreenTextStyleConfig,
 } from '@/app/ops-analysis/types/screen';
+import {
+  readWidgetInteraction,
+  shouldShowInteractionEntry,
+} from '@/app/ops-analysis/utils/interactionLink';
 import { getScreenClockDisplayParts } from '../utils/screenClock';
 import {
   isScreenClockItem,
@@ -18,7 +26,9 @@ import { screenShapeCss } from '../utils/screenShape';
 import {
   DecorationSkin,
   TitleFrameSkin,
-  screenChromeTextStyle,
+  screenUniformTextProps,
+  useScaledScreenChromeTextStyle,
+  useScreenChromePresentation,
 } from './screenChromeSkins';
 
 const ClockSkin: React.FC<{
@@ -33,18 +43,21 @@ const ClockSkin: React.FC<{
   }, []);
 
   const parts = getScreenClockDisplayParts(now, format);
-  const style = screenChromeTextStyle(textStyle, {
+  const style = useScaledScreenChromeTextStyle(textStyle, {
     fontSize: 20,
     fontWeight: 600,
     color: 'canvas',
   });
-
   const partClassName =
     'mr-2 leading-none tabular-nums tracking-[0.08em] last:mr-0';
 
   return (
     <div
-      className="flex h-full w-full flex-wrap items-center"
+      {...screenUniformTextProps(
+        textStyle,
+        undefined,
+        'flex h-full w-full flex-wrap items-center',
+      )}
       data-screen-clock
       style={{
         fontSize: style.fontSize,
@@ -61,6 +74,65 @@ const ClockSkin: React.FC<{
   );
 };
 
+const ScreenTextBody: React.FC<{ item: ScreenTextItem }> = ({ item }) => {
+  const textContent = useFilterTemplateText(item.content);
+  const textStyle = useScaledScreenChromeTextStyle(item.textStyle);
+  const surface = useInteractionSurface();
+  const titleConfig = item.interaction?.kind === 'title'
+    ? { interaction: item.interaction }
+    : undefined;
+  const showLink = shouldShowInteractionEntry(
+    surface,
+    Boolean(readWidgetInteraction(titleConfig)),
+  );
+  if (!showLink) {
+    return (
+      <div
+        {...screenUniformTextProps(
+          item.textStyle,
+          undefined,
+          'h-full w-full px-1 py-1',
+        )}
+        style={textStyle}
+      >
+        {textContent}
+      </div>
+    );
+  }
+
+  const align = item.textStyle?.align ?? 'left';
+  const multiline = textContent.includes('\n');
+  return (
+    <div
+      {...screenUniformTextProps(
+        item.textStyle,
+        undefined,
+        'flex h-full w-full min-w-0 flex-nowrap items-center justify-start overflow-hidden px-1 py-1',
+      )}
+      data-screen-text-link=""
+      style={{
+        ...textStyle,
+        gap: '0.4em',
+      }}
+    >
+      <span
+        data-screen-text-label=""
+        className="min-w-0 overflow-hidden"
+        style={{
+          flex: '1 1 auto',
+          textAlign: align,
+          whiteSpace: multiline ? 'pre-wrap' : 'nowrap',
+          wordBreak: multiline ? 'break-word' : 'normal',
+          textOverflow: multiline ? 'clip' : 'ellipsis',
+        }}
+      >
+        {textContent}
+      </span>
+      <InteractionTitleIcon config={titleConfig} variant="text" />
+    </div>
+  );
+};
+
 interface ScreenChromeRendererProps {
   item: ScreenItem;
 }
@@ -68,13 +140,10 @@ interface ScreenChromeRendererProps {
 const ScreenChromeRenderer: React.FC<ScreenChromeRendererProps> = ({
   item,
 }) => {
+  const { borderDensity } = useScreenChromePresentation();
   let body: React.ReactNode = null;
   if (isScreenTextItem(item)) {
-    body = (
-      <div className="h-full w-full px-1 py-1" style={screenChromeTextStyle(item.textStyle)}>
-        {item.content}
-      </div>
-    );
+    body = <ScreenTextBody item={item} />;
   } else if (isScreenClockItem(item)) {
     body = <ClockSkin format={item.format} textStyle={item.textStyle} />;
   } else if (isScreenTitleFrameItem(item)) {
@@ -82,7 +151,7 @@ const ScreenChromeRenderer: React.FC<ScreenChromeRendererProps> = ({
   } else if (isScreenDecorationItem(item)) {
     body = <DecorationSkin item={item} />;
   } else if (isScreenShapeItem(item)) {
-    body = <div style={screenShapeCss(item.shape, item.shapeStyle)} />;
+    body = <div style={screenShapeCss(item.shape, item.shapeStyle, borderDensity)} />;
   }
 
   return <div className="relative h-full w-full">{body}</div>;

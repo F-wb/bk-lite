@@ -36,9 +36,10 @@ from apps.cmdb.services.collect_object_tree import get_collect_obj_tree
 from apps.cmdb.services.collect_service import CollectModelService
 from apps.cmdb.services.instance_identity import optional_inst_uuid
 from apps.cmdb.services.network_config_file_policy import get_supported_brand_options
+from apps.cmdb.services.network_unknown_soid import save_unknown_soid_mappings, write_unknown_devices
 from apps.cmdb.utils.base import get_current_team_from_request
 from apps.core.decorators.api_permission import HasPermission
-from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.exceptions.base_app_exception import BaseAppException, ForbiddenException, ValidationAppException
 from apps.core.logger import cmdb_logger as logger
 from apps.core.utils.permission_utils import get_permission_rules
 from apps.core.utils.team_utils import get_current_team
@@ -119,7 +120,10 @@ class CollectModelViewSet(AuthViewSet):
         if action in {"list", "task_status", "collect_task_names"}:
             queryset = self.apply_visibility_filter(queryset)
         if action == "list" and request is not None and not str(request.query_params.get("custom_plugin_pk") or "").strip():
-            queryset = queryset.exclude(task_type=CollectPluginTypes.CUSTOM_SCRIPT)
+            # 内置插件列表按模型过滤，不能把同模型的自定义任务混进去。
+            # 总览和全部任务没有模型条件，自定义任务要留在列表里。
+            if str(request.query_params.get("model_id") or "").strip():
+                queryset = queryset.exclude(task_type=CollectPluginTypes.CUSTOM_SCRIPT)
         return queryset
 
     def _get_authorized_task(self, request, task_id):
@@ -403,6 +407,30 @@ class CollectModelViewSet(AuthViewSet):
         return result
 
     @HasPermission("auto_collection-Execute")
+    @action(methods=["POST"], detail=True, url_path="unknown_soid_mappings")
+    def unknown_soid_mappings(self, request, *args, **kwargs):
+        return self._run_unknown_soid(request, save_unknown_soid_mappings, request.data.get("items"))
+
+    @HasPermission("auto_collection-Execute")
+    @action(methods=["POST"], detail=True, url_path="write_unknown_devices")
+    def write_unknown_devices(self, request, *args, **kwargs):
+        return self._run_unknown_soid(request, write_unknown_devices, request.data.get("ip_addrs"))
+
+    def _run_unknown_soid(self, request, handler, payload):
+        instance = self.get_object()
+        user = request.user
+        current_team = get_current_team_from_request(request)
+        include_children = request.COOKIES.get("include_children", "0") == "1"
+        if not self.get_has_permission(user, instance, current_team, include_children=include_children):
+            return WebUtils.response_403("您没有操作该采集任务的权限！")
+        try:
+            return WebUtils.response_success(handler(instance, user, payload))
+        except ForbiddenException as exc:
+            return WebUtils.response_403(exc.message)
+        except ValidationAppException as exc:
+            return WebUtils.response_error(exc.render_data() or {}, error_message=exc.message)
+
+    @HasPermission("auto_collection-Execute")
     @action(methods=["POST"], detail=False, url_path="pc_test_connection")
     def pc_test_connection(self, request, *args, **kwargs):
         """PC 连接测试：未落库表单经 HTTP debug 端点直连 Stargazer，不写 CMDB。
@@ -576,7 +604,15 @@ class CollectModelViewSet(AuthViewSet):
 
         def increment(status_key, exec_status, total=1):
             if status_key not in data:
-                data[status_key] = {"success": 0, "failed": 0, "running": 0, "partial_success": 0}
+                data[status_key] = {
+                    "success": 0,
+                    "failed": 0,
+                    "running": 0,
+                    "partial_success": 0,
+                    "not_start": 0,
+                    "total": 0,
+                }
+            data[status_key]["total"] += total
             if exec_status == CollectRunStatusType.SUCCESS:
                 data[status_key]["success"] += total
             elif exec_status == CollectRunStatusType.ERROR:
@@ -585,12 +621,13 @@ class CollectModelViewSet(AuthViewSet):
                 data[status_key]["running"] += total
             elif exec_status == CollectRunStatusType.PARTIAL_SUCCESS:
                 data[status_key]["partial_success"] += total
+            elif exec_status == CollectRunStatusType.NOT_START:
+                data[status_key]["not_start"] += total
 
         for model_data in status_rows:
-            if model_data.get("task_type") == CollectPluginTypes.CUSTOM_SCRIPT:
-                plugin_pk = model_data.get("params__custom_plugin_pk")
-                if plugin_pk:
-                    increment(f"custom_script__{plugin_pk}", model_data["exec_status"], model_data["total"])
+            plugin_pk = model_data.get("params__custom_plugin_pk")
+            if plugin_pk:
+                increment(f"custom_script__{plugin_pk}", model_data["exec_status"], model_data["total"])
                 continue
             driver_type = model_data.get("driver_type") or ""
             status_key = f"{model_data['model_id']}__{driver_type}" if driver_type else model_data["model_id"]

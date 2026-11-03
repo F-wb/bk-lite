@@ -35,6 +35,7 @@
   - `tasks/monitor_policy.py:retry_alert_center_lifecycle_notify_task`（告警中心生命周期通知重试，`monitor_policy.py:100`）—— 由 beat 每 5 分钟触发（`config.py:12-15`）。
   - `tasks/monitor_policy.py:scan_policy_task`（策略扫描评估）—— 不在静态 `config.py` 中，而是按每条策略的 `schedule`（min/hour/day）动态注册为 django-celery-beat 的 `PeriodicTask`（任务名 `scan_policy_task_{policy_id}`），在策略保存时由 `views/monitor_policy.py:380-395` 创建/更新（crontab 由 `format_crontab` 依策略调度生成，`views/monitor_policy.py:340-378`）；仍属周期调度，只是周期随策略而定，非 NATS 触发。
 - 策略扫描服务层 `tasks/services/policy_scan/`：`scanner.py`、`metric_query.py`、`alert_detector.py`、`event_alert_manager.py`、`snapshot_recorder.py`（入口 `MonitorPolicyScan`）。
+- 多指标条件【已实现】：`query_condition.type=multi`，2–5 个条件、组合方式仅全部满足、级别取最低、前置条件只做门槛。判定在 `tasks/utils/policy_calculate_multi.py`，事件形状与 `calculate_alerts` 一致。策略组按 `condition_thresholds` 改各条件阈值。条件条目可不带 `source`（原生指标）；`source: formula` 时该条是条件内公式，操作数在 `operands[]`，结果名称是条目 `metric_name`。契约见 `specs/changes/monitor-policy-multi-metric/spec.md` 与 `specs/changes/monitor-policy-condition-source/spec.md`。
 - `retry_alert_center_lifecycle_notify_task` 关键约束【已实现/已存在】：每次最多取 200 条待重试告警（`monitor_policy.py:110`）；单条最大重试 10 次（`alert_center_retry_count__lt=10`，`monitor_policy.py:109`）；达上限的告警以 ERROR 汇总告警并不再补偿，需人工介入（`monitor_policy.py:149-154`）。
 - 管理命令【已实现/已存在】：
   - `management/commands/plugin_init.py:9`：监控插件初始化入口，依次执行插件、策略与默认排序迁移。插件文件逐项解析失败会记录并汇总后跳过该文件；已形成的插件批次采用原子数据库写入，批量写入失败会向上抛出，因而不继续策略和默认排序阶段。
@@ -73,6 +74,7 @@
 - Monitor 依赖 CMDB 的实例稳定身份：`MonitorInstance.cmdb_id` 最终保存 CMDB 的规范 `inst_uuid`。迁移期接收 `cmdb_id_aliases`，以规范身份与旧数字 ID 共同查找存量关联；命中旧值后会在本次更新中触达式回填为规范身份。若节点关联与 CMDB 候选分别命中不同实例，或 ip+云区域已绑定其它节点，返回冲突结果而不合并。ID 未命中后，先用 `CMDB_MODEL_TO_MONITOR_OBJECT` 把 CMDB `model_id` 换成监控对象 `name`（仅一对一能对上现有插件对象的内置模型；对不上则跳过类型身份）。主机按 IP+云区域再按同对象唯一 IP 认领；网络设备及其它已映射对象只按同对象唯一 IP 认领（不看云区域；列 `ip`、摘要 `asset.ip` 或网络设备主键中的 IP）。同 IP 多条则回落到实例名精确且唯一匹配。Docker（`model_id=docker` → 对象 `Docker Container`）跳过同对象唯一 IP，只按同对象下唯一实例名认领（容器共享宿主机 IP）。CMDB 列表可批量无凭据同步；详情可按监控实例名手绑 / 解绑（仅清指针）；占用中的 `cmdb_id` 拒绝绑定。
 - 监控发起的创建与删除通知携带来源链路标识；接收自身发起的回写时仅返回既有实例，避免循环处理。主机监控实例新建后会尽力通知节点管理和 CMDB，任一对端失败不影响监控实例创建；用户也可将既有监控实例显式推送至 CMDB。
 - 节点管理退役通知会停用并软删除对应监控实例；CMDB 或其他来源的解绑通知只清除关联标识，不删除监控资产。节点来源的新实例会创建监控实例并套用 Host + Telegraf 主机采集模板；插件按名称 `Host` 查找，找不到模板或套用失败则整次同步失败。规范主键已被同对象占用（含软删）时回收该行并回写关联，不再 `uuid` 另建空壳；认领已有采集行后同样通知 CMDB，成对写入 `monitor_id`。接入套用复用 ingest 主键，并带上 IP / `node_id` / `cmdb_id`。CMDB 发起的自动创建路径当前处于关闭状态，未满足既有创建条件时只做关联处理。
+- 主机 Telegraf Agent 接入页的「已接入主机监控」只认还活着的 Host 对象 `CollectConfig`。进程监控等同样 `collect_type=host` 的子配置不占用主机 Agent 节点；再次接入只会清掉没有活着采集配置绑定的残留子配置，不会误删进程采集。
 
 相关架构：[[legacy-ard-modules-cmdb.md#4. 依赖与通信【已实现/已存在】]]、[[legacy-ard-modules-node-mgmt.md#4. 通信机制【已实现/已存在】]]；相关产品能力：[[legacy-prd-监控系统-集成.md#3.2.1 资产协同]]；相关功能清单：[[legacy-fuctionlist-02-监控系统-功能清单.md#7. Integration - 资产管理]]。
 > 证据来源：server/apps/cmdb/services/instance_identity.py:55-106；server/apps/monitor/models/monitor_object.py:122-136；server/apps/monitor/services/module_ingest.py:53-169,628-639,750-834；server/apps/monitor/services/module_push.py:62-178,181-239,291-406；server/apps/monitor/views/monitor_instance.py:397-410；server/apps/monitor/nats/monitor.py:1565-1578　|　同步基线：b98b782a7　|　【已实现】
@@ -94,8 +96,18 @@
 ## 2026-10-09 Code-ARD 校准
 - `[monitor#20261009-001]` 采集配置可绑定凭据仓库。`CollectConfig.vault_*` 只存凭据 ID、分支、绑定人、名称快照和同步状态。UI 下发 `credential_binding`。编辑请求带 `credential`。NATS `monitor_count_credential_refs` 与 `monitor_refresh_credential_refs` 已注册。重下发与每 10 分钟对账按秘密版本差补齐。手填 env 与手填探测敏感键不变。
 
+## 2026-10-20 Code-ARD 校准
+- `[monitor#20261020-001]` 告警策略增加多指标条件 `query_condition.type=multi`。模式由页面显式选择，不再按指标行数推断公式。证据见 `specs/changes/monitor-policy-multi-metric/verification.md`。
+- `[monitor#20261021-001]` 策略「定义指标」改为单条件 / 多条件，条件卡内可选原生指标或计算指标。多条件计算条目使用 `source: formula`，不新增查询类型。证据见 `specs/changes/monitor-policy-condition-source/verification.md`。
+
 ## 2026-08-20 Code-ARD 校准
 - `[monitor#20260820-001]` 新增主机看板 NATS：`get_host_instance_list`、`get_host_metric_range`、`get_host_resource_snapshot`；`get_host_resource_top` 增加可选 `instance_ids` 收窄。未选主机的趋势/快照不退化为全量。权限与现有监控实例可见范围一致，fail-closed。
+
+## 2026-10-19 Code-ARD 校准
+- `[monitor#20261019-001]` 主机 Telegraf Agent「已接入主机监控」只认活着的 Host 对象 `CollectConfig`。进程监控等同样 `collect_type=host` 的子配置不占用该节点；软删/删除后残留且已无活着采集配置的 host ChildConfig 会在再次接入前清理。
+
+## 2026-10-29 Code-ARD 校准
+- `[monitor#20261029-001]` 监控资产已配置采集模板多于 1 个时，可按 `instance_id` + `monitor_plugin_id` 解绑指定模板（`POST /monitor/api/monitor_instance/unbind_monitor_plugin/`）。删除该插件的 `CollectConfig`，并同步调用 `NodeMgmt.delete_child_configs` / `delete_configs`。不删除 `MonitorInstance`，不改 CMDB，不走 `remove_monitor_instance`。只剩一个已配置模板时拒绝。告警与策略只裁明确绑定该插件、且指标名不被其余已配置模板共享的部分。
 
 ## 7. 证据来源
 `server/apps/monitor/{urls.py,config.py,constants/alert_policy.py,models/*,tasks/*,views/monitor_policy.py:38-69,92-153,285-295,528-609,views/monitor_condition.py:23-54,63-112,140-176,views/collect_detect.py:15-86,services/flow_*.py,services/flow_access_guide.py:10,13,14,services/flow_sampling.py,services/collect_detect.py:29-69,198-213,utils/victoriametrics_api.py,nats/monitor.py,language/zh-Hans.yaml:4867,language/en.yaml:4865,migrations/0044_rename_monitor_object_type_os_to_host_resource.py:1-28,management/commands/{plugin_init.py:9,autodiscover.py:5,backfill_metric_instance_id_keys.py:12,gen_display_fields.py:59,refresh_display_fields.py:26,create_monitor_instance.py:14,21,create_monitor_instance.md:5},support-files/plugins/Telegraf/snmp/{access_topvision/policy.json,access_icotera/policy.json,switch_ipinfusion/policy.json,transmission_ifotec/policy.json,wireless_xirrus/policy.json}}`、`server/apps/rpc/monitor.py`、`web/src/app/monitor/api/integration.ts:220-239`、`web/src/app/monitor/hooks/integration/{index.tsx,objects/middleware/{jboss,jetty,tongWeb,webLogic}.tsx}`。

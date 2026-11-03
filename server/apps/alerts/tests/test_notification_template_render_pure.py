@@ -52,6 +52,38 @@ def test_email_html_keeps_layout_and_escapes_variable_values():
     assert result.missing_fields == []
 
 
+@pytest.mark.parametrize(
+    ("time_zone", "expected_times", "expected_cell"),
+    [
+        ("UTC", "2026-10-16 03:24:01｜2026-10-16 03:24:01｜2026-10-16 03:30:00", "2026-10-16 03:24:01"),
+        ("Asia/Shanghai", "2026-10-16 11:24:01｜2026-10-16 11:24:01｜2026-10-16 11:30:00", "2026-10-16 11:24:01"),
+        ("Europe/Berlin", "2026-10-16 05:24:01｜2026-10-16 05:24:01｜2026-10-16 05:30:00", "2026-10-16 05:24:01"),
+    ],
+)
+def test_time_variables_follow_display_timezone(time_zone, expected_times, expected_cell):
+    from datetime import datetime, timezone
+
+    from apps.alerts.notification_templates.events import cell_text
+    from apps.alerts.notification_templates.renderer import build_alert_context, render_source
+
+    created_at = datetime(2026, 10, 16, 3, 24, 1, 123456, tzinfo=timezone.utc)
+    context = build_alert_context(
+        AlertStub(created_at=created_at, first_event_time=created_at),
+        [],
+        "assignment",
+        generated_at=datetime(2026, 10, 16, 3, 30, tzinfo=timezone.utc),
+        display_timezone=time_zone,
+    )
+    result = render_source(
+        "{{ alert.created_at }}｜{{ alert.first_event_time }}｜{{ notification.generated_at }}",
+        context,
+        channel_type="custom_webhook",
+    )
+
+    assert result.value == expected_times
+    assert cell_text(created_at, time_zone) == expected_cell
+
+
 def test_receiver_names_are_human_readable_without_changing_raw_receiver_list():
     from apps.alerts.notification_templates.renderer import build_alert_context
 
@@ -238,6 +270,53 @@ def test_large_collection_is_rejected_before_output_expansion():
 
     with pytest.raises(TemplateValidationError, match="不能超过 100 项"):
         render_source("{{ enrichment.cmdb.owners }}", context, channel_type="enterprise_wechat_bot")
+
+
+@pytest.mark.parametrize(
+    ("level", "token"),
+    [("0", "warning"), ("1", "warning"), ("2", "comment"), ("3", "info"), ("提醒", "info")],
+)
+def test_wecom_color_follows_alert_level_id(level, token):
+    from apps.alerts.notification_templates.renderer import build_alert_context, render_source
+
+    context = build_alert_context(AlertStub(level=level), [], "assignment", level_display_name="级别")
+    result = render_source(
+        '<font color="{{ alert.wecom_color }}">{{ alert.level }}</font>',
+        context,
+        channel_type="enterprise_wechat_bot",
+    )
+
+    assert result.value == f'<font color="{token}">级别</font>'
+
+
+@pytest.mark.parametrize(
+    ("level", "token"),
+    [("0", "red"), ("1", "orange"), ("2", "yellow"), ("3", "green"), ("提醒", "green")],
+)
+def test_feishu_color_follows_alert_level_id(level, token):
+    from apps.alerts.notification_templates.renderer import build_alert_context, render_source
+
+    context = build_alert_context(AlertStub(level=level), [], "assignment", level_display_name="级别")
+    result = render_source(
+        "<font color='{{ alert.feishu_color }}'>{{ alert.level }}</font>",
+        context,
+        channel_type="feishu_bot",
+    )
+
+    assert result.value == f"<font color='{token}'>级别</font>"
+
+
+def test_feishu_operation_template_colors_level_only():
+    from apps.alerts.notification_templates.operation import _operation_base_content
+
+    _subject, feishu = _operation_base_content("feishu_bot")
+    _subject, dingtalk = _operation_base_content("dingtalk_bot")
+
+    assert "<font color='{{ alert.feishu_color }}'>{{ alert.level }}</font>" in feishu
+    assert "{{ alert.title }}" in feishu
+    assert "{{ notification.action_summary }}" in feishu
+    assert "<font" not in dingtalk
+    assert "｜{{ alert.level }}" in dingtalk
 
 
 def test_email_style_accepts_only_level_color_variable():
