@@ -36,16 +36,19 @@ COMPOSE_DIR="${COMPOSE_DIR:-/opt/bk-lite}"
 ACR="${ACR:-crpi-qp8pnmdzkajoq92t.cn-hangzhou.personal.cr.aliyuncs.com/fanwenbin/bk-lite}"
 SERVER_TAG="${SERVER_TAG:-server}"
 WEB_TAG="${WEB_TAG:-web}"
-# 本项目精简镜像（.[cmdb,dev]）验证过的已知良好应用清单（9 个基础应用）。
-# 若将来改用官方全量 Dockerfile 构建（见《盛大运维系统_AI模块规划.md》），
-# 可传入官方默认列表而无需改脚本。
+# 一期启用范围的已知良好应用清单（9 个基础应用）。
+# 镜像自 2026-11 起已切换官方全量 Dockerfile（extras 含 mlops/opspilot 全依赖），
+# 9 应用仍为一期收敛目标；启用 AI 时显式传入 DESIRED_INSTALL_APPS 并包含 opspilot,mlops
+# （否则会被本脚本收回，见《盛大运维系统_AI模块规划.md》）。
 DESIRED_INSTALL_APPS="${DESIRED_INSTALL_APPS:-system_mgmt,cmdb,monitor,node_mgmt,console_mgmt,alerts,log,job_mgmt,patch_mgmt}"
 
 CLEANUP_BEAT=false
 [ "${1:-}" = "--cleanup-beat" ] && CLEANUP_BEAT=true
 
-# 全部已知可选应用（用于推导 beat 清理范围；不在期望清单内的即视为已摘除）
-KNOWN_APPS="system_mgmt cmdb monitor node_mgmt console_mgmt alerts log job_mgmt patch_mgmt operation_analysis rum apm mlops opspilot workflow_orchestration cmdb_enterprise"
+# 全部已知可选应用（用于推导 beat 清理范围；不在期望清单内的即视为已摘除）。
+# workflow 为上游 3ccc3e336c 改名后的新名；workflow_orchestration 为旧名，
+# 保留仅用于清理历史残留 beat 行，不再作为 INSTALL_APPS 合法值。
+KNOWN_APPS="system_mgmt cmdb monitor node_mgmt console_mgmt alerts log job_mgmt patch_mgmt operation_analysis rum apm mlops opspilot workflow workflow_orchestration cmdb_enterprise"
 
 [ -f "$ENV_FILE" ] || { echo "[FATAL] 未找到 $ENV_FILE：基线安装未完成或目录结构已变更" >&2; exit 1; }
 
