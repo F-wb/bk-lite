@@ -19,8 +19,10 @@
 |---|---|
 | 源码 | `bk-lite-master` 仓分支 `shengda/v1.0-custom` @ `b5bc86ab37`（= 上游 `b44a5c92c0` + 631 提交 merge，30 二开文件完整）；服务器构建副本 `/opt/bk-lite-src` 同点（GitHub 自服务器不可达，经 git bundle 同步） |
 | 上游镜像 | `main` = 上游最新 `b44a5c92c0`（2026-11-03 同步，GitHub 与 GitLab 同 hash） |
-| 运行环境 | 测试机 192.168.1.11 `/opt/bk-lite`（compose 项目名 `compose`），18 服务全 Up，`https://192.168.1.11/` = 200；磁盘可用 66G（旧镜像已清） |
-| 预生产环境 | `https://10.10.2.91/`：跑**官方 latest 镜像**（非二开 ACR 镜像）做全功能试用；模块全部启用，`INSTALL_APPS` = 12 项 + `apm,rum,workflow`，编排引擎 conductor 已部署；`APP_WORKERS=4` |
+| 运行环境 | 开发机 192.168.1.11 `/opt/bk-lite`（compose 项目名 `compose`），18 服务全 Up，`https://192.168.1.11/` = 200；磁盘可用 66G（旧镜像已清） |
+| 预发布环境 | `https://10.10.2.91/`：跑**官方 latest 镜像**（非二开 ACR 镜像）做全功能试用；模块全部启用，`INSTALL_APPS` = 12 项 + `apm,rum,workflow`，编排引擎 conductor 已部署；`APP_WORKERS=4`。**定位：官方 AI 版试用，无二开版本** |
+| 生产环境 | `10.10.2.95`：**公司生产**，可 SSH、依赖已装好；**一期已获准部署（2026-11-03）**，部署方式=基线安装器 + 镜像覆盖（见部署手册 B 方案） |
+| 镜像仓库策略 | 构建/中转=个人 ACR `crpi-qp8pnmdzkajoq92t…/fanwenbin/bk-lite`；**部署拉取=公司仓库 `registry.cn-zhangjiakou.aliyuncs.com`（CI 体系 namespace `shengda`，需先同步镜像并确认 95 的 docker login）** |
 | 当前镜像 | ACR `:server-20261103a`（33 层，**官方 Dockerfile 原件**，extras 全量含 mlops/opspilot → **AI 就绪**）/ `:web-20261103a`（11 层）；回滚点 `:server-20261015d` / `:web-20261015c` |
 | 启用应用（9 个） | `system_mgmt,cmdb,monitor,node_mgmt,console_mgmt,alerts,log,job_mgmt,patch_mgmt` |
 | 未启用模块 | 测试机：apm / mlops / opspilot / operation_analysis / rum / workflow（原 workflow_orchestration，上游 3ccc3e336c 已改名）；菜单可见、点击 404 属预期 |
@@ -74,7 +76,8 @@
 
 ## 7. 待办
 
-- [ ] 【用户侧】一期排除模块的前端菜单手动隐藏（应用管理 UI）
+- [ ] 【生产部署·下一任务】一期上 10.10.2.95：①镜像同步个人 ACR→公司仓库 `registry.cn-zhangjiakou.aliyuncs.com/shengda/…`（tag 策略与 CI 体系对齐）②确认 95 docker login 与基线安装器预下载比对 ③备份策略在生产**必须配置 crontab**（异地/异盘待决策）④部署后七项校验 + 台账；变更前出详细计划等用户确认
+- [ ] 【用户侧】一期排除模块的前端菜单手动隐藏（应用管理 UI；95 生产部署后同样需要）
 - [ ] 【待决策】异地备份（现备份与生产同机同盘）；测试机 crontab 当前为空
 - [ ] 【待决策】SSH 保活（`~/.ssh/config` 加 ServerAliveInterval）
 - [ ] 每月第一周跟进上游（运维手册 §6.4）；**启用 AI 现已零门槛**：镜像已含全量依赖，只需重跑安装器 `--opspilot`（随后 `apply-state.sh` 传含 `opspilot,mlops` 的 DESIRED_INSTALL_APPS 收敛）+ UI 配模型服务
