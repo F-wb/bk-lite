@@ -21,8 +21,8 @@
 | 上游镜像 | `main` = 上游最新 `b44a5c92c0`（2026-11-03 同步，GitHub 与 GitLab 同 hash） |
 | 运行环境 | 开发机 192.168.1.11 `/opt/bk-lite`（compose 项目名 `compose`），18 服务全 Up，`https://192.168.1.11/` = 200；磁盘可用 66G（旧镜像已清） |
 | 预发布环境 | `https://10.10.2.91/`：跑**官方 latest 镜像**（非二开 ACR 镜像）做全功能试用；模块全部启用，`INSTALL_APPS` = 12 项 + `apm,rum,workflow`，编排引擎 conductor 已部署；`APP_WORKERS=4`。**定位：官方 AI 版试用，无二开版本** |
-| 生产环境 | `10.10.2.95`：**公司生产**，可 SSH、依赖已装好；**一期已获准部署（2026-11-03）**，部署方式=基线安装器 + 镜像覆盖（见部署手册 B 方案） |
-| 镜像仓库策略 | 构建/中转=个人 ACR `crpi-qp8pnmdzkajoq92t…/fanwenbin/bk-lite`；**部署拉取=公司仓库 `registry.cn-zhangjiakou.aliyuncs.com`（CI 体系 namespace `shengda`，需先同步镜像并确认 95 的 docker login）** |
+| 生产环境 | `https://10.10.2.95/`（主机名 ops，15G 内存/273G 磁盘）：**一期已于 2026-11-03 部署上线**——基线安装器 + 公司仓库镜像覆盖，18 服务全 Up、server/web healthy、站点 200；`INSTALL_APPS` 9 应用；品牌已收敛「盛大运维系统」；备份 crontab（每日 02:30）已配置。**待用户界面操作：钉钉企业登录参数配置（corp_id/appkey/appsecret）、JumpServer 集成实例、排除模块菜单隐藏** |
+| 镜像仓库策略 | 构建/中转=个人 ACR `crpi-qp8pnmdzkajoq92t…/fanwenbin/bk-lite`；**部署拉取=公司仓库 `registry.cn-zhangjiakou.aliyuncs.com/shengda/bk-lite`**（双 tag 已同步 `server/web-20261103a` + 滚动 tag，11 与 95 均已 docker login，账号 lloyd9527） |
 | 当前镜像 | ACR `:server-20261103a`（33 层，**官方 Dockerfile 原件**，extras 全量含 mlops/opspilot → **AI 就绪**）/ `:web-20261103a`（11 层）；回滚点 `:server-20261015d` / `:web-20261015c` |
 | 启用应用（9 个） | `system_mgmt,cmdb,monitor,node_mgmt,console_mgmt,alerts,log,job_mgmt,patch_mgmt` |
 | 未启用模块 | 测试机：apm / mlops / opspilot / operation_analysis / rum / workflow（原 workflow_orchestration，上游 3ccc3e336c 已改名）；菜单可见、点击 404 属预期 |
@@ -76,8 +76,8 @@
 
 ## 7. 待办
 
-- [ ] 【生产部署·下一任务】一期上 10.10.2.95：①镜像同步个人 ACR→公司仓库 `registry.cn-zhangjiakou.aliyuncs.com/shengda/…`（tag 策略与 CI 体系对齐）②确认 95 docker login 与基线安装器预下载比对 ③备份策略在生产**必须配置 crontab**（异地/异盘待决策）④部署后七项校验 + 台账；变更前出详细计划等用户确认
-- [ ] 【用户侧】一期排除模块的前端菜单手动隐藏（应用管理 UI；95 生产部署后同样需要）
+- [x] 【生产部署】一期上 10.10.2.95（2026-11-03 完成：install.run 基线 `427a2046…` + 公司仓库镜像覆盖 + 品牌 SQL 收敛 + 首备成功 + crontab 每日 02:30）
+- [ ] 【用户侧·95 生产】钉钉企业登录参数（corp_id/appkey/appsecret）与 JumpServer 集成实例需在界面重新配置（全新 DB 不继承 11 的运行时配置）；排除模块菜单隐藏（应用管理 UI）
 - [ ] 【待决策】异地备份（现备份与生产同机同盘）；测试机 crontab 当前为空
 - [ ] 【待决策】SSH 保活（`~/.ssh/config` 加 ServerAliveInterval）
 - [ ] 每月第一周跟进上游（运维手册 §6.4）；**启用 AI 现已零门槛**：镜像已含全量依赖，只需重跑安装器 `--opspilot`（随后 `apply-state.sh` 传含 `opspilot,mlops` 的 DESIRED_INSTALL_APPS 收敛）+ UI 配模型服务
@@ -117,3 +117,4 @@
 | 2026-11-02 | 预生产 91 模块全开：设 `CONDUCTOR_BASE_URL` 后重跑官方安装器 `--opspilot --apm --rum`，`INSTALL_APPS` 12→15 项，新增 conductor/victoria-traces/apm-collector/rum-* 共 9 个容器（19→28）；apm/rum/workflow 接口由 404 转 401，`show_urls` 实测 workflow 100 / apm 104 / rum 70 条路由，新模块表已迁移；`APP_WORKERS` 8→4。**未改任何代码**；变更前备份与留档在 `91:/opt/bk-lite/backup/pre-enable-all-20261102_015432/` |
 | 2026-11-02 | 查清两类遗留成因：① 官方 RUM beat 任务名复数失效（已禁用该行，功能由 dispatch 任务承担）② 上游 `3ccc3e336c` 把编排中心改名 `workflow`（含表名），旧路由已删但 DB 旧 app 记录未被清理→导航 404 且界面删不掉；已将 id=9 `is_build_in` 置 false（用户选择界面隐藏）。16 篇与 README 同步去旧写新 |
 | 2026-11-03 | **类型一升级 + 构建文件切换**：merge 上游 631 提交（tip `b44a5c92c0`，冲突仅 2 前端文件）→ 三端同 hash → 构建前拉起旧栈强制备份（`20261103_101406`，因发现容器已被外部清空、数据卷完好）→ `compose down` + `prune -a`（磁盘 29G→66G）→ server 改用**官方 Dockerfile**（extras 全量含 mlops/opspilot，**AI 就绪**，层数基准 29→33；Brotli CVE 断言通过）→ 双 tag 推送 → 部署校验全过（站点 200、迁移至 0053、**钉钉登录在新 LoginAuthBinding 链路存活**、beat 零噪音）。GitHub 自服务器不可达改走 git bundle；上游 URL 结构重构为 `api/v1/<app>/` + Next.js BFF（入坑册 12/13）。`apply-state.sh` KNOWN_APPS 同步 workflow 新旧名并存。**生产开启 AI 从此免重建镜像** |
+| 2026-11-03 | **一期上生产 95**：环境定版（11 开发/91 预发布官方AI版/95 生产）；镜像双仓库策略确立（个人 ACR 构建 → 公司仓库 `registry.cn-zhangjiakou.aliyuncs.com/shengda/bk-lite` 部署，4 tag 推送完成层数校验 33/11）；95 基线安装（install.run sha256 `427a2046…`，官方镜像拉起后 `apply-state.sh` 收敛为公司仓库镜像 + 9 应用，beat 清 5 行）；**坑：全新 DB 的品牌迁移种子由先跑的官方镜像写入（BlueKing Lite），需 SQL 收敛 portal_name/watermark_text**；备份脚本上 95 + 首备成功 + crontab 每日 02:30；最终 18 服务全 Up、站点 200、品牌「盛大运维系统」生效。**遗留用户侧：95 钉钉参数/JumpServer 实例/菜单隐藏需界面配置** |
