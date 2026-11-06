@@ -21,7 +21,7 @@
 | 上游镜像 | `main` = 上游最新 `b44a5c92c0`（2026-11-03 同步，GitHub 与 GitLab 同 hash） |
 | 运行环境 | 开发机 192.168.1.11 `/opt/bk-lite`（compose 项目名 `compose`），18 服务全 Up，`https://192.168.1.11/` = 200；磁盘可用 66G（旧镜像已清） |
 | 预发布环境 | `https://10.10.2.91/`：跑**官方 latest 镜像**（非二开 ACR 镜像）做全功能试用；模块全部启用，`INSTALL_APPS` = 12 项 + `apm,rum,workflow`，编排引擎 conductor 已部署；`APP_WORKERS=4`。**定位：官方 AI 版试用，无二开版本** |
-| 生产环境 | `https://10.10.2.95/`（主机名 ops，15G 内存/273G 磁盘）：**一期已于 2026-11-03 部署上线**——基线安装器 + 公司仓库镜像覆盖，18 服务全 Up、server/web healthy、站点 200；`INSTALL_APPS` 9 应用；品牌已收敛「盛大运维系统」；备份 crontab（每日 02:30）已配置。**待用户界面操作：钉钉企业登录参数配置（corp_id/appkey/appsecret）、JumpServer 集成实例、排除模块菜单隐藏** |
+| 生产环境 | `https://10.10.2.95/`（主机名 ops，15G 内存/273G 磁盘）：**一期已于 2026-11-03 部署上线**——基线安装器 + 公司仓库镜像覆盖，18 服务全 Up、server/web healthy、站点 200；`INSTALL_APPS` 9 应用；品牌已收敛「盛大运维系统」；备份 crontab（每日 02:30）已配置。**接入点已修复（2026-11-03 下午）**：SIDECAR_INIT_TOKEN/SIDECAR_NODE_ID 生成写入 + fusion-collector 重建，`fusion-collector-default`（container）注册成功，CMDB 采集接入点/节点管理自动采集已解锁。**待用户界面操作：钉钉企业登录参数配置（corp_id/appkey/appsecret）、JumpServer 集成实例、排除模块菜单隐藏** |
 | 镜像仓库策略 | 构建/中转=个人 ACR `crpi-qp8pnmdzkajoq92t…/fanwenbin/bk-lite`；**部署拉取=公司仓库 `registry.cn-zhangjiakou.aliyuncs.com/shengda/bk-lite`**（双 tag 已同步 `server/web-20261103a` + 滚动 tag，11 与 95 均已 docker login，账号 lloyd9527） |
 | 当前镜像 | ACR `:server-20261103a`（33 层，**官方 Dockerfile 原件**，extras 全量含 mlops/opspilot → **AI 就绪**）/ `:web-20261103a`（11 层）；回滚点 `:server-20261015d` / `:web-20261015c` |
 | 启用应用（9 个） | `system_mgmt,cmdb,monitor,node_mgmt,console_mgmt,alerts,log,job_mgmt,patch_mgmt` |
@@ -39,7 +39,10 @@
 | 文档旧仓 | `d:\Code` | 无 remote；手册与 ops 已迁出，仅留他用目录 |
 
 - 运行态：基线目录 `/opt/bk-lite`；自研脚本线上副本在 `deploy/`（镜像收敛）与 `scripts/`（备份还原）。
+- **仓库目录规范（2026-11-06 定）**：运维资产**按服务分目录**——可执行资产 `ops/<service>/`（现为 `ops/bk-lite/`、`ops/kubepi/`），模块技术文档 `docs/<service>/`（现为 `docs/kubepi/`）；`ops/` 根不得直接放脚本（唯一例外是其 `README.md` 本身）。规划产物在 `docs/specs/` 与 `docs/plans/`；产品级手册仍在仓库根。详见 `ops/README.md`。
+- 外挂模块「集群管理」（实现为 KubePi，宫格入口）的资产在 `ops/kubepi/`，线上位置 `/opt/kubepi` 与 `/opt/bk-lite` 完全隔离，平台安装器与 `apply-state.sh` 碰不到它；**生产运行容器数 = 平台 18 + 本模块 1 = 19**，凡「应为 18 个 running」的巡检判据需按此理解。
 - 交接仓已解除对 `bk-lite-master/` 的跟踪（2026-10-19，`.gitignore` 排除；此前 vendored 跟踪产生 1.7 万条 CRLF/快照漂移噪音，已清除）。提交仍用 pathspec 只提自己的文件。
+  > ⚠【2026-11-06 实测推翻】上面“已解除跟踪”**与现状不符**：`git ls-files bk-lite-master/` 仍返回 **17,822** 条，且工作树里该目录大量 M/D——即 `edc98a28` 并未真正生效。`.gitignore` 只屏蔽**未跟踪**文件，对已在索引里的条目无效。详见 §7 仓库治理待办；在它修好前，**严禁 `git commit -a`**。
 
 ## 4. 铁律（不得违反）
 
@@ -73,7 +76,12 @@
 11. 官方 latest 镜像启全模块要额外 ~10 个容器（conductor JVM、victoria-traces、rum 独立的 redis/minio/victoria-logs/victoria-traces）；16G 机器上很紧张，且**降 `APP_WORKERS` 对 server 占用帮助有限**（大头在 celery/nats_listener/长连接进程）。
 12. **上游 URL 结构已重构**（2026-11-03 版本实测）：Django 动态挂载 `api/v1/<app>/`，旧全局 `/api/menu`、`/api/get_login_auth_bindings/` 等**在 Django 侧已不存在**；前端经 Next.js BFF `/api/proxy/<app>/...` 转发（且有 308 去尾斜杠重定向，curl 验证需 `-L`）。验证登录绑定用 `/api/v1/core/api/get_login_auth_bindings/`。traefik web 路由绑 `Host(<IP>)`——用 `curl https://localhost/` 测试会 404，属测试方法问题。
 13. 新版官方镜像 supervisor conf 增加 workflow_worker / opspilot 长连接等，但 9 应用模式下 `startup.sh` 只加载对应的子集，不会崩溃循环（实测 supervisor 全 RUNNING）。
-14. **全新 DB 的三处"假故障"甄别（2026-11-03 95 实测）**：① `SIDECAR_INIT_TOKEN/SIDECAR_NODE_ID` 未定义警告——上游 compose 引用但安装器不写入 `.env`，空值即默认运行形态（11 同款已跑月余），95 的 `.env` 已补显式空定义消除噪音；② **vector 反复 Restarting（`No sources defined`）真凶是 401**：新版安装器漏写 `SYSTEM_VECTOR_CONFIG_TOKEN`（11/91 均有值），vector 拉配置 401 被解析成空配置退出重启循环——修复：`docker compose exec -T server python manage.py system_vector_token` 生成并**立即**写入 `.env`（重跑命令即失效旧 token）+ `up -d --force-recreate vector`，修复后初始快照即可正常加载（无需等用户建采集规则）；③ traefik 基线只发布 443（80/tcp 不暴露宿主机），`http://IP:443` 明文打 TLS 端口会 404——**访问必须 `https://IP/` 并信任自签证书**。
+14. ~~`SIDECAR_INIT_TOKEN/SIDECAR_NODE_ID` 未定义警告无害~~ **（2026-11-03 推翻）**：这两个变量是 **fusion-collector 容器（=默认云区域接入点）sidecar 的注册凭证**（compose 映射 `SERVER_API_TOKEN ← SIDECAR_INIT_TOKEN`、`SIDECAR_NODEID ← SIDECAR_NODE_ID`）；缺失 → sidecar `FATAL: No API token was configured` → CMDB 采集「接入点」下拉为空 + 节点管理自动采集被阻塞（`区域没有可用接入点`）。**修复**：server 容器 `python manage.py node_token_init --ip <本机IP>`（官方命令，幂等入库）→ node_id+token 写 `.env` → `up -d --force-recreate fusion-collector`（注意依赖链会连带 recreate server）。95 已修复（node_id `07dbf882…`）；11/91 的 .env 双值均为非空。安装器（install.run sha `427a2046…`）**不负责**生成这两个值——全新部署后必须手工补。
+15. **install.run 不支持 `--noexec`**：传入后内部 bootstrap.sh 照跑安装流程（重写 `.env` + 碰 compose 文件）。**禁止在目标机上对 install.run 做解包实验**；要看内容先 `bash install.run --noexec --target /tmp/x` 于**非生产机**验证，或干脆不碰。2026-11-03 在 95 上误触发：`.env` 被重写（镜像变量回官方源、INSTALL_APPS 变官方默认 10 项、vector token 清空）——已从运行容器 env 取证恢复（SECRET_KEY/DB_PASSWORD/OPENAPI_PROVIDER_TOKEN 重写前后一致，验证无加密数据损坏），全量恢复 + apply-state 口径收敛完成。
+16. **PowerShell 管道 SSH 输出会中途截断且退出码不可信**（高频会话尤甚，多条命令输出只剩前几行但 exit 0）：长脚本一律「base64 落盘到服务器 → `nohup … > /root/xxx.log 2>&1 &` → 轮询日志文件」模式执行；关键结果以新会话读文件为准，不信单次输出。
+17. `ops` host 节点是安装器给平台主机自动装的采集器（4 collectors running），属正常；filebeat/auditbeat 因无输入配置报 failing 为噪音。
+18. **vector 反复 Restarting（`No sources defined`）真凶是 401**：新版安装器漏写 `SYSTEM_VECTOR_CONFIG_TOKEN`，vector 拉 `/api/v1/log/open_api/system_vector/config/` 401 被解析成空配置退出重启循环——修复：`docker compose exec -T server python manage.py system_vector_token` 生成并**立即**写入 `.env`（重跑命令即失效旧 token）+ `up -d --force-recreate vector`。95 的该 token 2026-11-03 下午曾因误重装 .env 被清空，已从运行容器取证恢复。
+19. traefik 基线只发布 443（80/tcp 不暴露宿主机），`http://IP:443` 明文打 TLS 端口会 404——**访问必须 `https://IP/` 并信任自签证书**。
 
 ## 7. 待办
 
@@ -87,6 +95,9 @@
 - [ ] 【预生产】旧名幽灵应用 `workflow-orchestration` 残留未清（app 1 行 + role 3 + menu 8 + custom_menu_group 1 + admin 应用快照 1 处）；现已按用户决定改为界面隐藏，若顶部导航仍显示则需按残留清单清理（执行前先 pg_dump）
 - [ ] 【观察】测试机 server 启动期报 MinIO `cmdb-config-file` 桶缺失（新版功能所需桶未自动创建，~10 条/次启动）；若持续报错需在 MinIO 手动建桶
 - [ ] 【观察】预生产 server 容器内存长期占 ~9.9G/15.6G（可用仅 3.3G），怀疑内存增长；继上涨则扩容或定时重建
+- [ ] 【集群管理模块】台账待办 M1-1–M1-6 全部有效，见 `docs/kubepi/版本与变更台账.md`；其中 **M1-1**（面板镜像未 retag 进公司仓库，而镜像源已往白名单制收敛）与 **M1-2**（默认口令是否已改无凭证）优先
+- [ ] 【仓库治理·高优先】`bk-lite-master/` 仍有 **17,822** 条索引项与 `.gitignore` 冲突（10-19 的 `edc98a28` 声称已解除跟踪但**实际未生效**）：`git status` 长期数千 M/D，**任何 `git commit -a` 都会卷进 1.7 万个 vendored 文件**（与坑册第 1 条同族）。修法：单独批次 `git rm -r --cached bk-lite-master`，验证 `git ls-files bk-lite-master/` 为空；完成后回改本文件 §3 的“已解除跟踪”描述
+- [ ] 【行尾】本机与全局 `core.autocrlf=true`；2026-11-06 已新增窄范围 `.gitattributes` 钉住 `*.sh`/`*.yml` 为 LF。**重新 clone 后必须复核 `bash -n` 可过、compose 与线上 md5 相等**
 
 ## 8. 接手第一步
 
@@ -99,11 +110,13 @@
 | 需要什么 | 看哪份 |
 |---|---|
 | 二开 30 文件明细、对接记录、镜像台账、构建全流程 | `盛大运维系统_二开改动归档.md` |
-| 两类升级 SOP、回滚矩阵、基线变化应对 | `盛大运维系统_部署手册.md`（第五章；`ops/apply-state.sh` 源在 `ops/`） |
+| 两类升级 SOP、回滚矩阵、基线变化应对 | `盛大运维系统_部署手册.md`（第五章；`ops/bk-lite/apply-state.sh` 源在 `ops/bk-lite/`） |
 | 组件/数据卷、备份还原、巡检、事故案例 §5.4 | `盛大运维系统_运维手册.md` |
 | AI 模块（OpsPilot）零分叉启用方案（暂缓） | `盛大运维系统_AI模块规划.md` |
 | 需求/架构/钉钉/JumpServer | `盛大运维系统_{需求规格说明书,架构设计文档,钉钉登录对接操作手册,堡垒机对接文档}.md` |
 | 按模块的用户操作手册（按钮级，面向最终用户） | `盛大运维系统_使用文档/`（README 索引；00 总览 + 01~09 一期模块 + 10 二开 + 11~16 预生产模块；按钮文案以 `web/src/app/<模块>/locales/zh.json` 为准） |
+| 集群图形化管理（外挂模块）的设计取舍与否决理由 | `盛大运维系统_集群管控集成方案.md`（**决策存档**；事实已迁至台账；Provider 扩展包方案**未实施**，实际采用零代码外部应用登记） |
+| 集群管理模块的版本·镜像·数据配置·变更史 | `docs/kubepi/版本与变更台账.md`（**事实唯一权威**；可执行资产在 `ops/kubepi/`） |
 | Agent 长期记忆 | `c:\Users\Administrator\.trae-cn\memory\projects\-d-Code--p2-57a804f58e1514058492\`（project_memory + 每日 topics） |
 
 ## 10. 更新日志
@@ -119,3 +132,6 @@
 | 2026-11-02 | 查清两类遗留成因：① 官方 RUM beat 任务名复数失效（已禁用该行，功能由 dispatch 任务承担）② 上游 `3ccc3e336c` 把编排中心改名 `workflow`（含表名），旧路由已删但 DB 旧 app 记录未被清理→导航 404 且界面删不掉；已将 id=9 `is_build_in` 置 false（用户选择界面隐藏）。16 篇与 README 同步去旧写新 |
 | 2026-11-03 | **类型一升级 + 构建文件切换**：merge 上游 631 提交（tip `b44a5c92c0`，冲突仅 2 前端文件）→ 三端同 hash → 构建前拉起旧栈强制备份（`20261103_101406`，因发现容器已被外部清空、数据卷完好）→ `compose down` + `prune -a`（磁盘 29G→66G）→ server 改用**官方 Dockerfile**（extras 全量含 mlops/opspilot，**AI 就绪**，层数基准 29→33；Brotli CVE 断言通过）→ 双 tag 推送 → 部署校验全过（站点 200、迁移至 0053、**钉钉登录在新 LoginAuthBinding 链路存活**、beat 零噪音）。GitHub 自服务器不可达改走 git bundle；上游 URL 结构重构为 `api/v1/<app>/` + Next.js BFF（入坑册 12/13）。`apply-state.sh` KNOWN_APPS 同步 workflow 新旧名并存。**生产开启 AI 从此免重建镜像** |
 | 2026-11-03 | **一期上生产 95**：环境定版（11 开发/91 预发布官方AI版/95 生产）；镜像双仓库策略确立（个人 ACR 构建 → 公司仓库 `registry.cn-zhangjiakou.aliyuncs.com/shengda/bk-lite` 部署，4 tag 推送完成层数校验 33/11）；95 基线安装（install.run sha256 `427a2046…`，官方镜像拉起后 `apply-state.sh` 收敛为公司仓库镜像 + 9 应用，beat 清 5 行）；**坑：全新 DB 的品牌迁移种子由先跑的官方镜像写入（BlueKing Lite），需 SQL 收敛 portal_name/watermark_text**；备份脚本上 95 + 首备成功 + crontab 每日 02:30；最终 18 服务全 Up、站点 200、品牌「盛大运维系统」生效。**遗留用户侧：95 钉钉参数/JumpServer 实例/菜单隐藏需界面配置** |
+| 2026-11-03 | **资源纳管启动 + 接入点修复 + 误装事故**：产出《资源纳管操作手册》《生产环境对接操作手册》（自动发现矩阵/Windows IIS+MSSQL/C# 服务/K8s/ELK/Prometheus 并行策略）。查证「接入点为空」根因 = 安装器不生成 SIDECAR_INIT_TOKEN/SIDECAR_NODE_ID（坑 #14 修正），`node_token_init` 生成写入 + fusion-collector 重建后 `fusion-collector-default`（container）注册成功。**事故**：为查证误用 `bash install.run --noexec` 触发真实安装流程重写 `.env`（坑 #15），已从运行容器 env 取证全量恢复（SECRET_KEY/DB_PASSWORD 一致，无数据损坏），并补回 vector token。附带发现：11 整套容器当前停止（待用户处理）；91 postgres 曾短暂 Not running 需留意 |
+| 2026-11-05 | **集群管理模块（KubePi）上生产**：面板从 91 POC 迁至 95（`/opt/kubepi` + 命名卷 `kubepi-data`，`external: true`，非 privileged，55MiB），md5 三处全等；备份闭环（`/etc/cron.d/kubepi-backup` 02:40）+ 还原校验全等；91 试用实例彻底删除；前置反代评估后拆除（直连 18080 明文）。平台侧以**零代码外部应用**接入（应用表 `id=16 · 集群管理`），**Provider 扩展包方案未实施** |
+| 2026-11-06 | **集群管理模块资产规范化（M1）**：`ops/` 改为**按服务分目录**（平台 4 脚本 → `ops/bk-lite/`，新建 `ops/kubepi/`）并订正 11 处文档引用；compose/cron 线上原文首次入仓（compose 与线上 md5 全等）；`backup-kubepi.sh` 与四份手册（集成方案/生产对接/资源纳管/跟进官方固定动作）**发现从未入 git**，本批首次入库；建立 `docs/kubepi/版本与变更台账.md`（T1–T4 + M1-1–M1-6）；新增窄范围 `.gitattributes` 钉 LF（原 `core.autocrlf=true` 无属性文件，重新 clone 会把脚本变 CRLF）。**两项实测推翻**：`is_build_in` 实为 `false`（非 true，因此改 url 不会回表刷新、但界面可删，集成方案 6.1 第一条论证作废）；`bk-lite-master/` 解除跟踪**实际未生效**（仍 17,822 条索引）。服务器侧全程只读，零变更 |
