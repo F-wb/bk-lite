@@ -81,7 +81,13 @@
 16. **PowerShell 管道 SSH 输出会中途截断且退出码不可信**（高频会话尤甚，多条命令输出只剩前几行但 exit 0）：长脚本一律「base64 落盘到服务器 → `nohup … > /root/xxx.log 2>&1 &` → 轮询日志文件」模式执行；关键结果以新会话读文件为准，不信单次输出。
 17. `ops` host 节点是安装器给平台主机自动装的采集器（4 collectors running），属正常；filebeat/auditbeat 因无输入配置报 failing 为噪音。
 18. **vector 反复 Restarting（`No sources defined`）真凶是 401**：新版安装器漏写 `SYSTEM_VECTOR_CONFIG_TOKEN`，vector 拉 `/api/v1/log/open_api/system_vector/config/` 401 被解析成空配置退出重启循环——修复：`docker compose exec -T server python manage.py system_vector_token` 生成并**立即**写入 `.env`（重跑命令即失效旧 token）+ `up -d --force-recreate vector`。95 的该 token 2026-11-03 下午曾因误重装 .env 被清空，已从运行容器取证恢复。
-19. traefik 基线只发布 443（80/tcp 不暴露宿主机），`http://IP:443` 明文打 TLS 端口会 404——**访问必须 `https://IP/` 并信任自签证书**。
+19. traefik 基线只发布 443（80/tcp 不暴露宿主机），`http://IP:443` \u660e\u6587\u6253 TLS 端口会 404——**访问必须 `https://IP/` 并信任自签证书**。
+20. **外挂面板的库是 bbolt，不是 SQLite**（v2.0.3 依赖 `asdine/storm/v3`）：单文件 + 独占文件锁。后果：① 备份必须冷拷贝（短暂停容器），不能在线 `cp`；② **绝不允许两个实例同时打开同一份数据**（用快照验证请走 `ops/kubepi/restore-kubepi.sh --verify-only` 的临时卷路径）；③ 旧描述“SQLite 型本地库”**已证伪**。
+21. **读面板内容时，检索模式必须用面板自有的紧凑 JSON 结构，不是 kubeconfig/YAML 风格**（2026-11-06 连错两轮）：集群记录长这样 `{"kind":"Cluster","name":"121","spec":{"connect":{"forward":{"apiServer":"https://…:6443"}},"authentication":{"mode":"configFile","configFileContent":"<加密>"}},"status":{"version":"v1.36.5","phase":"Completed"}}`。用 `kind: Config`、`server: https://`、`client-certificate-data` 去查会**稳定得到 0 命中，把“有 2 个集群”报成“一个都没导入”**（假阴性比没数据更坏）。另：**去重要按 `uuid` 取 `updateAt` 最新一条**，bbolt 会保留同一记录新旧两版，整行 `sort -u` 会把 2 个报成 3 个。工具已固化：`ops/kubepi/export-panel-assets.sh`。
+22. **面板配置 `/etc/kubepi/app.yml` 在容器可写层**（不在 `kubepi-data` 卷内、也不在快照内），其中 `jwt.key` 由首次启动随机生成。所以升级/重建容器后全员会话失效需重新登录——**这是预期，不是故障**。一旦要改该文件里任何值，**必须同批把它挂载出来持久化**，否则下次重建静默回到镜像默认值（与坑 15/18 “install.run 重写 `.env`”同族）。
+23. **官方文档写面板要 `--privileged`，实测不需要**；不要加。另：`1panel/kubepi` 镜像在 91 上 `docker.io` 不可达、`docker.m.daocloud.io` 已改白名单制拒绝该镜像，**实测唯一可用源 `hub.rat.dev`**；拉取后必须比对 digest。公司仓库至今**没有** kubepi 镜像的 retag 副本（台账 M1-1）。
+24. **外挂服务的脚本不得长期停在 `d:\Code` 根或 `.tmp-*/`**：`.tmp-kubepi/` 一度堆了 40 个探测脚本（gitignore、无版本、无出处说明），面板源码级结论的行号无法对应任何 commit。现在面板相关的一切可执行文件一律进 `ops/kubepi/`；技术文档进 `docs/kubepi/`（规则见 `ops/README.md`）。
+25. **Windows 侧两个反复咬人的坑（本批全踩到了）**：① 编辑器写文默认 **CRLF**，入库前必须归一为 LF（compose 曾因 305 字节 vs 线上 289 字节而暴露），且仓库原先无 `.gitattributes` + `core.autocrlf=true`，**重新 clone 会把所有 bash 脚本变 CRLF**——已加窄范围属性钉死；② `ssh root@host "…"` 里的**双引号会被 PowerShell 剥掉**，一旦外层改用单引号嵌套，远端会在解析阶段直接报错（或删除字母 `r` 把 `grep` 变成 `gep`）；复杂命令一律 **scp 脚本落盘后执行**。
 
 ## 7. 待办
 
