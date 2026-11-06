@@ -1,0 +1,10 @@
+# KubePi 数据每日备份（独立于平台备份任务，02:40 跑在平台 02:30 之后）
+# 脚本内部已 tee 到 /var/log/kubepi_backup.log，故此处不再重定向到同一文件（避免行重复）
+40 2 * * * root /opt/kubepi/backup-kubepi.sh > /dev/null 2>&1
+#
+# 安装： install -m 644 cron.d-kubepi-backup /etc/cron.d/kubepi-backup
+# 卸载： rm -f /etc/cron.d/kubepi-backup
+# 校验： cat /etc/cron.d/kubepi-backup && tail -20 /var/log/kubepi_backup.log
+# 立即手动触发一次（验证任务本身能跑通，不等 02:40）：
+#   root@<host> /opt/kubepi/backup-kubepi.sh
+# 注意：cron.d 文件的行格式为「分 时 日 月 周 用户 命令」，比用户 crontab 多一个「用户」字段。

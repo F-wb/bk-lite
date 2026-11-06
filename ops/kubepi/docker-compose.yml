@@ -1,0 +1,16 @@
+services:
+  kubepi:
+    image: 1panel/kubepi:v2.0.3
+    container_name: kubepi
+    restart: unless-stopped
+    ports:
+      - "18080:80"
+    volumes:
+      - kubepi-data:/var/lib/kubepi
+networks:
+  default:
+    name: kubepi
+volumes:
+  kubepi-data:
+    name: kubepi-data
+    external: true
