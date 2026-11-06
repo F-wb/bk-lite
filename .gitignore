@@ -4,3 +4,6 @@
 # 官方安装器工件（基线升级时本地取用，不入库）
 /bootstrap.sh
 /install.run
+
+# 本地 IDE / AI 工具配置，不入库
+/.serena/
