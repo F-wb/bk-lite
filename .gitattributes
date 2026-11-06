@@ -1,0 +1,23 @@
+# 行尾与文本属性钉版
+#
+# 为什么必须有这个文件：本机与全局 git 配置均为 core.autocrlf=true，且此前无 .gitattributes。
+# 后果是「入库时 CRLF→LF，检出时 LF→CRLF」——在 Windows 上重新 clone 一次，所有 bash 脚本
+# 和 docker-compose.yml 都会变成 CRLF：脚本会在变量里带进 \r（历史事故：管道传脚本带 CRLF 导致
+# 远端静默失败），compose 也不再与 Linux 线上副本逐字节相等。
+# 因此这里显式钉住：运维资产一律 LF，检出也不转换。
+#
+# 范围刻意收窄：只声明需要按 LF 执行/比对的文件类型，不对全部文本开 text=auto，
+# 以免触发对 1.7 万个已跟踪文件的重新规范化。
+
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+cron.d-* text eol=lf
+
+# 明确不做行尾转换的二进制/密钥类
+*.png   binary
+*.jpg   binary
+*.gz    binary
+*.tar   binary
+*.btskey binary
+deploy_key binary
