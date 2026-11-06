@@ -1,0 +1,42 @@
+# 集群管理面板 · 内容清单（快照静态读取导出）
+#
+# 读取方式：从 /opt/kubepi/backup/<快照>/kubepi-data_*.tar.gz 解包到一次性目录后静态解析，
+#           全程未打开生产卷（bbolt 单文件独占锁），未启动第二个面板实例。
+# 重要：本清单反映的是「该快照时刻」的状态，不是实时状态。面板内容变更后需重新生成。
+# 严禁在本文件记录任何令牌、证书或口令内容。
+
+snapshot: "20261106_024001"
+snapshot_file_md5: "8eecdd0079f2c0481ee60d9bbb14f57f"
+read_at: "2026-11-06"
+read_method: "static parse of untarred snapshot copy (no bbolt open, no second instance)"
+
+panel:
+  db_file_size_bytes: 262144
+  db_version: 3                     # 启动日志 current db version: 3，非空库标志
+  iris_version: "12.2.11"           # 面板内置 Web 框架版本
+  image: "1panel/kubepi:v2.0.3"
+
+imported_clusters: []               # 本快照时刻：0 个
+credential_inventory:
+  kubeconfig_documents: 0           # kind: Config 计数
+  api_server_urls: []               # server: https://... 计数
+  client_certificate_data: 0
+  client_key_data: 0
+  ca_data: 0
+  token_bearing: 0
+  basic_auth: 0
+  insecure_skip_tls_verify: 0
+
+panel_users:
+  - username: lloyd9527
+    email: kubepi@fit2cloud.com     # 上游默认值，未改成企业邮箱
+    note: "由出厂 admin 改名而来；口令是否已改无凭证，见台账待办 M1-2"
+
+# 与实况的偏差（必读）
+discrepancy:
+  found_at: "2026-11-06"
+  fact: "运维于当日白天在面板中导入了集群，晚于 02:40 的每日快照，故本清单看不到。"
+  consequence: |
+    每日 02:40 的快照对「当天新导入的集群 / 新建的账号」有最长约 21 小时的可见性空窗。
+    需要当前状态时，必须先触发一次备份再读，而备份脚本会短暂停面板容器（实测约 2 秒）。
+  action_needed: "见台账 M1-4b：约定'何时需要新鲜快照'的触发条件（导入集群或建账号后立即手动跑一次备份脚本）"

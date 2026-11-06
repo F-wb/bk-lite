@@ -14,6 +14,8 @@
 | `backup-kubepi.sh` | `/opt/kubepi/backup-kubepi.sh`（`chmod 700`） | 每日冷拷贝快照（bbolt 需短暂停容器后 tar） |
 | `cron.d-kubepi-backup` | `/etc/cron.d/kubepi-backup` | 触发器，`40 2 * * *`，跑在平台 02:30 之后避免重叠 |
 | `restore-kubepi.sh` | 无固定线上位置 | **还原步骤的唯一权威**；文档只引用本脚本，不复制内容 |
+| `export-panel-assets.sh` | 无固定线上位置 | 从快照解包静态导出面板内容清单（集群数/凭据形态/账号）。**绝不开生产卷** |
+| `panel-assets.yaml` | 无 | 上一次导出的结果。**反映快照时刻而非实时**，看文件头的 `discrepancy` 节 |
 
 ## 同步方向（单向，仓库为准）
 
@@ -51,6 +53,7 @@ md5sum ops/kubepi/docker-compose.yml     # 两者必须相同，当前均为 121
 4. **禁止两个实例同时打开同一份数据**（bbolt 单文件 + 独占锁）。要用快照做验证就走 `restore-kubepi.sh --verify-only` 的临时卷路径，不要另起常驻实例。
 5. 入口端口 `18080` 变更时，须同步三处：本 compose、平台应用表 `system_mgmt_app`（`id=16`）的 `url`、以及台账；且改 App 表后**已有用户的应用快照不会自动刷新**（见台账 T3）。
 6. 本目录所有文件必须 **LF** 行尾——仓库已用 `.gitattributes` 钉住，因为本机 `core.autocrlf=true` 会把检出内容变成 CRLF，`bash` 与 `docker compose` 都会受影响。
+7. **不要为了拿到实时清单而去 `docker exec` 读生产库或用库文件起第二个实例**（bbolt 独占锁）。正确做法：先跑一次备份（会停容器约 2 秒，属变更操作，需先告知），再跑 `export-panel-assets.sh` 读新快照。
 
 ## 已知行为：重建容器会重置面板运行配置
 
