@@ -58,7 +58,8 @@ AI 模块是运维平台的**智能化增强层**，独立于核心业务模块�
 | 项 | 状态 |
 |---|---|
 | 模块启用状态 | **未启用**（一期排除；模块保留在系统中，由前端「应用管理」控制显示） |
-| App 表记录 | 已含 `opspilot` / `mlops` / `workflow-orchestration` —— 启用后可直接放显 |
+| App 表记录 | 已含 `opspilot` / `mlops` / `workflow-orchestration` —— 启用后可直接放显（⚠️ 上游 `3ccc3e336c`（2026-10-23）已把编排中心应用改名为 `workflow`，**连数据库表名一起改**；跟进该提交后 App 表会新旧两条并存，旧记录不会被官方初始化脚本清理） |
+| 启用参考 | 预生产 `10.10.2.91` 已于 2026-11-02 用**官方 latest 镜像**实测启用 apm/rum/mlops/opspilot/workflow 全模块（含 conductor 引擎）；结论：接口路由止 404、`INSTALL_APPS` 与开关对应关系见《运维手册》§2.4，但 16G 内存机器上全模块开会很紧（server 容器长期 ~9.9G） |
 | 容器数 | 18 个（不含 AI 相关服务） |
 | 向量库 | `pgvector` 容器运行中，`metis` 库已建但为空（0 张表）；`vector` 扩展**可用**（实测可 `CREATE EXTENSION`） |
 | 后端依赖 | ❌ **缺失**（见 3.2） |
@@ -202,7 +203,7 @@ cd /opt/bk-lite && docker compose up -d --force-recreate server web
 | C3 | `postgres` 可达（`mlflow` 库尚未建，补启用时创建） | ✅ |
 | C4 | `pgvector` 容器可达，`metis` 库存在 | ✅ |
 | C5 | `metis` 内 `vector` 扩展**可用**（0.8.1，实测可建、已回滚不留痕） | ✅ |
-| C6 | App 表已含 `opspilot` / `mlops` / `workflow-orchestration` 记录 | ✅ |
+| C6 | App 表已含 `opspilot` / `mlops` / `workflow-orchestration` 记录 | ✅（基于 2026-10-16 基线；升级过 `3ccc3e336c` 后该应用名为 `workflow`，见 §3.1 注） |
 
 **D. 资源与源码**
 
