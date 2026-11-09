@@ -7,3 +7,7 @@
 
 # 本地 IDE / AI 工具配置，不入库
 /.serena/
+
+# 告警触达配置：内含 webhook 令牌与加签密钥，严禁入库（线上放 /opt/bk-lite/etc/backup-alert.env，权限 600）
+*alert*.env
+backup-alert.env

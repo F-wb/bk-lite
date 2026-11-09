@@ -1,0 +1,15 @@
+# 备份看门狗：每天 03:00 UTC 跑（平台 02:30 与面板 02:40 都结束之后）
+# 判据是"产物能不能用于还原"，不是脚本退出码。
+# 注意时区：95 是 UTC，03:00 即北京时间上午 11:00。若要把告警压到工作时段开头，按 UTC 换算。
+0 3 * * * root /opt/bk-lite/scripts/backup-watchdog.sh --quiet >> /var/log/shengda_watchdog.log 2>&1
+
+# 安装： install -m 644 cron.d-backup-watchdog /etc/cron.d/backup-watchdog
+#       脚本本体需先放到 /opt/bk-lite/scripts/ 并 chmod +x
+# 卸载： rm -f /etc/cron.d/backup-watchdog
+# 立即验证一次（不会外发，只在 --force-alert 且已配 webhook 时才发）：
+#       bash /opt/bk-lite/scripts/backup-watchdog.sh ; echo rc=$?
+#       cat /var/lib/bk-lite-backup-watchdog/state
+#
+# 触达配置（不含在仓库里，权限 600，已在 .gitignore 排除）：
+#       /opt/bk-lite/etc/backup-alert.env   内含 ALERT_WEBHOOK / ALERT_WEBHOOK_SECRET
+#       未配置时看门狗仍然工作，但只能把结论写进状态文件——不会送达任何人。
