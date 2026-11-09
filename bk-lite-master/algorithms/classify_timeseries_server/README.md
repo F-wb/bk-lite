@@ -1,1 +1,0 @@
-copier copy -r ml-serving https://github.com/necomesh/python-template.git serving

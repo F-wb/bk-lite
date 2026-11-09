@@ -1,6 +1,7 @@
-# KubePi 数据每日备份（独立于平台备份任务，02:40 跑在平台 02:30 之后）
+# KubePi 数据每周备份（独立于平台备份任务，周日 02:40 跑在平台 02:30 之后）
+# 2026-11-09 由每日（40 2 * * *）改每周：单容器、数据量小，每日无必要；升级/重要变更前手动跑一次 backup-kubepi.sh 兼弥
 # 脚本内部已 tee 到 /var/log/kubepi_backup.log，故此处不再重定向到同一文件（避免行重复）
-40 2 * * * root /opt/kubepi/backup-kubepi.sh > /dev/null 2>&1
+40 2 * * 0 root /opt/kubepi/backup-kubepi.sh > /dev/null 2>&1
 #
 # 安装： install -m 644 cron.d-kubepi-backup /etc/cron.d/kubepi-backup
 # 卸载： rm -f /etc/cron.d/kubepi-backup

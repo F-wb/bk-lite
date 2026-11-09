@@ -1,4 +1,0 @@
-build/
-dist/
-*.egg-info/
-.ruff_cache/

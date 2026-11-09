@@ -11,8 +11,8 @@
 | 文件 | 线上位置 | 说明 |
 |---|---|---|
 | `docker-compose.yml` | `/opt/kubepi/docker-compose.yml` | **线上原文逐字副本**，非模板。禁止改写为 `${VAR}` 形式；与线上 md5 必须相等 |
-| `backup-kubepi.sh` | `/opt/kubepi/backup-kubepi.sh`（`chmod 700`） | 每日冷拷贝快照（bbolt 需短暂停容器后 tar） |
-| `cron.d-kubepi-backup` | `/etc/cron.d/kubepi-backup` | 触发器，`40 2 * * *`，跑在平台 02:30 之后避免重叠 |
+| `backup-kubepi.sh` | `/opt/kubepi/backup-kubepi.sh`（`chmod 700`） | 冷拷贝快照（bbolt 需短暂停容器后 tar）；现由每周 cron 触发，升级前可手动跑 |
+| `cron.d-kubepi-backup` | `/etc/cron.d/kubepi-backup` | 触发器，**`40 2 * * 0` 每周日 02:40**（2026-11-09 由每日改每周），跑在平台 02:30 之后避免重叠 |
 | `restore-kubepi.sh` | 无固定线上位置 | **还原步骤的唯一权威**；文档只引用本脚本，不复制内容 |
 | `export-panel-assets.sh` | 无固定线上位置 | 从快照解包静态导出面板内容清单（集群数/凭据形态/账号）。**绝不开生产卷** |
 | `panel-assets.yaml` | 无 | 上一次导出的结果。**反映快照时刻而非实时**，看文件头的 `discrepancy` 节 |
@@ -42,7 +42,7 @@ md5sum ops/kubepi/docker-compose.yml     # 两者必须相同，当前均为 121
 - 独立 compose 项目名 `kubepi`、独立网络 `kubepi`、独立卷 `kubepi-data`；与 `/opt/bk-lite` 完全隔离。
 - 平台安装器 `install.run` / `bootstrap.sh` / `apply-state.sh` **都碰不到本模块**——这是选择与平台同机混部（95）的前提。
 - 平台备份任务 `shengda-backup` 不含本模块；本模块快照由 `kubepi-backup` 独立负责。
-- **两者备份同在 95 本机同盘**，异地策略属未决项（见台账待办 M1-3）。
+- **两者备份同在 95 本机同盘**；面板单容器、快照仅 24K，**异地已决定不做**（台账 M1-3）。面板自动备份已降为每周，重要变更前需手动补一次快照（台账 M1-4b）。
 - 生产机运行容器数 = 平台 18 + 本模块 1 = **19**。凡"服务总数应为 18"的巡检判据都要按此理解。
 
 ## 禁改项（改了会静默出事）

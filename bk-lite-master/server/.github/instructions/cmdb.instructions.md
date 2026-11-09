@@ -1,3 +1,0 @@
----
-applyTo: 'apps/cmdb/**'
----

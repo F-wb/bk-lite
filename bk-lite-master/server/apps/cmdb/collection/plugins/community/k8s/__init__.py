@@ -1,1 +1,0 @@
-"""K8s collection plugins."""

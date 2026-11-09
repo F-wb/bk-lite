@@ -1,4 +1,0 @@
-vendor
-go.sum
-nats-executor
-pkg/

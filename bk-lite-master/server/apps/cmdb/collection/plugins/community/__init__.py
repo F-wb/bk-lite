@@ -1,1 +1,0 @@
-"""Community collection plugins."""

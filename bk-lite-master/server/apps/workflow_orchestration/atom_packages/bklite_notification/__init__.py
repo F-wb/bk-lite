@@ -1,1 +1,0 @@
-"""Platform notification atom package."""

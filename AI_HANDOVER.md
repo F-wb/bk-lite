@@ -34,7 +34,7 @@
 | 未启用模块 | 测试机：apm / mlops / opspilot / operation_analysis / rum / workflow（原 workflow_orchestration，上游 3ccc3e336c 已改名）；菜单可见、点击 404 属预期 |
 | 模块启用机制 | Django 只为 `.env` 里 `INSTALL_APPS` 列出的 app 注册路由；URL 结构已改为 `api/v1/<app>/` 动态挂载 + 前端 Next.js BFF（`/api/proxy/<app>/...`）；安装器开关持久化在 `common.env`，数值参数必须 `--app-workers=4` |
 | 宿主约束 | 内存 7.2G——构建前必须全停容器；**升级前强制备份**（本次迁移至 system_mgmt.0053） |
-| 使用文档 | `docs/bk-lite/盛大运维系统_使用文档/` v2（按钮级）共 **18 篇（00~17）**；**未含截图**。其中 00~16 文案取自 `web/src/app/<模块>/locales/zh.json`；**17_集群管理 是外挂模块**，文案改取面板自身前端资源内词表，懒加载子包里的按钮仍标 `[待实测]` |
+| 使用文档 | `docs/bk-lite/盛大运维系统_使用文档/` v2（按钮级）共 **18 篇（00~17）**；**未含截图**。其中 00~16 文案取自 `web/src/app/<模块>/locales/zh.json`；**17_集群管理 是外挂模块**，文案改取面板自身前端资源内词表；2026-11-09 已对面板一次只读登录，把懒加载子包里的工作负载按钮实测回填，不再标 `[待实测]` |
 
 ## 3. 仓库与路径
 
@@ -47,8 +47,8 @@
 - 运行态：基线目录 `/opt/bk-lite`；自研脚本线上副本在 `deploy/`（镜像收敛）与 `scripts/`（备份还原）。
 - **仓库目录规范（2026-11-06 定）**：运维资产**按服务分目录**——可执行资产 `ops/<service>/`（现为 `ops/bk-lite/`、`ops/kubepi/`），模块技术文档 `docs/<service>/`（现为 `docs/kubepi/`）；`ops/` 根不得直接放脚本（唯一例外是其 `README.md` 本身）。规划产物在 `docs/specs/` 与 `docs/plans/`；产品级手册仍在仓库根。详见 `ops/README.md`。
 - 外挂模块「集群管理」（实现为 KubePi，宫格入口）的资产在 `ops/kubepi/`，线上位置 `/opt/kubepi` 与 `/opt/bk-lite` 完全隔离，平台安装器与 `apply-state.sh` 碰不到它；**生产运行容器数 = 平台 18 + 本模块 1 = 19**，凡「应为 18 个 running」的巡检判据需按此理解。
-- 交接仓已解除对 `bk-lite-master/` 的跟踪（2026-10-19，`.gitignore` 排除；此前 vendored 跟踪产生 1.7 万条 CRLF/快照漂移噪音，已清除）。提交仍用 pathspec 只提自己的文件。
-  > ⚠【2026-11-06 实测推翻】上面“已解除跟踪”**与现状不符**：`git ls-files bk-lite-master/` 仍返回 **17,822** 条，且工作树里该目录大量 M/D——即 `edc98a28` 并未真正生效。`.gitignore` 只屏蔽**未跟踪**文件，对已在索引里的条目无效。详见 §7 仓库治理待办；在它修好前，**严禁 `git commit -a`**。
+- 交接仓已**真正解除**对 `bk-lite-master/` 的跟踪（2026-11-09 本轮 `git rm -r --cached bk-lite-master`，`git ls-files bk-lite-master/` 已为 0；`.gitignore` 的 `/bk-lite-master/` 从此生效）。磁盘文件与内层独立仓 `.git` 均未动。提交仍用 pathspec 只提自己的文件。
+  > 【2026-11-09 收口】早先 10-19 的 `edc98a28` 声称解除但未生效（`.gitignore` 屏蔽不了已入索引的条目，故长期数千 M/D）；本轮已彻底修正，不再需“严禁 `git commit -a`”的临时约束（vendored 文件已不在索引）。
 
 ## 4. 铁律（不得违反）
 
@@ -116,8 +116,8 @@
 - [ ] 【校验方法缺陷·本轮发现】spec §7 与计划 Task 7 的“旧路径引用残留应为 0”这条判据**没写作用域**：跑全局扫描会得到 23，全部来自 `docs/specs`+`docs/plans` 里“描述替换动作本身”的文本（`git mv` 命令、对照表左列），并非活引用。真实手册作用域（根 `*.md` / 使用文档 / `ops/`）实测均为 0。**必须把判据改成“排除 `docs/specs` 与 `docs/plans`”**，否则下个执行者会误判为订正未完成
 - [x] 【备份残缺目录】`/opt/bk-lite/backup/20261108_023001`（失败备份留下的残缺目录，无 `SHA256SUMS`/无 `MANIFEST`）**已于 2026-11-09 确认后删除**：删前逐个确认目录数 7→、其余 6 个均为 6 文件且 `latest` 不指向它；删后复核目录数 **6 且全为 6 文件**、`latest` 不变、磁盘余量 222G 不变
 - [ ] 【备份防复发待评估】falkordb 子进程为何会卡 2 天 **未查清**（`vm.overcommit_memory=0` 只是嫌疑，本次错是 `EEXIST` 不是 `ENOMEM`）。可选方向：备份脚本在 falkordb 步骤前先检测“bgsave 子进程长时间零 CPU 推进”，命中则告警而不是静默失败；以及给备份失败加对外告警（现在只写本地日志，**连续 2 天没人看见**）
-- [ ] 【集群管理模块】台账待办 M1-1–M1-8 全部有效，见 `docs/kubepi/版本与变更台账.md`；其中 **M1-1**（面板镜像未 retag 进公司仓库，而镜像源已往白名单制收敛）与 **M1-2**（默认口令是否已改无凭证）优先
-- [ ] 【仓库治理·高优先】`bk-lite-master/` 仍有 **17,822** 条索引项与 `.gitignore` 冲突（10-19 的 `edc98a28` 声称已解除跟踪但**实际未生效**）：`git status` 长期数千 M/D，**任何 `git commit -a` 都会卷进 1.7 万个 vendored 文件**（与坑册第 1 条同族）。修法：单独批次 `git rm -r --cached bk-lite-master`，验证 `git ls-files bk-lite-master/` 为空；完成后回改本文件 §3 的“已解除跟踪”描述
+- [x] 【集群管理模块】台账待办见 `docs/kubepi/版本与变更台账.md`：M1-2（登录实测确认口令已非默认）、M1-3（决定不做）、M1-4b（改每周）、M1-9（按钮文案已回填）均 2026-11-09 收口；**仅剩 M1-1**（面板镜像未 retag 进公司仓库，而镜像源已往白名单制收敛）为高优先未决项
+- [x] 【仓库治理·已完成 2026-11-09】`bk-lite-master/` 的 17,822 条误跟踪已本轮 `git rm -r --cached bk-lite-master` 解除，`git ls-files bk-lite-master/` 为空；§3 描述已同步回改
 - [ ] 【行尾】本机与全局 `core.autocrlf=true`；2026-11-06 已新增窄范围 `.gitattributes` 钉住 `*.sh`/`*.yml` 为 LF。**重新 clone 后必须复核 `bash -n` 可过、compose 与线上 md5 相等**
 
 ## 8. 接手第一步

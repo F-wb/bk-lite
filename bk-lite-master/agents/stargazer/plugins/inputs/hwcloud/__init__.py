@@ -1,1 +1,0 @@
-# huaweicloud collection plugin
