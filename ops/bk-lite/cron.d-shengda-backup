@@ -1,0 +1,13 @@
+# 盛大运维系统 生产库每日备份（保留 14 天，脚本内自动清理）
+30 2 * * * root /opt/bk-lite/scripts/backup-all.sh >> /var/log/shengda_backup.log 2>&1
+#
+# 说明：本行以上（含注释首行）为线上 /etc/cron.d/shengda-backup 原文逐字副本（2026-11-09 从 10.10.2.95 抓取），
+#       行以下为安装与校验注释，仅存在于仓库副本、线上未安装；因此本仓库文件与线上 md5 不等属预期。
+# 安装： install -m 644 cron.d-shengda-backup /etc/cron.d/shengda-backup
+# 卸载： rm -f /etc/cron.d/shengda-backup
+# 校验： cat /etc/cron.d/shengda-backup && tail -20 /var/log/shengda_backup.log
+# 立即手动触发一次（验证任务本身能跑通，不等 02:30）：
+#   root@<host> /opt/bk-lite/scripts/backup-all.sh
+# 注意：cron.d 文件的行格式为「分 时 日 月 周 用户 命令」，比用户 crontab 多一个「用户」字段。
+# 关联：面板侧独立任务见 ops/kubepi/cron.d-kubepi-backup；本任务 02:30、面板任务 02:40，均为 UTC。
+# 已知范围限制：本任务当前不带 --with-volumes，minio/redis/nats/victoria-metrics 未被覆盖，属平台侧整机备份策略问题。
