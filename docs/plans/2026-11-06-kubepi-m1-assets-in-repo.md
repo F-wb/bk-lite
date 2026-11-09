@@ -237,7 +237,7 @@ Expected: ① = `0`；② ≥ `11`（Step 3/4 写的两个 README 也含新路�
 
 额外硬校：PowerShell 写回必须保持**各文件原有的 BOM 状态**（上述脚本已如此）——历史坑：ps1/文档缺 BOM 或多出 BOM 会导致解析与显示错乱。
 
-- [ ] **Step 7: Commit（需用户已批准提交，否则跳过）**
+- [x] **Step 7: Commit（需用户已批准提交，否则跳过）**
 
 ```bash
 git add ops/README.md ops/bk-lite/README.md ops/bk-lite/apply-state.sh ops/bk-lite/backup-all.sh ops/bk-lite/overlay-images.sh ops/bk-lite/restore-all.sh
@@ -327,7 +327,7 @@ ssh root@10.10.2.95 "file /opt/kubepi/docker-compose.yml"; Select-String -Path b
 ```
 Expected: `file` 报告不含 `CRLF line terminators`；PowerShell 侧无命中。
 
-- [ ] **Step 6: Commit（需用户已批准提交，否则跳过）**
+- [x] **Step 6: Commit（需用户已批准提交，否则跳过）**
 
 ```bash
 git add ops/kubepi/docker-compose.yml ops/kubepi/cron.d-kubepi-backup
@@ -408,7 +408,7 @@ Expected: `git diff --cached --name-only` 输出 **恰好 5 行**（上列 5 个
 Run: `git -C bk-lite ls-files ops/`
 Expected: 返回 **5 行**，新增 `ops/kubepi/backup-kubepi.sh`；`ops/backup-kubepi.sh` 仍不出现。
 
-- [ ] **Step 7: Commit（需用户已批准提交，否则跳过）**
+- [x] **Step 7: Commit（需用户已批准提交，否则跳过）**
 
 ```bash
 git commit -m "chore: 集群管理备份脚本归位 ops/kubepi/；四份长期未入库的专题手册首次入库"
@@ -537,7 +537,7 @@ Expected: `0`（没有残留临时卷）、`running`、`19`。
 Run: `ssh root@10.10.2.95 "rm -f /tmp/rs.sh /tmp/rs.lf.sh"`
 （仅删本任务自建的 `/tmp` 副本，不涉及任何既有文件。）
 
-- [ ] **Step 7: Commit（需用户已批准提交，否则跳过）**
+- [x] **Step 7: Commit（需用户已批准提交，否则跳过）**
 
 ```bash
 git add ops/kubepi/restore-kubepi.sh
@@ -633,7 +633,7 @@ Get-ChildItem bk-lite\ops\kubepi -File | Select-String -Pattern 'jwt\.key: *[A-Z
 ```
 Expected: 第一组三行 `OK`；第二组**无命中**（严禁把真实密钥值或其片段写进文档；模式本身只包字段名，不含任何真实值）。
 
-- [ ] **Step 4: Commit（需用户已批准提交，否则跳过）**
+- [x] **Step 4: Commit（需用户已批准提交，否则跳过）**
 
 ```bash
 git add ops/kubepi/README.md
@@ -768,7 +768,7 @@ Select-String -Path "bk-lite\docs\kubepi\版本与变更台账.md" -Pattern '日
 ```
 Expected: 第一条**无命中**（不得残留占位符）。第二条命中 **1 处**且必须保留——那是 T4 中外部应用录入日期，因无可靠取证来源而**故意不填具体日期**（伪造日期比留空更危险）；若执行者能面板操作日志或 `system_mgmt_app` 的创建时间字段拿到确切日期，用真实值替换该格。
 
-- [ ] **Step 5: Commit（需用户已批准提交，否则跳过）**
+- [x] **Step 5: Commit（需用户已批准提交，否则跳过）**
 
 ```bash
 git add "docs/kubepi/版本与变更台账.md"
@@ -831,7 +831,7 @@ Expected: 命中 **4 处**（Step 2 两行 + Step 3 的两段各 1 行）。再�
 ```
 Expected: 与改动前相比 **+2**（仅 §9 表格新增两行；Step 3 追加的是 `- ` 开头的列表行，不计入表格）。若为 +3 说明 Step 3 误写成了表格行，需改回列表。
 
-- [ ] **Step 5: Commit（需用户已批准提交，否则跳过）**
+- [x] **Step 5: Commit（需用户已批准提交，否则跳过）**
 
 ```bash
 git add AI_HANDOVER.md
@@ -883,7 +883,7 @@ Remove-Item .tmp-kubepi\backup-kubepi.sh, .tmp-kubepi\backup-kubepi.lf.sh
 ```
 Expected: 两文件不存在。**只删这两个**，`.tmp-kubepi/` 其余文件的取舍属 spec §3.4 的完整三分类，留到 M5 一次性做，本批不扩大范围。
 
-- [ ] **Step 4: 汇报并确认是否提交**
+- [x] **Step 4: 汇报并确认是否提交**
 
 输出：判据一/二/三结果、Step 2 线上复核结果、已新增与已移动的文件清单。
 若用户尚未批准提交，此处询问是否执行 Task 1–6 的 commit 步骤（`git log --oneline` 应出现 6 条以内、按任务分粒度的提交）。

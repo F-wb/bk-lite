@@ -13,11 +13,17 @@
 
 「盛大运维系统」= 开源运维平台基线（官方安装器部署）+ 少量二开（品牌、钉钉登录、JumpServer SSH 终端），二开以自建前后端镜像经 ACR 覆盖交付。**一期已交付验收；AI 模块评估完成、暂缓实施。**
 
-## 2. 当前状态快照（2026-11-03）
+## 2. 当前状态快照（2026-11-06 收尾于 M3）
 
 | 项 | 值 |
 |---|---|
-| 源码 | `bk-lite-master` 仓分支 `shengda/v1.0-custom` @ `b5bc86ab37`（= 上游 `b44a5c92c0` + 631 提交 merge，30 二开文件完整）；服务器构建副本 `/opt/bk-lite-src` 同点（GitHub 自服务器不可达，经 git bundle 同步） |
+| **本轮节点（先看这一行）** | 「集群管理」模块规范化：spec → M1（资产落仓+台账）→ M2（内容清单）→ **M3（13 项文档补齐）已全部完成并提交**；**M4 / M5 未做**，下一步从 M4 开。详见 §7 待办与 `docs/kubepi/版本与变更台账.md` T4 |
+| 外挂模块「集群管理」 | 生产在用（95）：`/opt/kubepi` 独立 compose 项目 `kubepi` + 命名卷 `kubepi-data`（`external: true`）+ 独立备份 cron（02:40，还原已验证）；入口 `http://10.10.2.95:18080/kubepi` 明文 HTTP；**整机容器数 = 平台 18 + 外挂 1 = 19**（`docker compose ps` 口径仍为 18，两者都对） |
+| 面板实况（2026-11-06 快照实测） | 已纳管 **2 个集群**：`121`（v1.36.5，官方推荐区间）与 `110`（v1.22.2，**低于官方最低支持 v1.24**，已知情保留）；面板账号仅 `lloyd9527`（口令是否已改**仍无凭证**）；db version 3 / Iris 12.2.11 |
+| 仓库目录规范（本轮定下） | **一个服务一个子目录**：可执行资产 `ops/<service>/`（现为 `ops/bk-lite/`、`ops/kubepi/`），模块技术文档 `docs/<service>/`（现为 `docs/kubepi/`）；`ops/` 根不得直接放脚本；规则见 `ops/README.md` |
+| 版本可追溯入口 | 事实唯一权威 `docs/kubepi/版本与变更台账.md`（T1 上游锚点 commit `e183085d…` / T2 镜像与实例 / T3 数据配置 / T4 变更史 / M1-1…M1-8）；内容清单 `ops/kubepi/panel-assets.yaml`；决策存档 `盛大运维系统_集群管控集成方案.md` |
+| 本轮仓库提交 | 9 个（`chore` 目录重构 / `ops` 面板资产 / `docs` 台账 / `docs` 四份手册首次入库 / DEV-1 / M2 订正 / 运维手册 M3 / 其余四份手册 M3）；**均未 push** |
+| 源码 | `bk-lite-master` 仓分支 `shengda/v1.0-custom` @ `b5bc86ab37`（= 上游 `b44a5c92c0` + 631 提交 merge，30 二开文件完整）；服务器构建副本 `/opt/bk-lite-src` 同点 |
 | 上游镜像 | `main` = 上游最新 `b44a5c92c0`（2026-11-03 同步，GitHub 与 GitLab 同 hash） |
 | 运行环境 | 开发机 192.168.1.11 `/opt/bk-lite`（compose 项目名 `compose`），18 服务全 Up，`https://192.168.1.11/` = 200；磁盘可用 66G（旧镜像已清） |
 | 预发布环境 | `https://10.10.2.91/`：跑**官方 latest 镜像**（非二开 ACR 镜像）做全功能试用；模块全部启用，`INSTALL_APPS` = 12 项 + `apm,rum,workflow`，编排引擎 conductor 已部署；`APP_WORKERS=4`。**定位：官方 AI 版试用，无二开版本** |
@@ -28,7 +34,7 @@
 | 未启用模块 | 测试机：apm / mlops / opspilot / operation_analysis / rum / workflow（原 workflow_orchestration，上游 3ccc3e336c 已改名）；菜单可见、点击 404 属预期 |
 | 模块启用机制 | Django 只为 `.env` 里 `INSTALL_APPS` 列出的 app 注册路由；URL 结构已改为 `api/v1/<app>/` 动态挂载 + 前端 Next.js BFF（`/api/proxy/<app>/...`）；安装器开关持久化在 `common.env`，数值参数必须 `--app-workers=4` |
 | 宿主约束 | 内存 7.2G——构建前必须全停容器；**升级前强制备份**（本次迁移至 system_mgmt.0053） |
-| 使用文档 | `盛大运维系统_使用文档/` v2（按钮级）共 17 篇；**未含截图** |
+| 使用文档 | `盛大运维系统_使用文档/` v2（按钮级）共 17 篇（00~16）；**未含截图**；⚠ `17_集群管理.md` **尚未创建**（归 M4，所以现在没往 README 索引里登记，避免死链） |
 
 ## 3. 仓库与路径
 
@@ -101,7 +107,10 @@
 - [ ] 【预生产】旧名幽灵应用 `workflow-orchestration` 残留未清（app 1 行 + role 3 + menu 8 + custom_menu_group 1 + admin 应用快照 1 处）；现已按用户决定改为界面隐藏，若顶部导航仍显示则需按残留清单清理（执行前先 pg_dump）
 - [ ] 【观察】测试机 server 启动期报 MinIO `cmdb-config-file` 桶缺失（新版功能所需桶未自动创建，~10 条/次启动）；若持续报错需在 MinIO 手动建桶
 - [ ] 【观察】预生产 server 容器内存长期占 ~9.9G/15.6G（可用仅 3.3G），怀疑内存增长；继上涨则扩容或定时重建
-- [ ] 【集群管理模块】台账待办 M1-1–M1-6 全部有效，见 `docs/kubepi/版本与变更台账.md`；其中 **M1-1**（面板镜像未 retag 进公司仓库，而镜像源已往白名单制收敛）与 **M1-2**（默认口令是否已改无凭证）优先
+- [ ] 【集群管理模块·下一步 = M4】新建 `docs/kubepi/架构与部署.md` + 使用文档 `17_集群管理.md`（与其他 16 篇同口径：菜单实测 + `web/src/app/<模块>/locales/zh.json` 按钮文案）+ 对接手册新增一章「外部应用接入：集群管理」；**同一批再回头补 README 索引行与 AI_HANDOVER §9 剩下 2 行**（先登记会造死链，本轮故意没加）
+- [ ] 【集群管理模块·M5】集成方案改写为纯决策存档（事实已迁走，需标明保留哪些章节）+ `.tmp-kubepi/` 残留脚本按 `ops/README.md` 规则三分类清理（**`edge-proxy-95.sh` 必须标死或删——反代已拆，不标注会被照着重建**）
+- [ ] 【校验方法缺陷·本轮发现】spec §7 与计划 Task 7 的“旧路径引用残留应为 0”这条判据**没写作用域**：跑全局扫描会得到 23，全部来自 `docs/specs`+`docs/plans` 里“描述替换动作本身”的文本（`git mv` 命令、对照表左列），并非活引用。真实手册作用域（根 `*.md` / 使用文档 / `ops/`）实测均为 0。**必须把判据改成“排除 `docs/specs` 与 `docs/plans`”**，否则下个执行者会误判为订正未完成
+- [ ] 【集群管理模块】台账待办 M1-1–M1-8 全部有效，见 `docs/kubepi/版本与变更台账.md`；其中 **M1-1**（面板镜像未 retag 进公司仓库，而镜像源已往白名单制收敛）与 **M1-2**（默认口令是否已改无凭证）优先
 - [ ] 【仓库治理·高优先】`bk-lite-master/` 仍有 **17,822** 条索引项与 `.gitignore` 冲突（10-19 的 `edc98a28` 声称已解除跟踪但**实际未生效**）：`git status` 长期数千 M/D，**任何 `git commit -a` 都会卷进 1.7 万个 vendored 文件**（与坑册第 1 条同族）。修法：单独批次 `git rm -r --cached bk-lite-master`，验证 `git ls-files bk-lite-master/` 为空；完成后回改本文件 §3 的“已解除跟踪”描述
 - [ ] 【行尾】本机与全局 `core.autocrlf=true`；2026-11-06 已新增窄范围 `.gitattributes` 钉住 `*.sh`/`*.yml` 为 LF。**重新 clone 后必须复核 `bash -n` 可过、compose 与线上 md5 相等**
 
@@ -140,4 +149,4 @@
 | 2026-11-03 | **一期上生产 95**：环境定版（11 开发/91 预发布官方AI版/95 生产）；镜像双仓库策略确立（个人 ACR 构建 → 公司仓库 `registry.cn-zhangjiakou.aliyuncs.com/shengda/bk-lite` 部署，4 tag 推送完成层数校验 33/11）；95 基线安装（install.run sha256 `427a2046…`，官方镜像拉起后 `apply-state.sh` 收敛为公司仓库镜像 + 9 应用，beat 清 5 行）；**坑：全新 DB 的品牌迁移种子由先跑的官方镜像写入（BlueKing Lite），需 SQL 收敛 portal_name/watermark_text**；备份脚本上 95 + 首备成功 + crontab 每日 02:30；最终 18 服务全 Up、站点 200、品牌「盛大运维系统」生效。**遗留用户侧：95 钉钉参数/JumpServer 实例/菜单隐藏需界面配置** |
 | 2026-11-03 | **资源纳管启动 + 接入点修复 + 误装事故**：产出《资源纳管操作手册》《生产环境对接操作手册》（自动发现矩阵/Windows IIS+MSSQL/C# 服务/K8s/ELK/Prometheus 并行策略）。查证「接入点为空」根因 = 安装器不生成 SIDECAR_INIT_TOKEN/SIDECAR_NODE_ID（坑 #14 修正），`node_token_init` 生成写入 + fusion-collector 重建后 `fusion-collector-default`（container）注册成功。**事故**：为查证误用 `bash install.run --noexec` 触发真实安装流程重写 `.env`（坑 #15），已从运行容器 env 取证全量恢复（SECRET_KEY/DB_PASSWORD 一致，无数据损坏），并补回 vector token。附带发现：11 整套容器当前停止（待用户处理）；91 postgres 曾短暂 Not running 需留意 |
 | 2026-11-05 | **集群管理模块（KubePi）上生产**：面板从 91 POC 迁至 95（`/opt/kubepi` + 命名卷 `kubepi-data`，`external: true`，非 privileged，55MiB），md5 三处全等；备份闭环（`/etc/cron.d/kubepi-backup` 02:40）+ 还原校验全等；91 试用实例彻底删除；前置反代评估后拆除（直连 18080 明文）。平台侧以**零代码外部应用**接入（应用表 `id=16 · 集群管理`），**Provider 扩展包方案未实施** |
-| 2026-11-06 | **集群管理模块资产规范化（M1）**：`ops/` 改为**按服务分目录**（平台 4 脚本 → `ops/bk-lite/`，新建 `ops/kubepi/`）并订正 11 处文档引用；compose/cron 线上原文首次入仓（compose 与线上 md5 全等）；`backup-kubepi.sh` 与四份手册（集成方案/生产对接/资源纳管/跟进官方固定动作）**发现从未入 git**，本批首次入库；建立 `docs/kubepi/版本与变更台账.md`（T1–T4 + M1-1–M1-6）；新增窄范围 `.gitattributes` 钉 LF（原 `core.autocrlf=true` 无属性文件，重新 clone 会把脚本变 CRLF）。**两项实测推翻**：`is_build_in` 实为 `false`（非 true，因此改 url 不会回表刷新、但界面可删，集成方案 6.1 第一条论证作废）；`bk-lite-master/` 解除跟踪**实际未生效**（仍 17,822 条索引）。服务器侧全程只读，零变更 |
+| 2026-11-06 | **集群管理模块规范化 M1+M2+M3（当日 9 个提交，未 push）**：① **M1** `ops/` 改为按服务分目录（平台 4 脚本 `git mv` 入 `ops/bk-lite/`，新建 `ops/kubepi/`：compose/cron/backup/restore/export/README/panel-assets），订正 4 份文档共 11 处引用；`backup-kubepi.sh` 与《集成方案》《生产环境对接》《资源纳管》《跟进官方代码的固定动作》**发现从未入 git**，首次入库；新增 `docs/kubepi/版本与变更台账.md`（T1–T4 + M1-1…M1-8）；新增窄范围 `.gitattributes`——本机与全局 `core.autocrlf=true` 且原先无属性文件，**重新 clone 会把所有 bash 脚本与 compose 变 CRLF**（即坑 1 的机制根源）。② **M2 面板内容清单导出，连错两轮才对**：先用 kubeconfig/YAML 风格模式（`kind: Config`、`server: https://`、`client-certificate-data`）得出"面板没导入任何集群"的**假阴性**；实际面板用自有紧凑 JSON（`"kind":"Cluster"`、`spec.connect.forward.apiServer`），且 kubeconfig 存于**加密的** `configFileContent`，YAML 风格模式在原理上永远打不中。第二个错：整行 `sort -u` 去重把 2 个集群报成 3 个（bbolt 保留同一记录新旧两版），改按 `uuid` 取 `updateAt` 最新一条。两条限制已写进 `export-panel-assets.sh` 头注与 `panel-assets.yaml` 的 `method_caveats`。实测结论：**已纳管 2 个集群**（121 = v1.36.5 官方推荐区间 / 110 = v1.22.2），面板账号仅 `lloyd9527`。③ **DEV-1 收口**：110 **低于官方最低支持 v1.24** 却已纳管且 `phase=Completed`，决定**保留纳管**并改写集成方案 §1 结论 5 / §2.2 / §8.2（新增"110 纳管风险记录"）/ §14 R3。④ **M3** 运维手册 14 处补齐（含 §4.4 定时任务按生产实况订正：实为 `/etc/cron.d/` 两条且不带 `--with-volumes`，root crontab 为空）；部署手册新增第八章"外挂模块"并重排后续章节号；架构设计文档 §1.3 新增"外挂模块"类 + §9.2.1 生产单机实际布局；使用文档 01/09 补外部应用语义（含 `app=''` 角色短路的开通前必查 SQL）；坑册新增 20–25 六条。**未做**：M4（`docs/kubepi/架构与部署.md`、使用文档 `17_集群管理.md`、对接手册新章、索引 2 行）、M5（集成方案定性为纯决策存档、`.tmp-kubepi` 三分类清理）。**服务器全程只读**，唯一写操作 = 经确认后手动跑一次面板备份（停容器约 2 秒）。**推翻两条旧记载**：`is_build_in` 实为 `false`（故改 url 不回表刷新、但界面可删，集成方案 6.1 第一条论证作废）；`bk-lite-master/` 解除跟踪**实际未生效**（仍 17,822 条索引） |
