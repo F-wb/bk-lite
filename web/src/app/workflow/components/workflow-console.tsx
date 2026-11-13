@@ -9,7 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import OperateModal from '@/components/operate-modal';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
-import useApiClient from '@/utils/request';
+import useApiClient, { HandledRequestError } from '@/utils/request';
 import { useTranslation } from '@/utils/i18n';
 import { WorkflowCanvasEdge } from './workflow-canvas-edge';
 import { defaultNodeInputValues, SchemaNodeField, SchemaNodeForm } from './schema-node-form';
@@ -19,6 +19,7 @@ import { AtomIcon } from './atom-icon';
 import { FormSchemaEditor } from './form-schema-editor';
 import { DocumentRenderForm } from './document-render-form';
 import { FileSampleLinks } from './file-sample-links';
+import { FileDistributeForm } from './file-distribute-form';
 import { JobExecuteForm } from './job-execute-form';
 import { JobTargetSelectionDialog } from './job-target-selection-dialog';
 import { WORKFLOW_OVERLAY_MODAL_Z_INDEX } from './workflow-launch-dialog';
@@ -1107,10 +1108,46 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
       const persisted = workflow.id
         ? workflow
         : await post<WorkflowRecord>(`${API}/workflows/`, { name: workflow.name.trim(), description: workflow.description, definition, canvas_metadata: canvasMetadata, starter: 'blank' });
-      const published = await post<WorkflowRecord>(`${API}/workflows/${persisted.id}/publish/`, { name: persisted.name, description: persisted.description, definition, canvas_metadata: canvasMetadata, draft_revision: persisted.draft_revision });
+      const published = await post<WorkflowRecord>(
+        `${API}/workflows/${persisted.id}/publish/`,
+        { name: persisted.name, description: persisted.description, definition, canvas_metadata: canvasMetadata, draft_revision: persisted.draft_revision },
+        { suppressErrorNotification: true },
+      );
       setWorkflow(published); setDefinition(published.definition); setMetadata(published.canvas_metadata as WorkflowCanvasMetadata); setDirty(false);
       if (!workflow.id) router.replace(`/workflow/workflows/${published.id}?mode=edit`);
       message.success(t('workflowOrchestration.editor.publishedAndEnabled', 'v{version} 已发布并启用', { version: published.current_version }));
+    } catch (error) {
+      if (error instanceof HandledRequestError) {
+        const hintByCode: Record<string, { id: string; defaultMessage: string }> = {
+          DRAFT_REVISION_CONFLICT: {
+            id: 'workflowOrchestration.editor.publishDraftConflictHint',
+            defaultMessage: '草稿已被更新。请重新载入后再发布，避免覆盖他人修改。',
+          },
+          PUBLISH_VERSION_CONFLICT: {
+            id: 'workflowOrchestration.editor.publishVersionConflictHint',
+            defaultMessage: '版本号已被并发发布占用。请刷新后重试。',
+          },
+          ENGINE_DEFINITION_CONFLICT: {
+            id: 'workflowOrchestration.editor.publishEngineConflictHint',
+            defaultMessage: '远端定义与本次内容冲突。请刷新核对是否上次发布未完成落库，不要强行覆盖。',
+          },
+        };
+        const hint = error.code ? hintByCode[error.code] : undefined;
+        if (hint) {
+          message.error(`${error.message} ${t(hint.id, hint.defaultMessage)}`);
+        } else if (error.status === 503) {
+          message.error(
+            t(
+              'workflowOrchestration.editor.publishUnavailableHint',
+              '发布服务暂时不可用。请稍后重试；不要假定本地已发布成功。',
+            ),
+          );
+        } else {
+          message.error(error.message);
+        }
+      } else {
+        message.error(error instanceof Error ? error.message : t('common.failed', '操作失败'));
+      }
     } finally { setPendingAction(null); }
   };
 
@@ -1482,29 +1519,47 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
                   onChange={changeTaskInputs}
                   onNodeTitleChange={changeTaskTitle}
                 />
-                : OPSPILOT_ATOM_KEYS.has(selectedTask.name)
-                  ? <OpsPilotAtomForm
-                    atomKey={selectedTask.name}
+                : selectedTask.name === 'bklite_file_distribute'
+                  ? <FileDistributeForm
+                    key={selectedTask.taskReferenceName}
                     schema={selectedAtom?.input_schema}
                     value={selectedTask.inputParameters || {}}
                     references={references}
-                    workflowId={workflow.id || null}
                     nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
                     readOnly={readOnly}
+                    targetRecords={jobTargetRecords}
+                    fieldActions={readOnly ? {} : {
+                      targets: <WorkflowPermission operation="Edit" instancePermissions={workflow.permission}><Button onClick={() => {
+                        setJobTargetSelectorPurpose('params');
+                        setJobTargetSelectorOpen(true);
+                      }}>{t('workflowOrchestration.launch.selectTarget', '选择主机')}</Button></WorkflowPermission>,
+                    }}
                     onChange={changeTaskInputs}
                     onNodeTitleChange={changeTaskTitle}
                   />
-                  : <SchemaNodeForm
-                    schema={selectedAtom?.input_schema}
-                    uiSchema={selectedAtom?.ui_schema}
-                    value={selectedTask.inputParameters || {}}
-                    references={references}
-                    atomKey={selectedTask.name}
-                    nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
-                    readOnly={readOnly}
-                    onChange={changeTaskInputs}
-                    onNodeTitleChange={changeTaskTitle}
-                  />)}
+                  : OPSPILOT_ATOM_KEYS.has(selectedTask.name)
+                    ? <OpsPilotAtomForm
+                      atomKey={selectedTask.name}
+                      schema={selectedAtom?.input_schema}
+                      value={selectedTask.inputParameters || {}}
+                      references={references}
+                      workflowId={workflow.id || null}
+                      nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
+                      readOnly={readOnly}
+                      onChange={changeTaskInputs}
+                      onNodeTitleChange={changeTaskTitle}
+                    />
+                    : <SchemaNodeForm
+                      schema={selectedAtom?.input_schema}
+                      uiSchema={selectedAtom?.ui_schema}
+                      value={selectedTask.inputParameters || {}}
+                      references={references}
+                      atomKey={selectedTask.name}
+                      nodeTitle={resolveEditableNodeTitle(selectedAtom?.name || selectedTask.name)}
+                      readOnly={readOnly}
+                      onChange={changeTaskInputs}
+                      onNodeTitleChange={changeTaskTitle}
+                    />)}
             {selectedCondition && <ConditionEditor
               value={selectedCondition}
               references={references}
@@ -1663,7 +1718,7 @@ export function WorkflowOrchestrationConsole({ workflowId, initialName, mode = '
       </Form> : null}
       {inspectorTestTrigger
         ? Object.keys(nodeTestInputContract.schema.properties || {}).length
-          ? selectedTask?.name === 'bklite_job_execute' && jobTestTargetsField
+          ? (selectedTask?.name === 'bklite_job_execute' || selectedTask?.name === 'bklite_file_distribute') && jobTestTargetsField
             ? <Form layout="vertical" className="flex flex-col gap-4">
               <Form.Item className="mb-0" label={t('workflowOrchestration.editor.targetHosts', '目标主机')} required>
                 <WorkflowPermission operation="Execute" instancePermissions={workflow.permission} className="block w-full"><button
